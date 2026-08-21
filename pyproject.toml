@@ -11,6 +11,10 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
     "python-multipart>=0.0.9",
+    # Chat templates are Jinja, including the ones models ship in their own
+    # tokenizer_config.json. The controller renders them so a preview shows
+    # exactly what the runner will train on.
+    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]

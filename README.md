@@ -241,6 +241,27 @@ fix. Where the obvious fix is useless it says something else instead: a width
 of 577 has no sensible divisor, so rather than advising "try 1 head" it
 suggests a width of 576.
 
+## Conversations, roles and templates
+
+Conversation datasets are the awkward case, and there is no single format for
+them. `content` may be a string or a list of typed parts; roles may be under
+`role` or `from`; a tool-calling dataset carries `tool_calls` on assistant
+turns and a `tools` schema in its own column. All of it is normalised to one
+shape in `common/formatting.py` before any template sees it, so system, user,
+assistant and tool turns survive intact — including the tool calls.
+
+Then a **Jinja template** turns that into training text. Three sources:
+
+| | |
+|---|---|
+| **The model's own** | Read from the base model's `tokenizer_config.json`. Almost always right: every instruct model was trained to expect one exact layout and ships it. |
+| **Plain and readable** | Roles written out as text. The correct choice for a base model, which has no format of its own. |
+| **Your own** | A Jinja template given `messages`, `tools` and every column of the row. Sandboxed, and compile and render errors are reported against real rows rather than swallowed. |
+
+**All three work for fine-tuning and for training from scratch.** A model built
+from nothing can learn a conversation format at the same time as it learns the
+language — it simply learns whichever shape it is shown.
+
 ## Playground
 
 Every finished run stays available to chat with. Inference runs on a runner,
@@ -248,11 +269,25 @@ never on the controller — that is what keeps the controller GPU-free — so a
 message is routed over the fleet websocket and the reply streams back token by
 token.
 
-The two kinds of result behave differently, and the interface says which one it
-is holding. A fine-tune gets your message wrapped in the exact template it was
-trained with (skip that, and it ignores the question and rambles). A model
-built from scratch is a base model: it continues text and has never seen a
-question in its life, so it is asked for an opening instead.
+**The Playground speaks the shape the model was taught, never one of its own.**
+Every run records the exact format it trained with, and the Playground sends
+the conversation back through that same format. Getting this wrong is how a
+perfectly good fine-tune comes to look broken: give a model a layout it has
+never seen and it ignores most of what it learned. Three interfaces follow from
+the recorded format:
+
+- **chat** — roles, a system prompt, and turns that accumulate as context.
+- **instruct** — one question at a time, wrapped in its training template,
+  with no memory of earlier ones, because that is how it was trained.
+- **continue** — a base model, which continues text and has never seen a
+  question.
+
+The **system prompt** the model trained with is offered back, because a model
+fine-tuned with one behaves noticeably worse without it and nobody writes it
+down. It is recorded when the run is created, and recovered from the run's own
+dataset when it was not — so runs made before this existed, or through the API,
+get theirs back too. "What the model is actually being sent" shows the finished
+prompt after templating, for when the answer is not what you expected.
 
 Runners fetch and cache the artifact from the controller on first use, and
 release the GPU after 15 idle minutes so a chat cannot block the next training
@@ -320,7 +355,9 @@ reverse proxy that provides auth.
 ## Project layout
 
 ```
-common/       formatting shared by both, so previews cannot drift from training
+common/       message normalising, Jinja templating and prompt building --
+              shared, so the preview, the trainer and the playground cannot
+              render the same conversation three different ways
 controller/   FastAPI app, SQLite, scheduler, HF proxy  (no torch)
 runner/       capability probe, websocket agent, trainers, inference host
 web/          zero-build UI (ES modules, no dependencies)
@@ -364,6 +401,9 @@ Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 | From scratch, 29M params | 11.5 GB against a 10.5 GB estimate |
 | Hand-designed 448x7, 20M params | trained from the designer end to end |
 | Multi-config dataset | configurations listed from the card when the viewer 501s |
+| Tool-calling chat dataset | 4 roles, 19 tools, tool calls preserved end to end |
+| Qwen 0.5B on that dataset | loss 2.246 → 1.392 with the model's own template |
+| Deleting a run | rows, model file and each runner's cached copy |
 | Cancelling a run mid-training | stopped cleanly, runner stayed online |
 | Runner killed mid-run | job requeued and restarted automatically |
 | Runner killed after upload | run kept as finished, not restarted from noise |
@@ -400,7 +440,9 @@ really did start from nothing.
   and a runner that is training will not serve the playground. A second job
   waits on the queue and is told so once, rather than being offered to the busy
   machine every five seconds.
-- **No way to delete a run.** Finished and failed runs accumulate.
+- **Training learns from the whole conversation**, including the system prompt
+  and the user's turns, rather than masking the loss to assistant replies only.
+  Standard, and it works; masking would squeeze more out of the same data.
 - **From-scratch tops out around 200M parameters**, which is a compute limit
   rather than an arbitrary one. See the table above.
 - **The corpus is held in host RAM** while training (capped at 500M tokens,

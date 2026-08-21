@@ -266,5 +266,26 @@ def add_artifact(job_id: str, kind: str, filename: str, size: int) -> str:
     return aid
 
 
+def update_job_config(job_id: str, cfg: dict) -> None:
+    ex("UPDATE jobs SET config=? WHERE id=?", (json.dumps(cfg), job_id))
+
+
+def delete_job(job_id: str) -> list[str]:
+    """Remove a job and everything hanging off it.
+
+    Returns the artifact filenames so the caller can delete the files too --
+    the rows are cheap, the zips are not, and leaving a few hundred megabytes
+    behind on every delete would make the feature actively harmful.
+    """
+    files = [r["filename"] for r in
+             q("SELECT filename FROM artifacts WHERE job_id=?", (job_id,))]
+    c = connect()
+    for table in ("metrics", "logs", "artifacts"):
+        c.execute("DELETE FROM %s WHERE job_id=?" % table, (job_id,))
+    c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+    c.commit()
+    return files
+
+
 def list_artifacts(job_id: str) -> list[dict]:
     return q("SELECT * FROM artifacts WHERE job_id=? ORDER BY created_at", (job_id,))

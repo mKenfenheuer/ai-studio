@@ -144,6 +144,11 @@ export async function wizardView(mount) {
     // The data step, shared by both paths.
     dataset: null, configs: resource(), config: null, split: "train",
     preview: resource(), textField: null, formatMode: null,
+    // How a conversation becomes training text. "model" uses the base model's
+    // own chat template, which is what an instruct model was trained to expect
+    // and therefore the right default; "custom" is a Jinja template the user
+    // writes; "builtin" is a plain readable rendering.
+    templateSource: "model", customTemplate: "", builtin: resource(),
     // From scratch.
     minutes: 60, size: null, vocab: 8192, custom: null,
     sizes: resource(), plan: resource(), ftPlan: resource(),
@@ -430,17 +435,16 @@ function stepData(body, ctx) {
       }
     }
     if (c.status === "ready") {
-      const key = [state.dataset, state.config, state.split,
-                   state.formatMode || "", state.textField || ""].join("|");
-      ensure(state.preview, key, () => api.trainingPreview({
-        dataset: state.dataset,
-        config: state.config,
-        split: state.split,
-        format: state.formatMode ? { mode: state.formatMode } : null,
-        text_field: scratch ? state.textField : null,
-      }), draw);
+      ensure(state.preview, previewKey(state, scratch),
+             () => api.trainingPreview(previewRequest(state, scratch)), draw);
+      if (state.preview.status === "ready") {
+        state.previewIsChat = state.preview.data.format?.mode === "chat";
+      }
     }
   }
+  // Fetched once, and only used to seed the editor when someone chooses to
+  // write their own.
+  if (!scratch) ensure(state.builtin, "builtin", () => api.builtinTemplate(), draw);
 
   body.innerHTML = html`
     <div class="card" style="margin-bottom:14px">
@@ -498,6 +502,8 @@ function stepData(body, ctx) {
     // exhaust the dataset, the second is what the model is asked to continue.
     state.corpusTokens = +t.dataset.tokens || null;
     state.samplePrompt = t.dataset.prompt || null;
+    state.templateSource = "model";
+    state.customTemplate = "";
     state.plan = resource();
     state.sizes = resource();
     draw();
@@ -520,6 +526,40 @@ function stepData(body, ctx) {
   });
   on(body, "change", "#formatSelect", (_e, t) => {
     state.formatMode = t.value || null; state.preview = resource(); draw();
+  });
+  on(body, "click", "[data-tmplsrc]", (_e, t) => {
+    state.templateSource = t.dataset.tmplsrc;
+    if (state.templateSource === "custom" && !state.customTemplate) {
+      // Start from something that already works rather than a blank box.
+      const b = state.builtin.data || {};
+      const det = state.preview.data?.format || {};
+      state.customTemplate = det.mode === "chat"
+        ? (b.template || "") : (b.instruction_template || "");
+    }
+    state.preview = resource();
+    draw();
+  });
+  // Applied on demand, not per keystroke: re-rendering four examples on every
+  // character would fight the cursor and hammer the dataset server.
+  // Expanding rewrites one paragraph in place. Going through draw() would
+  // re-render the step and fold it straight back up.
+  on(body, "click", "[data-expand]", (_e, t) => {
+    const card = t.closest(".sample");
+    const para = card && card.querySelector(".txt");
+    const idx = [...body.querySelectorAll(".sample")].indexOf(card);
+    const full = state.preview.data?.rendered?.[idx]?.text;
+    if (!para || full == null) return;
+    const wasExpanded = para.dataset.full === "0";
+    para.textContent = wasExpanded ? shorten(full) : full;
+    para.dataset.full = wasExpanded ? "1" : "0";
+    t.textContent = wasExpanded
+      ? "Show all " + fmtNum(full.length) + " characters" : "Show less";
+  });
+  on(body, "click", "#applyTemplate", () => {
+    const box = $("#templateBox", body);
+    if (box) state.customTemplate = box.value;
+    state.preview = resource();
+    draw();
   });
 
   wireSearch(body, "ds", async (q) => {
@@ -577,7 +617,163 @@ function dataDetail(state, scratch) {
       </div>
     </div>
 
+    <div style="margin-top:14px">${raw(templatePanel(state, scratch))}</div>
     <div style="margin-top:14px">${raw(trainingText(state, scratch))}</div>`;
+}
+
+const TEMPLATE_SOURCES = [
+  { id: "model", title: "The model's own format",
+    desc: "Every instruct model was trained to expect one exact layout, and "
+        + "ships it in its own files. Using it is almost always right — give a "
+        + "model a shape it has never seen and it ignores half of what you "
+        + "taught it." },
+  { id: "builtin", title: "Plain and readable",
+    desc: "Roles written out as text. Fine for a base model, and easy to read "
+        + "when you are checking the data rather than the format." },
+  { id: "custom", title: "Write it yourself",
+    desc: "A Jinja template with the conversation and tools handed to it. Full "
+        + "control, for a layout neither of the others produces." },
+];
+
+function templatePanel(state, scratch) {
+  const p = state.preview;
+  const det = p.status === "ready" ? (p.data.format || {}) : {};
+  const isChat = det.mode === "chat";
+  const src = state.templateSource;
+  // A model being built from scratch has no "own format" to borrow -- it has
+  // never been trained on anything. It learns whichever shape it is shown, so
+  // the choice is between the plain rendering and one written by hand.
+  const sources = scratch
+    ? TEMPLATE_SOURCES.filter((t) => t.id !== "model")
+    : TEMPLATE_SOURCES;
+  if (scratch && !isChat && src === "model") state.templateSource = "builtin";
+
+  return html`
+    <div class="card">
+      <div class="row-between" style="margin-bottom:4px">
+        <h3 style="margin:0">How a row becomes training text</h3>
+        ${raw(p.status === "ready" && p.data.template_source
+          ? `<span class="badge badge-accent">using: ${esc(p.data.template_source)}</span>` : "")}
+      </div>
+      ${raw(scratch && isChat ? html`
+        <div class="callout" style="margin:0 0 12px">
+          <strong>A conversation, learned from nothing</strong>
+          This dataset is a conversation, and a model built from scratch can
+          learn its shape along with the language — the roles below become part
+          of what it writes. Whatever you choose here is exactly what the
+          Playground will speak to it afterwards.
+        </div>` : "")}
+      ${raw(isChat ? html`
+        <p class="muted tiny" style="margin:0 0 10px">
+          This is a conversation dataset. Roles found:
+          ${raw((det.roles || []).map((r) =>
+            `<span class="badge">${esc(r)}</span>`).join(" "))}
+          ${raw(det.tools_field
+            ? `<span class="badge badge-accent">tool definitions in
+               "${esc(det.tools_field)}"</span>` : "")}
+          ${raw(det.has_tool_calls
+            ? `<span class="badge badge-accent">tool calls</span>` : "")}
+        </p>` : html`
+        <p class="muted tiny" style="margin:0 0 10px">
+          Rows are read as ${esc(det.mode || "…")}. Change the template below if
+          that is not the shape you want the model to learn.</p>`)}
+
+      <div class="grid grid-3">
+        ${raw(sources.map((t) => html`
+          <button class="pick ${src === t.id ? "selected" : ""}" data-tmplsrc="${t.id}">
+            <span class="t">${t.title}
+              ${raw(t.id === "model" ? `<span class="badge badge-ok">recommended</span>` : "")}
+            </span>
+            <span class="d">${t.desc}</span>
+          </button>`).join(""))}
+      </div>
+
+      ${raw(p.status === "ready" && p.data.template_note ? html`
+        <div class="callout callout-warn" style="margin-top:12px">
+          <strong>No template on this model</strong>${p.data.template_note}
+          Falling back to the plain readable form.
+        </div>` : "")}
+
+      ${raw(src === "custom" ? html`
+        <div class="field" style="margin-top:12px">
+          <label for="templateBox">Jinja template</label>
+          <textarea id="templateBox" rows="10" spellcheck="false"
+                    class="mono">${state.customTemplate}</textarea>
+          <div class="hint">
+            Available: <code>messages</code> (each with
+            <code>role</code>, <code>content</code>, <code>tool_calls</code>,
+            <code>train</code>), <code>tools</code>, and every column of the row
+            by name. Example:
+            <code>{% for m in messages %}{{ m.role }}: {{ m.content }}
+            {% endfor %}</code>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn-primary btn-sm" id="applyTemplate">Apply and preview</button>
+          </div>
+        </div>` : "")}
+
+      ${raw(p.status === "ready" && (p.data.system_prompts || []).length ? html`
+        <details class="adv" style="margin-top:10px">
+          <summary>System prompt found in this data</summary>
+          <p class="muted tiny" style="margin:8px 0 4px">Kept with the run, and
+            offered again in the Playground — a model trained with a system
+            prompt behaves differently without it.</p>
+          <p class="txt mono tiny" style="white-space:pre-wrap;max-height:180px;
+             overflow:auto;background:var(--surface-2);padding:10px;
+             border-radius:8px">${p.data.system_prompts[0].slice(0, 1500)}</p>
+        </details>` : "")}
+
+      ${raw(p.status === "ready" && p.data.template_error ? html`
+        <div class="callout callout-err" style="margin-top:12px">
+          <strong>That template did not work</strong>${p.data.template_error}
+        </div>` : "")}
+    </div>`;
+}
+
+// How much of an example is shown before it is folded. Long enough to see
+// the shape of a conversation, short enough that several still fit a screen.
+const SHORT = 2600;
+
+function shorten(text) {
+  if (!text || text.length <= SHORT) return text;
+  const head = Math.round(SHORT * 0.6);
+  const tail = SHORT - head;
+  return text.slice(0, head)
+    + "\n\n… " + fmtNum(text.length - SHORT) + " characters hidden …\n\n"
+    + text.slice(-tail);
+}
+
+function previewKey(state, scratch) {
+  return JSON.stringify([state.dataset, state.config, state.split,
+                         state.formatMode, state.textField, state.model,
+                         state.templateSource, state.customTemplate]);
+}
+
+function previewRequest(state, scratch) {
+  const fmt = {};
+  if (state.formatMode) fmt.mode = state.formatMode;
+  // The same three sources for both paths, minus the one a from-scratch model
+  // cannot have. Building the format here rather than per-path is what lets a
+  // conversation dataset train a model from nothing and then be talked to in
+  // the same shape afterwards.
+  if (!scratch && state.templateSource === "model") {
+    fmt.use_model_template = true;
+  } else if (state.templateSource === "custom" && state.customTemplate) {
+    // "jinja" rather than a chat template, so the same box works whether or
+    // not the dataset is a conversation.
+    fmt.mode = "jinja";
+    fmt.template = state.customTemplate;
+  }
+  return {
+    dataset: state.dataset,
+    config: state.config,
+    split: state.split,
+    format: Object.keys(fmt).length ? fmt : null,
+    // A plain-text corpus still names its column; a conversation does not.
+    text_field: (scratch && state.templateSource === "builtin"
+                 && !state.previewIsChat) ? state.textField : null,
+    base_model: scratch ? null : state.model,
+  };
 }
 
 function previewControls(state, scratch) {
@@ -623,15 +819,19 @@ function trainingText(state, scratch) {
 
   const rendered = p.data.rendered || [];
   const counts = p.data.counts || {};
+  // A failed template makes every row unreadable. Saying so *and* accusing the
+  // data of being empty sends the reader looking in the wrong place; the
+  // template panel above already shows the real reason.
+  const blame = !p.data.template_error;
   return html`
-    ${raw(counts.unreadable ? html`
+    ${raw(blame && counts.unreadable ? html`
       <div class="callout callout-err">
         <strong>${counts.unreadable} of ${counts.sampled} sampled rows could not be read</strong>
         These rows have content, but the columns chosen above do not reach it,
         so training would skip them. The dataset's columns are:
         ${(p.data.columns || []).join(", ")}.
       </div>` : "")}
-    ${raw(counts.empty ? html`
+    ${raw(blame && counts.empty ? html`
       <div class="callout">
         <strong>${counts.empty} of ${counts.sampled} sampled rows are blank</strong>
         Perfectly normal in line-by-line corpora — blank lines separate
@@ -650,11 +850,16 @@ function trainingText(state, scratch) {
         ${raw(rendered.map((r, i) => html`
           <div class="sample">
             <div class="hd"><span class="badge">example ${i + 1}</span>
+              <span class="row" style="gap:6px">
+              ${raw(r.length ? `<span class="badge">${fmtNum(r.length)} characters</span>` : "")}
               ${raw(r.status === "unreadable"
                 ? `<span class="badge badge-err">columns do not match</span>`
                 : r.status === "empty"
-                ? `<span class="badge">blank row</span>` : "")}</div>
-            <p class="txt">${r.text || "(nothing)"}</p>
+                ? `<span class="badge">blank row</span>` : "")}</span></div>
+            <p class="txt" data-full="${r.length > SHORT ? "1" : ""}">${
+                r.length > SHORT ? shorten(r.text) : (r.text || "(nothing)")}</p>
+              ${raw(r.length > SHORT ? `<button class="btn-sm" data-expand
+                  style="margin-top:6px">Show all ${fmtNum(r.length)} characters</button>` : "")}
           </div>`).join(""))}
       </div>
     </div>`;
@@ -1267,6 +1472,20 @@ function buildJob(mount, state) {
     dataset_split: state.split || "train",
   };
 
+  // Whatever the preview proved, recorded on the job. The Playground reads it
+  // back so it speaks to the finished model in the shape the model learned,
+  // and the remembered system prompt is offered there as a starting point.
+  const trained = { ...(state.preview.data?.format || {}) };
+  delete trained.specials;
+  if (state.templateSource === "model" && state.mode === "finetune") {
+    trained.use_model_template = true;
+    delete trained.chat_template;
+  } else if (state.templateSource === "custom" && state.customTemplate) {
+    trained.mode = "jinja";
+    trained.template = state.customTemplate;
+  }
+  const systemPrompt = (state.preview.data?.system_prompts || [])[0] || "";
+
   if (state.mode === "scratch") {
     // Guarded: the review used to read .settings straight off a plan that
     // could still be null, which threw instead of explaining itself.
@@ -1276,15 +1495,13 @@ function buildJob(mount, state) {
     return {
       name, kind: "pretrain_llm",
       config: { ...dataBits, text_field: state.textField || "text",
+                format: trained, system_prompt: systemPrompt,
                 required_runner: state.runnerId, ...s },
     };
   }
 
   if (state.ftPlan.status !== "ready") return null;
   const s = { ...state.ftPlan.data.settings, ...state.overrides };
-  const fmt = state.formatMode
-    ? { mode: state.formatMode }
-    : (state.preview.data?.format || { mode: "auto" });
   return {
     name, kind: "finetune_llm",
     config: {
@@ -1293,7 +1510,8 @@ function buildJob(mount, state) {
       params_b: state.modelDetail.data?.params_b ?? null,
       goal: state.goal,
       required_runner: state.runnerId,
-      format: fmt,
+      format: trained,
+      system_prompt: systemPrompt,
       ...s,
     },
   };

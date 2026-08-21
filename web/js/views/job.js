@@ -99,6 +99,18 @@ export async function jobView(mount, [jobId]) {
     catch (e) { toast(e.message, "err"); }
   });
 
+  on(mount, "click", "#deleteBtn", async () => {
+    const hasModel = job.artifacts?.length;
+    if (!confirm(`Delete "${job.name}"?\n\n` + (hasModel
+      ? "Its trained model file will be deleted too, and cannot be recovered."
+      : "Its logs and measurements will be deleted."))) return;
+    try {
+      await api.deleteJob(jobId);
+      toast("Run deleted.", "ok");
+      location.hash = "#/jobs";
+    } catch (e) { toast(e.message, "err"); }
+  });
+
   return () => { unsub(); lossChart.destroy(); lrChart.destroy(); };
 }
 
@@ -168,7 +180,8 @@ function paintHeader(mount, job) {
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download</a>` : "")}
-    ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>` : "")}`;
+    ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>`
+                : `<button class="btn-danger btn-sm" id="deleteBtn">Delete</button>`)}`;
 
   // Assigned, not prepended: paintHeader runs on every metric tick, and
   // prepending would stack a fresh copy of the error on each one.

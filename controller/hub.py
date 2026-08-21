@@ -352,14 +352,14 @@ async def dataset_preview(dataset_id: str, config_name: str | None = None,
         "split": params["split"],
         "columns": features,
         "rows": rows,
-        "detected_format": detect_format(features),
+        "detected_format": detect_format(features, rows),
     }
 
 
-def detect_format(columns: list[str]) -> dict:
+def detect_format(columns: list[str], rows: list[dict] | None = None) -> dict:
     """Guess how a dataset is laid out. Delegates to the shared rules so the
     preview and the trainer always agree about what a row means."""
-    return formatting.detect_format(columns)
+    return formatting.detect_format(columns, rows)
 
 
 async def dataset_configs(dataset_id: str) -> dict:
@@ -451,9 +451,45 @@ def _pick_split(splits: list[str], wanted: str = "train") -> str:
     return splits[0] if splits else "train"
 
 
+# A hard ceiling on what one example may send, so a pathological row
+# cannot turn a preview into a multi-megabyte response. Well above
+# anything real: the largest seen so far is a 13k-character tool-calling
+# conversation.
+MAX_PREVIEW_CHARS = 60_000
+
+
+def _row_is_blank(row: dict) -> bool:
+    """Whether a row genuinely holds nothing.
+
+    Checked across every type, not just strings. A conversation row carries all
+    of its content inside a list, so a string-only test declared every row of a
+    tool-calling dataset empty -- and then reported a broken template as "five
+    blank rows" instead of as the template error it was.
+    """
+    for value in row.values():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return False
+        elif isinstance(value, (list, tuple, dict, set)):
+            if value:
+                return False
+        else:
+            return False
+    return True
+
+
+def _clip(text: str) -> str:
+    if len(text) <= MAX_PREVIEW_CHARS:
+        return text
+    return text[:MAX_PREVIEW_CHARS] + "\n\n... truncated ..."
+
+
 async def training_preview(dataset_id: str, config_name: str | None,
                            split: str, fmt: dict | None,
-                           text_field: str | None = None) -> dict:
+                           text_field: str | None = None,
+                           base_model: str | None = None) -> dict:
     """Show the exact strings the model will be trained on.
 
     Not the raw columns -- the rendered result, after the instruction template
@@ -470,20 +506,54 @@ async def training_preview(dataset_id: str, config_name: str | None,
     if text_field:
         resolved = {"mode": "text", "text_field": text_field}
 
+    # Fill in the model's own template when the caller asked for it. Done here
+    # rather than in the browser so the preview and the runner start from the
+    # same source, and so a model without one is reported honestly instead of
+    # silently falling back.
+    if resolved.get("use_model_template") and base_model and \
+            not resolved.get("chat_template"):
+        found = await model_chat_template(base_model)
+        if found.get("available"):
+            resolved["chat_template"] = found["chat_template"]
+            resolved["specials"] = found.get("specials") or {}
+            base["template_source"] = "model"
+        else:
+            base["template_source"] = "builtin"
+            base["template_note"] = found.get("reason")
+    elif resolved.get("template"):
+        base["template_source"] = "custom"
+    elif resolved.get("chat_template"):
+        base["template_source"] = "custom"
+    else:
+        base["template_source"] = "builtin"
+
     # Three outcomes, not two. A row that renders is fine; a row that is blank
     # in the source is also fine -- line-oriented corpora like WikiText are
     # full of empty lines and the trainer simply skips them. Only a row with
     # real content that the chosen columns cannot reach is a mistake, and
     # conflating the last two would raise a false alarm on half of WikiText.
     rendered = []
+    template_error = None
     for row in rows:
-        text = formatting.format_example(row, resolved)
-        blank = not any(str(v).strip() for v in row.values()
-                        if isinstance(v, (str, int, float)))
+        try:
+            text = formatting.format_example(row, resolved)
+        except formatting.TemplateError as e:
+            # A broken template is the user's own mistake and needs saying
+            # plainly, not swallowing into "0 readable rows".
+            template_error = str(e)
+            text = None
+        blank = _row_is_blank(row)
         rendered.append({
             "status": "ok" if text else ("empty" if blank else "unreadable"),
             "ok": bool(text),
-            "text": (text or "")[:1200],
+            # Sent whole. The browser shortens it for display and offers
+            # to show the rest, because deciding server-side which part
+            # matters gets it wrong: a tool-calling conversation hides
+            # its tool schema ten thousand characters into a system
+            # prompt, and any fixed window cuts away exactly what the
+            # user opened this to check.
+            "text": _clip(text or ""),
+            "length": len(text or ""),
         })
 
     # Show rows that have something in them first: an empty leading row would
@@ -493,7 +563,19 @@ async def training_preview(dataset_id: str, config_name: str | None,
     if not shown:
         shown = rendered[:3]
 
-    base["format"] = resolved
+    # The template is echoed back so the editor can show what actually ran,
+    # but never the special tokens dict -- that is noise in a text box.
+    echo = dict(resolved)
+    echo.pop("specials", None)
+    base["format"] = echo
+    # Offered back in the playground later. A model fine-tuned with a system
+    # prompt behaves quite differently without one, and the prompt it learned
+    # is rarely something anybody writes down.
+    base["system_prompts"] = formatting.system_prompts(rows, resolved)
+    base["style"] = formatting.conversation_style(resolved)
+    base["template_error"] = template_error
+    base["messages_field"] = resolved.get("messages_field")
+    base["tools_field"] = resolved.get("tools_field")
     base["rendered"] = shown
     base["counts"] = {
         "ok": sum(1 for r in rendered if r["status"] == "ok"),
@@ -505,3 +587,62 @@ async def training_preview(dataset_id: str, config_name: str | None,
     base["suggested_text_field"] = formatting.pick_text_column(
         base["columns"], rows)
     return base
+
+
+# A model's chat template is the single most important thing to get right when
+# fine-tuning an instruct model, and it is not something a person should have
+# to know. Every model that has one ships it in tokenizer_config.json, as a
+# Jinja string -- the same Jinja this app renders. So the correct default is
+# simply to use the model's own, and to show it working before training starts.
+_TEMPLATE_CACHE: dict[str, dict] = {}
+
+
+def _token_text(value) -> str | None:
+    """Special tokens are sometimes a string and sometimes an AddedToken dict."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("content")
+    return None
+
+
+async def model_chat_template(model_id: str) -> dict:
+    """The chat template a model ships, plus the special tokens it references."""
+    if model_id in _TEMPLATE_CACHE:
+        return _TEMPLATE_CACHE[model_id]
+
+    url = "https://huggingface.co/%s/resolve/main/tokenizer_config.json" % model_id
+    try:
+        r = await client().get(url)
+        r.raise_for_status()
+        conf = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        return {"available": False, "reason": str(e)[:200], "model": model_id}
+
+    template = conf.get("chat_template")
+    # Some repositories ship several named templates (a default and a
+    # tool-using one). Prefer the default, and say which was taken.
+    name = None
+    if isinstance(template, list):
+        entries = {t.get("name"): t.get("template") for t in template
+                   if isinstance(t, dict)}
+        name = "default" if "default" in entries else next(iter(entries), None)
+        template = entries.get(name)
+
+    specials = {}
+    for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
+        if (text := _token_text(conf.get(key))) is not None:
+            specials[key] = text
+
+    out = {
+        "available": bool(template),
+        "model": model_id,
+        "chat_template": template,
+        "template_name": name,
+        "specials": specials,
+        "reason": None if template else
+                  "This model does not ship a chat template, which usually "
+                  "means it is a base model rather than an instruct one.",
+    }
+    _TEMPLATE_CACHE[model_id] = out
+    return out

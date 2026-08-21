@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, fmtAgo, fmtDuration, statusBadge } from "../util.js";
+import { html, raw, esc, on, fmtAgo, fmtDuration, statusBadge, toast } from "../util.js";
 
 export async function jobsView(mount) {
   const paint = async () => {
@@ -29,6 +29,14 @@ export async function jobsView(mount) {
         </div>`)}`;
   };
   await paint();
+  // Delegated to the mount, which survives every repaint. Bound to the buttons
+  // directly it would be lost the next time a job changed status.
+  on(mount, "click", "[data-del]", async (_e, t) => {
+    if (!confirm(`Delete "${t.dataset.name}"?\n\nIts model file, logs and `
+                 + "measurements are deleted and cannot be recovered.")) return;
+    try { await api.deleteJob(t.dataset.del); toast("Run deleted.", "ok"); }
+    catch (e) { toast(e.message, "err"); }
+  });
   return events.subscribe((m) => { if (m.type === "jobs_changed") paint(); });
 }
 
@@ -51,6 +59,10 @@ function row(j) {
       <td><div class="row" style="gap:5px">
         ${raw(j.status === "succeeded"
           ? `<a class="btn btn-sm btn-primary" href="#/play/${esc(j.id)}">Try</a>` : "")}
-        <a class="btn btn-sm" href="#/jobs/${j.id}">Open</a></div></td>
+        <a class="btn btn-sm" href="#/jobs/${j.id}">Open</a>
+        ${raw(["succeeded", "failed", "cancelled"].includes(j.status)
+          ? `<button class="btn-sm btn-danger" data-del="${esc(j.id)}"
+                     data-name="${esc(j.name)}" title="Delete this run">✕</button>` : "")}
+      </div></td>
     </tr>`;
 }

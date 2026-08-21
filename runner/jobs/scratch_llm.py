@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
+from common.formatting import detect_format, format_example
+
 from .lora_llm import Cancelled
 
 EOS = "<|endoftext|>"
@@ -223,6 +225,12 @@ def _iter_texts(cfg: dict, ctx: Any) -> Iterator[str]:
 
     name = cfg["dataset"]
     field = cfg.get("text_field") or "text"
+    # A corpus is not always a column of prose. Conversations, instruction
+    # pairs and hand-written templates all work here too, rendered by exactly
+    # the same code the fine-tuner uses -- a model learning language from
+    # scratch can learn a conversation format at the same time, and it can only
+    # do that if what it reads matches what the playground will later send it.
+    fmt = dict(cfg.get("format") or {})
     kwargs = {"split": cfg.get("dataset_split") or "train", "token": ctx.hf_token}
     if conf := cfg.get("dataset_config"):
         kwargs["name"] = conf
@@ -234,17 +242,33 @@ def _iter_texts(cfg: dict, ctx: Any) -> Iterator[str]:
                 "it in full instead." % type(e).__name__, "warn")
         ds = load_dataset(name, **kwargs)
 
+    seen = 0
+    unreadable = 0
     for row in ds:
-        value = row.get(field)
-        if value is None:
-            # Wrong column name is the most common setup mistake, and silently
-            # yielding nothing would look like a mysteriously tiny corpus.
-            raise ValueError(
-                "This dataset has no column called %r. Its columns are: %s."
-                % (field, ", ".join(map(str, row.keys()))))
-        text = str(value).strip()
+        seen += 1
+        if not fmt:
+            # No format recorded -- an older job, or one made through the API.
+            # Work it out from the data rather than assuming a column called
+            # "text", which fails instantly on any conversation dataset and
+            # tells the user about a column they never asked for.
+            fmt = detect_format(list(row.keys()), [row])
+            if field and field in row and fmt.get("mode") != "chat":
+                fmt = {"mode": "text", "text_field": field}
+            ctx.log("No format was recorded for this run; reading these rows "
+                    "as %s." % fmt.get("mode", "text"))
+        text = (format_example(row, fmt) or "").strip()
         if text:
             yield text
+            continue
+        unreadable += 1
+        # A dataset where nothing at all can be read is a setup mistake, not a
+        # quiet zero-token corpus. Checked on a sample rather than on the first
+        # row, because blank rows are normal in line-oriented text.
+        if seen == 200 and unreadable == seen:
+            raise ValueError(
+                "None of the first %d rows could be read as %s. The columns "
+                "are: %s. Check the column or template chosen for this dataset."
+                % (seen, fmt.get("mode", "text"), ", ".join(map(str, row.keys()))))
 
 
 def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):

@@ -23,6 +23,7 @@ export const api = {
   jobMetrics:  (id) => req(`/api/jobs/${encodeURIComponent(id)}/metrics`),
   jobLogs:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/logs`),
   cancelJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createJob:   (body) => req("/api/jobs", { method: "POST", body: JSON.stringify(body) }),
 
   starters:    () => req("/api/hub/starters"),
@@ -36,6 +37,9 @@ export const api = {
   // The rendered training text, built by the same code the runner uses.
   trainingPreview: (body) =>
     req("/api/hub/training-preview", { method: "POST", body: JSON.stringify(body) }),
+  modelTemplate: (id) =>
+    req(`/api/hub/model-template?id=${encodeURIComponent(id)}`),
+  builtinTemplate: () => req("/api/hub/builtin-template"),
   plan:        (body) => req("/api/plan", { method: "POST", body: JSON.stringify(body) }),
 
   // Training from scratch. Sizes are scored against a specific machine and a
@@ -50,6 +54,8 @@ export const api = {
   chat:        (id, body) =>
     req(`/api/jobs/${encodeURIComponent(id)}/chat`,
         { method: "POST", body: JSON.stringify(body) }),
+  jobSystemPrompt: (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/system-prompt`),
   chatCancel:  (requestId) =>
     req(`/api/chat/${encodeURIComponent(requestId)}/cancel`, { method: "POST" }),
 };

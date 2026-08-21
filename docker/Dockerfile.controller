@@ -10,14 +10,19 @@ ENV PYTHONUNBUFFERED=1 \
     AI_STUDIO_PORT=8420
 
 WORKDIR /app
-RUN pip install --no-cache-dir \
-        "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" \
-        "python-multipart>=0.0.9"
+
+# Dependencies come from pyproject.toml, never from a second list here. This
+# file used to repeat them, and the two drifted the first time one was added:
+# the tests passed locally and every template render failed in the container.
+# Copying only pyproject first keeps this layer cached until the deps change.
+COPY pyproject.toml /app/
+RUN python -c "import tomllib; print(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && cat /tmp/requirements.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY controller /app/controller
 COPY web /app/web
 COPY common /app/common
-COPY pyproject.toml /app/
 
 EXPOSE 8420
 VOLUME ["/data"]

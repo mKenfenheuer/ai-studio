@@ -302,6 +302,18 @@ details.adv > summary { cursor: pointer; color: var(--accent); font-size: 13px;
   white-space: pre-wrap; word-break: break-word; color: var(--text); margin: 0; }
 .sample .txt .seed { color: var(--text-3); }
 
+/* A Jinja template is code, so it gets a code editor's shape: monospace,
+   no spellcheck squiggles, and tall enough to see a whole loop. */
+textarea.mono {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  width: 100%; resize: vertical; min-height: 150px; tab-size: 2;
+}
+.field .hint code {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 4px; font-size: 11.5px;
+  font-family: var(--mono); word-break: break-word;
+}
+
 /* ------------------------------------------------------- playground */
 .chat { display: flex; flex-direction: column; gap: 12px; }
 .chat-log {
@@ -319,6 +331,14 @@ details.adv > summary { cursor: pointer; color: var(--accent); font-size: 13px;
   content: "▍"; animation: blink 1s steps(2) infinite; color: var(--text-3);
 }
 @keyframes blink { 50% { opacity: 0; } }
+/* The role is named above each bubble, not signalled by its side alone:
+   a conversation with system and tool turns has more than two speakers. */
+.bubble[data-role]::before {
+  content: attr(data-role);
+  display: block; font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; opacity: .65; margin-bottom: 3px;
+}
+.bubble.me[data-role]::before { text-align: right; }
 .chat-input { display: flex; gap: 8px; align-items: flex-end; }
 .chat-input textarea {
   flex: 1; resize: vertical; min-height: 46px; max-height: 180px;

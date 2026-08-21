@@ -142,7 +142,29 @@ def run(cfg: dict, ctx: Any) -> dict:
     if (limit := cfg.get("max_samples")):
         ds = ds.select(range(min(int(limit), len(ds))))
 
-    fmt = cfg.get("format", {"mode": "auto"})
+    fmt = dict(cfg.get("format") or {"mode": "auto"})
+
+    # The model's own chat template, when the plan asked for it. Pulled off the
+    # tokenizer here and rendered through the shared Jinja code rather than
+    # through apply_chat_template, so that what trains is byte-for-byte what
+    # the preview showed. Two renderers would be two chances to differ.
+    if fmt.get("use_model_template") and not fmt.get("chat_template"):
+        template = getattr(tok, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default") or next(iter(template.values()), None)
+        if template:
+            fmt["chat_template"] = template
+            fmt["specials"] = {
+                k: v for k, v in (
+                    ("bos_token", tok.bos_token), ("eos_token", tok.eos_token),
+                    ("pad_token", tok.pad_token), ("unk_token", tok.unk_token))
+                if v}
+            ctx.log("Using %s's own chat template." % base_model)
+        else:
+            ctx.log("%s ships no chat template, so the conversations are "
+                    "rendered in a plain readable form instead." % base_model,
+                    "warn")
+
     sample_row = ds[0] if len(ds) else {}
     preview = format_example(sample_row, fmt)
     if not preview:
@@ -150,7 +172,7 @@ def run(cfg: dict, ctx: Any) -> dict:
             "Could not work out how to read this dataset. Its columns are: %s. "
             "Pick which column holds the text on the previous step."
             % ", ".join(map(str, sample_row.keys())))
-    ctx.log("Example training text:\n%s" % preview[:400])
+    ctx.log("Example training text:\n%s" % preview[:600])
     ctx.emit_meta({"dataset_rows": len(ds), "dataset_columns": list(sample_row.keys()),
                    "example_text": preview[:1000]})
 

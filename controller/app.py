@@ -238,6 +238,34 @@ async def cancel_job(job_id: str) -> dict:
     return {"ok": True}
 
 
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str) -> dict:
+    """Delete a run, its metrics, its logs and its model file."""
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "No such run.")
+    if job["status"] in ("queued", "assigned", "running"):
+        # Deleting the row of a job a runner is still working on would leave
+        # the runner training something that no longer exists, and its next
+        # message would arrive for an unknown job. Stopping it first is one
+        # click, and it is the honest order of operations.
+        raise HTTPException(
+            400, "This run has not finished. Stop it first, then delete it.")
+
+    for filename in db.delete_job(job_id):
+        with contextlib.suppress(OSError):
+            (config.ARTIFACT_DIR / filename).unlink()
+
+    # Runners cache a copy of any model they have served. Ask them to drop it,
+    # so deleting a run actually reclaims the space rather than only hiding it.
+    for runner_id in list(fleet.connections):
+        await fleet.send_to_runner(runner_id, {"type": "purge_model",
+                                               "job_id": job_id})
+    fleet.declined.discard(job_id)
+    await fleet.broadcast_ui({"type": "jobs_changed"})
+    return {"ok": True, "deleted": job_id}
+
+
 @app.post("/api/jobs/{job_id}/artifact")
 async def upload_artifact(job_id: str, file: UploadFile,
                           x_runner_token: str = Header(default="")) -> dict:
@@ -333,6 +361,22 @@ async def hub_dataset_configs(id: str = Query(...)) -> dict:
         return {"available": False, "reason": str(e)[:200], "configs": []}
 
 
+@app.get("/api/hub/model-template")
+async def hub_model_template(id: str = Query(...)) -> dict:
+    """The chat template this model was trained to expect."""
+    try:
+        return await hub.model_chat_template(id)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": str(e)[:200], "model": id}
+
+
+@app.get("/api/hub/builtin-template")
+async def hub_builtin_template() -> dict:
+    """The fallback conversation template, as a starting point to edit."""
+    return {"template": hub.formatting.BUILTIN_CHAT_TEMPLATE,
+            "instruction_template": hub.formatting.DEFAULT_INSTRUCTION_TEMPLATE}
+
+
 @app.post("/api/hub/training-preview")
 async def hub_training_preview(payload: dict = Body(...)) -> dict:
     """The exact text the model will be trained on.
@@ -344,7 +388,7 @@ async def hub_training_preview(payload: dict = Body(...)) -> dict:
         return await hub.training_preview(
             payload["dataset"], payload.get("config") or None,
             payload.get("split") or "train", payload.get("format"),
-            payload.get("text_field"))
+            payload.get("text_field"), payload.get("base_model"))
     except Exception as e:  # noqa: BLE001
         return {"available": False, "reason": str(e)[:300],
                 "dataset": payload.get("dataset")}
@@ -621,46 +665,27 @@ def _explain_scratch(s: dict, counts: dict, verdict: dict, fit: dict) -> list[di
 # is a request routed over the same websocket the fleet already holds open,
 # and the reply streams back through the browser event stream token by token.
 
-# The prompt shapes each kind of run was trained on. Handing a fine-tuned model
-# a bare question when it learned "### Instruction:" produces rambling
-# continuation, and the user reasonably concludes the training failed.
-_TEMPLATES = {
-    "instruction": {
-        "template": "### Instruction:\n{instruction}\n\n### Response:\n",
-        # More than just the training template. A fine-tuned instruct model
-        # answers correctly and then carries on inventing a conversation,
-        # because a LoRA over a few thousand examples learns the shape of a
-        # response but never learns to emit an end-of-text token. These are
-        # the turn markers the underlying base model falls back on.
-        "stop": ["### Instruction:", "\n### ", "Human:", "\nUser:",
-                 "Assistant:", "<|im_end|>", "<|endoftext|>"],
-    },
-    "chat": {
-        "template": "user: {instruction}\nassistant:",
-        "stop": ["\nuser:", "\nsystem:", "Human:", "<|im_end|>"],
-    },
-}
-
-
 def chat_spec(job: dict) -> dict:
-    """Everything a runner needs to serve this particular result."""
+    """Everything a runner needs to serve this particular result.
+
+    The important field is `format`: the *exact* format the run was trained
+    with, carried through unchanged. Guessing it again here would let the
+    playground drift from the model, and a model given a shape it never saw
+    looks broken when it is not.
+    """
     cfg = job["config"]
-    spec = {"job_id": job["id"], "kind": job["kind"],
-            "base_model": cfg.get("base_model")}
-    if job["kind"] == "pretrain_llm":
-        # A model trained from scratch is a text continuer, not an assistant.
-        # It has never seen a question-and-answer shape in its life.
-        spec["mode"] = "continue"
-        return spec
-    mode = (cfg.get("format") or {}).get("mode", "auto")
-    shape = _TEMPLATES.get(mode)
-    if shape:
-        spec["prompt_template"] = shape["template"]
-        spec["stop"] = shape["stop"]
-        spec["mode"] = "instruct"
-    else:
-        spec["mode"] = "continue"
-    return spec
+    fmt = dict(cfg.get("format") or {})
+    if not fmt and job["kind"] == "pretrain_llm":
+        fmt = {"mode": "text"}
+
+    return {
+        "job_id": job["id"],
+        "kind": job["kind"],
+        "base_model": cfg.get("base_model"),
+        "format": fmt,
+        "style": hub.formatting.conversation_style(fmt),
+        "system_prompt": cfg.get("system_prompt") or "",
+    }
 
 
 def _pick_chat_runner(job: dict) -> tuple[str, dict]:
@@ -707,17 +732,55 @@ async def playground() -> list[dict]:
         if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
             continue
         cfg = job["config"]
+        spec = chat_spec(job)
         entry = {
             "id": job["id"], "name": job["name"], "kind": job["kind"],
             "finished_at": job["finished_at"], "dataset": cfg.get("dataset"),
             "base_model": cfg.get("base_model"),
-            "mode": chat_spec(job)["mode"],
+            "style": spec["style"],
+            "mode": spec["style"],          # kept for older cached scripts
+            "system_prompt": spec["system_prompt"],
         }
         if job["kind"] == "pretrain_llm":
             a = cfg.get("arch") or {}
             entry["size"] = (arch.preset(a.get("size_id", "")) or {}).get("label")
         out.append(entry)
     return out
+
+
+@app.get("/api/jobs/{job_id}/system-prompt")
+async def job_system_prompt(job_id: str) -> dict:
+    """The system prompt this run was trained with.
+
+    Recorded on the job when it was created, and looked up from the dataset
+    when it was not -- runs made before this existed, or through the API, still
+    have their prompt sitting in the data they trained on. A model fine-tuned
+    with a system prompt behaves noticeably worse without it, so it is worth
+    going back for.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "No such run.")
+    cfg = job["config"]
+    if cfg.get("system_prompt"):
+        return {"system_prompt": cfg["system_prompt"], "source": "recorded"}
+    if not cfg.get("dataset"):
+        return {"system_prompt": "", "source": "none"}
+
+    try:
+        preview = await hub.training_preview(
+            cfg["dataset"], cfg.get("dataset_config"),
+            cfg.get("dataset_split") or "train", cfg.get("format"),
+            None, cfg.get("base_model"))
+    except Exception as e:  # noqa: BLE001
+        return {"system_prompt": "", "source": "none", "reason": str(e)[:200]}
+
+    found = (preview.get("system_prompts") or [""])[0]
+    if found:
+        # Remembered now, so the dataset is only read once.
+        cfg["system_prompt"] = found
+        db.update_job_config(job_id, cfg)
+    return {"system_prompt": found, "source": "dataset" if found else "none"}
 
 
 @app.post("/api/jobs/{job_id}/chat")
@@ -729,9 +792,23 @@ async def chat(job_id: str, payload: dict = Body(...)) -> dict:
         raise HTTPException(400, "This run has not finished successfully.")
     if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
         raise HTTPException(400, "This run did not leave a downloadable model.")
-    prompt = (payload.get("prompt") or "").strip()
-    if not prompt:
+    # A conversation, not a string. The playground keeps the turns so the model
+    # sees the same running context it was trained on; a single prompt is still
+    # accepted, and becomes a one-turn conversation.
+    messages = payload.get("messages")
+    if not messages:
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(400, "Type something first.")
+        messages = [{"role": "user", "content": prompt}]
+    if not any((m.get("content") or "").strip() for m in messages
+               if m.get("role") != "system"):
         raise HTTPException(400, "Type something first.")
+
+    system = (payload.get("system") or "").strip()
+    if system:
+        messages = [{"role": "system", "content": system}] + [
+            m for m in messages if m.get("role") != "system"]
 
     runner_id, runner = _pick_chat_runner(job)
     spec = chat_spec(job)
@@ -740,7 +817,7 @@ async def chat(job_id: str, payload: dict = Body(...)) -> dict:
     request_id = db.new_id("gen")
     sent = await fleet.send_to_runner(runner_id, {
         "type": "generate", "request_id": request_id, "spec": spec,
-        "prompt": prompt,
+        "messages": messages,
         "params": {
             "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
             "temperature": float(payload.get("temperature") or 0.8),
@@ -752,7 +829,7 @@ async def chat(job_id: str, payload: dict = Body(...)) -> dict:
         raise HTTPException(503, "That machine dropped off just now. Try again.")
     fleet.generations[request_id] = runner_id
     return {"request_id": request_id, "runner": runner["name"],
-            "runner_id": runner_id, "mode": spec["mode"]}
+            "runner_id": runner_id, "style": spec["style"]}
 
 
 @app.post("/api/chat/{request_id}/cancel")

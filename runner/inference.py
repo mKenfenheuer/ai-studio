@@ -33,6 +33,8 @@ from typing import Any, Callable
 
 import httpx
 
+from common import formatting
+
 CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
 
 # How long a model may sit loaded with nobody talking to it. The GPU is shared
@@ -52,6 +54,8 @@ class ModelHost:
         self.loaded_id: str | None = None
         self.model = None
         self.tok = None
+        self.chat_template: str | None = None
+        self.specials: dict = {}
         self.last_used = 0.0
         self._cancel = threading.Event()
 
@@ -148,6 +152,19 @@ class ModelHost:
 
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
+
+        # The template this model actually carries, read off the tokenizer that
+        # is about to run. Training reads the same field, so the playground and
+        # the run it is talking to cannot disagree about the format.
+        template = getattr(self.tok, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default") or next(iter(template.values()), None)
+        self.chat_template = template
+        self.specials = {k: v for k, v in (
+            ("bos_token", self.tok.bos_token), ("eos_token", self.tok.eos_token),
+            ("pad_token", self.tok.pad_token), ("unk_token", self.tok.unk_token))
+            if v}
+
         self.model = self.model.to(self.device).eval()
         self.model.config.use_cache = True
         self.loaded_id = job_id
@@ -158,7 +175,7 @@ class ModelHost:
     def cancel(self) -> None:
         self._cancel.set()
 
-    def generate(self, spec: dict, prompt: str, params: dict,
+    def generate(self, spec: dict, messages: list, params: dict,
                  on_token: Callable[[str], None],
                  log: Callable[[str], None]) -> dict:
         import torch
@@ -169,7 +186,24 @@ class ModelHost:
             model, tok = self.model, self.tok
             self.last_used = time.time()
 
-            text = _apply_template(prompt, spec)
+            fmt = dict(spec.get("format") or {})
+            # A fine-tune trained with "the model's own format" stores a flag
+            # rather than the template text, because the tokenizer is the
+            # authoritative copy. Resolve it here, against the tokenizer that
+            # is loaded.
+            if fmt.get("use_model_template") and not fmt.get("chat_template"):
+                if self.chat_template:
+                    fmt["chat_template"] = self.chat_template
+                else:
+                    log("This model carries no chat template; using the plain "
+                        "conversation format instead.")
+            fmt.setdefault("specials", self.specials)
+
+            text = formatting.render_prompt(messages, fmt,
+                                            tools=spec.get("tools"))
+            stop_texts = spec.get("stop") or formatting.stop_sequences(
+                fmt, self.specials)
+
             ids = tok(text, return_tensors="pt").input_ids.to(self.device)
             prompt_len = ids.shape[1]
 
@@ -177,7 +211,6 @@ class ModelHost:
             temperature = float(params.get("temperature", 0.8))
             top_k = int(params.get("top_k", 50))
             top_p = float(params.get("top_p", 0.95))
-            stop_texts = spec.get("stop") or []
             hold = max((len(s) for s in stop_texts), default=0)
 
             past = None
@@ -260,21 +293,8 @@ class ModelHost:
                 "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
                 "prompt_tokens": prompt_len,
                 "cancelled": self._cancel.is_set(),
+                "prompt_preview": text[-600:],
             }
-
-
-def _apply_template(prompt: str, spec: dict) -> str:
-    """Format the input the way this model was trained to receive it.
-
-    A base model trained from scratch continues text and has never seen a
-    question-and-answer shape, so its prompt is passed through untouched. A
-    fine-tune that learned an instruction template must be given that exact
-    template back, or it will read the question as more text to continue.
-    """
-    template = spec.get("prompt_template")
-    if not template:
-        return prompt
-    return template.replace("{instruction}", prompt).replace("{response}", "")
 
 
 def clear_cache(job_id: str | None = None) -> None:

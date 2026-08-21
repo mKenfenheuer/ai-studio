@@ -184,6 +184,14 @@ class Runner:
             elif kind == "unload_model":
                 if self.host and not self.generating:
                     self.host.unload()
+            elif kind == "purge_model":
+                # The run was deleted. Drop the cached copy so the disk space
+                # actually comes back, and let go of it first if it happens to
+                # be the model currently loaded.
+                if self.host:
+                    if self.host.loaded_id == msg.get("job_id"):
+                        self.host.unload()
+                    inference.clear_cache(msg.get("job_id"))
 
     async def _send_loop(self, ws) -> None:
         """Drain the training thread's outbox onto the socket.
@@ -291,7 +299,10 @@ class Runner:
                              "delta": delta})
 
         try:
-            result = self.host.generate(spec, msg.get("prompt", ""),
+            messages = msg.get("messages")
+            if not messages:
+                messages = [{"role": "user", "content": msg.get("prompt", "")}]
+            result = self.host.generate(spec, messages,
                                         msg.get("params") or {}, on_token, log)
             self.outbox.put({"type": "generate_done", "request_id": rid, **result})
         except Exception as e:  # noqa: BLE001
