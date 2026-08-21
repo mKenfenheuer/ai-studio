@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from common import formatting
+
 from . import config
 
 HF_API = "https://huggingface.co/api"
@@ -355,21 +357,151 @@ async def dataset_preview(dataset_id: str, config_name: str | None = None,
 
 
 def detect_format(columns: list[str]) -> dict:
-    """Guess how the dataset is laid out, so the UI can pre-fill the mapping."""
-    cols = {c.lower() for c in columns if c}
-    if {"instruction"} & cols and cols & {"output", "response"}:
-        return {"mode": "instruction", "instruction_field": "instruction",
-                "response_field": "output" if "output" in cols else "response",
-                "confidence": "high"}
-    if "messages" in cols or "conversations" in cols:
-        return {"mode": "chat",
-                "messages_field": "messages" if "messages" in cols else "conversations",
-                "confidence": "high"}
-    if {"prompt"} & cols and cols & {"completion", "response", "answer"}:
-        resp = next(c for c in ("completion", "response", "answer") if c in cols)
-        return {"mode": "instruction", "instruction_field": "prompt",
-                "response_field": resp, "confidence": "high"}
-    for c in ("text", "content", "document"):
-        if c in cols:
-            return {"mode": "text", "text_field": c, "confidence": "medium"}
-    return {"mode": "auto", "confidence": "low"}
+    """Guess how a dataset is laid out. Delegates to the shared rules so the
+    preview and the trainer always agree about what a row means."""
+    return formatting.detect_format(columns)
+
+
+async def dataset_configs(dataset_id: str) -> dict:
+    """Which configurations and splits this dataset offers.
+
+    Many datasets on the Hub are really several datasets sharing a name, and
+    `load_dataset` refuses to guess between them:
+
+        Config name is missing. Please pick one among the available configs:
+        ['harness_drop_3', 'harness_gsm8k_5', ...]
+
+    Discovering this up front turns a run that fails minutes in into a choice
+    made before anything starts.
+    """
+    by_config: dict[str, list[str]] = {}
+    source = "datasets-server"
+    try:
+        r = await client().get(DATASETS_SERVER + "/splits",
+                               params={"dataset": dataset_id})
+        r.raise_for_status()
+        for row in r.json().get("splits", []):
+            by_config.setdefault(row["config"], []).append(row["split"])
+    except httpx.HTTPError:
+        # The dataset viewer does not cover every dataset -- it answers 501 for
+        # anything it cannot index, which includes most of the leaderboard
+        # result dumps. The repository's own card still lists the
+        # configurations, so fall back to that rather than giving up and
+        # letting the runner discover the problem an hour later.
+        by_config = await _configs_from_card(dataset_id)
+        source = "dataset card"
+
+    if not by_config:
+        return {"available": False, "configs": [],
+                "reason": "Could not discover this dataset's configurations."}
+
+    configs = [{"name": name, "splits": sorted(set(splits))}
+               for name, splits in by_config.items()]
+    return {
+        "available": bool(configs),
+        "dataset": dataset_id,
+        "source": source,
+        "configs": configs,
+        # A dataset with exactly one configuration needs no decision from the
+        # user, and the UI hides the choice in that case.
+        "needs_choice": len(configs) > 1,
+        "default_config": _default_config(configs),
+    }
+
+
+async def _configs_from_card(dataset_id: str) -> dict[str, list[str]]:
+    """Configurations as declared in the dataset repository's own card."""
+    try:
+        r = await client().get("%s/datasets/%s" % (HF_API, dataset_id))
+        r.raise_for_status()
+        declared = ((r.json().get("cardData") or {}).get("configs")) or []
+    except (httpx.HTTPError, ValueError):
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for entry in declared:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("config_name")
+        if not name:
+            continue
+        splits = [f.get("split") for f in (entry.get("data_files") or [])
+                  if isinstance(f, dict) and f.get("split")]
+        out[name] = splits or ["train"]
+    return out
+
+
+def _default_config(configs: list[dict]) -> str | None:
+    """The configuration a person would pick if forced to guess."""
+    if not configs:
+        return None
+    names = [c["name"] for c in configs]
+    for preferred in ("default", "main", "all", "en"):
+        if preferred in names:
+            return preferred
+    return names[0]
+
+
+def _pick_split(splits: list[str], wanted: str = "train") -> str:
+    if wanted in splits:
+        return wanted
+    for fallback in ("train", "training", "validation", "test"):
+        if fallback in splits:
+            return fallback
+    return splits[0] if splits else "train"
+
+
+async def training_preview(dataset_id: str, config_name: str | None,
+                           split: str, fmt: dict | None,
+                           text_field: str | None = None) -> dict:
+    """Show the exact strings the model will be trained on.
+
+    Not the raw columns -- the rendered result, after the instruction template
+    or the chat flattening has been applied. Reading the wrong column, or
+    reading the right column in the wrong shape, is the most expensive mistake
+    available here, and it is invisible until you look at the finished text.
+    """
+    base = await dataset_preview(dataset_id, config_name, split)
+    if not base.get("available"):
+        return base
+
+    rows = base["rows"]
+    resolved = dict(fmt or base["detected_format"])
+    if text_field:
+        resolved = {"mode": "text", "text_field": text_field}
+
+    # Three outcomes, not two. A row that renders is fine; a row that is blank
+    # in the source is also fine -- line-oriented corpora like WikiText are
+    # full of empty lines and the trainer simply skips them. Only a row with
+    # real content that the chosen columns cannot reach is a mistake, and
+    # conflating the last two would raise a false alarm on half of WikiText.
+    rendered = []
+    for row in rows:
+        text = formatting.format_example(row, resolved)
+        blank = not any(str(v).strip() for v in row.values()
+                        if isinstance(v, (str, int, float)))
+        rendered.append({
+            "status": "ok" if text else ("empty" if blank else "unreadable"),
+            "ok": bool(text),
+            "text": (text or "")[:1200],
+        })
+
+    # Show rows that have something in them first: an empty leading row would
+    # otherwise make a perfectly good dataset look broken.
+    shown = [r for r in rendered if r["status"] == "ok"][:3]
+    shown += [r for r in rendered if r["status"] == "unreadable"][:2]
+    if not shown:
+        shown = rendered[:3]
+
+    base["format"] = resolved
+    base["rendered"] = shown
+    base["counts"] = {
+        "ok": sum(1 for r in rendered if r["status"] == "ok"),
+        "empty": sum(1 for r in rendered if r["status"] == "empty"),
+        "unreadable": sum(1 for r in rendered if r["status"] == "unreadable"),
+        "sampled": len(rendered),
+    }
+    base["readable"] = base["counts"]["ok"]
+    base["suggested_text_field"] = formatting.pick_text_column(
+        base["columns"], rows)
+    return base

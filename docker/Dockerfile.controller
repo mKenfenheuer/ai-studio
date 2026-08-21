@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir \
 
 COPY controller /app/controller
 COPY web /app/web
+COPY common /app/common
 COPY pyproject.toml /app/
 
 EXPOSE 8420

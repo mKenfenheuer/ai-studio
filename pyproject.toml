@@ -36,7 +36,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["controller", "controller.api", "runner", "runner.jobs"]
+packages = ["common", "controller", "controller.api", "runner", "runner.jobs"]
 
 [tool.setuptools.package-data]
 controller = ["../web/**/*"]

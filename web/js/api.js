@@ -31,6 +31,11 @@ export const api = {
   searchDatasets: (q) => req(`/api/hub/datasets?q=${encodeURIComponent(q)}`),
   modelDetail:    (id) => req(`/api/hub/model?id=${encodeURIComponent(id)}`),
   datasetPreview: (id) => req(`/api/hub/dataset-preview?id=${encodeURIComponent(id)}`),
+  datasetConfigs: (id) =>
+    req(`/api/hub/dataset-configs?id=${encodeURIComponent(id)}`),
+  // The rendered training text, built by the same code the runner uses.
+  trainingPreview: (body) =>
+    req("/api/hub/training-preview", { method: "POST", body: JSON.stringify(body) }),
   plan:        (body) => req("/api/plan", { method: "POST", body: JSON.stringify(body) }),
 
   // Training from scratch. Sizes are scored against a specific machine and a

@@ -320,6 +320,32 @@ async def hub_dataset_preview(id: str = Query(...), config_name: str | None = No
         return {"available": False, "reason": str(e), "dataset": id}
 
 
+@app.get("/api/hub/dataset-configs")
+async def hub_dataset_configs(id: str = Query(...)) -> dict:
+    """Which configurations a dataset offers, so one can be chosen up front."""
+    try:
+        return await hub.dataset_configs(id)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": str(e)[:200], "configs": []}
+
+
+@app.post("/api/hub/training-preview")
+async def hub_training_preview(payload: dict = Body(...)) -> dict:
+    """The exact text the model will be trained on.
+
+    Rendered by the same function the runner uses to build its batches, so
+    what is shown here is what the model reads -- not an approximation of it.
+    """
+    try:
+        return await hub.training_preview(
+            payload["dataset"], payload.get("config") or None,
+            payload.get("split") or "train", payload.get("format"),
+            payload.get("text_field"))
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": str(e)[:300],
+                "dataset": payload.get("dataset")}
+
+
 @app.post("/api/plan")
 async def plan(payload: dict = Body(...)) -> dict:
     """Turn a chosen model + runner into concrete, explained settings.
@@ -400,12 +426,6 @@ def _estimate_minutes(steps: int, params_b: float | None, caps: dict) -> float |
 # Training from scratch
 # ===========================================================================
 
-# Peak learning rate by model width. A model starting from noise wants a much
-# higher rate than fine-tuning ever uses -- 6e-4 against 2e-4 -- because it has
-# far further to travel. It falls off with width because wider layers produce
-# larger activations, and the same step size starts to destabilise them.
-_SCRATCH_LR = {256: 1.0e-3, 384: 8.0e-4, 512: 6.0e-4, 768: 3.0e-4, 1024: 2.5e-4}
-
 TIME_BUDGETS = [
     {"minutes": 15, "label": "15 minutes",
      "hint": "Long enough to see whether it is working."},
@@ -441,6 +461,8 @@ async def scratch_sizes(runner_id: str = Query(...), minutes: float = 60,
         "vocab_presets": arch.VOCAB_PRESETS,
         "tokens_per_param_target": arch.TOKENS_PER_PARAM_TARGET,
         "max_scratch_params": arch.max_trainable_params(caps),
+        "limits": arch.LIMITS,
+        "presets": arch.SIZE_PRESETS,
     }
 
 
@@ -452,7 +474,10 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
     minutes = float(payload.get("minutes") or 60)
     vocab_size = int(payload.get("vocab_size") or arch.DEFAULT_VOCAB)
 
-    architecture = arch.build_arch(size_id, vocab_size)
+    if size_id == "custom":
+        architecture = arch.build_custom_arch(payload.get("custom") or {}, vocab_size)
+    else:
+        architecture = arch.build_arch(size_id, vocab_size)
     if not architecture:
         raise HTTPException(400, "Unknown model size: %s" % size_id)
 
@@ -471,12 +496,6 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                    optim_8bit=optim_8bit, checkpointing=True,
                                    flash=flash)
-    if not fit["fits"]:
-        raise HTTPException(
-            400, "The %s size needs about %.1f GB and this machine has %.1f GB. "
-                 "Choose a smaller size."
-                 % (size_id, fit["memory"]["total_gb"], caps.get("vram_gb") or 0))
-
     budget = arch.tokens_in_time(architecture, caps, minutes) or 0
 
     # A corpus can be smaller than the time budget wants to consume. Reading
@@ -494,13 +513,14 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         budget = int(corpus_tokens * 4)
 
     steps = int(max(20, budget // max(fit["tokens_per_step"], 1)))
-    lr = _SCRATCH_LR.get(architecture["hidden_size"], 3e-4)
+    lr = arch.recommended_lr(architecture["hidden_size"])
     verdict = arch.training_verdict(architecture, budget)
 
     settings = {
         "arch": architecture,
         "vocab_size": vocab_size,
         "dtype": caps.get("recommended_dtype", "float32"),
+        "fits": fit["fits"],
         "batch_size": fit["batch_size"],
         "grad_accum": fit["grad_accum"],
         "max_steps": steps,
@@ -517,12 +537,22 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "sample_prompt": payload.get("sample_prompt") or "Once upon a time",
         "text_field": payload.get("text_field") or "text",
     }
+    settings.update(payload.get("overrides") or {})
+
+    issues = arch.validate_arch(architecture, caps, minutes=minutes,
+                                corpus_tokens=corpus_tokens)
+    issues += arch.check_settings(settings, architecture)
+
     return {
         "settings": settings,
         "params": counts,
         "params_label": arch.fmt_params(counts["total"]),
         "verdict": verdict,
         "notes": notes,
+        "issues": issues,
+        "blocked": any(i["level"] == "error" for i in issues),
+        "recommended_lr": arch.recommended_lr(architecture["hidden_size"]),
+        "limits": arch.LIMITS,
         "memory_gb": fit["memory"]["total_gb"],
         "tokens_per_step": fit["tokens_per_step"],
         "estimated_minutes": round(minutes, 1),

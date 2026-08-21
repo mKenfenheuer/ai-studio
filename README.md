@@ -184,6 +184,63 @@ run that looks fine and learns nothing:
 - **The model writes a sample every few dozen steps.** Watching noise become
   words become sentences is the clearest evidence a run is working.
 
+## Choosing the data
+
+The step before training shows **the exact text the model will be trained on**
+— not the raw columns, but the finished string after the instruction template
+or chat flattening has been applied. It is rendered by importing the same
+function the runner uses to build its batches, from `common/formatting.py`, so
+a preview cannot drift from reality.
+
+Three things it catches before a run starts rather than an hour in:
+
+- **Datasets that are several datasets.** `load_dataset` refuses to guess
+  between configurations and fails with *"Config name is missing. Please pick
+  one among the available configs"*. The configurations are discovered up
+  front, from the datasets-server where it indexes the dataset and from the
+  repository's own card where it does not — the latter matters, because the
+  viewer answers 501 for a great many datasets.
+- **The wrong column.** Rows that have content the chosen columns cannot reach
+  are counted and shown, because they would be silently skipped.
+- **Blank rows, which are not a problem.** Line-oriented corpora like WikiText
+  are full of empty lines. Reporting those as failures would be a false alarm
+  on half the dataset, so empty and unreadable are counted separately and only
+  one of them is an error.
+
+## Designing the model yourself
+
+The five sizes are a starting point, not a ceiling. "Design it yourself" opens
+layers, width, attention heads, context length and feed-forward width, and
+recomputes the parameter count, memory, batch size, step count and time
+estimate as you type. Every training hyperparameter is editable on the review
+step, each with a sentence explaining what it does.
+
+A transformer has combinations that are silently wrong rather than loudly
+broken, and a from-scratch run is far too slow to find them by trying. So
+everything is checked against the machine as it is typed, at three levels —
+`error` cannot start, `warn` will run and disappoint, `info` is a trade-off
+worth knowing:
+
+| Checked | Because |
+|---|---|
+| Width divides by heads | Attention splits the width evenly; it has to divide exactly |
+| Head dimension is 32/64/128 | Other sizes fall back to a slower attention path |
+| Width is a multiple of 64 | Otherwise part of every matrix tile sits idle |
+| Depth against width | Deep and narrow trains slowly and destabilises; wide and shallow cannot compose |
+| Feed-forward ratio | Below ~1.5x starves where most of the capacity lives |
+| Embedding share | Above half the model, the vocabulary is eating the network |
+| Context vs attention kernel | Without a fused kernel, memory grows with the square of it |
+| Fits in VRAM | Checked at the chosen batch, then at batch 1 before refusing |
+| Tokens per parameter | The Chinchilla ratio, against your actual time budget |
+| Learning rate vs width | Scales as 1/width; 3x over is flagged, 4x under too |
+| Tokens per step | Below ~16k the gradient is too noisy to follow |
+| Warmup, weight decay, clipping | Ranges that will run and should not |
+
+Every message names the field, says what is wrong, and suggests a specific
+fix. Where the obvious fix is useless it says something else instead: a width
+of 577 has no sensible divisor, so rather than advising "try 1 head" it
+suggests a width of 576.
+
 ## Playground
 
 Every finished run stays available to chat with. Inference runs on a runner,
@@ -263,12 +320,25 @@ reverse proxy that provides auth.
 ## Project layout
 
 ```
+common/       formatting shared by both, so previews cannot drift from training
 controller/   FastAPI app, SQLite, scheduler, HF proxy  (no torch)
-runner/       capability probe, websocket agent, trainers
+runner/       capability probe, websocket agent, trainers, inference host
 web/          zero-build UI (ES modules, no dependencies)
 docker/       controller + rocm/cuda runner images, compose
 scripts/      host provisioning, bare-metal runner install
 ```
+
+### One rule in the web UI
+
+`draw()` renders purely from state, and no render may start work that causes
+another render synchronously. Every asynchronous load goes through `ensure()`,
+which marks itself in-flight *before* awaiting, so the re-render it eventually
+triggers finds the work already done rather than starting it again.
+
+This is written down because breaking it is not obvious and not survivable: an
+earlier version called `draw()` from inside the click handler that each step
+re-ran on render, which recursed until the stack gave out and filled the
+console with `too much recursion`.
 
 ## Status
 
@@ -292,6 +362,8 @@ Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 | Playground, second turn | 0.0 s — the loaded model is reused |
 | Playground, 3B fine-tune | base + adapter loaded in 11.7 s |
 | From scratch, 29M params | 11.5 GB against a 10.5 GB estimate |
+| Hand-designed 448x7, 20M params | trained from the designer end to end |
+| Multi-config dataset | configurations listed from the card when the viewer 501s |
 | Cancelling a run mid-training | stopped cleanly, runner stayed online |
 | Runner killed mid-run | job requeued and restarted automatically |
 | Unsupported model / bad ID | refused with a plain-language message |

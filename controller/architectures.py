@@ -422,3 +422,305 @@ def max_trainable_params(caps: dict) -> int | None:
     per_param = (10 if optim_8bit else 16) + 2
     usable = max(0.0, vram - 3.0) * 1024 ** 3
     return int(usable / per_param)
+
+
+# ===========================================================================
+# Designing your own architecture
+# ===========================================================================
+#
+# The presets above are five points on a very large surface. Someone who knows
+# what they want should be able to reach the rest of it -- but a transformer
+# has combinations that are silently wrong rather than loudly broken, and a
+# from-scratch run is far too slow to discover them by trying. Everything here
+# exists to say what is wrong, and why, before anything starts.
+
+LIMITS = {
+    "num_hidden_layers":       {"min": 1,  "max": 64,   "label": "Layers"},
+    "hidden_size":             {"min": 64, "max": 4096, "label": "Width"},
+    "num_attention_heads":     {"min": 1,  "max": 64,   "label": "Attention heads"},
+    "max_position_embeddings": {"min": 64, "max": 8192, "label": "Context length"},
+    "vocab_size":              {"min": 256, "max": 65536, "label": "Vocabulary"},
+    "intermediate_size":       {"min": 64, "max": 16384, "label": "Feed-forward width"},
+}
+
+# Head dimensions that attention kernels are actually tuned for. Anything else
+# runs, and runs slower.
+GOOD_HEAD_DIMS = (32, 48, 64, 80, 96, 128)
+
+# Width divided by depth. Real language models cluster tightly in this range;
+# the GPT and Llama families all sit between roughly 60 and 130.
+ASPECT_HEALTHY = (32, 320)
+
+
+def recommended_lr(dim: int) -> float:
+    """Peak learning rate for a model of this width.
+
+    Scales as 1/width, which is the rule maximal-update parametrisation
+    arrives at and which happens to fit the presets that were tuned by hand:
+    1e-3 at 256 wide, 2.5e-4 at 1024. Wider layers produce larger activations,
+    and the same step size that trains a narrow model destabilises a wide one.
+    """
+    return round(min(2e-3, max(1e-4, 0.256 / max(dim, 1))), 6)
+
+
+def build_custom_arch(spec: dict, vocab_size: int) -> dict:
+    """An architecture from raw numbers, with the derivable parts derived."""
+    dim = int(spec.get("hidden_size") or 512)
+    heads = int(spec.get("num_attention_heads") or max(1, dim // 64))
+    kv = int(spec.get("num_key_value_heads") or heads)
+    return {
+        "size_id": "custom",
+        "model_type": "llama",
+        "vocab_size": int(vocab_size),
+        "hidden_size": dim,
+        "intermediate_size": int(spec.get("intermediate_size") or _intermediate(dim)),
+        "num_hidden_layers": int(spec.get("num_hidden_layers") or 8),
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv,
+        "max_position_embeddings": int(spec.get("max_position_embeddings") or 512),
+        "tie_word_embeddings": bool(spec.get("tie_word_embeddings", True)),
+        "rms_norm_eps": 1e-5,
+    }
+
+
+def _issue(level, field, message, fix=None):
+    return {"level": level, "field": field, "message": message, "fix": fix}
+
+
+def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
+                  minutes: float | None = None) -> list[dict]:
+    """Everything wrong or questionable about this architecture.
+
+    Three levels. `error` cannot be started -- it would crash or refuse to
+    build. `warn` will run and will disappoint. `info` is a trade-off worth
+    knowing about but not a mistake.
+    """
+    out: list[dict] = []
+    d = arch["hidden_size"]
+    layers = arch["num_hidden_layers"]
+    heads = arch["num_attention_heads"]
+    kv = arch.get("num_key_value_heads", heads)
+    seq = arch["max_position_embeddings"]
+    vocab = arch["vocab_size"]
+
+    # ---- hard errors ----------------------------------------------------
+    for field, bound in LIMITS.items():
+        v = arch.get(field)
+        if v is None:
+            continue
+        if v < bound["min"] or v > bound["max"]:
+            out.append(_issue("error", field,
+                "%s must be between %s and %s." % (bound["label"], bound["min"], bound["max"])))
+
+    if d % heads:
+        # Two ways out, and the useful one depends on the numbers. A prime
+        # width has no divisors worth suggesting -- "try 1 head" is technically
+        # a fix and practically nonsense -- so in that case nudge the width
+        # instead, to the nearest multiple of the head count they asked for.
+        divisor = _nearest_divisor(d, heads)
+        fix = ("Try %d heads." % divisor if divisor > 2 or heads <= 2
+               else "Use a width of %d, which divides evenly by %d heads."
+                    % (max(heads, round(d / heads) * heads), heads))
+        out.append(_issue("error", "num_attention_heads",
+            "Width %d cannot be split across %d heads -- attention divides the "
+            "width evenly between them, so it has to divide exactly." % (d, heads),
+            fix))
+    if heads % kv:
+        out.append(_issue("error", "num_key_value_heads",
+            "Attention heads (%d) must be a multiple of key/value heads (%d)."
+            % (heads, kv)))
+
+    # ---- performance warnings -------------------------------------------
+    if d % heads == 0:
+        head_dim = d // heads
+        if head_dim not in GOOD_HEAD_DIMS:
+            out.append(_issue("warn", "num_attention_heads",
+                "Each head would be %d wide. Attention kernels are written for "
+                "%s, and other sizes fall back to a slower path."
+                % (head_dim, ", ".join(str(x) for x in GOOD_HEAD_DIMS)),
+                "%d heads gives 64 per head." % max(1, d // 64)))
+
+    if d % 64:
+        out.append(_issue("warn", "hidden_size",
+            "A width that is not a multiple of 64 leaves part of every matrix "
+            "tile idle on the GPU. The cost is real and easy to avoid.",
+            "Use %d." % (round(d / 64) * 64 or 64)))
+
+    aspect = d / max(layers, 1)
+    if aspect < ASPECT_HEALTHY[0]:
+        out.append(_issue("warn", "num_hidden_layers",
+            "This is very deep for its width (%d layers at %d wide). Deep, "
+            "narrow models train slowly and are prone to unstable gradients."
+            % (layers, d),
+            _layer_advice(d)))
+    elif aspect > ASPECT_HEALTHY[1]:
+        out.append(_issue("warn", "num_hidden_layers",
+            "This is very wide for its depth (%d layers at %d wide). Most of "
+            "the parameters end up in a handful of layers, which limits how "
+            "much the model can compose." % (layers, d),
+            _layer_advice(d)))
+
+    counts = count_params(arch)
+    if counts["embedding_share"] > 0.5:
+        out.append(_issue("warn", "vocab_size",
+            "The vocabulary is %.0f%% of this model. More of it would be spent "
+            "on the lookup table than on the network that does the thinking."
+            % (counts["embedding_share"] * 100),
+            "Shrink the vocabulary, or widen the model."))
+    elif counts["embedding_share"] > 0.3:
+        out.append(_issue("info", "vocab_size",
+            "The vocabulary is %.0f%% of this model's parameters. Workable, "
+            "but a smaller one would leave more capacity for the network."
+            % (counts["embedding_share"] * 100)))
+
+    flash = bool((caps.get("attention") or {}).get("flash"))
+    if seq > 1024 and not flash:
+        out.append(_issue("warn", "max_position_embeddings",
+            "This machine has no fused attention kernel, so attention memory "
+            "grows with the square of context length. At %d tokens that "
+            "becomes the largest thing on the card." % seq,
+            "1024 or less is comfortable here."))
+
+    if arch.get("intermediate_size") and d:
+        ratio = arch["intermediate_size"] / d
+        if ratio < 1.5:
+            out.append(_issue("warn", "intermediate_size",
+                "The feed-forward width is only %.1fx the model width. This is "
+                "where most of a transformer's capacity lives, and starving it "
+                "wastes the rest of the model." % ratio,
+                "%d is the usual choice." % _intermediate(d)))
+        elif ratio > 6:
+            out.append(_issue("info", "intermediate_size",
+                "The feed-forward width is %.1fx the model width, well above "
+                "the usual 2.7x. It will work, and most of the parameters will "
+                "sit here." % ratio))
+
+    # ---- can it actually run --------------------------------------------
+    vram = caps.get("vram_gb")
+    if vram:
+        optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
+        fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
+                              checkpointing=False, flash=flash)
+        if not fit["fits"]:
+            fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
+                                  checkpointing=True, flash=flash)
+            if fit["fits"]:
+                out.append(_issue("info", "hidden_size",
+                    "This only fits with activation recomputation turned on, "
+                    "which costs about 30%% of the speed."))
+            else:
+                at_one = training_memory_gb(arch, 1, optim_8bit=optim_8bit,
+                                            checkpointing=True, flash=flash)
+                out.append(_issue("error", "hidden_size",
+                    "This will not fit in %.1f GB. Even a single sequence at a "
+                    "time needs about %.1f GB." % (vram, at_one["total_gb"]),
+                    "Reduce the width, the depth, or the context length."))
+
+    # ---- will it learn anything -----------------------------------------
+    if minutes:
+        budget = tokens_in_time(arch, caps, minutes)
+        verdict = training_verdict(arch, budget)
+        if verdict["verdict"] in ("not_viable", "weak"):
+            out.append(_issue(
+                "error" if verdict["verdict"] == "not_viable" else "warn",
+                "budget",
+                "In %s this model would see %.1f tokens per parameter. %s"
+                % (_hours(minutes), verdict.get("ratio") or 0, verdict["message"]),
+                "Choose a smaller model, or allow more time."))
+        elif verdict.get("ratio", 0) > TOKENS_PER_PARAM_TARGET * 3:
+            out.append(_issue("info", "budget",
+                "This model finishes learning well inside your time budget "
+                "(%.0f tokens per parameter against a target of %d). A larger "
+                "one would use the time better."
+                % (verdict["ratio"], TOKENS_PER_PARAM_TARGET)))
+
+    if corpus_tokens and vocab > corpus_tokens / 200:
+        out.append(_issue("warn", "vocab_size",
+            "A %s-token vocabulary needs far more text than this dataset holds "
+            "to be built well. Rare merges will be learned from a handful of "
+            "examples." % f"{vocab:,}",
+            "Around %s would suit this dataset." % f"{max(256, int(corpus_tokens / 400)):,}"))
+
+    return out
+
+
+def check_settings(settings: dict, arch: dict) -> list[dict]:
+    """Training hyperparameters that will run but should not."""
+    out: list[dict] = []
+    d = arch["hidden_size"]
+    seq = arch["max_position_embeddings"]
+
+    lr = float(settings.get("learning_rate") or 0)
+    want = recommended_lr(d)
+    if lr <= 0:
+        out.append(_issue("error", "learning_rate",
+            "The learning rate must be greater than zero."))
+    elif lr > want * 3:
+        out.append(_issue("warn", "learning_rate",
+            "%.1e is %.1fx the rate this width usually tolerates. Too high and "
+            "the loss spikes and never recovers." % (lr, lr / want),
+            "%.1e is the recommendation for a %d-wide model." % (want, d)))
+    elif lr < want / 4:
+        out.append(_issue("warn", "learning_rate",
+            "%.1e is well below what this width can take. Training will work "
+            "and will waste most of your time budget getting nowhere." % lr,
+            "%.1e is the recommendation for a %d-wide model." % (want, d)))
+
+    tokens_per_step = (int(settings.get("batch_size") or 1)
+                       * int(settings.get("grad_accum") or 1) * seq)
+    if tokens_per_step < 16384:
+        out.append(_issue("warn", "grad_accum",
+            "Only %s tokens per update. Pretraining gradients are noisy, and "
+            "below about 16,000 tokens per step the loss curve wanders instead "
+            "of descending." % f"{tokens_per_step:,}",
+            "Raise gradient accumulation to %d."
+            % max(1, round(65536 / max(tokens_per_step, 1)
+                           * int(settings.get("grad_accum") or 1)))))
+
+    steps = int(settings.get("max_steps") or 0)
+    warmup = int(settings.get("warmup_steps") or 0)
+    if steps and warmup > steps * 0.5:
+        out.append(_issue("warn", "warmup_steps",
+            "Warmup covers more than half the run, so the model spends most of "
+            "its time below the learning rate you chose."))
+    elif steps and warmup < 5:
+        out.append(_issue("warn", "warmup_steps",
+            "Almost no warmup. A model starting from random weights takes a "
+            "large, badly-aimed first step without it.",
+            "%d steps is a reasonable warmup." % max(10, steps // 20)))
+
+    wd = settings.get("weight_decay")
+    if wd is not None and not (0 <= float(wd) <= 0.5):
+        out.append(_issue("warn", "weight_decay",
+            "Weight decay is normally between 0 and 0.2. Outside that range it "
+            "either does nothing or pulls the model apart."))
+
+    clip = settings.get("grad_clip")
+    if clip is not None and float(clip) <= 0:
+        out.append(_issue("error", "grad_clip",
+            "Gradient clipping must be greater than zero."))
+    elif clip is not None and float(clip) > 5:
+        out.append(_issue("info", "grad_clip",
+            "Clipping above 5 effectively disables it, which leaves the run "
+            "exposed to a single bad batch."))
+
+    return out
+
+
+def _layer_advice(dim: int) -> str:
+    """Depth that suits a given width, phrased for a human."""
+    n = max(2, round(dim / 96))
+    return "Around %d layer%s suits a width of %d." % (n, "" if n == 1 else "s", dim)
+
+
+def _nearest_divisor(n: int, near: int) -> int:
+    divisors = [i for i in range(1, min(n, 64) + 1) if n % i == 0]
+    return min(divisors, key=lambda x: abs(x - near)) if divisors else 1
+
+
+def _hours(minutes: float) -> str:
+    if minutes < 90:
+        return "%d minutes" % round(minutes)
+    if minutes < 2880:
+        return "%.1f hours" % (minutes / 60)
+    return "%.1f days" % (minutes / 1440)

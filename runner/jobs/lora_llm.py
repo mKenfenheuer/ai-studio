@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from common.formatting import format_example
+
 # LoRA adapts attention (and often MLP) projections. Names differ per
 # architecture, so we match against what the model actually contains rather
 # than hardcoding one family's naming.
@@ -41,56 +43,6 @@ def _pick_target_modules(model) -> list[str]:
     names = {n.split(".")[-1] for n, m in model.named_modules()
              if isinstance(m, nn.Linear) and "head" not in n and "lm_head" not in n}
     return sorted(names)[:6]
-
-
-def _format_example(row: dict, fmt: dict) -> str | None:
-    """Turn one dataset row into a training string.
-
-    Supports the three shapes that cover almost everything on the Hub: plain
-    text, instruction/response pairs, and chat message lists.
-    """
-    mode = fmt.get("mode", "auto")
-    text_field = fmt.get("text_field")
-    if mode == "text" or (mode == "auto" and text_field and text_field in row):
-        val = row.get(text_field or "text")
-        return str(val) if val else None
-
-    if mode in ("instruction", "auto"):
-        instr_f = fmt.get("instruction_field") or _first_present(
-            row, ["instruction", "prompt", "question", "input"])
-        resp_f = fmt.get("response_field") or _first_present(
-            row, ["output", "response", "answer", "completion"])
-        if instr_f and resp_f:
-            instr, resp = row.get(instr_f), row.get(resp_f)
-            if instr and resp:
-                ctx = row.get("input") if instr_f != "input" else None
-                tmpl = fmt.get("template") or (
-                    "### Instruction:\n{instruction}\n\n### Response:\n{response}")
-                prompt = str(instr) + (("\n\n" + str(ctx)) if ctx else "")
-                return tmpl.format(instruction=prompt, response=str(resp))
-
-    if mode in ("chat", "auto"):
-        msgs = row.get(fmt.get("messages_field") or "messages")
-        if isinstance(msgs, list) and msgs:
-            parts = []
-            for m in msgs:
-                if isinstance(m, dict) and "content" in m:
-                    parts.append("%s: %s" % (m.get("role", "user"), m["content"]))
-            if parts:
-                return "\n".join(parts)
-
-    if mode == "auto":
-        for f in ("text", "content", "document", "sentence"):
-            if row.get(f):
-                return str(row[f])
-    return None
-
-
-def _first_present(row: dict, names: list[str]) -> str | None:
-    for n in names:
-        if n in row and row[n]:
-            return n
-    return None
 
 
 def run(cfg: dict, ctx: Any) -> dict:
@@ -192,7 +144,7 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     fmt = cfg.get("format", {"mode": "auto"})
     sample_row = ds[0] if len(ds) else {}
-    preview = _format_example(sample_row, fmt)
+    preview = format_example(sample_row, fmt)
     if not preview:
         raise ValueError(
             "Could not work out how to read this dataset. Its columns are: %s. "
@@ -208,7 +160,7 @@ def run(cfg: dict, ctx: Any) -> dict:
         texts = []
         for i in range(n):
             row = {k: batch_rows[k][i] for k in keys}
-            t = _format_example(row, fmt)
+            t = format_example(row, fmt)
             # Every example ends with the end-of-text token. Without it the
             # model learns what a response looks like but never learns that one
             # has *finished*, so at generation time it answers correctly and
