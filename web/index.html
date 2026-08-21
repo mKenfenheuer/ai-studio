@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Studio</title>
+<link rel="stylesheet" href="/static/css/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎛️</text></svg>">
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">◆</span>
+      <div>
+        <div class="brand-name">AI Studio</div>
+        <div class="brand-sub">train · tune · evaluate</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <a href="#/" data-nav="dashboard"><span class="ico">▤</span><span class="lbl">Dashboard</span></a>
+      <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">✦</span><span class="lbl">New training run</span></a>
+      <a href="#/jobs" data-nav="jobs"><span class="ico">≡</span><span class="lbl">Runs</span></a>
+      <a href="#/play" data-nav="play"><span class="ico">💬</span><span class="lbl">Playground</span></a>
+      <a href="#/runners" data-nav="runners"><span class="ico">▦</span><span class="lbl">Machines</span></a>
+      <a href="#/settings" data-nav="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="fleet-pill">
+        <span class="dot dot-idle" data-fleet-dot></span>
+        <span data-fleet-text>connecting…</span>
+      </div>
+      <button class="link-btn" id="helpToggle" type="button">
+        New to this? Start here →
+      </button>
+    </div>
+  </aside>
+
+  <!-- Mobile-only top bar. The sidebar collapses to a bottom tab bar on small
+       screens, so brand and status need a home that is still reachable. -->
+  <header class="topbar">
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">AI Studio</span>
+    <div class="spacer"></div>
+    <div class="fleet-pill">
+      <span class="dot dot-idle" data-fleet-dot></span>
+      <span data-fleet-text>connecting…</span>
+    </div>
+    <button class="icon-btn" id="helpToggleMobile" type="button"
+            aria-label="Help for beginners">?</button>
+  </header>
+
+  <main class="main" id="main"><div class="loading">Loading…</div></main>
+</div>
+
+<!-- Beginner primer. Deliberately reachable from every screen: the target
+     user does not know the vocabulary and should never have to leave to look
+     it up. -->
+<div class="drawer" id="helpDrawer" hidden>
+  <div class="drawer-inner">
+    <button class="drawer-close" id="helpClose" type="button" aria-label="Close">✕</button>
+    <h2>What is this app doing?</h2>
+    <p class="lede">There are two things you can do here. Usually you take a
+      model someone else already trained and teach it <em>your</em> task using
+      examples you choose — that is <strong>fine-tuning</strong>, and it takes
+      minutes to hours. Or you can <strong>build a model from scratch</strong>,
+      starting from random numbers, which is slower and only works for small
+      models on one graphics card — but the result is entirely yours.</p>
+
+    <div class="help-flow">
+      <div class="help-step"><span class="n">1</span>
+        <div><h4>Pick a base model</h4><p>A model that already understands
+        language. Bigger ones are smarter but need more memory.</p></div></div>
+      <div class="help-step"><span class="n">2</span>
+        <div><h4>Pick your examples</h4><p>A dataset of questions and good
+        answers. The model learns the pattern in them.</p></div></div>
+      <div class="help-step"><span class="n">3</span>
+        <div><h4>Train</h4><p>Your GPU repeatedly shows the model examples and
+        nudges it toward better answers. You watch the error go down.</p></div></div>
+      <div class="help-step"><span class="n">4</span>
+        <div><h4>Use the result</h4><p>Chat with it in the
+        <a href="#/play">Playground</a>, or download it. A fine-tune gives you a
+        small <em>adapter</em> file; a model built from scratch is a complete
+        model of its own.</p></div></div>
+    </div>
+
+    <h3>Building from scratch</h3>
+    <p>The same four steps, with two differences. There is no base model — you
+      choose a <strong>size</strong> instead — and instead of examples you give
+      it plain text to read. The honest part: a model needs roughly
+      <strong>20 words of text for every parameter</strong> it has before it
+      finishes learning. On one graphics card that means small models, and the
+      app will show you exactly where the limit falls rather than letting you
+      find out overnight.</p>
+
+    <h3>Words you will see</h3>
+    <dl class="glossary">
+      <dt>Loss</dt><dd>How wrong the model is. Training works when this goes
+        down. It is the single number to watch.</dd>
+      <dt>LoRA</dt><dd>A trick that trains a tiny number of extra parameters
+        instead of all billions of them. Much faster, needs far less memory,
+        and works nearly as well.</dd>
+      <dt>Epoch</dt><dd>One complete pass through all your examples.</dd>
+      <dt>Step</dt><dd>One update to the model. Many steps make an epoch.</dd>
+      <dt>VRAM</dt><dd>Memory on your graphics card. The main limit on how big
+        a model you can train.</dd>
+      <dt>Quantization</dt><dd>Storing the model with less precision so it
+        fits in less memory. Slight quality cost, big memory saving.</dd>
+      <dt>Adapter</dt><dd>The small file your training produces. Combine it
+        with the base model to get your fine-tuned model.</dd>
+      <dt>Overfitting</dt><dd>When the model memorises your examples instead of
+        learning the pattern. Watch for loss that keeps dropping while results
+        get worse.</dd>
+      <dt>Token</dt><dd>A chunk of text, usually part of a word. Models read and
+        write tokens, not letters. Roughly four characters each.</dd>
+      <dt>Vocabulary</dt><dd>The full set of tokens a model knows. Built from
+        your own text when you train from scratch.</dd>
+      <dt>From scratch</dt><dd>Training a model whose weights start as random
+        noise, rather than adjusting one that already works.</dd>
+      <dt>Held-out loss</dt><dd>The loss measured on text the model was never
+        trained on. The honest number: if it rises while training loss falls,
+        the model is memorising.</dd>
+      <dt>Base model</dt><dd>A model that only continues text. It has not been
+        taught to answer questions — that is what fine-tuning adds.</dd>
+    </dl>
+  </div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

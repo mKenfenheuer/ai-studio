@@ -1,0 +1,54 @@
+# Controller plus one local AMD runner.
+#
+# The runner reaches the controller by service name, so no ports need to be
+# published for them to talk. Only the UI port is exposed.
+services:
+  controller:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.controller
+    image: ai-studio/controller:latest
+    restart: unless-stopped
+    ports:
+      # Host port is configurable; 80 gives a bare http://host with no port.
+      - "${AI_STUDIO_UI_PORT:-8420}:8420"
+    volumes:
+      - studio-data:/data
+    environment:
+      # Set a fixed token so runners can be configured before first boot.
+      AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN:?set AI_STUDIO_JOIN_TOKEN in .env}
+      HF_TOKEN: ${HF_TOKEN:-}
+
+  runner-rocm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runner.rocm
+      args:
+        BNB_ROCM_ARCH: ${BNB_ROCM_ARCH:-gfx1030}
+    image: ai-studio/runner:rocm
+    restart: unless-stopped
+    depends_on: [controller]
+    # ROCm needs the compute device, the render node, and membership of the
+    # video/render groups. Without all three the GPU is invisible in-container.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Numeric GIDs, taken from the HOST. Group *names* resolve inside the
+    # container, where `render` often has a different GID (or is absent), which
+    # silently leaves the GPU unreadable. Populate via scripts/make-env.sh.
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-993}"
+    security_opt: ["seccomp=unconfined"]
+    ipc: host
+    volumes:
+      - runner-data:/data
+    environment:
+      AI_STUDIO_CONTROLLER: http://controller:8420
+      AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
+      AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-amd-runner}
+      HF_TOKEN: ${HF_TOKEN:-}
+
+volumes:
+  studio-data:
+  runner-data:

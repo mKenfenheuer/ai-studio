@@ -1,0 +1,27 @@
+# NVIDIA runner. Use alongside the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d
+services:
+  runner-cuda:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runner.cuda
+    image: ai-studio/runner:cuda
+    restart: unless-stopped
+    depends_on: [controller]
+    volumes:
+      - runner-cuda-data:/data
+    environment:
+      AI_STUDIO_CONTROLLER: http://controller:8420
+      AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
+      AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-nvidia-runner}
+      HF_TOKEN: ${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  runner-cuda-data:

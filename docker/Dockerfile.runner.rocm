@@ -1,0 +1,71 @@
+# AI Studio runner — AMD / ROCm
+#
+# The GPU userspace is the fragile part of an AMD setup, so it is pinned in
+# here rather than on the host. The host supplies only the amdgpu kernel
+# driver (/dev/kfd + /dev/dri); this image supplies everything above it. Same
+# division of labour as NVIDIA's driver/CUDA-container split.
+ARG ROCM_VERSION=6.4
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+# Which GPU to compile kernels for. gfx1030 = RX 6800/6900 XT (RDNA2),
+# gfx1100 = RX 7900 XTX (RDNA3), gfx90a/gfx942 = Instinct.
+# Multiple architectures may be given, semicolon-separated.
+ARG BNB_ROCM_ARCH=gfx1030
+ARG TORCH_INDEX=https://download.pytorch.org/whl/rocm6.4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/data/hf \
+    AI_STUDIO_RUNNER_STATE=/data/runner-id
+
+# Persist compiled GPU kernels on the data volume. Without this, every
+# container start recompiles them and the first hardware probe takes minutes
+# of apparent hang before it reports anything.
+ENV MIOPEN_USER_DB_PATH=/data/miopen \
+    MIOPEN_CUSTOM_CACHE_DIR=/data/miopen \
+    TRITON_CACHE_DIR=/data/triton
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git cmake build-essential \
+        rocminfo curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --no-cache-dir --upgrade pip wheel \
+    && pip install --no-cache-dir torch --index-url ${TORCH_INDEX}
+
+RUN pip install --no-cache-dir \
+        transformers>=4.44 peft>=0.12 accelerate>=0.34 datasets>=2.20 \
+        safetensors>=0.4 websockets>=12 httpx>=0.27 numpy
+
+# bitsandbytes ships CUDA-only wheels on PyPI. On ROCm hardware, importing that
+# wheel does not raise -- it aborts the process at the HIP level. Building from
+# source against this GPU's architecture is what makes 4-bit (QLoRA) work, and
+# is the difference between a 3B and a 7B ceiling on a 16GB card.
+RUN git clone --depth 1 https://github.com/bitsandbytes-foundation/bitsandbytes.git /tmp/bnb \
+    && cd /tmp/bnb \
+    && cmake -DCOMPUTE_BACKEND=hip -DBNB_ROCM_ARCH="${BNB_ROCM_ARCH}" -S . \
+    && make -j"$(nproc)" \
+    && pip install --no-cache-dir . \
+    && cd / && rm -rf /tmp/bnb
+
+# Persist compiled GPU kernels on the data volume. Without this, every
+# container start recompiles them and the first hardware probe takes minutes
+# of apparent hang before it reports anything.
+ENV MIOPEN_USER_DB_PATH=/data/miopen \
+    MIOPEN_CUSTOM_CACHE_DIR=/data/miopen \
+    TRITON_CACHE_DIR=/data/triton
+
+COPY runner /app/runner
+COPY pyproject.toml /app/
+WORKDIR /app
+
+# Healthy means "the agent is connected and reporting", which is what
+# actually matters. Deliberately does NOT import torch: opening a second HIP/
+# CUDA context beside the running agent is wasteful and can spuriously fail.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=900s --retries=3     CMD python -c "import os,time,sys;         f=os.environ.get('AI_STUDIO_LIVENESS','/tmp/ai-studio-runner.alive');         sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 120 else 1)"
+
+VOLUME ["/data"]
+ENTRYPOINT ["python", "-m", "runner"]

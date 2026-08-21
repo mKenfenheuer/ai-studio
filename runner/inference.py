@@ -1,0 +1,262 @@
+"""Running a finished model, so you can actually talk to the thing you trained.
+
+A training run that ends in a download link is only half an answer. This module
+loads a completed result back onto the GPU and streams text from it, which is
+the only way most people can tell whether the run worked.
+
+Three things make it more than a wrapper around `generate()`:
+
+* **The result is fetched from the controller, not rebuilt.** The runner that
+  serves a chat need not be the one that trained the model, and the machine
+  that trained it may be long gone. Artifacts live on the controller; a runner
+  pulls one down, caches it on its data volume, and can serve it forever.
+
+* **Prompts are formatted the way the model was trained.** A LoRA fine-tune
+  that learned "### Instruction:\\n...\\n\\n### Response:\\n" will ignore a bare
+  question, and the user concludes the training failed. The controller passes
+  the template that was used, and it is applied here.
+
+* **Generation is a hand-written loop.** `TextIteratorStreamer` needs a second
+  thread and a queue to stream; doing it directly gives per-token delivery,
+  immediate cancellation, and correct incremental decoding of multi-byte
+  characters that a byte-level BPE splits across tokens.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import threading
+import time
+import zipfile
+from pathlib import Path
+from typing import Any, Callable
+
+import httpx
+
+CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
+
+# How long a model may sit loaded with nobody talking to it. The GPU is shared
+# with training, and holding 6 GB for a conversation that ended an hour ago
+# would block the next run for no reason.
+IDLE_UNLOAD_S = 15 * 60
+
+
+class ModelHost:
+    """Keeps at most one model resident and generates from it."""
+
+    def __init__(self, controller_url: str, token: str, caps: dict):
+        self.controller_url = controller_url.rstrip("/")
+        self.token = token
+        self.caps = caps
+        self.lock = threading.Lock()
+        self.loaded_id: str | None = None
+        self.model = None
+        self.tok = None
+        self.last_used = 0.0
+        self._cancel = threading.Event()
+
+    # ------------------------------------------------------------ device
+    @property
+    def device(self) -> str:
+        backend = self.caps.get("backend")
+        if backend in ("cuda", "rocm"):
+            return "cuda"
+        return "mps" if backend == "mps" else "cpu"
+
+    # ------------------------------------------------------------ loading
+    def _artifact_dir(self, job_id: str) -> Path:
+        return CACHE_DIR / job_id
+
+    def _fetch(self, job_id: str, log: Callable[[str], None]) -> Path:
+        """Download and unpack this job's result, unless it is already here."""
+        dest = self._artifact_dir(job_id)
+        if (dest / "config.json").exists() or (dest / "adapter_config.json").exists():
+            return dest
+
+        log("Downloading the trained result from the controller…")
+        dest.mkdir(parents=True, exist_ok=True)
+        zip_path = dest.with_suffix(".zip")
+        url = "%s/api/jobs/%s/download" % (self.controller_url, job_id)
+        with httpx.stream("GET", url, timeout=600,
+                          headers={"X-Runner-Token": self.token}) as r:
+            r.raise_for_status()
+            with open(zip_path, "wb") as fh:
+                for chunk in r.iter_bytes(1 << 20):
+                    fh.write(chunk)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(dest)
+        zip_path.unlink(missing_ok=True)
+        log("Result unpacked.")
+        return dest
+
+    def unload(self) -> None:
+        with self.lock:
+            self._unload_locked()
+
+    def _unload_locked(self) -> None:
+        if self.model is None:
+            return
+        import torch
+        self.model = None
+        self.tok = None
+        self.loaded_id = None
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
+    def maybe_unload_idle(self) -> bool:
+        if self.model is None or not self.last_used:
+            return False
+        if time.time() - self.last_used < IDLE_UNLOAD_S:
+            return False
+        self.unload()
+        return True
+
+    def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        job_id = spec["job_id"]
+        if self.loaded_id == job_id and self.model is not None:
+            return
+
+        self._unload_locked()
+        path = self._fetch(job_id, log)
+        dtype_name = self.caps.get("recommended_dtype", "float32")
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(
+            dtype_name, torch.float32)
+        if self.device == "cpu":
+            dtype = torch.float32
+
+        if spec.get("kind") == "pretrain_llm":
+            log("Loading your model…")
+            self.tok = AutoTokenizer.from_pretrained(str(path))
+            self.model = AutoModelForCausalLM.from_pretrained(str(path), dtype=dtype)
+        else:
+            base = spec.get("base_model")
+            if not base:
+                raise ValueError(
+                    "This result is an adapter, which needs the model it was "
+                    "trained on, but that model is not recorded on the run.")
+            log("Loading %s, then applying what you trained…" % base)
+            from peft import PeftModel
+            self.tok = AutoTokenizer.from_pretrained(str(path)) \
+                if (path / "tokenizer_config.json").exists() \
+                else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
+            self.model = AutoModelForCausalLM.from_pretrained(
+                base, dtype=dtype, token=spec.get("hf_token"))
+            self.model = PeftModel.from_pretrained(self.model, str(path))
+
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        self.model = self.model.to(self.device).eval()
+        self.model.config.use_cache = True
+        self.loaded_id = job_id
+        self.last_used = time.time()
+        log("Ready.")
+
+    # --------------------------------------------------------- generating
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def generate(self, spec: dict, prompt: str, params: dict,
+                 on_token: Callable[[str], None],
+                 log: Callable[[str], None]) -> dict:
+        import torch
+
+        self._cancel.clear()
+        with self.lock:
+            self.ensure_loaded(spec, log)
+            model, tok = self.model, self.tok
+            self.last_used = time.time()
+
+            text = _apply_template(prompt, spec)
+            ids = tok(text, return_tensors="pt").input_ids.to(self.device)
+            prompt_len = ids.shape[1]
+
+            max_new = int(params.get("max_new_tokens", 200))
+            temperature = float(params.get("temperature", 0.8))
+            top_k = int(params.get("top_k", 50))
+            top_p = float(params.get("top_p", 0.95))
+            stop_texts = spec.get("stop") or []
+
+            past = None
+            emitted = ""
+            produced: list[int] = []
+            t0 = time.time()
+            cur = ids
+
+            for _ in range(max_new):
+                if self._cancel.is_set():
+                    break
+                with torch.no_grad():
+                    out = model(input_ids=cur, past_key_values=past, use_cache=True)
+                past = out.past_key_values
+                logits = out.logits[:, -1, :].float()
+
+                if temperature <= 0:
+                    nxt = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    logits = logits / max(temperature, 1e-5)
+                    if top_k > 0:
+                        kth = torch.topk(logits, min(top_k, logits.shape[-1]))[0][..., -1, None]
+                        logits = logits.masked_fill(logits < kth, float("-inf"))
+                    if 0 < top_p < 1:
+                        srt, idx = torch.sort(logits, descending=True, dim=-1)
+                        cum = torch.softmax(srt, dim=-1).cumsum(dim=-1)
+                        # Keep the first token that crosses the threshold, or a
+                        # very peaked distribution would leave nothing to pick.
+                        drop = cum - torch.softmax(srt, dim=-1) > top_p
+                        srt = srt.masked_fill(drop, float("-inf"))
+                        logits = torch.full_like(logits, float("-inf")).scatter(1, idx, srt)
+                    nxt = torch.multinomial(torch.softmax(logits, dim=-1), 1)
+
+                token_id = int(nxt[0, 0])
+                if token_id == tok.eos_token_id:
+                    break
+                produced.append(token_id)
+                cur = nxt
+
+                # Decode the whole continuation each step and emit the
+                # difference. Decoding one token at a time corrupts any
+                # character whose bytes a BPE split across two tokens.
+                full = tok.decode(produced, skip_special_tokens=True)
+                if len(full) > len(emitted):
+                    on_token(full[len(emitted):])
+                    emitted = full
+
+                if any(stop in emitted for stop in stop_texts):
+                    for stop in stop_texts:
+                        if stop in emitted:
+                            emitted = emitted.split(stop)[0]
+                    break
+
+            self.last_used = time.time()
+            elapsed = time.time() - t0
+            return {
+                "text": emitted,
+                "tokens": len(produced),
+                "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
+                "prompt_tokens": prompt_len,
+                "cancelled": self._cancel.is_set(),
+            }
+
+
+def _apply_template(prompt: str, spec: dict) -> str:
+    """Format the input the way this model was trained to receive it.
+
+    A base model trained from scratch continues text and has never seen a
+    question-and-answer shape, so its prompt is passed through untouched. A
+    fine-tune that learned an instruction template must be given that exact
+    template back, or it will read the question as more text to continue.
+    """
+    template = spec.get("prompt_template")
+    if not template:
+        return prompt
+    return template.replace("{instruction}", prompt).replace("{response}", "")
+
+
+def clear_cache(job_id: str | None = None) -> None:
+    if job_id:
+        shutil.rmtree(CACHE_DIR / job_id, ignore_errors=True)
+    else:
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)

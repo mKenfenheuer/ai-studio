@@ -1,0 +1,42 @@
+[project]
+name = "ai-studio"
+version = "0.1.0"
+description = "Low-code web studio for training, fine-tuning and evaluating LLM and vision models across NVIDIA, AMD and Apple hardware."
+requires-python = ">=3.10"
+
+# The controller is deliberately dependency-light: no torch, no CUDA/ROCm.
+# It must be installable on any machine, including ones with no GPU at all.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# Installed only on machines that actually train. Torch itself is NOT listed
+# here: its wheel is backend-specific (rocm/cu124/cpu) and is installed
+# separately by scripts/install-runner.sh against the right index URL.
+runner = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "transformers>=4.44",
+    "peft>=0.12",
+    "accelerate>=0.34",
+    "datasets>=2.20",
+    "safetensors>=0.4",
+]
+
+[project.scripts]
+ai-studio = "controller.__main__:main"
+ai-studio-runner = "runner.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["controller", "controller.api", "runner", "runner.jobs"]
+
+[tool.setuptools.package-data]
+controller = ["../web/**/*"]

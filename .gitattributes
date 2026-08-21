@@ -1,0 +1,10 @@
+# Shell scripts and Dockerfiles run on Linux even when authored on Windows.
+# CRLF in a shebang line produces "bad interpreter: /usr/bin/env bash^M".
+*.sh        text eol=lf
+Dockerfile* text eol=lf
+*.yml       text eol=lf
+*.py        text eol=lf
+*.js        text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.md        text eol=lf
