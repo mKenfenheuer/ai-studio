@@ -77,18 +77,16 @@ async def runner_ws(ws: WebSocket) -> None:
         if runner_id:
             fleet.detach(runner_id)
             db.mark_runner_offline(runner_id)
-            requeued, rescued = db.requeue_jobs_for_runner(runner_id)
-            for jid in requeued:
-                db.add_log(jid, "The machine disconnected before this finished; "
-                                "the run has gone back on the queue.", "warn")
-            for jid in rescued:
-                db.add_log(jid, "The machine disconnected just after uploading "
-                                "the result, so this run is complete.")
-            for jid in requeued:
-                fleet.declined.discard(jid)
+            # Deliberately NOT requeuing here. A dropped socket does not stop
+            # a training run: the runner keeps going and dials back in. The
+            # commonest cause of this branch is the controller itself being
+            # restarted for an update, and requeuing on that would abandon
+            # every run in progress and start them again from noise.
+            #
+            # Instead the job is left alone and the scheduler reconciles it
+            # once the runner has been silent long enough to be genuinely
+            # gone. See Fleet.reconcile_orphans.
             await fleet.broadcast_ui({"type": "runners_changed"})
-            if requeued or rescued:
-                await fleet.broadcast_ui({"type": "jobs_changed"})
 
 
 # ===========================================================================

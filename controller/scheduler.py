@@ -120,11 +120,37 @@ class Fleet:
                            % (mem["total_gb"], vram))
         return True, ""
 
+    async def reconcile_orphans(self) -> None:
+        """Deal with work whose machine has genuinely vanished.
+
+        Split out from the disconnect handler on purpose. A socket closing
+        says nothing about whether training stopped -- restarting the
+        controller closes every socket while every run carries on. Only
+        prolonged silence means the work is really lost, and by then the
+        runner has had several heartbeats to say otherwise.
+        """
+        for job in db.orphaned_jobs():
+            jid = job["id"]
+            if job["runner_id"] in self.connections:
+                continue
+            requeued, rescued = db.requeue_jobs_for_runner(job["runner_id"])
+            for j in rescued:
+                db.add_log(j, "The machine went away just after uploading the "
+                              "result, so this run is complete.")
+            for j in requeued:
+                self.declined.discard(j)
+                db.add_log(j, "The machine has been unreachable for a while; "
+                              "the run has gone back on the queue.", "warn")
+            if requeued or rescued:
+                await self.broadcast_ui({"type": "jobs_changed"})
+                self.wake()
+
     async def scheduler_loop(self) -> None:
         """Assign queued jobs to idle runners. Woken by events, with a periodic
         tick as a backstop so nothing can sit stuck if a wake-up is missed."""
         while True:
             try:
+                await self.reconcile_orphans()
                 await self._dispatch_once()
             except asyncio.CancelledError:
                 raise
@@ -195,8 +221,20 @@ class Fleet:
             # controller restarts, and then hands work to a machine that is
             # already training.
             if msg.get("busy"):
-                self.busy[runner_id] = (msg.get("job_id")
-                                        or self.busy.get(runner_id) or "?")
+                jid = msg.get("job_id")
+                self.busy[runner_id] = jid or self.busy.get(runner_id) or "?"
+                # The runner is still working on this. If the controller
+                # restarted and lost track, or an earlier disconnect put the
+                # job back on the queue, correct that now rather than running
+                # the same work twice.
+                if jid:
+                    job = db.get_job(jid)
+                    if job and job["status"] in ("queued", "assigned"):
+                        db.set_job_status(jid, "running")
+                        db.assign_job_runner(jid, runner_id)
+                        self.declined.discard(jid)
+                        await self.broadcast_ui({"type": "jobs_changed",
+                                                 "job_id": jid})
             elif time.time() - self.dispatched_at.get(runner_id, 0) > 30:
                 # Genuinely idle, and not merely slow to pick up work just
                 # handed to it.

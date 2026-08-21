@@ -196,6 +196,19 @@ def set_job_progress(job_id: str, step: int, total: int) -> None:
     ex("UPDATE jobs SET step=?, total_steps=? WHERE id=?", (step, total, job_id))
 
 
+def assign_job_runner(job_id: str, runner_id: str) -> None:
+    ex("UPDATE jobs SET runner_id=? WHERE id=?", (runner_id, job_id))
+
+
+def orphaned_jobs() -> list[dict]:
+    """Jobs whose machine has been silent past the heartbeat deadline."""
+    cutoff = now() - config.HEARTBEAT_TIMEOUT_S
+    return [_hydrate(r) for r in q(
+        "SELECT j.* FROM jobs j JOIN runners r ON r.id = j.runner_id"
+        " WHERE j.status IN ('assigned','running') AND r.last_seen < ?",
+        (cutoff,))]
+
+
 def requeue_jobs_for_runner(runner_id: str) -> tuple[list[str], list[str]]:
     """A runner vanished mid-job. Decide what happens to its work.
 
