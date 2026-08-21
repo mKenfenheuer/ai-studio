@@ -250,6 +250,16 @@ class Fleet:
             return
 
         if kind == "job_started":
+            # A restarted attempt begins its curve again at step 1. Leaving the
+            # abandoned attempt's measurements behind gives the job two rows
+            # for every step, so the chart draws itself backwards and the
+            # "latest" reading comes from a run that no longer exists. The logs
+            # keep the history; the measurements describe the live attempt.
+            if db.count_metrics(jid):
+                db.clear_metrics(jid)
+                db.add_log(jid, "Starting again from the beginning; the "
+                                "measurements from the interrupted attempt "
+                                "have been cleared.", "warn")
             db.set_job_status(jid, "running")
             self.declined.discard(jid)
             self.busy[runner_id] = jid

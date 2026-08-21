@@ -242,6 +242,15 @@ def add_metric(job_id: str, step: int, data: dict) -> None:
        (job_id, step, now(), json.dumps(data)))
 
 
+def count_metrics(job_id: str) -> int:
+    return len(q("SELECT 1 FROM metrics WHERE job_id=? LIMIT 1", (job_id,)))
+
+
+def clear_metrics(job_id: str) -> None:
+    """Drop the measurements of an attempt that is being redone."""
+    ex("DELETE FROM metrics WHERE job_id=?", (job_id,))
+
+
 def get_metrics(job_id: str) -> list[dict]:
     out = []
     for r in q("SELECT step,ts,data FROM metrics WHERE job_id=? ORDER BY step", (job_id,)):
