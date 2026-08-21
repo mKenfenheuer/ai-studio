@@ -243,7 +243,8 @@ class Runner:
     def _start_job(self, job: dict) -> None:
         if self.current is not None:
             self.outbox.put({"type": "job_rejected", "job_id": job["id"],
-                             "reason": "runner already busy"})
+                             "reason": "runner already busy",
+                             "current_job": self.current.job_id})
             return
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders

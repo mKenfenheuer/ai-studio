@@ -77,11 +77,17 @@ async def runner_ws(ws: WebSocket) -> None:
         if runner_id:
             fleet.detach(runner_id)
             db.mark_runner_offline(runner_id)
-            requeued = db.requeue_jobs_for_runner(runner_id)
+            requeued, rescued = db.requeue_jobs_for_runner(runner_id)
             for jid in requeued:
-                db.add_log(jid, "Runner disconnected; job returned to the queue.", "warn")
+                db.add_log(jid, "The machine disconnected before this finished; "
+                                "the run has gone back on the queue.", "warn")
+            for jid in rescued:
+                db.add_log(jid, "The machine disconnected just after uploading "
+                                "the result, so this run is complete.")
+            for jid in requeued:
+                fleet.declined.discard(jid)
             await fleet.broadcast_ui({"type": "runners_changed"})
-            if requeued:
+            if requeued or rescued:
                 await fleet.broadcast_ui({"type": "jobs_changed"})
 
 

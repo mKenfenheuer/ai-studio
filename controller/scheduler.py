@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 from fastapi import WebSocket
@@ -20,6 +21,13 @@ class Fleet:
         self.busy: dict[str, str] = {}          # runner_id -> job_id
         self.ui_clients: set[WebSocket] = set()
         self.generations: dict[str, str] = {}   # request_id -> runner_id
+        # When each runner was last handed work. A runner takes a moment to
+        # pick a job up, and during that gap its heartbeat still says idle --
+        # without this the scheduler would hand it a second job.
+        self.dispatched_at: dict[str, float] = {}
+        # Jobs already told the user they are waiting, so a queue that has to
+        # wait an hour does not write an hour of identical log lines.
+        self.declined: set[str] = set()
         self._wake = asyncio.Event()
 
     # ------------------------------------------------------------ plumbing
@@ -29,6 +37,7 @@ class Fleet:
     def detach(self, runner_id: str) -> None:
         self.connections.pop(runner_id, None)
         self.busy.pop(runner_id, None)
+        self.dispatched_at.pop(runner_id, None)
 
     def wake(self) -> None:
         self._wake.set()
@@ -148,6 +157,7 @@ class Fleet:
 
                 db.assign_job(job["id"], runner_id)
                 self.busy[runner_id] = job["id"]
+                self.dispatched_at[runner_id] = time.time()
                 sent = await self.send_to_runner(runner_id, {
                     "type": "job_assign",
                     "job": {"id": job["id"], "kind": job["kind"], "config": job["config"]},
@@ -155,6 +165,7 @@ class Fleet:
                 if not sent:
                     # Socket died between the idle check and the send.
                     self.busy.pop(runner_id, None)
+                    self.dispatched_at.pop(runner_id, None)
                     db.set_job_status(job["id"], "queued")
                     continue
                 db.add_log(job["id"], "Assigned to runner '%s'." % runner["name"])
@@ -179,6 +190,18 @@ class Fleet:
 
         if kind == "heartbeat":
             db.touch_runner(runner_id, "busy" if msg.get("busy") else "online")
+            # The runner is the authority on what it is doing. Deriving this
+            # from dispatch bookkeeping alone loses track the moment the
+            # controller restarts, and then hands work to a machine that is
+            # already training.
+            if msg.get("busy"):
+                self.busy[runner_id] = (msg.get("job_id")
+                                        or self.busy.get(runner_id) or "?")
+            elif time.time() - self.dispatched_at.get(runner_id, 0) > 30:
+                # Genuinely idle, and not merely slow to pick up work just
+                # handed to it.
+                if self.busy.pop(runner_id, None) is not None:
+                    self.wake()
             return
 
         if kind == "capabilities":
@@ -190,6 +213,7 @@ class Fleet:
 
         if kind == "job_started":
             db.set_job_status(jid, "running")
+            self.declined.discard(jid)
             self.busy[runner_id] = jid
             db.touch_runner(runner_id, "busy")
             await self.broadcast_ui({"type": "jobs_changed", "job_id": jid})
@@ -257,7 +281,19 @@ class Fleet:
             self.wake()
 
         elif kind == "job_rejected":
+            # A decline is information about the runner, not just about the
+            # job. Clearing `busy` here and waking the scheduler produced a
+            # tight loop: the job went back on the queue, the same busy runner
+            # looked free, it was handed the job again, and it declined again
+            # -- 250 times in a few minutes, writing a log line each way.
+            #
+            # So mark the runner busy and do NOT wake. Its next heartbeat that
+            # reports idle will wake the scheduler, which is the moment there
+            # is actually any point in trying again.
             db.set_job_status(jid, "queued")
-            db.add_log(jid, "Runner declined the job: %s" % msg.get("reason", ""), "warn")
-            self.busy.pop(runner_id, None)
-            self.wake()
+            self.busy[runner_id] = msg.get("current_job") or "?"
+            if jid not in self.declined:
+                self.declined.add(jid)
+                db.add_log(jid, "Waiting for %s to finish its current run."
+                           % (db.get_runner(runner_id) or {}).get("name", "that machine"),
+                           "warn")

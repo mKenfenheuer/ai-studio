@@ -196,15 +196,30 @@ def set_job_progress(job_id: str, step: int, total: int) -> None:
     ex("UPDATE jobs SET step=?, total_steps=? WHERE id=?", (step, total, job_id))
 
 
-def requeue_jobs_for_runner(runner_id: str) -> list[str]:
-    """A runner vanished mid-job. Put its unfinished work back on the queue so
-    another capable runner can take it, instead of the job hanging forever."""
-    ids = [r["id"] for r in
-           q("SELECT id FROM jobs WHERE runner_id=? AND status IN ('assigned','running')",
-             (runner_id,))]
-    for jid in ids:
-        ex("UPDATE jobs SET status='queued', runner_id=NULL, step=0 WHERE id=?", (jid,))
-    return ids
+def requeue_jobs_for_runner(runner_id: str) -> tuple[list[str], list[str]]:
+    """A runner vanished mid-job. Decide what happens to its work.
+
+    Returns (requeued, rescued).
+
+    The distinction matters more than it looks. A job that already uploaded an
+    artifact has *finished* -- the runner died in the gap between the upload
+    landing and the "done" message being processed. Requeuing that job throws
+    away a completed model and starts a twenty-minute run again from noise,
+    which is the worst possible response to work that already succeeded.
+    """
+    rows = q("SELECT id FROM jobs WHERE runner_id=? AND status IN ('assigned','running')",
+             (runner_id,))
+    requeued, rescued = [], []
+    for r in rows:
+        jid = r["id"]
+        if q1("SELECT id FROM artifacts WHERE job_id=? LIMIT 1", (jid,)):
+            ex("UPDATE jobs SET status='succeeded', finished_at=COALESCE(finished_at,?)"
+               " WHERE id=?", (now(), jid))
+            rescued.append(jid)
+        else:
+            ex("UPDATE jobs SET status='queued', runner_id=NULL, step=0 WHERE id=?", (jid,))
+            requeued.append(jid)
+    return requeued, rescued
 
 
 # ------------------------------------------------- metrics / logs / files

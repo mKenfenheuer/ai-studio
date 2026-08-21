@@ -366,6 +366,8 @@ Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 | Multi-config dataset | configurations listed from the card when the viewer 501s |
 | Cancelling a run mid-training | stopped cleanly, runner stayed online |
 | Runner killed mid-run | job requeued and restarted automatically |
+| Runner killed after upload | run kept as finished, not restarted from noise |
+| Second job while one is training | queued once, not re-offered every tick |
 | Unsupported model / bad ID | refused with a plain-language message |
 | Model too large for the GPU | refused at creation, not left queued |
 | UI at 1440px and 390px | no JS errors, no horizontal overflow |
@@ -395,7 +397,10 @@ really did start from nothing.
 - **No user authentication.** The join token is the only credential. Put it
   behind a reverse proxy or keep it on a trusted network.
 - **One job per runner at a time.** No multi-GPU or multi-job scheduling yet,
-  and a runner that is training will not serve the playground.
+  and a runner that is training will not serve the playground. A second job
+  waits on the queue and is told so once, rather than being offered to the busy
+  machine every five seconds.
+- **No way to delete a run.** Finished and failed runs accumulate.
 - **From-scratch tops out around 200M parameters**, which is a compute limit
   rather than an arbitrary one. See the table above.
 - **The corpus is held in host RAM** while training (capped at 500M tokens,
