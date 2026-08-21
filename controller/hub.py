@@ -458,6 +458,28 @@ def _pick_split(splits: list[str], wanted: str = "train") -> str:
 MAX_PREVIEW_CHARS = 60_000
 
 
+def _resolved_fields(rows: list[dict], fmt: dict) -> dict:
+    """A sample of what the current mapping pulls out of the data."""
+    msgs = []
+    for row in rows[:3]:
+        msgs += formatting.find_messages(row, fmt.get("messages_field"),
+                                         fmt.get("selectors"))
+    if not msgs:
+        return {}
+    calls = [c for m in msgs for c in m["tool_calls"]]
+    return {
+        "roles": list(dict.fromkeys(m["role"] for m in msgs)),
+        "turns": len(msgs),
+        "with_reasoning": sum(1 for m in msgs if m["reasoning"]),
+        "tool_calls": [{"name": c["name"], "arguments": (c["arguments"] or "")[:120]}
+                       for c in calls[:3]],
+        "tool_results": [{"name": m["name"], "content": m["content"][:120]}
+                         for m in msgs if m["role"] in ("tool", "function")][:3],
+        "empty_content": sum(1 for m in msgs if not m["content"].strip()
+                             and not m["tool_calls"]),
+    }
+
+
 def _row_is_blank(row: dict) -> bool:
     """Whether a row genuinely holds nothing.
 
@@ -574,6 +596,9 @@ async def training_preview(dataset_id: str, config_name: str | None,
     # prompt behaves quite differently without one, and the prompt it learned
     # is rarely something anybody writes down.
     base["system_prompts"] = formatting.system_prompts(rows, resolved)
+    # What the field mapping actually found, on real rows. A selector you
+    # cannot see the result of is a guess with extra steps.
+    base["resolved"] = _resolved_fields(rows, resolved)
     base["style"] = formatting.conversation_style(resolved)
     base["template_error"] = template_error
     base["messages_field"] = resolved.get("messages_field")

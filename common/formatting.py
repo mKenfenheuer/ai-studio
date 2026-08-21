@@ -109,29 +109,39 @@ def _content_text(content: Any) -> str:
     return _part_text(content)
 
 
-def _normalize_tool_call(call: Any) -> dict | None:
+def _normalize_tool_call(call: Any, selectors: dict | None = None) -> dict | None:
     """One tool call, flattened out of whichever wrapper it arrived in."""
     if not isinstance(call, dict):
         return None
+    sel = selectors or {}
     fn = call.get("function") if isinstance(call.get("function"), dict) else call
-    name = fn.get("name")
+    name = select(call, sel.get("tool_name")) or select(fn, sel.get("tool_name")) \
+        or fn.get("name")
     if not name:
         return None
-    args = fn.get("arguments", fn.get("parameters"))
+    args = select(call, sel.get("tool_arguments"))
+    if args is None:
+        args = select(fn, sel.get("tool_arguments"))
+    if args is None:
+        args = fn.get("arguments", fn.get("parameters"))
     if isinstance(args, (dict, list)):
         args = json.dumps(args, ensure_ascii=False)
     return {"id": call.get("id"), "name": name, "arguments": args or ""}
 
 
-def normalize_messages(value: Any) -> list[dict]:
+def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
     """One consistent message shape, whatever the dataset used.
 
-    Returns a list of {role, content, tool_calls, train, name}. Handles the
-    OpenAI shape, the ShareGPT `from`/`value` shape, typed content parts, and
-    tool calls under either `tool_calls` or a bare `function_call`.
+    Returns a list of {role, content, reasoning, tool_calls, train, name}.
+    Handles the OpenAI shape, the ShareGPT `from`/`value` shape, typed content
+    parts, and tool calls under either `tool_calls` or a bare `function_call`.
+
+    `selectors` overrides any of that with an explicit path, for the datasets
+    that do none of the above.
     """
     if not isinstance(value, list):
         return []
+    sel = selectors or {}
     out = []
     for m in value:
         if isinstance(m, str):
@@ -141,16 +151,29 @@ def normalize_messages(value: Any) -> list[dict]:
         if not isinstance(m, dict):
             continue
 
-        role = m.get("role") or m.get("from") or "user"
+        role = select_in_message(m, sel.get("role")) \
+            or m.get("role") or m.get("from") or "user"
+        role = str(role).lower()
+        # Known aliases first, then any mapping supplied alongside the
+        # selectors. A dataset that calls its tool turns "tool_out" needs them
+        # recognised as tool results, or the format renders them as an unknown
+        # speaker and the model never learns what a tool reply looks like.
         role = {"human": "user", "gpt": "assistant", "bot": "assistant",
-                "system_prompt": "system"}.get(str(role).lower(), str(role).lower())
+                "system_prompt": "system"}.get(role, role)
+        role = {str(k).lower(): str(v).lower()
+                for k, v in (sel.get("role_map") or {}).items()}.get(role, role)
 
-        content = m.get("content")
+        content = select_in_message(m, sel.get("content"))
+        if content is None:
+            content = m.get("content")
         if content is None:
             content = m.get("value")
 
         reasoning = ""
-        for key in _REASONING_FIELDS:
+        chosen = select_in_message(m, sel.get("reasoning"))
+        if isinstance(chosen, str) and chosen.strip():
+            reasoning = chosen.strip()
+        for key in [] if reasoning else _REASONING_FIELDS:
             if isinstance(m.get(key), str) and m[key].strip():
                 reasoning = m[key].strip()
                 break
@@ -171,8 +194,23 @@ def normalize_messages(value: Any) -> list[dict]:
         raw_calls = m.get("tool_calls")
         if raw_calls is None and m.get("function_call"):
             raw_calls = [m["function_call"]]
-        calls = [c for c in (_normalize_tool_call(c) for c in (raw_calls or []))
-                 if c]
+        calls = [c for c in (_normalize_tool_call(c, sel)
+                             for c in (raw_calls or [])) if c]
+
+        # A call described by selectors alone, with no tool_calls list at all.
+        if not calls and (sel.get("tool_name") or sel.get("tool_arguments")):
+            named = select_in_message(m, sel.get("tool_name"))
+            args = select_in_message(m, sel.get("tool_arguments"))
+            if named and args is not None and role == "assistant":
+                if isinstance(args, (dict, list)):
+                    args = json.dumps(args, ensure_ascii=False)
+                calls = [{"id": None, "name": str(named), "arguments": str(args)}]
+
+        # A tool result whose payload is a field of a larger object.
+        picked = select_in_message(m, sel.get("tool_result"))
+        if picked is not None and role in ("tool", "function"):
+            content = picked if isinstance(picked, str) else json.dumps(
+                picked, ensure_ascii=False)
 
         out.append({
             "role": role,
@@ -185,7 +223,42 @@ def normalize_messages(value: Any) -> list[dict]:
             "train": bool(m.get("train_on_turn", m.get("train", True))),
             "name": m.get("name"),
         })
-    return out
+    return _name_tool_results(out)
+
+
+def _name_tool_results(messages: list[dict]) -> list[dict]:
+    """Give every tool result the name of the tool that produced it.
+
+    Harmony addresses a tool result by its author -- `functions.HassTurnOff to=
+    assistant` -- so an unnamed result cannot be rendered at all. Datasets
+    rarely put the name on the message: it is either inside the JSON payload or
+    only knowable from the call that preceded it. Both are recovered here, once,
+    rather than in each template.
+    """
+    pending: list[str] = []
+    for m in messages:
+        if m.get("_selected_name"):
+            m["name"] = m.pop("_selected_name")
+        if m["role"] == "assistant" and m["tool_calls"]:
+            pending = [c["name"] for c in m["tool_calls"]]
+            continue
+        if m["role"] not in ("tool", "function") or m["name"]:
+            continue
+        found = None
+        # Many datasets name the tool inside the result payload.
+        try:
+            payload = json.loads(m["content"])
+            if isinstance(payload, dict):
+                for key in ("tool_name", "name", "function", "tool"):
+                    if isinstance(payload.get(key), str):
+                        found = payload[key]
+                        break
+        except (ValueError, TypeError):
+            pass
+        if not found and pending:
+            found = pending.pop(0)
+        m["name"] = found or "tool"
+    return messages
 
 
 def normalize_tools(value: Any) -> list[dict]:
@@ -223,9 +296,10 @@ def _prune(value: Any) -> Any:
     return value
 
 
-def find_messages(row: dict, field: str | None = None) -> list[dict]:
+def find_messages(row: dict, field: str | None = None,
+                  selectors: dict | None = None) -> list[dict]:
     key = field or first_present(row, _MESSAGE_FIELDS)
-    return normalize_messages(row.get(key)) if key else []
+    return normalize_messages(row.get(key), selectors) if key else []
 
 
 def find_tools(row: dict, field: str | None = None) -> list[dict]:
@@ -277,7 +351,8 @@ def render_template(template: str, *, row: dict | None = None,
                     tools: list[dict] | None = None,
                     specials: dict | None = None,
                     add_generation_prompt: bool = False,
-                    reasoning: bool = False) -> str:
+                    reasoning: bool = False,
+                    tools_text: str = "") -> str:
     """Render one example with a Jinja template.
 
     The same call renders the preview in the browser and the training batch on
@@ -293,6 +368,7 @@ def render_template(template: str, *, row: dict | None = None,
     ctx.update({
         "messages": messages or [],
         "tools": tools or None,
+        "tools_text": tools_text or "",
         "row": row or {},
         "add_generation_prompt": add_generation_prompt,
         # Whether the model should be invited to reason before answering. The
@@ -321,7 +397,8 @@ def format_example(row: dict, fmt: dict) -> str | None:
             return None
         text = render_template(
             template, row=row,
-            messages=find_messages(row, fmt.get("messages_field")),
+            messages=find_messages(row, fmt.get("messages_field"),
+                                   fmt.get("selectors")),
             tools=find_tools(row, fmt.get("tools_field")),
             specials=fmt.get("specials"))
         return text.strip() or None
@@ -332,12 +409,15 @@ def format_example(row: dict, fmt: dict) -> str | None:
         return str(val) if val else None
 
     if mode in ("chat", "auto"):
-        messages = find_messages(row, fmt.get("messages_field"))
+        messages = find_messages(row, fmt.get("messages_field"),
+                                 fmt.get("selectors"))
         if messages:
             tools = find_tools(row, fmt.get("tools_field"))
             template = fmt.get("chat_template") or BUILTIN_CHAT_TEMPLATE
             text = render_template(template, row=row, messages=messages,
-                                   tools=tools, specials=fmt.get("specials"))
+                                   tools=tools, specials=fmt.get("specials"),
+                                   tools_text=tool_declaration(
+                                       tools, fmt.get("chat_format")))
             # Returned exactly as the template produced it, trailing newline
             # and all. Stripping would leave our training text one token
             # different from what transformers' own apply_chat_template emits
@@ -479,7 +559,7 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
                   reasoning: bool = False) -> str:
     """Text for the model to continue, given the conversation so far."""
     fmt = resolve_format(fmt)
-    messages = normalize_messages(messages)
+    messages = normalize_messages(messages, fmt.get("selectors"))
     style = conversation_style(fmt)
     specials = fmt.get("specials")
 
@@ -491,7 +571,9 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
         # the opening of the assistant turn itself.
         return render_template(template, messages=messages, tools=tools,
                                specials=specials, add_generation_prompt=True,
-                               reasoning=reasoning)
+                               reasoning=reasoning,
+                               tools_text=tool_declaration(
+                                   tools, fmt.get("chat_format")))
 
     if style == "chat":
         body = render_template(BUILTIN_CHAT_TEMPLATE, messages=messages,
@@ -622,3 +704,139 @@ def split_reasoning(text: str, fmt: dict | None = None) -> tuple[str, str]:
     if open_tag:
         return open_tag.group(2).strip(), ""
     return "", text
+
+
+def tool_declaration(tools: list[dict] | None, format_id: str | None = None) -> str:
+    """How this format tells the model which tools exist.
+
+    Harmony declares them as a TypeScript-ish namespace inside a developer
+    message, which is what gpt-oss is trained to read. Everything else gets a
+    plain list, which is all a small model can use.
+    """
+    tools = tools or []
+    if not tools:
+        return ""
+    if format_id == "harmony":
+        return _harmony_namespace(tools)
+    return "Available tools:\n" + "\n".join(
+        "- %s: %s" % (t["name"], t["description"]) for t in tools)
+
+
+def _ts_type(schema: Any) -> str:
+    """A JSON-schema property as the type Harmony's namespace block writes."""
+    if not isinstance(schema, dict):
+        return "any"
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((k for k in kind if k != "null"), "any")
+    if schema.get("enum"):
+        return " | ".join(json.dumps(v, ensure_ascii=False) for v in schema["enum"])
+    if kind == "array":
+        return _ts_type(schema.get("items")) + "[]"
+    return {"string": "string", "integer": "number", "number": "number",
+            "boolean": "boolean", "object": "object"}.get(kind, "any")
+
+
+def _harmony_namespace(tools: list[dict]) -> str:
+    lines = ["# Tools", "", "## functions", "", "namespace functions {", ""]
+    for t in tools:
+        if t["description"]:
+            lines.append("// %s" % t["description"].replace("\n", " "))
+        params = t.get("parameters") or {}
+        props = params.get("properties") if isinstance(params, dict) else None
+        required = set(params.get("required") or []) if isinstance(params, dict) else set()
+        if not props:
+            lines.append("type %s = () => any;" % t["name"])
+            lines.append("")
+            continue
+        lines.append("type %s = (_: {" % t["name"])
+        for name, schema in props.items():
+            if isinstance(schema, dict) and schema.get("description"):
+                lines.append("// %s" % str(schema["description"]).replace("\n", " "))
+            lines.append("%s%s: %s," % (name, "" if name in required else "?",
+                                        _ts_type(schema)))
+        lines.append("}) => any;")
+        lines.append("")
+    lines.append("} // namespace functions")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Selectors
+# ---------------------------------------------------------------------------
+#
+# Auto-detection covers the shapes that recur, and there are always datasets it
+# does not. A selector says exactly where a value lives instead of guessing:
+#
+#     tool_name        content.tool_name
+#     tool_arguments   function.arguments
+#     reasoning        extra.thinking
+#     content          value
+#
+# Dotted paths with numeric indices, evaluated against the message object. A
+# path may start with `content.` to look inside the message's content when that
+# content is JSON -- which is where a tool result usually hides its own name.
+# Deliberately not full JSONPath: a path someone can read at a glance, and
+# predict the behaviour of, is worth more here than filters and wildcards.
+
+_INDEX_RE = re.compile(r"^(.*?)\[(-?\d+)\]$")
+
+
+def select(obj: Any, path: str | None) -> Any:
+    """Follow a dotted path, returning None rather than raising."""
+    if not path or obj is None:
+        return None
+    current = obj
+    for raw in str(path).split("."):
+        part, index = raw, None
+        found = _INDEX_RE.match(raw)
+        if found:
+            part, index = found.group(1), int(found.group(2))
+        if part:
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part, None)
+        if current is None:
+            return None
+        if index is not None:
+            if not isinstance(current, (list, tuple)) or \
+                    not (-len(current) <= index < len(current)):
+                return None
+            current = current[index]
+    return current
+
+
+def select_in_message(message: dict, path: str | None) -> Any:
+    """A selector against a message, able to reach inside JSON content.
+
+    `content.tool_name` looks in the parsed content when the message's own
+    `content` is a JSON string, which is how most datasets carry a tool result.
+    """
+    if not path:
+        return None
+    value = select(message, path)
+    if value is not None:
+        return value
+    if path.startswith("content."):
+        raw = message.get("content")
+        if isinstance(raw, str):
+            try:
+                return select(json.loads(raw), path[len("content."):])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+# Applied after the role selector, for datasets whose role *values* are their
+# own invention: {"tool_out": "tool", "narrator": "system"}.
+ROLE_MAP_KEY = "role_map"
+
+SELECTOR_FIELDS = [
+    ("role", "Which speaker the turn belongs to"),
+    ("content", "The words of the turn"),
+    ("reasoning", "The model's working, if the data records it separately"),
+    ("tool_name", "Which tool a call or a result belongs to"),
+    ("tool_arguments", "The arguments a tool was called with"),
+    ("tool_result", "The payload a tool returned"),
+]

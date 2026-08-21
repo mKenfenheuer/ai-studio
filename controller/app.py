@@ -377,6 +377,17 @@ async def chat_formats() -> dict:
     return {"formats": cf.public_formats(), "default": cf.DEFAULT_FORMAT}
 
 
+@app.get("/api/selectors")
+async def selector_fields() -> dict:
+    """The field mapping a dataset can be read through."""
+    from common import formatting as fmt
+    return {
+        "fields": [{"id": k, "hint": h} for k, h in fmt.SELECTOR_FIELDS],
+        "role_map_key": fmt.ROLE_MAP_KEY,
+        "roles": list(fmt.KNOWN_ROLES),
+    }
+
+
 @app.get("/api/hub/builtin-template")
 async def hub_builtin_template() -> dict:
     """The fallback conversation template, as a starting point to edit."""

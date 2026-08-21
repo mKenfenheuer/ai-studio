@@ -41,6 +41,7 @@ export const api = {
     req(`/api/hub/model-template?id=${encodeURIComponent(id)}`),
   builtinTemplate: () => req("/api/hub/builtin-template"),
   chatFormats: () => req("/api/chat-formats"),
+  selectorFields: () => req("/api/selectors"),
   plan:        (body) => req("/api/plan", { method: "POST", body: JSON.stringify(body) }),
 
   // Training from scratch. Sizes are scored against a specific machine and a

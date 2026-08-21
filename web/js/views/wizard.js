@@ -151,6 +151,8 @@ export async function wizardView(mount) {
     templateSource: "model", customTemplate: "", builtin: resource(),
     // Which set of message-boundary tokens a from-scratch model is taught.
     chatFormat: "chatml", formats: resource(), teachReasoning: false,
+    // Explicit paths for datasets auto-detection reads wrongly.
+    selectors: {}, roleMap: "", selectorFields: resource(),
     // From scratch.
     minutes: 60, size: null, vocab: 8192, custom: null,
     sizes: resource(), plan: resource(), ftPlan: resource(),
@@ -448,6 +450,7 @@ function stepData(body, ctx) {
   // write their own.
   if (!scratch) ensure(state.builtin, "builtin", () => api.builtinTemplate(), draw);
   if (scratch) ensure(state.formats, "formats", () => api.chatFormats(), draw);
+  ensure(state.selectorFields, "sel", () => api.selectorFields(), draw);
 
   body.innerHTML = html`
     <div class="card" style="margin-bottom:14px">
@@ -568,6 +571,17 @@ function stepData(body, ctx) {
     para.dataset.full = wasExpanded ? "1" : "0";
     t.textContent = wasExpanded
       ? "Show all " + fmtNum(full.length) + " characters" : "Show less";
+  });
+  on(body, "click", "#applySelectors", () => {
+    const next = {};
+    $$("[data-selector]", body).forEach((el) => {
+      const v = el.value.trim();
+      if (v) next[el.dataset.selector] = v;
+    });
+    state.selectors = next;
+    state.roleMap = ($("[data-rolemap]", body) || {}).value || "";
+    state.preview = resource();
+    draw();
   });
   on(body, "click", "#applyTemplate", () => {
     const box = $("#templateBox", body);
@@ -739,6 +753,8 @@ function templatePanel(state, scratch) {
              border-radius:8px">${p.data.system_prompts[0].slice(0, 1500)}</p>
         </details>` : "")}
 
+      ${raw(selectorPanel(state))}
+
       ${raw(p.status === "ready" && p.data.template_error ? html`
         <div class="callout callout-err" style="margin-top:12px">
           <strong>That template did not work</strong>${p.data.template_error}
@@ -842,11 +858,95 @@ function reasoningPanel(state, formats) {
     </div>`;
 }
 
+function selectorPanel(state) {
+  const r = state.selectorFields;
+  if (r.status !== "ready") return "";
+  const found = state.preview.status === "ready"
+    ? (state.preview.data.resolved || {}) : {};
+  const anySet = Object.values(state.selectors).some((v) => v)
+    || state.roleMap.trim();
+
+  return html`
+    <details class="adv" style="margin-top:10px" ${anySet ? "open" : ""}>
+      <summary>Where the fields are${raw(anySet
+        ? ` <span class="badge badge-accent">mapped by hand</span>`
+        : ` <span class="badge">found automatically</span>`)}</summary>
+
+      <div class="card" style="margin-top:10px">
+        <p class="muted tiny" style="margin:0 0 10px">
+          Detection covers the shapes that recur, and there are always datasets
+          it reads wrongly. Point at a field directly with a dotted path —
+          <code>invoke.tool</code>, <code>args[0].value</code>, or
+          <code>content.tool_name</code> to look inside a message whose content
+          is itself JSON. Leave one blank to keep detecting it.
+        </p>
+
+        <div class="grid grid-3">
+          ${raw(r.data.fields.map((f) => html`
+            <div class="field">
+              <label for="sel_${f.id}">${f.id}</label>
+              <input id="sel_${f.id}" data-selector="${f.id}" type="text"
+                     class="mono" placeholder="detect"
+                     value="${state.selectors[f.id] || ""}">
+              <div class="hint">${f.hint}</div>
+            </div>`).join(""))}
+          <div class="field">
+            <label for="sel_rolemap">role names</label>
+            <input id="sel_rolemap" data-rolemap type="text" class="mono"
+                   placeholder="tool_out=tool, narrator=system"
+                   value="${state.roleMap}">
+            <div class="hint">Rename this dataset's own role words to
+              ${(r.data.roles || []).join(", ")}.</div>
+          </div>
+        </div>
+
+        <button class="btn-primary btn-sm" id="applySelectors">Apply and preview</button>
+
+        ${raw(found.turns ? html`
+          <div class="callout" style="margin-top:12px">
+            <strong>What that found</strong>
+            ${found.turns} turns across the sampled rows · roles
+            ${raw((found.roles || []).map((x) =>
+              `<span class="badge">${esc(x)}</span>`).join(" "))}
+            ${raw(found.with_reasoning
+              ? ` · <span class="badge badge-accent">${found.with_reasoning} with reasoning</span>` : "")}
+            ${raw(found.empty_content
+              ? ` · <span class="badge badge-warn">${found.empty_content} with no content</span>` : "")}
+            ${raw((found.tool_calls || []).length ? html`
+              <div class="mono tiny" style="margin-top:8px">
+                ${raw(found.tool_calls.map((c) =>
+                  `<div>call ${esc(c.name)}(${esc(c.arguments)})</div>`).join(""))}
+                ${raw((found.tool_results || []).map((t) =>
+                  `<div>result from ${esc(t.name || "?")}: ${esc(t.content)}</div>`).join(""))}
+              </div>` : "")}
+          </div>` : "")}
+      </div>
+    </details>`;
+}
+
 function previewKey(state, scratch) {
   return JSON.stringify([state.dataset, state.config, state.split,
                          state.formatMode, state.textField, state.model,
                          state.templateSource, state.customTemplate,
-                         state.chatFormat, state.teachReasoning]);
+                         state.chatFormat, state.teachReasoning,
+                         state.selectors, state.roleMap]);
+}
+
+/** "a=b, c=d" as an object; blank entries ignored. */
+function parseRoleMap(text) {
+  const out = {};
+  (text || "").split(",").forEach((pair) => {
+    const [from, to] = pair.split("=").map((x) => (x || "").trim());
+    if (from && to) out[from] = to;
+  });
+  return out;
+}
+
+function selectorsFor(state) {
+  const sel = { ...state.selectors };
+  const map = parseRoleMap(state.roleMap);
+  if (Object.keys(map).length) sel.role_map = map;
+  return Object.keys(sel).length ? sel : null;
 }
 
 function previewRequest(state, scratch) {
@@ -870,6 +970,8 @@ function previewRequest(state, scratch) {
     fmt.mode = "jinja";
     fmt.template = state.customTemplate;
   }
+  const sel = selectorsFor(state);
+  if (sel) fmt.selectors = sel;
   return {
     dataset: state.dataset,
     config: state.config,
@@ -1599,6 +1701,8 @@ function buildJob(mount, state) {
     if (state.teachReasoning) trained.reasoning = true;
     delete trained.chat_template;
   }
+  const sel = selectorsFor(state);
+  if (sel) trained.selectors = sel;
   const systemPrompt = (state.preview.data?.system_prompts || [])[0] || "";
 
   if (state.mode === "scratch") {
