@@ -738,9 +738,34 @@ if config.WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(config.WEB_DIR)), name="static")
 
 
+@app.middleware("http")
+async def revalidate_ui(request: Request, call_next):
+    """Make the browser check before reusing any part of the UI.
+
+    Without a Cache-Control header a browser is free to invent one: it caches
+    heuristically, for a fraction of the file's age, and reuses the file with
+    no request at all. For a page and its scripts that ship as one unit, that
+    produces the worst possible failure -- a *mixture* of versions. Exactly
+    that happened here: a phone picked up new HTML, which advertised a page
+    the cached app.js had no route for, so a real link answered "page not
+    found".
+
+    Content-hashed filenames are the usual fix, and they need a build step
+    this app deliberately does not have. `no-cache` is the honest alternative:
+    it does not mean "do not store", it means "revalidate before reuse". The
+    files are already served with ETags, so an unchanged asset costs a 304 and
+    a few hundred bytes rather than a re-download.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> Any:
     idx = config.WEB_DIR / "index.html"
     if not idx.exists():
         return HTMLResponse("<h1>AI Studio</h1><p>Web UI not found.</p>", status_code=500)
-    return FileResponse(idx)
+    return FileResponse(idx, headers={"Cache-Control": "no-cache"})

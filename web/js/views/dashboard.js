@@ -41,7 +41,7 @@ export async function dashboardView(mount) {
             <div class="row">
               <a class="btn btn-primary btn-lg" href="#/new">Start a training run →</a>
               ${raw(jobs.some((j) => j.status === "succeeded")
-                ? `<a class="btn btn-lg" href="#/play">💬 Playground</a>` : "")}
+                ? `<a class="btn btn-lg" href="#/play">▷ Playground</a>` : "")}
             </div>
           </div>
         </div>` : "")}

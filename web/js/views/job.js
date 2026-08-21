@@ -164,7 +164,7 @@ function paintHeader(mount, job) {
   box.innerHTML = html`
     ${statusBadge(job.status)}
     ${raw(usable
-      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">💬 Try it out</a>` : "")}
+      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>` : "")}
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download</a>` : "")}
