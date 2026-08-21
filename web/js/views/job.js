@@ -57,7 +57,10 @@ export async function jobView(mount, [jobId]) {
   logBox.scrollTop = logBox.scrollHeight;
 
   let latest = metrics[metrics.length - 1] || {};
-  paintStats(mount, job, latest, scratch);
+  // The stage the runner last reported. paintStats runs on every metric and
+  // must not claim "training" while the tokenizer is still being built.
+  let stage = job.status === "running" ? "" : "training";
+  paintStats(mount, job, latest, scratch, stage);
 
   const unsub = events.subscribe(async (msg) => {
     if (msg.job_id && msg.job_id !== jobId) return;
@@ -69,7 +72,7 @@ export async function jobView(mount, [jobId]) {
       if (msg.data.val_loss != null) lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
       if (msg.data.learning_rate != null)
         lrChart.push({ x: msg.step, y: msg.data.learning_rate });
-      paintStats(mount, job, latest, scratch);
+      paintStats(mount, job, latest, scratch, stage);
     } else if (msg.type === "job_sample") {
       samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
       paintSamples(mount, samples);
@@ -78,12 +81,13 @@ export async function jobView(mount, [jobId]) {
       appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
       if (atBottom) logBox.scrollTop = logBox.scrollHeight;
     } else if (msg.type === "job_progress") {
-      job.step = msg.step; job.total_steps = msg.total;
-      paintProgress(mount, job, msg.stage);
+      stage = msg.stage;
+      if (stage === "training") { job.step = msg.step; job.total_steps = msg.total; }
+      paintProgress(mount, job, stage, msg.step, msg.total);
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
       paintHeader(mount, job);
-      paintStats(mount, job, latest, scratch);
+      paintStats(mount, job, latest, scratch, stage);
     }
   });
 
@@ -174,28 +178,32 @@ function paintHeader(mount, job) {
     : "";
 }
 
-function paintProgress(mount, job, stage = "") {
-  const pct = job.total_steps ? Math.min(100, (job.step / job.total_steps) * 100) : 0;
+function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null) {
+  const training = stage === "training" || stage === "";
+  // Preparation stages count their own units -- documents scanned, tokens
+  // collected -- so the bar follows those while they run, and the step counter
+  // is only shown once those units really are training steps.
+  const step = training ? job.step : (rawStep ?? 0);
+  const total = training ? job.total_steps : (rawTotal ?? 0);
+  const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
   const stageText = STAGES[stage] || (running ? "Working…" : "");
-  // Preparation stages report their own progress with no step total, and
-  // showing "step 0 of 0" during a five-minute tokenizer build reads as stuck.
-  const counted = job.total_steps > 0 && stage === "training";
+  const counted = total > 0 && training;
 
   $("#progressCard", mount).innerHTML = running ? html`
     <div class="card" style="margin-bottom:16px">
       <div class="row-between" style="margin-bottom:8px">
         <strong class="tiny">${stageText}</strong>
         <span class="tiny muted">${counted
-          ? `step ${job.step} of ${job.total_steps}` : ""}</span>
+          ? `step ${step} of ${total}` : ""}</span>
       </div>
       <div class="progress"><i style="width:${pct}%"></i></div>
     </div>` : "";
 }
 
-function paintStats(mount, job, m, scratch) {
+function paintStats(mount, job, m, scratch, stage = "training") {
   paintHeader(mount, job);
-  paintProgress(mount, job, "training");
+  paintProgress(mount, job, stage);
   const cards = scratch ? [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
     ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—", "on unseen text"],

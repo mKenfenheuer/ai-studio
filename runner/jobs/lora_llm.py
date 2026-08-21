@@ -209,7 +209,11 @@ def run(cfg: dict, ctx: Any) -> dict:
         for i in range(n):
             row = {k: batch_rows[k][i] for k in keys}
             t = _format_example(row, fmt)
-            texts.append(t or "")
+            # Every example ends with the end-of-text token. Without it the
+            # model learns what a response looks like but never learns that one
+            # has *finished*, so at generation time it answers correctly and
+            # then keeps going, inventing a follow-up conversation.
+            texts.append((t + tok.eos_token) if t else "")
         enc = tok(texts, truncation=True, max_length=max_seq,
                   padding="max_length", return_tensors=None)
         enc["labels"] = [list(ids) for ids in enc["input_ids"]]
@@ -251,6 +255,11 @@ def run(cfg: dict, ctx: Any) -> dict:
     # bf16 and fp32 do not, and enabling it there is pure overhead.
     use_scaler = (torch_dtype == torch.float16 and device == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+    if device == "cuda":
+        # Per-process high-water mark, and the agent runs many jobs in one
+        # process. Reset it, or this run reports the previous run's peak.
+        torch.cuda.reset_peak_memory_stats()
 
     ctx.log("Starting training: %d steps, batch %d x %d accumulation, lr %.2e"
             % (total_steps, bs, accum, lr))

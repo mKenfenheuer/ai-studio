@@ -387,8 +387,12 @@ details.adv > summary { cursor: pointer; color: var(--accent); font-size: 13px;
   .nav a.nav-cta, .nav a.nav-cta:hover, .nav a.nav-cta.active {
     background: transparent; color: var(--accent); margin: 0;
   }
+  /* Six tabs share a 390px screen, so the two long labels are swapped for
+     short ones rather than being ellipsised into "New tra…" and "Playgro…". */
   .nav a[data-nav="new"] .lbl { font-size: 0; }
   .nav a[data-nav="new"] .lbl::after { content: "New"; font-size: 10.5px; }
+  .nav a[data-nav="play"] .lbl { font-size: 0; }
+  .nav a[data-nav="play"] .lbl::after { content: "Chat"; font-size: 10.5px; }
 
   /* Leave room for the fixed tab bar. */
   .main { padding: 16px 14px calc(78px + env(safe-area-inset-bottom, 0px)); }

@@ -178,9 +178,11 @@ class ModelHost:
             top_k = int(params.get("top_k", 50))
             top_p = float(params.get("top_p", 0.95))
             stop_texts = spec.get("stop") or []
+            hold = max((len(s) for s in stop_texts), default=0)
 
             past = None
             emitted = ""
+            hit_stop = False
             produced: list[int] = []
             t0 = time.time()
             cur = ids
@@ -216,19 +218,39 @@ class ModelHost:
                 produced.append(token_id)
                 cur = nxt
 
-                # Decode the whole continuation each step and emit the
-                # difference. Decoding one token at a time corrupts any
-                # character whose bytes a BPE split across two tokens.
+                # Decode the whole continuation each step and emit only what is
+                # new. Decoding one token at a time corrupts any character whose
+                # bytes a BPE split across two tokens.
                 full = tok.decode(produced, skip_special_tokens=True)
-                if len(full) > len(emitted):
-                    on_token(full[len(emitted):])
-                    emitted = full
 
-                if any(stop in emitted for stop in stop_texts):
-                    for stop in stop_texts:
-                        if stop in emitted:
-                            emitted = emitted.split(stop)[0]
+                hit = next((s for s in stop_texts if s in full), None)
+                if hit:
+                    full = full.split(hit)[0]
+                    if len(full) > len(emitted):
+                        on_token(full[len(emitted):])
+                    emitted = full
+                    hit_stop = True
                     break
+
+                # Hold back the last few characters, because they may turn out
+                # to be the start of a stop sequence. Without this the model
+                # streams "…green.Human:" to the browser and only then notices
+                # it should have stopped -- the reply is trimmed server-side but
+                # the reader has already seen the text it was supposed to cut.
+                safe = full[:-hold] if hold else full
+                if len(safe) > len(emitted):
+                    on_token(safe[len(emitted):])
+                    emitted = safe
+
+            # The loop can also end at the token limit, at end-of-text, or on a
+            # cancel -- and in all three the held-back characters were never
+            # suspect. Release them, or every reply stops a few letters short.
+            # Only a real stop sequence means the tail should stay cut.
+            if not hit_stop and produced:
+                tail = tok.decode(produced, skip_special_tokens=True)
+                if len(tail) > len(emitted):
+                    on_token(tail[len(emitted):])
+                    emitted = tail
 
             self.last_used = time.time()
             elapsed = time.time() - t0

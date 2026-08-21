@@ -206,11 +206,18 @@ class Fleet:
                                      "step": msg["step"], "data": msg["data"]})
 
         elif kind == "job_progress":
-            db.set_job_progress(jid, msg.get("step", 0), msg.get("total", 0))
+            stage = msg.get("stage", "")
+            # Only training steps are persisted. Preparation stages report
+            # their own units -- documents scanned, tokens collected -- and
+            # writing those into the job's step counter makes every list that
+            # reads it announce "step 25000 of 60000" for a 300-step run.
+            # They still stream to open tabs, which is where they belong.
+            if stage in ("", "training"):
+                db.set_job_progress(jid, msg.get("step", 0), msg.get("total", 0))
             await self.broadcast_ui({"type": "job_progress", "job_id": jid,
                                      "step": msg.get("step", 0),
                                      "total": msg.get("total", 0),
-                                     "stage": msg.get("stage", "")})
+                                     "stage": stage})
 
         elif kind == "job_meta":
             meta = msg.get("meta", {})

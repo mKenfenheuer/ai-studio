@@ -593,11 +593,17 @@ def _explain_scratch(s: dict, counts: dict, verdict: dict, fit: dict) -> list[di
 _TEMPLATES = {
     "instruction": {
         "template": "### Instruction:\n{instruction}\n\n### Response:\n",
-        "stop": ["### Instruction:", "\n### "],
+        # More than just the training template. A fine-tuned instruct model
+        # answers correctly and then carries on inventing a conversation,
+        # because a LoRA over a few thousand examples learns the shape of a
+        # response but never learns to emit an end-of-text token. These are
+        # the turn markers the underlying base model falls back on.
+        "stop": ["### Instruction:", "\n### ", "Human:", "\nUser:",
+                 "Assistant:", "<|im_end|>", "<|endoftext|>"],
     },
     "chat": {
         "template": "user: {instruction}\nassistant:",
-        "stop": ["\nuser:", "\nsystem:"],
+        "stop": ["\nuser:", "\nsystem:", "Human:", "<|im_end|>"],
     },
 }
 

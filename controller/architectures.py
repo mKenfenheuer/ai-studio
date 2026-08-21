@@ -185,23 +185,43 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     state = n * (per_param + 2)
 
     tokens = batch * s
+    # 44 bytes per token, per unit of width, per layer. Counting the tensors a
+    # Llama block keeps for its backward pass gives ~34; the rest is the parts
+    # autocast keeps in fp32 rather than fp16 -- both RMSNorms and the rotary
+    # inputs. Calibrated against two measured runs rather than derived, and it
+    # is deliberately the conservative end of what they imply.
     if checkpointing:
         # Only layer inputs survive the forward pass; the rest is recomputed.
-        acts = tokens * d * L * 2 + tokens * d * 34
+        acts = tokens * d * L * 2 + tokens * d * 44
     else:
-        acts = tokens * d * L * 34
+        acts = tokens * d * L * 44
 
     attn = 0
     if not flash:
-        # Without a fused kernel the full score matrix is materialised per
-        # layer and kept for the backward pass. Quadratic in sequence length,
-        # and on a 16GB card this is what actually stops you.
-        attn = batch * h * s * s * 2 * L
+        # Without a fused kernel the scores matrix is materialised per layer
+        # AND its softmax is kept for the backward pass -- two tensors, not
+        # one, which is why this is doubled. Quadratic in sequence length, so
+        # it is negligible at 256 tokens and the largest single term at 1024.
+        attn = 2 * batch * h * s * s * 2 * L
 
-    total = (state + acts + attn) / 1024 ** 3
+    # The output logits, and the single most surprising term here.
+    #
+    # For a small model this is larger than everything else combined: one
+    # value per token per vocabulary entry, and the cross-entropy path keeps
+    # about five copies of it -- fp16 logits, the fp32 upcast transformers
+    # does before the loss, log-softmax, and the gradients of both. Measured
+    # on a 5.3M-parameter model at batch 64 x 256 with an 8k vocabulary, this
+    # alone was 2.15 GB against 0.72 GB for the whole rest of the run.
+    #
+    # Omitting it made the estimate 4x optimistic, which is exactly the
+    # direction that picks a batch size and then runs out of memory.
+    logits = tokens * arch["vocab_size"] * 16
+
+    total = (state + acts + attn + logits) / 1024 ** 3
     return {
         "optimizer_gb": round(state / 1024 ** 3, 2),
         "activations_gb": round((acts + attn) / 1024 ** 3, 2),
+        "logits_gb": round(logits / 1024 ** 3, 2),
         "total_gb": round(total, 2),
     }
 
@@ -217,7 +237,11 @@ def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = Fal
     mathematically equivalent and costs only wall-clock time.
     """
     seq = arch["max_position_embeddings"]
-    budget = (vram_gb or 8.0) * 0.80
+    # 72% of the card, not 100%. The estimate above is good to about 10%, and
+    # the allocator's fragmentation is real memory that no formula sees. An
+    # over-optimistic batch does not degrade -- it dies at step one, an hour
+    # into a download, which is the single worst outcome this app can produce.
+    budget = (vram_gb or 8.0) * 0.72
 
     batch = 1
     for candidate in (64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1):
@@ -239,25 +263,36 @@ def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = Fal
 # Compute
 # ---------------------------------------------------------------------------
 
-def _efficiency(dim: int) -> float:
+def _efficiency(dim: int, flash: bool = False) -> float:
     """Fraction of the GPU's measured peak a model of this width can reach.
 
-    The benchmark in the capability probe multiplies 2048x2048 matrices, which
-    saturates the card. A 256-wide transformer does not: its matmuls are too
-    narrow to fill the compute units, and launch overhead dominates. Applying
-    peak throughput to a tiny model overstates its speed by an order of
-    magnitude, which is exactly the error that produces "why is my 30-minute
-    run still going after six hours".
+    The capability probe multiplies 2048x2048 matrices, which saturates the
+    card. A transformer does not reach that, and how far short it falls is the
+    difference between a 30-minute estimate and a six-hour run.
+
+    These numbers are MEASURED, on an RX 6900 XT training TinyStories:
+
+        nano   d=256, seq=256, batch 64   222k tokens/s  ->  0.223 of peak
+        small  d=512, seq=512, batch 48    50k tokens/s  ->  0.279 of peak
+
+    The direction was right and the magnitude was not: efficiency does climb
+    with width, but the first guess here (0.06 at 256 wide, rising to 0.22)
+    was nearly four times too pessimistic at the small end. That error would
+    have reported the smallest size as unable to finish when in fact it
+    reaches a full Chinchilla budget in eight minutes.
+
+    One measurement was itself misleading and worth recording. The same Small
+    model first measured 0.203, not 0.279 -- because that run was at batch 64,
+    which sat against the memory ceiling and stalled on the allocator. A model
+    squeezed into barely enough memory does not fail; it just runs a third
+    slower, which is a good reason for the batch planner to leave headroom.
+
+    Sizes above 512 wide are extrapolated, and so is every flash-attention
+    figure: no card in this fleet has the kernels.
     """
-    if dim <= 256:
-        return 0.06
-    if dim <= 384:
-        return 0.09
-    if dim <= 512:
-        return 0.12
-    if dim <= 768:
-        return 0.18
-    return 0.22
+    if flash:
+        return 0.26 if dim <= 256 else 0.30 if dim <= 384 else 0.34
+    return 0.22 if dim <= 256 else 0.25 if dim <= 384 else 0.28 if dim <= 512 else 0.30
 
 
 def tokens_per_second(arch: dict, caps: dict) -> float | None:
@@ -265,8 +300,9 @@ def tokens_per_second(arch: dict, caps: dict) -> float | None:
     if not tflops:
         return None
     n = count_params(arch)["total"]
+    flash = bool((caps.get("attention") or {}).get("flash"))
     # 6 FLOPs per parameter per token covers forward and backward.
-    return (tflops * 1e12 * _efficiency(arch["hidden_size"])) / (6 * n)
+    return (tflops * 1e12 * _efficiency(arch["hidden_size"], flash)) / (6 * n)
 
 
 def tokens_in_time(arch: dict, caps: dict, minutes: float) -> int | None:

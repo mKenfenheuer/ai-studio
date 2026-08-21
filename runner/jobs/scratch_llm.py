@@ -449,6 +449,14 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         model.train()
         return sum(losses) / len(losses)
 
+    if device == "cuda":
+        # The peak-memory counter is a high-water mark for the whole process,
+        # and the agent trains many jobs in one process. Without this reset,
+        # every run after the first reports the largest job's peak as its own
+        # -- which is how a batch that was reduced to fit still appeared to use
+        # exactly the memory of the run that had just failed.
+        torch.cuda.reset_peak_memory_stats()
+
     ctx.log("Training for %d steps at %s tokens per step (batch %d x %d "
             "accumulation x %d context). Peak learning rate %.2e after %d "
             "warmup steps." % (total_steps, f"{S['tokens_per_step']:,}",

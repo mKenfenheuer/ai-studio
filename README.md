@@ -119,17 +119,49 @@ measured throughput and the time you say you can wait. On an RX 6900 XT:
 
 | Size | Params | Chinchilla budget | Time to reach it |
 |---|---|---|---|
-| Nano | 5M | 105M tokens | ~30 min |
-| Tiny | 14M | 275M tokens | ~2h 15m |
-| Small | 29M | 590M tokens | ~7h 30m |
-| Base | 91M | 1.8B tokens | ~2 days |
-| Large | 211M | 4.2B tokens | ~9 days |
+| Nano | 5M | 106M tokens | ~8 min |
+| Tiny | 14M | 275M tokens | ~48 min |
+| Small | 29M | 582M tokens | ~3 hours |
+| Base | 91M | 1.8B tokens | ~29 hours |
+| Large | 211M | 4.2B tokens | ~6 days |
 
 So the UI does not offer a 1B model, and it marks the largest size that
 actually *finishes* in your budget rather than letting you pick the biggest and
-find out overnight. Estimates scale throughput down with model width, because a
-256-wide matmul cannot saturate a modern GPU — using peak TFLOP/s here would
-overstate a tiny model's speed by an order of magnitude.
+find out overnight.
+
+### These numbers are measured, and measuring them corrected two mistakes
+
+The estimates started as reasoning about how a GPU works. Running real jobs
+disproved both halves of that reasoning:
+
+**Throughput was four times too pessimistic.** The assumption was that narrow
+matmuls underuse the card, so efficiency should climb steeply with width — 6%
+of peak at 256 wide, 22% at 1024. Measured on the RX 6900 XT:
+
+| | measured | of peak |
+|---|---|---|
+| Nano (d=256, seq=256, batch 64) | 222k tokens/s | 22.3% |
+| Small (d=512, seq=512, batch 48) | 50k tokens/s | 27.9% |
+
+The direction was right; the magnitude was not. The original guess would have
+reported Nano as unable to finish, when it in fact reaches a full Chinchilla
+budget in eight minutes.
+
+One measurement was itself misleading, and is worth recording. The same Small
+model first measured 20.3%, because that run used batch 64 and sat against the
+memory ceiling. A model squeezed into barely enough memory does not fail — it
+just runs a third slower. That is a good reason for the batch planner to leave
+headroom, and a good reason to distrust a single benchmark.
+
+**Memory was 1.4× too optimistic, and the missing term was the logits.** For a
+small model the output layer dominates everything else: one value per token per
+vocabulary entry, with about five copies live across the cross-entropy path.
+At batch 64 × 256 tokens with an 8k vocabulary that is 2.15 GB, against 0.72 GB
+for the entire rest of the run. Omitting it was not a rounding error — the
+planner proposed a batch size that died at step one. That is the worst failure
+this app can produce, so the estimator now carries the logits term explicitly,
+doubles the no-flash attention term (scores *and* softmax are both retained for
+the backward pass), and plans against 72% of the card rather than 80%.
 
 ### What the from-scratch trainer does differently
 
@@ -254,9 +286,33 @@ Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 |---|---|
 | LoRA fp16, SmolLM2-135M | loss 10.89 → 3.01, 0.67 GB |
 | QLoRA 4-bit, Qwen2.5-3B | loss 10.74 → 3.01, **3.17 GB** |
+| From scratch, 5.3M params, 300 steps | loss 8.999 → 2.904 in **120 s** |
+| Held-out loss on the same run | 6.446 → 2.927, tracking training loss |
+| Playground, from-scratch model | 214 tokens/s, first token in 0.3 s |
+| Playground, second turn | 0.0 s — the loaded model is reused |
+| Playground, 3B fine-tune | base + adapter loaded in 11.7 s |
+| From scratch, 29M params | 11.5 GB against a 10.5 GB estimate |
+| Cancelling a run mid-training | stopped cleanly, runner stayed online |
+| Runner killed mid-run | job requeued and restarted automatically |
 | Unsupported model / bad ID | refused with a plain-language message |
 | Model too large for the GPU | refused at creation, not left queued |
 | UI at 1440px and 390px | no JS errors, no horizontal overflow |
+
+The 5.3M model, from noise, on TinyStories:
+
+```
+step  50  Once upon a time, there was a little happy they was very he. The a a
+          loved was a a on it said very a to the.
+step 150  Once upon a time, there was a little girl named Timmy. Timmy loved't
+          play with his friends. One day, Timmy's friends went to the park.
+step 300  Once upon a time, there was a little girl named Lily. She loved to
+          play outside in the park with her friends. One day, she found a shiny
+          rock on the ground.
+```
+
+Loss began at 8.999, which is `ln(8192)` — exactly the cost of guessing
+uniformly from an 8192-token vocabulary, and a useful check that the model
+really did start from nothing.
 
 ### Known limitations
 

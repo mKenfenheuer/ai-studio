@@ -85,9 +85,13 @@ function runCard(r) {
 // ------------------------------------------------------------------ chat
 function chatView(mount, run, runs) {
   const ui = MODE_UI[run.mode] || MODE_UI.continue;
-  const turns = [];
   let requestId = null;
   let pending = null;      // the bubble currently being written into
+  // The runner can answer faster than the POST that started it can return --
+  // first token measured at 0.3s against a round trip that also has to load a
+  // model. Anything that arrives before we know our own request id is held
+  // here and replayed, rather than being dropped as somebody else's.
+  let early = [];
 
   mount.innerHTML = html`
     <div class="page-head">
@@ -167,6 +171,7 @@ function chatView(mount, run, runs) {
 
   const finish = () => {
     requestId = null;
+    early = [];
     pending?.classList.remove("pending");
     pending = null;
     sendBtn.disabled = false;
@@ -185,6 +190,7 @@ function chatView(mount, run, runs) {
     // moment the runner produces it rather than after the whole reply.
     pending = bubble("it pending", "");
     statusEl.textContent = "Waking the model up…";
+    early = [];
     try {
       const r = await api.chat(run.id, {
         prompt: text,
@@ -194,6 +200,9 @@ function chatView(mount, run, runs) {
       requestId = r.request_id;
       stopBtn.hidden = false;
       statusEl.textContent = `Running on ${r.runner}…`;
+      const buffered = early.filter((m) => m.request_id === requestId);
+      early = [];
+      buffered.forEach(handle);
     } catch (e) {
       pending.classList.remove("pending");
       pending.classList.add("err");
@@ -213,7 +222,17 @@ function chatView(mount, run, runs) {
   });
 
   const unsub = events.subscribe((msg) => {
-    if (!requestId || msg.request_id !== requestId) return;
+    if (!String(msg.type || "").startsWith("generate_")) return;
+    if (!requestId) {
+      // Our own POST has not returned yet; hold it until we can tell.
+      if (pending) early.push(msg);
+      return;
+    }
+    if (msg.request_id !== requestId) return;
+    handle(msg);
+  });
+
+  function handle(msg) {
     if (msg.type === "generate_status") {
       statusEl.textContent = msg.status;
     } else if (msg.type === "generate_delta") {
@@ -223,6 +242,13 @@ function chatView(mount, run, runs) {
       statusEl.textContent = "";
       if (atBottom) scroll();
     } else if (msg.type === "generate_done") {
+      // The runner's final text is authoritative. Normally it matches what the
+      // deltas built, but if a stop sequence trimmed the tail this is where the
+      // bubble catches up.
+      if (pending && typeof msg.text === "string"
+          && msg.text !== pending.textContent) {
+        pending.textContent = msg.text;
+      }
       if (pending && !pending.textContent) {
         pending.textContent = "(it produced nothing — try a different opening, "
           + "or a longer length limit)";
@@ -241,7 +267,7 @@ function chatView(mount, run, runs) {
       toast(msg.error, "err");
       finish();
     }
-  });
+  }
 
   box.focus();
   return () => { unsub(); if (requestId) api.chatCancel(requestId).catch(() => {}); };
