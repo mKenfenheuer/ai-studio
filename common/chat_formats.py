@@ -94,13 +94,12 @@ CHAT_FORMATS = [
                      "<|return|>", "<|call|>", "<|constrain|>"],
         "eos_token": "<|end|>",
         "bos_token": None,
-        "stop": ["<|end|>", "<|return|>", "<|start|>", "<|call|>"],
-        # With reasoning on, `<|end|>` closes the analysis channel partway
-        # through the reply, so stopping there would throw the answer away
-        # before it was written. Only `<|return|>` means finished -- which is
-        # exactly the distinction Harmony draws between a message already in
-        # the context and one the model has just produced.
-        "reasoning_stop": ["<|return|>", "<|call|>"],
+        # Only two tokens end a *generated* reply: <|return|> when the model
+        # has finished answering, <|call|> when it has finished specifying a
+        # tool call. <|end|> merely closes one message of several -- an
+        # analysis turn before a final one, or a preamble before a call -- so
+        # stopping there would cut the reply off partway through.
+        "stop": ["<|return|>", "<|call|>"],
         # Follows the published Harmony layout, which routes each kind of
         # message to a different channel:
         #
@@ -108,13 +107,18 @@ CHAT_FORMATS = [
         #   commentary  preambles AND tool calls, addressed with `to=`
         #   final       what the user sees
         #
-        # A tool call is NOT a final message. It goes to commentary, names its
-        # recipient as `functions.{name}`, declares its argument type with
-        # <|constrain|>, and ends with <|call|> rather than <|end|>. The tool's
-        # answer comes back authored by `functions.{name} to=assistant`, also
-        # on commentary. Getting this wrong -- putting calls and results in
-        # `final` -- teaches the model to announce tool output as if it were
-        # speaking to the user.
+        # A tool call is NOT a final message. The recipient goes on the AUTHOR,
+        # before the channel -- `<|start|>assistant to=functions.{name}` --
+        # then `<|channel|>commentary <|constrain|>json`, ending in <|call|>
+        # rather than <|end|>. The tool's answer comes back as a message
+        # authored by the tool and nothing else: `<|start|>functions.{name}`,
+        # with no recipient and no channel.
+        #
+        # Both of those were wrong here until they were checked against the
+        # implementation's own fixtures rather than against prose about it
+        # (test-data/test_does_not_drop_if_ongoing_analysis.txt). Putting the
+        # recipient after the channel, or addressing the reply back `to=
+        # assistant`, produces text no gpt-oss model has ever seen.
         #
         # Tools are declared in a developer message, after the system message,
         # as a namespace block. See formatting.tool_declaration.
@@ -137,32 +141,35 @@ CHAT_FORMATS = [
             " + m.content + '<|end|>' }}"
             "{% endif %}"
             "{% for c in m.tool_calls %}"
-            "{{ '<|start|>assistant<|channel|>commentary to=functions.' + c.name"
-            " + ' <|constrain|>json<|message|>' + c.arguments + '<|call|>' }}"
+            "{{ '<|start|>assistant to=functions.' + c.name"
+            " + '<|channel|>commentary <|constrain|>json<|message|>'"
+            " + c.arguments + '<|call|>' }}"
             "{% endfor %}"
             "{% elif m.content %}"
             "{{ '<|start|>assistant<|channel|>final<|message|>' + m.content }}"
             "{{ '<|return|>' if loop.last else '<|end|>' }}"
             "{% endif %}"
             "{% elif m.role in ['tool', 'function'] %}"
-            "{{ '<|start|>functions.' + (m.name or 'tool') + ' to=assistant"
-            "<|channel|>commentary<|message|>' + m.content + '<|end|>' }}"
+            "{{ '<|start|>functions.' + (m.name or 'tool')"
+            " + '<|message|>' + m.content + '<|end|>' }}"
             "{% else %}"
             "{{ '<|start|>' + m.role + '<|message|>' + m.content + '<|end|>' }}"
             "{% endif %}"
             "{% endfor %}"
+            # The generation prompt is a bare `<|start|>assistant`, with no
+            # channel. That is the point of the format: the model chooses
+            # whether to reason, call a tool, or answer. Forcing `final` here
+            # -- as this did -- makes a tool call impossible to produce, which
+            # would have left a model trained to call tools unable to.
             "{% if add_generation_prompt %}"
-            "{% if reasoning %}"
-            "{{ '<|start|>assistant<|channel|>analysis<|message|>' }}"
-            "{% else %}"
-            "{{ '<|start|>assistant<|channel|>final<|message|>' }}"
-            "{% endif %}"
+            "{{ '<|start|>assistant' }}"
+            "{% if reasoning %}{{ '<|channel|>analysis<|message|>' }}{% endif %}"
             "{% endif %}"
         ),
         "reasoning_specials": [],
         "reasoning_note": 'Its own analysis channel — the mechanism the format was designed around. Nothing extra to reserve; the channel tokens are already there.',
         "sample_prompt": ("<|start|>user<|message|>hello<|end|>"
-                          "<|start|>assistant<|channel|>final<|message|>"),
+                          "<|start|>assistant"),
     },
     {
         "id": "inst",
