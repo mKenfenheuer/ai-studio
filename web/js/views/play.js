@@ -109,6 +109,9 @@ function chatView(mount, run, runs) {
   let requestId = null;
   let pending = null;      // the bubble currently being written into
   let early = [];          // events that beat their own POST response
+  // Only offered for a run that was actually taught to reason; a model that
+  // never saw a reasoning block just writes prose inside one.
+  let think = !!run.reasoning;
 
   mount.innerHTML = html`
     <div class="page-head">
@@ -163,11 +166,19 @@ function chatView(mount, run, runs) {
         <button class="btn-primary" id="sendBtn">Send</button>
         <button class="btn-danger" id="stopBtn" hidden>Stop</button>
       </div>
-      <div class="row" style="margin-top:8px">
+      <div class="row" style="margin-top:8px;flex-wrap:wrap">
         ${raw(ui.multiturn
-          ? `<button class="btn-sm" id="resetChat">New conversation</button>
-             <span class="tiny muted" id="turnCount"></span>` : "")}
+          ? `<button class="btn-sm" id="resetChat">New conversation</button>` : "")}
+        ${raw(run.reasoning
+          ? `<button class="btn-sm btn-primary" id="thinkBtn"
+                     title="Ask it to work through the problem first">Reasoning: on</button>`
+          : "")}
+        <span class="tiny muted" id="turnCount"></span>
       </div>
+      ${raw(run.reasoning ? html`
+        <p class="muted tiny" style="margin:8px 0 0">This model was trained to
+          reason before answering. Its working is shown above each reply and
+          can be folded away.</p>` : "")}
       <details class="adv">
         <summary>Generation settings</summary>
         <div class="grid grid-3" style="margin-top:10px">
@@ -262,6 +273,7 @@ function chatView(mount, run, runs) {
         system: systemBox ? systemBox.value : "",
         temperature: parseFloat($("#temp", mount).value) || 0.8,
         max_new_tokens: parseInt($("#maxTok", mount).value, 10) || 200,
+        reasoning: think,
       });
       requestId = r.request_id;
       stopBtn.hidden = false;
@@ -290,6 +302,11 @@ function chatView(mount, run, runs) {
     if (requestId) await api.chatCancel(requestId).catch(() => {});
   });
 
+  on(mount, "click", "#thinkBtn", (_e, t) => {
+    think = !think;
+    t.textContent = think ? "Reasoning: on" : "Reasoning: off";
+    t.classList.toggle("btn-primary", think);
+  });
   on(mount, "click", "#resetChat", () => {
     turns = [];
     log.innerHTML = `<div class="chat-empty" id="chatEmpty">Nothing said yet. ${
@@ -331,6 +348,20 @@ function chatView(mount, run, runs) {
       if (pending && typeof msg.text === "string"
           && msg.text !== pending.textContent) {
         pending.textContent = msg.text;
+      }
+      // Its working, kept apart from its answer and folded away by default:
+      // the reasoning is usually longer than the reply and rarely the thing
+      // you are reading for.
+      if (pending && msg.reasoning) {
+        const box = document.createElement("details");
+        box.className = "reasoning";
+        box.innerHTML = `<summary>Its reasoning (${
+          msg.reasoning.length} characters)</summary>`;
+        const body = document.createElement("p");
+        body.className = "txt";
+        body.textContent = msg.reasoning;
+        box.appendChild(body);
+        pending.parentNode.insertBefore(box, pending);
       }
       const reply = pending ? pending.textContent : "";
       if (pending && !reply) {

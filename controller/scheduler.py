@@ -209,6 +209,7 @@ class Fleet:
         # SQLite would turn a chat into a few hundred transactions a minute.
         if kind in ("generate_delta", "generate_status", "generate_done",
                     "generate_error"):
+            # Passed through whole, reasoning field included.
             await self.broadcast_ui({**msg, "type": msg["type"]})
             if kind in ("generate_done", "generate_error"):
                 self.generations.pop(msg.get("request_id"), None)

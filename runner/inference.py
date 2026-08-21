@@ -199,8 +199,12 @@ class ModelHost:
                         "conversation format instead.")
             fmt.setdefault("specials", self.specials)
 
+            want_reasoning = bool(params.get("reasoning"))
+            if want_reasoning:
+                fmt["reasoning"] = True
             text = formatting.render_prompt(messages, fmt,
-                                            tools=spec.get("tools"))
+                                            tools=spec.get("tools"),
+                                            reasoning=want_reasoning)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
 
@@ -287,8 +291,17 @@ class ModelHost:
 
             self.last_used = time.time()
             elapsed = time.time() - t0
+            # The prompt already opened the reasoning block, so the model's
+            # output continues inside it -- put the opener back before
+            # splitting, or the first half of its own reply looks like prose.
+            whole = emitted
+            if want_reasoning and not whole.lstrip().startswith("<"):
+                whole = "<think>\n" + whole if "<|channel|>" not in text \
+                    else "<|channel|>analysis<|message|>" + whole
+            reasoning, answer = formatting.split_reasoning(whole, fmt)
             return {
-                "text": emitted,
+                "text": answer if want_reasoning and reasoning else emitted,
+                "reasoning": reasoning,
                 "tokens": len(produced),
                 "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
                 "prompt_tokens": prompt_len,

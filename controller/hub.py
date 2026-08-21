@@ -520,6 +520,8 @@ async def training_preview(dataset_id: str, config_name: str | None,
         else:
             base["template_source"] = "builtin"
             base["template_note"] = found.get("reason")
+    elif resolved.get("chat_format"):
+        base["template_source"] = resolved["chat_format"]
     elif resolved.get("template"):
         base["template_source"] = "custom"
     elif resolved.get("chat_template"):

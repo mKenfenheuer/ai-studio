@@ -370,6 +370,13 @@ async def hub_model_template(id: str = Query(...)) -> dict:
         return {"available": False, "reason": str(e)[:200], "model": id}
 
 
+@app.get("/api/chat-formats")
+async def chat_formats() -> dict:
+    """Message-boundary formats a from-scratch run can be taught."""
+    from common import chat_formats as cf
+    return {"formats": cf.public_formats(), "default": cf.DEFAULT_FORMAT}
+
+
 @app.get("/api/hub/builtin-template")
 async def hub_builtin_template() -> dict:
     """The fallback conversation template, as a starting point to edit."""
@@ -685,6 +692,9 @@ def chat_spec(job: dict) -> dict:
         "format": fmt,
         "style": hub.formatting.conversation_style(fmt),
         "system_prompt": cfg.get("system_prompt") or "",
+        # Whether this run was actually taught to reason, so the playground
+        # offers the toggle only where it means something.
+        "reasoning": bool(fmt.get("reasoning")),
     }
 
 
@@ -740,6 +750,7 @@ async def playground() -> list[dict]:
             "style": spec["style"],
             "mode": spec["style"],          # kept for older cached scripts
             "system_prompt": spec["system_prompt"],
+            "reasoning": spec["reasoning"],
         }
         if job["kind"] == "pretrain_llm":
             a = cfg.get("arch") or {}
@@ -823,6 +834,10 @@ async def chat(job_id: str, payload: dict = Body(...)) -> dict:
             "temperature": float(payload.get("temperature") or 0.8),
             "top_k": int(payload.get("top_k") or 50),
             "top_p": float(payload.get("top_p") or 0.95),
+            # Ask the model to work through the problem before answering. Only
+            # meaningful if it was trained that way; a model that never saw a
+            # reasoning block will simply carry on writing prose inside one.
+            "reasoning": bool(payload.get("reasoning")),
         },
     })
     if not sent:

@@ -33,7 +33,9 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-from common.formatting import detect_format, format_example
+from common import chat_formats
+from common.formatting import (conversation_style,
+                               detect_format, format_example, resolve_format)
 
 from .lora_llm import Cancelled
 
@@ -111,7 +113,7 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     # ---- 3. the model ---------------------------------------------------
     ctx.progress(0, 0, stage="building_model")
-    model, counts = _build_model(arch, ctx, torch)
+    model, counts = _build_model(arch, ctx, torch, tok)
     model = model.to(device)
     model.config.use_cache = False
 
@@ -168,16 +170,40 @@ def _build_tokenizer(cfg: dict, ctx: Any):
 
     vocab_size = int((cfg.get("arch") or {}).get("vocab_size", 8192))
     sample_rows = int(cfg.get("tokenizer_sample_rows", 200_000))
+
+    # Message-boundary tokens are reserved BEFORE training, so each becomes a
+    # single atomic id inside the vocabulary the model was sized for. Added
+    # afterwards they would grow the vocabulary past that size, and the
+    # embedding table would no longer match. Reserved here, "<|im_start|>" is
+    # one token that means exactly one thing; left to ordinary BPE it is half a
+    # dozen pieces the model must learn to recognise in sequence, and which
+    # also occur in ordinary text.
+    fmt = resolve_format(cfg.get("format"))
+    is_chat = conversation_style(fmt) == "chat"
+    spec = chat_formats.format_or_default(fmt.get("chat_format")) if is_chat else None
+    wants_reasoning = bool(fmt.get("reasoning"))
+    specials = (chat_formats.special_tokens(fmt.get("chat_format"), wants_reasoning)
+                if spec else [EOS])
+
     ctx.log("Training a new %d-token vocabulary on this text. A small "
             "vocabulary keeps the embedding table from swallowing the "
             "parameter budget." % vocab_size)
+    if spec:
+        ctx.log("Reserving %d %s boundary tokens so the model can learn where "
+                "a turn starts and stops: %s"
+                % (len(specials), spec["label"], " ".join(specials)))
+        if wants_reasoning:
+            extra = spec.get("reasoning_specials") or []
+            ctx.log("Teaching it to reason before answering. %s%s"
+                    % (spec.get("reasoning_note", ""),
+                       (" Reserved: " + " ".join(extra)) if extra else ""))
 
     tk = Tokenizer(models.BPE(unk_token=None))
     tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tk.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=[EOS],
+        special_tokens=specials,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=False,
     )
@@ -196,10 +222,18 @@ def _build_tokenizer(cfg: dict, ctx: Any):
 
     tk.train_from_iterator(texts(), trainer=trainer)
 
+    eos = spec["eos_token"] if spec else EOS
+    bos = (spec.get("bos_token") if spec else None) or eos
     tok = PreTrainedTokenizerFast(
-        tokenizer_object=tk, eos_token=EOS, bos_token=EOS,
-        unk_token=EOS, pad_token=EOS,
+        tokenizer_object=tk, eos_token=eos, bos_token=bos,
+        unk_token=eos, pad_token=eos,
+        additional_special_tokens=[t for t in specials if t not in (eos, bos)],
     )
+    if spec:
+        # Written onto the tokenizer so the finished model is self-describing:
+        # the playground reads this back the same way it reads a model
+        # downloaded from the Hub, and speaks the format it was taught.
+        tok.chat_template = spec["template"]
     # Documents are encoded whole and then packed into blocks, so a document
     # longer than the context window is expected and correct. Without this the
     # tokenizer prints an alarming length warning for most of the corpus.
@@ -295,6 +329,8 @@ def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):
     capacity = int(token_budget * 1.02) + 1_000_000
     buf = np.empty(capacity, dtype=dtype)
     filled = 0
+    # Documents are separated by the same token that ends a turn, so the model
+    # sees one consistent "this is finished" signal everywhere.
     eos_id = tok.eos_token_id or 0
 
     ctx.log("Reading and tokenizing text until %s tokens are collected."
@@ -353,7 +389,7 @@ def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):
 # Model
 # ===========================================================================
 
-def _build_model(arch: dict, ctx: Any, torch):
+def _build_model(arch: dict, ctx: Any, torch, tok=None):
     from transformers import AutoModelForCausalLM, LlamaConfig
 
     conf = LlamaConfig(
@@ -366,7 +402,12 @@ def _build_model(arch: dict, ctx: Any, torch):
         max_position_embeddings=arch["max_position_embeddings"],
         rms_norm_eps=arch.get("rms_norm_eps", 1e-5),
         tie_word_embeddings=arch.get("tie_word_embeddings", True),
-        bos_token_id=0, eos_token_id=0, pad_token_id=0,
+        # Taken from the tokenizer rather than assumed to be zero. With a
+        # chat format these are the boundary tokens, and generation stops on
+        # the real one instead of on whatever happened to land at id 0.
+        bos_token_id=(tok.bos_token_id if tok else 0) or 0,
+        eos_token_id=(tok.eos_token_id if tok else 0) or 0,
+        pad_token_id=(tok.pad_token_id if tok else 0) or 0,
         attention_dropout=0.0,
         use_cache=False,
     )
@@ -419,7 +460,16 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     weight_decay = float(cfg.get("weight_decay", 0.1))
     eval_every = int(cfg.get("eval_every") or max(20, total_steps // 25))
     sample_every = int(cfg.get("sample_every") or max(40, total_steps // 10))
-    sample_prompt = cfg.get("sample_prompt") or "Once upon a time"
+    sample_prompt = cfg.get("sample_prompt")
+    if not sample_prompt:
+        # A chat model asked to continue "Once upon a time" is being shown a
+        # shape it never trained on. Ask it for a turn instead.
+        chat_fmt = resolve_format(cfg.get("format"))
+        if conversation_style(chat_fmt) == "chat":
+            sample_prompt = chat_formats.format_or_default(
+                chat_fmt.get("chat_format"))["sample_prompt"]
+        else:
+            sample_prompt = "Once upon a time"
     grad_clip = float(cfg.get("grad_clip", 1.0))
 
     # Blocks are indexed rather than copied: the token array can be a gigabyte

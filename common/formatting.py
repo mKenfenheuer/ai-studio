@@ -18,7 +18,10 @@ that is normalised to one shape here before any template sees it.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+from . import chat_formats
 
 DEFAULT_INSTRUCTION_TEMPLATE = (
     "### Instruction:\n{instruction}\n\n### Response:\n{response}")
@@ -28,6 +31,14 @@ _RESPONSE_FIELDS = ["output", "response", "answer", "completion"]
 _TEXT_FIELDS = ["text", "content", "document", "sentence", "raw", "body"]
 _MESSAGE_FIELDS = ["messages", "conversations", "conversation", "chat", "turns"]
 _TOOL_FIELDS = ["tools", "functions", "tool_schema"]
+_REASONING_FIELDS = ["reasoning", "reasoning_content", "thinking",
+                     "thought", "analysis", "rationale"]
+
+# A reply that reasons first is written one of two ways: tagged inline in
+# the content, or carried in a field of its own. Both are unpacked into the
+# same place, so a template never has to know which the dataset used.
+_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
 
 # Roles a chat template is expected to understand. Anything else is passed
 # through untouched rather than dropped -- an unfamiliar role is far more
@@ -124,8 +135,8 @@ def normalize_messages(value: Any) -> list[dict]:
     out = []
     for m in value:
         if isinstance(m, str):
-            out.append({"role": "user", "content": m, "tool_calls": [],
-                        "train": True, "name": None})
+            out.append({"role": "user", "content": m, "reasoning": "",
+                        "tool_calls": [], "train": True, "name": None})
             continue
         if not isinstance(m, dict):
             continue
@@ -138,6 +149,25 @@ def normalize_messages(value: Any) -> list[dict]:
         if content is None:
             content = m.get("value")
 
+        reasoning = ""
+        for key in _REASONING_FIELDS:
+            if isinstance(m.get(key), str) and m[key].strip():
+                reasoning = m[key].strip()
+                break
+        # Harmony carries the same thing as a channel on the message.
+        if not reasoning and str(m.get("channel", "")).lower() == "analysis":
+            reasoning, content = _content_text(content), ""
+
+        text = _content_text(content)
+        if not reasoning:
+            # Tagged inline. Lifted out of the answer, so the visible reply is
+            # the reply and the reasoning can be shown or hidden separately.
+            found = _THINK_RE.search(text)
+            if found:
+                reasoning = found.group(2).strip()
+                text = _THINK_RE.sub("", text, count=1).strip()
+        content = text
+
         raw_calls = m.get("tool_calls")
         if raw_calls is None and m.get("function_call"):
             raw_calls = [m["function_call"]]
@@ -146,7 +176,8 @@ def normalize_messages(value: Any) -> list[dict]:
 
         out.append({
             "role": role,
-            "content": _content_text(content),
+            "content": content,
+            "reasoning": reasoning,
             "tool_calls": calls,
             # Some datasets mark which turns are worth learning from. Carried
             # through so a template can act on it, even though the trainer
@@ -245,7 +276,8 @@ def render_template(template: str, *, row: dict | None = None,
                     messages: list[dict] | None = None,
                     tools: list[dict] | None = None,
                     specials: dict | None = None,
-                    add_generation_prompt: bool = False) -> str:
+                    add_generation_prompt: bool = False,
+                    reasoning: bool = False) -> str:
     """Render one example with a Jinja template.
 
     The same call renders the preview in the browser and the training batch on
@@ -263,6 +295,9 @@ def render_template(template: str, *, row: dict | None = None,
         "tools": tools or None,
         "row": row or {},
         "add_generation_prompt": add_generation_prompt,
+        # Whether the model should be invited to reason before answering. The
+        # template decides what that looks like in its own idiom.
+        "reasoning": reasoning,
     })
     ctx.update(specials or {})
     try:
@@ -277,7 +312,7 @@ def render_template(template: str, *, row: dict | None = None,
 
 def format_example(row: dict, fmt: dict) -> str | None:
     """Render one row as the model will see it, or None if it cannot be read."""
-    fmt = fmt or {}
+    fmt = resolve_format(fmt)
     mode = fmt.get("mode", "auto")
 
     if mode == "jinja":
@@ -303,7 +338,13 @@ def format_example(row: dict, fmt: dict) -> str | None:
             template = fmt.get("chat_template") or BUILTIN_CHAT_TEMPLATE
             text = render_template(template, row=row, messages=messages,
                                    tools=tools, specials=fmt.get("specials"))
-            return text.strip() or None
+            # Returned exactly as the template produced it, trailing newline
+            # and all. Stripping would leave our training text one token
+            # different from what transformers' own apply_chat_template emits
+            # for the very template we save onto the tokenizer -- so anyone who
+            # downloaded the model would prompt it slightly differently from
+            # how it was taught.
+            return text if text.strip() else None
 
     if mode in ("instruction", "auto"):
         instr_f = fmt.get("instruction_field") or first_present(row, _INSTRUCTION_FIELDS)
@@ -339,14 +380,16 @@ def detect_format(columns: list[str], rows: list[dict] | None = None) -> dict:
         # Report the roles actually present, so the UI can say what it found
         # rather than making the user open the raw rows to find out.
         if rows:
-            roles, has_calls = [], False
+            roles, has_calls, has_reasoning = [], False, False
             for r in rows:
                 for m in normalize_messages(r.get(msg_field)):
                     if m["role"] not in roles:
                         roles.append(m["role"])
                     has_calls = has_calls or bool(m["tool_calls"])
+                    has_reasoning = has_reasoning or bool(m["reasoning"])
             out["roles"] = roles
             out["has_tool_calls"] = has_calls
+            out["has_reasoning"] = has_reasoning
         return out
 
     if {"instruction"} & cols and cols & {"output", "response"}:
@@ -416,7 +459,8 @@ def system_prompts(rows: list[dict], fmt: dict | None = None,
 def conversation_style(fmt: dict | None) -> str:
     """How this model expects to be talked to: chat, instruct, or continue."""
     fmt = fmt or {}
-    if fmt.get("use_model_template") or fmt.get("chat_template"):
+    if (fmt.get("use_model_template") or fmt.get("chat_template")
+            or fmt.get("chat_format")):
         return "chat"
     mode = fmt.get("mode")
     if mode == "chat":
@@ -431,9 +475,10 @@ def conversation_style(fmt: dict | None) -> str:
 
 
 def render_prompt(messages: list[dict], fmt: dict | None = None,
-                  tools: list[dict] | None = None) -> str:
+                  tools: list[dict] | None = None,
+                  reasoning: bool = False) -> str:
     """Text for the model to continue, given the conversation so far."""
-    fmt = fmt or {}
+    fmt = resolve_format(fmt)
     messages = normalize_messages(messages)
     style = conversation_style(fmt)
     specials = fmt.get("specials")
@@ -445,7 +490,8 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
         # A model's own template understands add_generation_prompt and emits
         # the opening of the assistant turn itself.
         return render_template(template, messages=messages, tools=tools,
-                               specials=specials, add_generation_prompt=True)
+                               specials=specials, add_generation_prompt=True,
+                               reasoning=reasoning)
 
     if style == "chat":
         body = render_template(BUILTIN_CHAT_TEMPLATE, messages=messages,
@@ -481,7 +527,10 @@ def stop_sequences(fmt: dict | None, specials: dict | None = None) -> list[str]:
     Derived from the template rather than guessed: whatever marks the start of
     the *next* turn is what must not be generated into.
     """
-    fmt = fmt or {}
+    fmt = resolve_format(fmt)
+    # A named format states exactly where a reply ends; nothing needs guessing.
+    if fmt.get("stop"):
+        return list(fmt["stop"])
     style = conversation_style(fmt)
     out: list[str] = []
     for key in ("eos_token", "bos_token"):
@@ -502,3 +551,74 @@ def stop_sequences(fmt: dict | None, specials: dict | None = None) -> list[str]:
     # Turn markers a base model falls back on when nothing taught it to stop.
     out += ["Human:", "\nUser:", "<|endoftext|>"]
     return list(dict.fromkeys(out))
+
+
+# ---------------------------------------------------------------------------
+# Named message formats
+# ---------------------------------------------------------------------------
+
+def resolve_format(fmt: dict | None) -> dict:
+    """Fill in the template and tokens implied by a named chat format.
+
+    `{"mode": "chat", "chat_format": "chatml"}` becomes a format carrying the
+    ChatML Jinja and its special tokens. Done in one place so the preview, the
+    trainer and the playground cannot each interpret the name differently.
+    """
+    fmt = dict(fmt or {})
+    name = fmt.get("chat_format")
+    if not name or fmt.get("chat_template"):
+        return fmt
+    spec = chat_formats.chat_format(name)
+    if not spec:
+        return fmt
+    fmt["chat_template"] = spec["template"]
+    # A format may end a reply differently once it is reasoning; Harmony does.
+    fmt["stop"] = list(spec.get("reasoning_stop") if fmt.get("reasoning")
+                       and spec.get("reasoning_stop") else spec["stop"])
+    specials = dict(fmt.get("specials") or {})
+    specials.setdefault("eos_token", spec["eos_token"])
+    if spec["bos_token"]:
+        specials.setdefault("bos_token", spec["bos_token"])
+    fmt["specials"] = specials
+    if fmt.get("mode") in (None, "auto"):
+        fmt["mode"] = "chat"
+    return fmt
+
+
+def split_reasoning(text: str, fmt: dict | None = None) -> tuple[str, str]:
+    """Separate a model's reasoning from its answer.
+
+    The mirror of rendering. A reply generated in a reasoning format arrives as
+    one string with the working still in it; the playground shows the two apart
+    so the answer is readable and the reasoning is there when you want it.
+    """
+    if not text:
+        return "", ""
+
+    # Harmony keeps them in named channels rather than tags.
+    if "<|channel|>" in text:
+        reasoning, answer = "", text
+        analysis = re.search(
+            r"<\|channel\|>analysis<\|message\|>(.*?)(?:<\|end\|>|<\|start\|>|$)",
+            text, re.DOTALL)
+        if analysis:
+            reasoning = analysis.group(1).strip()
+        final = re.search(
+            r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)",
+            text, re.DOTALL)
+        if final:
+            answer = final.group(1).strip()
+        elif reasoning:
+            answer = ""
+        return reasoning, answer
+
+    found = _THINK_RE.search(text)
+    if found:
+        return found.group(2).strip(), _THINK_RE.sub("", text, count=1).strip()
+
+    # An unterminated block: the model was still thinking when it was cut off.
+    open_tag = re.search(r"<(think|thinking|reasoning)>(.*)$", text,
+                         re.DOTALL | re.IGNORECASE)
+    if open_tag:
+        return open_tag.group(2).strip(), ""
+    return "", text

@@ -339,6 +339,18 @@ textarea.mono {
   text-transform: uppercase; opacity: .65; margin-bottom: 3px;
 }
 .bubble.me[data-role]::before { text-align: right; }
+/* A model's working, beside its answer rather than inside it. */
+details.reasoning {
+  align-self: flex-start; max-width: 84%; margin: 0 0 -4px;
+  border-left: 2px solid var(--border-2); padding-left: 10px;
+}
+details.reasoning > summary {
+  cursor: pointer; font-size: 11.5px; color: var(--text-3); font-weight: 600;
+}
+details.reasoning .txt {
+  font-size: 12.5px; color: var(--text-2); white-space: pre-wrap;
+  margin: 6px 0 0; font-family: var(--mono); line-height: 1.55;
+}
 .chat-input { display: flex; gap: 8px; align-items: flex-end; }
 .chat-input textarea {
   flex: 1; resize: vertical; min-height: 46px; max-height: 180px;

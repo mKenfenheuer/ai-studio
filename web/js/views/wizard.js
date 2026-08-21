@@ -149,6 +149,8 @@ export async function wizardView(mount) {
     // and therefore the right default; "custom" is a Jinja template the user
     // writes; "builtin" is a plain readable rendering.
     templateSource: "model", customTemplate: "", builtin: resource(),
+    // Which set of message-boundary tokens a from-scratch model is taught.
+    chatFormat: "chatml", formats: resource(), teachReasoning: false,
     // From scratch.
     minutes: 60, size: null, vocab: 8192, custom: null,
     sizes: resource(), plan: resource(), ftPlan: resource(),
@@ -445,6 +447,7 @@ function stepData(body, ctx) {
   // Fetched once, and only used to seed the editor when someone chooses to
   // write their own.
   if (!scratch) ensure(state.builtin, "builtin", () => api.builtinTemplate(), draw);
+  if (scratch) ensure(state.formats, "formats", () => api.chatFormats(), draw);
 
   body.innerHTML = html`
     <div class="card" style="margin-bottom:14px">
@@ -526,6 +529,17 @@ function stepData(body, ctx) {
   });
   on(body, "change", "#formatSelect", (_e, t) => {
     state.formatMode = t.value || null; state.preview = resource(); draw();
+  });
+  on(body, "click", "#teachReasoning", (_e, t) => {
+    state.teachReasoning = !state.teachReasoning;
+    state.preview = resource();
+    draw();
+  });
+  on(body, "click", "[data-chatfmt]", (_e, t) => {
+    state.chatFormat = t.dataset.chatfmt;
+    state.templateSource = "builtin";
+    state.preview = resource();
+    draw();
   });
   on(body, "click", "[data-tmplsrc]", (_e, t) => {
     state.templateSource = t.dataset.tmplsrc;
@@ -678,7 +692,9 @@ function templatePanel(state, scratch) {
           Rows are read as ${esc(det.mode || "…")}. Change the template below if
           that is not the shape you want the model to learn.</p>`)}
 
-      <div class="grid grid-3">
+      ${raw(scratch && isChat
+        ? formatPicker(state)
+        : html`<div class="grid grid-3">
         ${raw(sources.map((t) => html`
           <button class="pick ${src === t.id ? "selected" : ""}" data-tmplsrc="${t.id}">
             <span class="t">${t.title}
@@ -686,7 +702,7 @@ function templatePanel(state, scratch) {
             </span>
             <span class="d">${t.desc}</span>
           </button>`).join(""))}
-      </div>
+      </div>`)}
 
       ${raw(p.status === "ready" && p.data.template_note ? html`
         <div class="callout callout-warn" style="margin-top:12px">
@@ -743,10 +759,94 @@ function shorten(text) {
     + text.slice(-tail);
 }
 
+function formatPicker(state) {
+  const r = state.formats;
+  if (r.status === "loading") return loading("Loading the formats…");
+  if (r.status === "error") return failed(r.error);
+  if (r.status !== "ready") return "";
+  const formats = r.data.formats || [];
+
+  return html`
+    <div class="callout" style="margin:0 0 12px">
+      <strong>Why this matters</strong>
+      Written as plain text, "assistant" is just a word — the model has to
+      guess where a turn ends from punctuation, and generation has nothing
+      dependable to stop on. These formats reserve <em>single, atomic tokens</em>
+      for the boundaries before the vocabulary is trained, which only a
+      from-scratch run can do: adding tokens to an existing model's tokenizer
+      would leave its embedding table the wrong size.
+    </div>
+    <div class="grid grid-2">
+      ${raw(formats.map((f) => html`
+        <button class="pick ${state.chatFormat === f.id ? "selected" : ""}"
+                data-chatfmt="${f.id}">
+          <span class="t">${f.label}
+            <span class="badge">${f.token_count} token${f.token_count > 1 ? "s" : ""}</span>
+            ${raw(f.id === "chatml" ? `<span class="badge badge-ok">recommended</span>` : "")}
+          </span>
+          <span class="d">${f.blurb}</span>
+          <span class="mono tiny" style="display:block;background:var(--surface-2);
+                padding:7px 9px;border-radius:6px;white-space:pre-wrap;
+                word-break:break-all;color:var(--text-2)">${f.sample}</span>
+          <span class="row" style="gap:5px;flex-wrap:wrap">
+            ${raw(f.specials.map((t) =>
+              `<span class="badge">${esc(t)}</span>`).join(""))}
+          </span>
+        </button>`).join(""))}
+    </div>
+    ${raw(reasoningPanel(state, formats))}
+
+    <details class="adv" style="margin-top:10px">
+      <summary>Or write the layout yourself</summary>
+      <p class="muted tiny" style="margin:8px 0 0">Choosing "write it yourself"
+        below gives you the Jinja, but no reserved tokens — anything you invent
+        is split into ordinary pieces by the tokenizer. Use one of the formats
+        above unless you have a reason not to.</p>
+      <div class="row" style="margin-top:8px">
+        <button class="btn-sm ${state.templateSource === "custom" ? "btn-primary" : ""}"
+                data-tmplsrc="custom">Write it yourself</button>
+        ${raw(state.templateSource === "custom"
+          ? `<button class="btn-sm" data-tmplsrc="builtin">Back to a standard format</button>` : "")}
+      </div>
+    </details>`;
+}
+
+function reasoningPanel(state, formats) {
+  const det = state.preview.status === "ready"
+    ? (state.preview.data.format || {}) : {};
+  const chosen = formats.find((f) => f.id === state.chatFormat) || {};
+  const on = state.teachReasoning;
+  return html`
+    <div class="card" style="margin-top:12px;box-shadow:none;background:var(--surface-2)">
+      <div class="row-between" style="flex-wrap:wrap;gap:8px">
+        <div style="flex:1;min-width:240px">
+          <strong class="tiny">Teach it to reason before answering</strong>
+          <p class="muted tiny" style="margin:4px 0 0">
+            ${raw(det.has_reasoning
+              ? "This dataset contains worked reasoning as well as answers. "
+              + "Trained on it, the model writes out its thinking first and "
+              + "the answer after — and the two stay separable afterwards."
+              : "This dataset has no reasoning in it, so there is nothing to "
+              + "learn from. Turning this on would only teach the model to "
+              + "open an empty block.")}
+          </p>
+          ${raw(on && chosen.reasoning_note
+            ? `<p class="muted tiny" style="margin:6px 0 0"><em>${
+                esc(chosen.label)}: ${esc(chosen.reasoning_note)}</em></p>` : "")}
+        </div>
+        <button class="btn-sm ${on ? "btn-primary" : ""}" id="teachReasoning"
+                ${det.has_reasoning ? "" : "disabled"}>
+          ${on ? "On" : "Off"}
+        </button>
+      </div>
+    </div>`;
+}
+
 function previewKey(state, scratch) {
   return JSON.stringify([state.dataset, state.config, state.split,
                          state.formatMode, state.textField, state.model,
-                         state.templateSource, state.customTemplate]);
+                         state.templateSource, state.customTemplate,
+                         state.chatFormat, state.teachReasoning]);
 }
 
 function previewRequest(state, scratch) {
@@ -758,6 +858,12 @@ function previewRequest(state, scratch) {
   // the same shape afterwards.
   if (!scratch && state.templateSource === "model") {
     fmt.use_model_template = true;
+  } else if (scratch && state.templateSource !== "custom" && state.previewIsChat) {
+    // A named format carries its own Jinja and its own reserved tokens; the
+    // controller resolves the name so the preview shows what will be trained.
+    fmt.chat_format = state.chatFormat;
+    fmt.mode = "chat";
+    if (state.teachReasoning) fmt.reasoning = true;
   } else if (state.templateSource === "custom" && state.customTemplate) {
     // "jinja" rather than a chat template, so the same box works whether or
     // not the dataset is a conversation.
@@ -1483,6 +1589,15 @@ function buildJob(mount, state) {
   } else if (state.templateSource === "custom" && state.customTemplate) {
     trained.mode = "jinja";
     trained.template = state.customTemplate;
+  }
+  // The format is recorded by name, not as expanded Jinja: the runner needs
+  // the name to know which tokens to reserve in the vocabulary it trains.
+  if (state.mode === "scratch" && state.previewIsChat
+      && state.templateSource !== "custom") {
+    trained.chat_format = state.chatFormat;
+    trained.mode = "chat";
+    if (state.teachReasoning) trained.reasoning = true;
+    delete trained.chat_template;
   }
   const systemPrompt = (state.preview.data?.system_prompts || [])[0] || "";
 
