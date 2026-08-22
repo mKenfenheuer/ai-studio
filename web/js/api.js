@@ -152,6 +152,7 @@ export const api = {
   job:         (id) => req(`/api/jobs/${encodeURIComponent(id)}`),
   jobMetrics:  (id) => req(`/api/jobs/${encodeURIComponent(id)}/metrics`),
   jobLogs:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/logs`),
+  jobReport:   (id) => req(`/api/jobs/${encodeURIComponent(id)}/report`),
   // `save` decides whether the half-trained model survives the stop.
   cancelJob:   (id, save = true) =>
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
@@ -164,6 +165,12 @@ export const api = {
   jobChatTemplate: (id) =>
     req(`/api/jobs/${encodeURIComponent(id)}/chat-template`),
   createJob:   (body) => req("/api/jobs", { method: "POST", body: JSON.stringify(body) }),
+
+  // ---- sweeps ----------------------------------------------------------
+  sweeps:      () => req("/api/sweeps"),
+  sweep:       (id) => req(`/api/sweeps/${encodeURIComponent(id)}`),
+  createSweep: (body) =>
+    req("/api/sweeps", { method: "POST", body: JSON.stringify(body) }),
 
   starters:    () => req("/api/hub/starters"),
   searchModels:   (q, task = "text-generation") =>

@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import architectures as arch
-from . import config, datasets as dsets, db, hfaccount, hub, serving
+from . import config, datasets as dsets, db, diagnose, hfaccount, hub, serving
 from .api import accounts, data, evals, security, sharing
 from .scheduler import Fleet
 
@@ -267,6 +267,16 @@ def _check_generation_source(request: Request, cfg: dict) -> None:
 
 @app.post("/api/jobs")
 async def create_job(request: Request, payload: dict = Body(...)) -> dict:
+    return {"id": await _create_job(request, payload)}
+
+
+async def _create_job(request: Request, payload: dict) -> str:
+    """Validate and queue one run. The single door every run comes through.
+
+    Extracted so that sweeps create their variants through exactly the same
+    checks. A second, looser path would be a second set of rules about what a
+    valid run is, and the looser one always wins by accident.
+    """
     user = security.current_user(request)
     kind = payload.get("kind", "finetune_llm")
     cfg = payload.get("config") or {}
@@ -346,7 +356,146 @@ async def create_job(request: Request, payload: dict = Body(...)) -> dict:
     db.add_log(jid, "Job created and queued.")
     await fleet.broadcast_ui({"type": "jobs_changed"})
     fleet.wake()
-    return {"id": jid}
+    return jid
+
+
+# How many variants one sweep may launch. Each is a whole training run on the
+# same card, so eight is already most of a night; the limit exists to make
+# that obvious before the queue does.
+MAX_SWEEP_RUNS = 8
+
+
+def _label(key: str, value) -> str:
+    """A short, readable name for one varied setting."""
+    short = {"learning_rate": "lr", "lora_r": "rank", "batch_size": "batch",
+             "grad_accum": "accum", "epochs": "epochs",
+             "weight_decay": "decay", "lora_alpha": "alpha",
+             "max_steps": "steps", "warmup_steps": "warmup"}.get(key, key)
+    # One format for every value in a sweep. Switching to scientific notation
+    # below a threshold made a single sweep read "lr 0.001, lr 6.0e-04,
+    # lr 3.0e-04" -- three notations for three neighbouring numbers, in the
+    # one place where they are meant to be compared at a glance.
+    text = ("%.6g" % value) if isinstance(value, float) else str(value)
+    return "%s %s" % (short, text)
+
+
+@app.post("/api/sweeps")
+async def create_sweep(request: Request, payload: dict = Body(...)) -> dict:
+    """Launch several variants of one run, differing in named settings.
+
+    The reason to do this in the app rather than by hand is that the hard part
+    was never launching the runs -- it was comparing them afterwards, and
+    keeping straight which was which a week later. Every variant carries the
+    sweep it belongs to and the exact values that make it different, so the
+    comparison is a fact about the runs rather than something reconstructed
+    from their names.
+
+    Runs are created together and then compete for the card like anything
+    else. The queue is dealt round-robin between people, so a sweep of eight
+    does not lock a colleague out -- it simply takes its turns.
+    """
+    base = payload.get("base") or {}
+    vary = payload.get("vary") or {}
+    if not isinstance(vary, dict) or not vary:
+        raise HTTPException(400, "Name at least one setting to vary.")
+
+    combos: list[dict] = [{}]
+    for key, values in vary.items():
+        if not isinstance(values, list) or not values:
+            raise HTTPException(400, "'%s' needs a list of values to try." % key)
+        combos = [{**c, key: v} for c in combos for v in values]
+
+    if len(combos) > MAX_SWEEP_RUNS:
+        raise HTTPException(
+            400, "That is %d runs. Each one is a full training run on the same "
+                 "card, so a sweep is limited to %d -- vary one setting at a "
+                 "time, or try fewer values."
+                 % (len(combos), MAX_SWEEP_RUNS))
+
+    sweep_id = db.new_id("swp")
+    sweep_name = (payload.get("name") or "").strip()         or ("Trying %s" % " and ".join(vary))
+    base_name = (base.get("name") or "").strip()
+
+    created = []
+    for combo in combos:
+        cfg = {**(base.get("config") or {}), **combo,
+               "sweep_id": sweep_id, "sweep_name": sweep_name,
+               "sweep_values": combo}
+        label = ", ".join(_label(k, v) for k, v in combo.items())
+        name = "%s · %s" % (base_name or sweep_name, label)
+        try:
+            created.append(await _create_job(request, {
+                "kind": base.get("kind", "finetune_llm"),
+                "name": name, "config": cfg}))
+        except HTTPException as e:
+            # One variant that cannot run means the settings being varied are
+            # not all viable. Undo the rest rather than leaving half a sweep
+            # in the queue: a comparison missing three of its five runs looks
+            # exactly like a complete one.
+            for jid in created:
+                db.delete_job(jid)
+            raise HTTPException(
+                e.status_code,
+                "The variant with %s cannot run: %s" % (label, e.detail)) from e
+
+    return {"sweep_id": sweep_id, "name": sweep_name, "jobs": created}
+
+
+def _sweep_rows(user: dict) -> dict[str, dict]:
+    """Sweeps assembled from the runs in them, rather than from a table.
+
+    There is no sweeps table on purpose. A sweep is exactly its runs: it
+    inherits their visibility with no second set of sharing rules, and when
+    the last run is deleted the sweep stops existing, which is the right
+    answer rather than a dangling row.
+    """
+    out: dict[str, dict] = {}
+    for job in db.visible_jobs(user, 500):
+        sid = (job.get("config") or {}).get("sweep_id")
+        if not sid:
+            continue
+        entry = out.setdefault(sid, {
+            "id": sid, "name": job["config"].get("sweep_name") or sid,
+            "created_at": job["created_at"], "runs": []})
+        entry["created_at"] = min(entry["created_at"], job["created_at"])
+        entry["runs"].append({
+            "id": job["id"], "name": job["name"], "status": job["status"],
+            "step": job["step"], "total_steps": job["total_steps"],
+            "values": job["config"].get("sweep_values") or {},
+            "has_model": job.get("has_model"),
+            "summary": job.get("summary"),
+            "finished_at": job.get("finished_at"),
+        })
+    return out
+
+
+@app.get("/api/sweeps")
+async def list_sweeps(request: Request) -> list[dict]:
+    rows = list(_sweep_rows(security.current_user(request)).values())
+    for r in rows:
+        r["runs"].sort(key=lambda x: x["name"])
+    return sorted(rows, key=lambda r: r["created_at"], reverse=True)
+
+
+@app.get("/api/sweeps/{sweep_id}")
+async def get_sweep(request: Request, sweep_id: str) -> dict:
+    row = _sweep_rows(security.current_user(request)).get(sweep_id)
+    if not row:
+        raise HTTPException(404, "No such sweep.")
+    row["runs"].sort(key=lambda x: x["name"])
+    # Which setting actually differs, so the table can put it in a column
+    # rather than leaving the reader to diff the names.
+    keys: set = set()
+    for r in row["runs"]:
+        keys.update(r["values"])
+    row["varied"] = sorted(keys)
+    done = [r for r in row["runs"]
+            if r["status"] in ("succeeded", "cancelled", "failed")]
+    row["finished"] = len(done)
+    scored = [r for r in done if (r.get("summary") or {}).get("best_val_loss")]
+    row["best"] = min(scored,
+                      key=lambda r: r["summary"]["best_val_loss"])["id"]         if scored else None
+    return row
 
 
 def _default_job_name(cfg: dict, kind: str = "finetune_llm") -> str:
@@ -431,6 +580,19 @@ async def resume_job(request: Request, job_id: str) -> dict:
 async def job_metrics(request: Request, job_id: str) -> list[dict]:
     _job_or_404(request, job_id)
     return db.get_metrics(job_id)
+
+
+@app.get("/api/jobs/{job_id}/report")
+async def job_report(request: Request, job_id: str) -> dict:
+    """What this run says about itself, in words rather than in a curve.
+
+    Computed on demand rather than stored, so improving the analysis improves
+    every past run rather than only the ones trained after the change.
+    """
+    job = _job_or_404(request, job_id)
+    job["runner"] = db.get_runner(job["runner_id"]) if job["runner_id"] else None
+    job["artifacts"] = db.list_artifacts(job_id)
+    return diagnose.report(job, db.get_metrics(job_id))
 
 
 @app.get("/api/jobs/{job_id}/logs")

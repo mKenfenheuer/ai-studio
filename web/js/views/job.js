@@ -114,6 +114,7 @@ export async function jobView(mount, [jobId]) {
       // A run that just finished has a model to build on, and one that just
       // failed has a checkpoint to carry on from. Both change this panel.
       paintFurther();
+      paintReport();
     }
   });
 
@@ -131,6 +132,20 @@ export async function jobView(mount, [jobId]) {
 
   // Datasets are only needed by the "train this further" panel, which most
   // visits never open, so the list is fetched after the page is on screen.
+  // The report only exists once a run has ended; asking for it while it is
+  // still training would be diagnosing a curve that has not finished.
+  const paintReport = async () => {
+    const box = $("#reportCard", mount);
+    if (!box) return;
+    if (!["succeeded", "failed", "cancelled"].includes(job.status)) {
+      box.innerHTML = "";
+      return;
+    }
+    try { box.innerHTML = reportCard(await api.jobReport(jobId)); }
+    catch { box.innerHTML = ""; }
+  };
+  paintReport();
+
   let datasets = [];
   const paintFurther = () => {
     const box = $("#furtherRow", mount);
@@ -243,9 +258,14 @@ function layout(job, scratch, experts = 0) {
         <div class="row" id="headerActions"></div>
       </div>
       <p class="sub mono tiny" style="margin-top:4px">${subtitle}</p>
+      ${raw(job.config.sweep_id ? html`
+        <p class="tiny" style="margin:4px 0 0">One of several variants —
+          <a href="#/sweeps/${esc(job.config.sweep_id)}">see them side by
+          side</a>.</p>` : "")}
     </div>
 
     <div id="errorCard"></div>
+    <div id="reportCard"></div>
     <div id="resumeCard"></div>
     <div id="queueCard"></div>
     <div id="stopPanel"></div>
@@ -301,6 +321,48 @@ function layout(job, scratch, experts = 0) {
         <span class="tiny muted">Newest at the bottom</span>
       </div>
       <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+const REPORT_ICON = { ok: "✓", warn: "!", error: "✕" };
+
+/** What the run says about itself. Findings first, numbers second: the
+ *  numbers are only interesting once you know which of them to look at. */
+function reportCard(r) {
+  const findings = r.findings || [];
+  if (!findings.length && !(r.facts || []).length) return "";
+  const worst = findings.some((f) => f.level === "error") ? "error"
+    : findings.some((f) => f.level === "warn") ? "warn" : "ok";
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">What happened in this run</h3>
+        <span class="badge ${worst === "error" ? "badge-err"
+          : worst === "warn" ? "badge-warn" : "badge-ok"}">${
+          worst === "error" ? "something went wrong"
+            : worst === "warn" ? "worth a look" : "healthy"}</span>
+      </div>
+
+      ${raw((r.facts || []).length ? html`
+        <div class="factrow">
+          ${raw(r.facts.map((f) => html`
+            <div class="fact">
+              <span class="k">${f.label}</span>
+              <span class="v">${f.value}</span>
+              ${raw(f.note ? `<span class="n">${esc(f.note)}</span>` : "")}
+            </div>`).join(""))}
+        </div>` : "")}
+
+      ${raw(findings.map((f) => html`
+        <div class="finding lv-${f.level}">
+          <span class="mark">${REPORT_ICON[f.level] || "·"}</span>
+          <div>
+            <strong>${f.title}</strong>
+            <p class="saw">${f.saw}</p>
+            <p class="means">${f.means}</p>
+            <p class="do"><span class="lbl">What to do</span> ${f.do}</p>
+          </div>
+        </div>`).join(""))}
     </div>`;
 }
 

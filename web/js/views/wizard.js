@@ -1541,11 +1541,13 @@ function stepReview(body, ctx) {
     }), draw);
     body.innerHTML = finetuneReview(state, runner, caps);
     if (state.ftPlan.status === "ready") wireOverrides(body, ctx);
+    wireSweep(body, ctx);
     return;
   }
 
   ensure(state.plan, planKey(state), () => api.scratchPlan(planPayload(state)), draw);
   body.innerHTML = scratchReview(state, runner, caps);
+  wireSweep(body, ctx);
   if (state.plan.status === "ready") {
     wireOverrides(body, ctx);
     refreshPlan(ctx, "#reviewIssues", (_s, plan) => issueList(plan.issues));
@@ -1637,6 +1639,8 @@ function finetuneReview(state, runner, caps) {
         </div>
       </details>
     </div>
+
+    ${raw(sweepPanel(state))}
 
     <div class="field card">
       <label for="jobName">Name this run</label>
@@ -1740,7 +1744,9 @@ function scratchReview(state, runner, caps) {
           String(state.dataset || "").split("/").pop()}">
         <div class="hint">Just so you can find it later.</div>
       </div>
-    </div>`;
+    </div>
+
+    ${raw(sweepPanel(state))}`;
 }
 
 // ===========================================================================
@@ -1799,6 +1805,22 @@ const FLOAT_SETTINGS = new Set(["learning_rate", "weight_decay", "grad_clip",
 const BOOL_SETTINGS = new Set(["gradient_checkpointing", "optim_8bit",
                                "adapt_experts", "early_stop"]);
 
+function wireSweep(mount, ctx) {
+  const { state, draw } = ctx;
+  const sel = mount.querySelector("#sweepKey");
+  if (!sel) return;
+  sel.addEventListener("change", () => {
+    state.sweepKey = sel.value || null;
+    const opt = (SWEEPABLE[state.mode] || []).find((o) => o[0] === state.sweepKey);
+    // Prefilled with the values worth trying, because the point of this
+    // feature is for somebody who does not know what to try.
+    state.sweepValues = opt ? opt[2].join(", ") : "";
+    draw();
+  });
+  const box = mount.querySelector("#sweepValues");
+  box?.addEventListener("input", () => { state.sweepValues = box.value; });
+}
+
 function wireOverrides(body, ctx) {
   const { state, draw } = ctx;
   on(body, "change", "[data-setting]", (_e, t) => {
@@ -1853,6 +1875,71 @@ function planPayload(state) {
     text_field: state.textField || "text",
     overrides: state.overrides,
   };
+}
+
+// Settings worth trying several values of, and why each one. Deliberately
+// short: a sweep costs a full training run per value, so the list is the
+// handful where the right answer is genuinely unknown in advance rather than
+// everything that happens to be a number.
+const SWEEPABLE = {
+  finetune: [
+    ["learning_rate", "Learning rate", [5e-5, 1e-4, 2e-4, 4e-4],
+     "The setting most likely to be wrong, and the one with the largest "
+     + "effect. Too high and the loss spikes; too low and the run is wasted."],
+    ["lora_r", "Adapter size", [8, 16, 32, 64],
+     "How much capacity the adapter has. Larger learns more and overfits "
+     + "sooner on a small dataset."],
+    ["epochs", "Passes over the data", [1, 2, 3, 4],
+     "More passes learn more from the same examples, until they start "
+     + "memorising them."],
+  ],
+  scratch: [
+    ["learning_rate", "Learning rate", [3e-4, 6e-4, 1e-3, 2e-3],
+     "Scales with model width, and the recommendation is an estimate. The "
+     + "loss curve tells you within a few hundred steps whether it was right."],
+    ["weight_decay", "Weight decay", [0.0, 0.05, 0.1, 0.2],
+     "Gentle pressure toward smaller weights. Matters most when the corpus "
+     + "is small enough to memorise."],
+    ["warmup_steps", "Warmup steps", [10, 50, 100, 200],
+     "How long the learning rate takes to reach full size. Too short and the "
+     + "first update can wreck a model of random weights."],
+  ],
+};
+
+function sweepPanel(state) {
+  const options = SWEEPABLE[state.mode] || [];
+  return html`
+    <details class="card" style="margin-bottom:14px">
+      <summary><strong>Or try several values at once</strong>
+        <span class="muted tiny"> — launch a few variants and compare them</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        Runs one variant per value, identical in every other respect, and ranks
+        them by held-out loss when they finish. Each variant is a whole
+        training run on the same card, so three values take three times as
+        long — they take turns, and the queue is dealt between people so this
+        does not lock anyone else out.</p>
+      <div class="field" style="margin-top:10px">
+        <label for="sweepKey">Vary</label>
+        <select id="sweepKey">
+          <option value="">Nothing — just one run</option>
+          ${raw(options.map(([k, label]) => html`
+            <option value="${k}"${state.sweepKey === k ? " selected" : ""}
+            >${label}</option>`).join(""))}
+        </select>
+        <div class="hint" id="sweepWhy">${
+          (options.find((o) => o[0] === state.sweepKey) || [])[3] || ""}</div>
+      </div>
+      <div class="field">
+        <label for="sweepValues">Values to try</label>
+        <input type="text" id="sweepValues" class="mono"
+               value="${esc(state.sweepValues || "")}"
+               placeholder="${esc(((options.find(
+                 (o) => o[0] === state.sweepKey) || [])[2] || [])
+                 .join(", "))}">
+        <div class="hint">Separated by commas. Up to eight in total.</div>
+      </div>
+    </details>`;
 }
 
 function gateNext(blocked, hintText) {
@@ -1920,20 +2007,54 @@ function wireNav(mount, ctx) {
 
     const job = buildJob(mount, state);
     if (!job) { toast("The plan is not ready yet.", "err"); return; }
+    const varied = parseSweep(state);
+    if (varied && varied.error) { toast(varied.error, "err"); return; }
     state.starting = true;
     next.disabled = true;
-    next.textContent = "Starting…";
+    next.textContent = varied ? "Launching variants…" : "Starting…";
     try {
-      const { id } = await api.createJob(job);
-      toast("Training run created.", "ok");
-      location.hash = `#/jobs/${id}`;
+      if (varied) {
+        const r = await api.createSweep({
+          name: `${job.name || "Run"} · trying ${varied.key}`,
+          base: job, vary: { [varied.key]: varied.values } });
+        toast(`${r.jobs.length} runs queued.`, "ok");
+        location.hash = `#/sweeps/${r.sweep_id}`;
+      } else {
+        const { id } = await api.createJob(job);
+        toast("Training run created.", "ok");
+        location.hash = `#/jobs/${id}`;
+      }
     } catch (e) {
       toast(e.message, "err");
       state.starting = false;
       next.disabled = false;
       next.textContent = "Start training";
     }
+
   });
+}
+
+/** The sweep the user asked for, or null, or an explanation of what is wrong.
+ *  Parsed here rather than server-side so a typo is caught before eight runs
+ *  are queued and then deleted again. */
+function parseSweep(state) {
+  if (!state.sweepKey) return null;
+  const raw_ = (state.sweepValues || "").split(",")
+    .map((v) => v.trim()).filter(Boolean);
+  if (raw_.length < 2) {
+    return { error: "Give at least two values to compare, separated by commas." };
+  }
+  if (raw_.length > 8) {
+    return { error: `That is ${raw_.length} runs. Eight is the limit.` };
+  }
+  const values = raw_.map(Number);
+  if (values.some((v) => !isFinite(v))) {
+    return { error: "Those values are not all numbers." };
+  }
+  const whole = new Set(["lora_r", "epochs", "warmup_steps", "batch_size",
+                         "grad_accum", "max_steps", "lora_alpha"]);
+  return { key: state.sweepKey,
+           values: whole.has(state.sweepKey) ? values.map(Math.round) : values };
 }
 
 function buildJob(mount, state) {

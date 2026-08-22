@@ -45,7 +45,10 @@ function row(j) {
   const dur = j.finished_at && j.started_at ? j.finished_at - j.started_at : null;
   return html`
     <tr>
-      <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a></td>
+      <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a>
+        ${raw(j.config.sweep_id
+          ? `<div class="tiny"><a href="#/sweeps/${esc(j.config.sweep_id)}"
+               >part of a sweep</a></div>` : "")}</td>
       <td>${statusBadge(j.status)}${raw(
         j.status === "cancelled" && j.has_model
           ? ` <span class="badge badge-ok">model kept</span>` : "")}${raw(

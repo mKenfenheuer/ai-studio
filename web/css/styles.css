@@ -634,3 +634,34 @@ details.card > summary { cursor: pointer; list-style: none; }
 details.card > summary::-webkit-details-marker { display: none; }
 details.card > summary::before { content: "▸ "; color: var(--text-3); }
 details.card[open] > summary::before { content: "▾ "; }
+
+/* ---------------------------------------------------------------------------
+   The post-run report. Three lines per finding, always in the same order:
+   what was seen, what it means, what to do about it. The order is the point --
+   the measurement first so the reader can check it, the advice last so it is
+   never mistaken for the observation. */
+.factrow { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.fact { flex: 1 1 130px; background: var(--surface-2); border-radius: 8px;
+        padding: 8px 10px; display: flex; flex-direction: column; gap: 1px; }
+.fact .k { font-size: 11px; color: var(--text-3); text-transform: uppercase;
+           letter-spacing: .04em; }
+.fact .v { font-size: 15px; font-weight: 600; }
+.fact .n { font-size: 11px; color: var(--text-2); }
+
+.finding { display: flex; gap: 10px; padding: 10px 0;
+           border-top: 1px solid var(--border); }
+.finding:first-of-type { border-top: none; }
+.finding .mark { flex: 0 0 20px; height: 20px; border-radius: 50%;
+                 display: grid; place-items: center; font-size: 12px;
+                 font-weight: 700; margin-top: 1px; }
+.finding.lv-ok    .mark { background: var(--ok-bg);   color: var(--ok); }
+.finding.lv-warn  .mark { background: var(--warn-bg); color: var(--warn); }
+.finding.lv-error .mark { background: var(--err-bg);  color: var(--err); }
+.finding strong { font-size: 13.5px; }
+.finding p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.55; }
+.finding .saw   { color: var(--text-2); font-family: var(--mono);
+                  font-size: 11.5px; }
+.finding .means { color: var(--text); }
+.finding .do    { color: var(--text-2); }
+.finding .do .lbl { color: var(--text-3); text-transform: uppercase;
+                    font-size: 10.5px; letter-spacing: .05em; margin-right: 4px; }
