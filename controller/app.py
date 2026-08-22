@@ -14,8 +14,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import architectures as arch
-from . import config, datasets as dsets, db, hfaccount, hub
-from .api import accounts, data, security, sharing
+from . import config, datasets as dsets, db, hfaccount, hub, serving
+from .api import accounts, data, evals, security, sharing
 from .scheduler import Fleet
 
 fleet = Fleet()
@@ -45,7 +45,13 @@ app.middleware("http")(security.authenticate)
 
 app.include_router(accounts.router)
 app.include_router(data.router)
+app.include_router(evals.router)
 app.include_router(sharing.router)
+
+# The evaluation routes queue jobs, which means they need the live fleet. Set
+# here rather than imported the other way round, because the fleet is created
+# in this module and an import back into it would be a cycle.
+evals.FLEET = fleet
 
 
 # ===========================================================================
@@ -71,6 +77,7 @@ async def runner_ws(ws: WebSocket) -> None:
         runner_id = first["runner_id"]
         db.upsert_runner(runner_id, first.get("name") or runner_id,
                          first.get("capabilities") or {})
+        fleet.note_checkpoints(runner_id, first.get("checkpoints") or [])
         fleet.attach(runner_id, ws)
         await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
         await fleet.broadcast_ui({"type": "runners_changed"})
@@ -132,6 +139,40 @@ async def events_ws(ws: WebSocket) -> None:
 # Status / runners
 # ===========================================================================
 
+@app.get("/api/health")
+async def health() -> dict:
+    """Is the controller up? Nothing more, and deliberately public.
+
+    This exists because /api/status stopped being an honest health check the
+    day accounts landed: it answers 401 to anyone without a session, which is
+    correct -- it carries the join token and the fleet's shape -- but it meant
+    the container healthcheck had reported "unhealthy" ever since, for a
+    controller that was working perfectly. A liveness probe must not need a
+    credential, so it must not carry anything worth protecting.
+    """
+    return {"ok": True, "version": "0.1.0"}
+
+
+@app.get("/api/fleet/in-flight")
+async def fleet_in_flight() -> dict:
+    """What a restart would interrupt right now.
+
+    Authenticated with the join token rather than a session, because the
+    caller is a deploy script on the host, not a browser. It is the same
+    credential a runner uses and it is already in the .env file that starts
+    the containers -- so the guard needs no new secret to be useful.
+    """
+    jobs = fleet.in_flight()
+    return {
+        "busy": bool(jobs),
+        "jobs": jobs,
+        "queued": len(db.q("SELECT id FROM jobs WHERE status='queued'")),
+        # Whether interrupting would actually cost anything. With a checkpoint
+        # a restart costs minutes; without one it costs the whole run.
+        "resumable": all(j["checkpoint_step"] for j in jobs) if jobs else True,
+    }
+
+
 @app.get("/api/status")
 async def status(request: Request) -> dict:
     runners = db.list_runners()
@@ -157,6 +198,7 @@ async def get_runners() -> list[dict]:
     for r in db.list_runners():
         r["connected"] = r["id"] in fleet.connections
         r["current_job"] = fleet.busy.get(r["id"])
+        r["checkpoints"] = sorted(fleet.checkpoints.get(r["id"], set()))
         out.append(r)
     return out
 
@@ -175,7 +217,14 @@ async def reprobe(runner_id: str) -> dict:
 
 @app.get("/api/jobs")
 async def get_jobs(request: Request, limit: int = 100) -> list[dict]:
-    return db.visible_jobs(security.current_user(request), limit)
+    jobs = db.visible_jobs(security.current_user(request), limit)
+    positions = fleet.queue_positions()
+    waiting = len(positions)
+    for j in jobs:
+        if j["status"] == "queued":
+            j["queue_position"] = positions.get(j["id"])
+            j["queue_length"] = waiting
+    return jobs
 
 
 def _job_or_404(request: Request, job_id: str, need: str = "view") -> dict:
@@ -224,10 +273,31 @@ async def create_job(request: Request, payload: dict = Body(...)) -> dict:
         cfg["dataset_is_local"] = True
         cfg["dataset_label"] = d["name"]
 
+    # Training on top of something this studio already built. The permission
+    # check is the point: without it, any run id pasted into this field would
+    # hand out the weights of a model you are not allowed to see.
+    if source_id := (cfg.get("continue_from") or cfg.get("base_model_job")):
+        src = _job_or_404(request, source_id)
+        if not (config.ARTIFACT_DIR / ("%s.zip" % source_id)).exists():
+            raise HTTPException(400, "That run has no saved model to build on.")
+        if src["status"] not in ("succeeded", "cancelled"):
+            raise HTTPException(400, "That run has not finished yet.")
+        if kind == "pretrain_llm" and src["kind"] != "pretrain_llm":
+            raise HTTPException(
+                400, "Only a model trained from scratch can be trained further "
+                     "this way. A fine-tune produces an adapter, which is "
+                     "carried on with a fine-tuning run instead.")
+        if src["kind"] == "finetune_llm":
+            # An adapter needs the model it was built for. Carried across so
+            # the run does not depend on the user retyping it correctly.
+            cfg.setdefault("base_model", src["config"].get("base_model"))
+        cfg["source_run_name"] = src["name"]
+
     if kind == "finetune_llm":
-        for field in ("base_model", "dataset"):
-            if not cfg.get(field):
-                raise HTTPException(400, "Missing required setting: %s" % field)
+        if not cfg.get("base_model") and not cfg.get("base_model_job"):
+            raise HTTPException(400, "Missing required setting: base_model")
+        if not cfg.get("dataset"):
+            raise HTTPException(400, "Missing required setting: dataset")
     elif kind == "pretrain_llm":
         if not cfg.get("dataset"):
             raise HTTPException(400, "Choose some text to learn from.")
@@ -290,9 +360,61 @@ async def get_job(request: Request, job_id: str) -> dict:
     job["shares"] = db.list_shares("job", job_id)
     job["artifacts"] = db.list_artifacts(job_id)
     job["runner"] = db.get_runner(job["runner_id"]) if job["runner_id"] else None
+    if job["status"] == "queued":
+        positions = fleet.queue_positions()
+        job["queue_position"] = positions.get(job_id)
+        job["queue_length"] = len(positions)
+    job["resumable"] = _resumable(job)
     # Never hand the runner's copy of the HF token back to the browser.
     job["config"].pop("hf_token", None)
     return job
+
+
+def _resumable(job: dict) -> dict | None:
+    """Whether this run could be picked up where it stopped, and on what.
+
+    A checkpoint is only useful while the machine holding it still exists, so
+    the answer includes which machine that is and whether it is reachable --
+    "resume" that silently starts from zero would be worse than no button.
+    """
+    step = int(job.get("checkpoint_step") or 0)
+    if not step or job["status"] not in ("failed", "cancelled"):
+        return None
+    holder = job.get("checkpoint_runner")
+    runner = db.get_runner(holder) if holder else None
+    return {
+        "step": step,
+        "total": job.get("total_steps") or 0,
+        "runner_id": holder,
+        "runner": (runner or {}).get("name"),
+        "online": holder in fleet.connections,
+    }
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(request: Request, job_id: str) -> dict:
+    """Put a stopped or failed run back on the queue, to carry on from its
+    checkpoint rather than from the beginning."""
+    job = _job_or_404(request, job_id, "edit")
+    info = _resumable(job)
+    if not info:
+        raise HTTPException(
+            400, "There is no checkpoint for this run, so starting it again "
+                 "would start it from the beginning. Create a new run instead.")
+    if not info["online"]:
+        raise HTTPException(
+            400, "The machine holding this run's progress (%s) is not "
+                 "connected. Bring it back and try again."
+                 % (info["runner"] or "unknown"))
+    db.ex("UPDATE jobs SET status='queued', runner_id=NULL, error=NULL,"
+          " finished_at=NULL, step=? WHERE id=?", (info["step"], job_id))
+    fleet.declined.discard(job_id)
+    fleet.gave_up_waiting.discard(job_id)
+    db.add_log(job_id, "Queued again, to carry on from the checkpoint at step "
+               "%d on %s." % (info["step"], info["runner"] or "its machine"))
+    await fleet.broadcast_ui({"type": "jobs_changed", "job_id": job_id})
+    fleet.wake()
+    return {"ok": True, "from_step": info["step"]}
 
 
 @app.get("/api/jobs/{job_id}/metrics")
@@ -450,6 +572,40 @@ async def publish_job(request: Request, job_id: str,
         raise HTTPException(400, str(e)) from e
     except Exception as e:  # noqa: BLE001 - hub failures are not ours to classify
         raise HTTPException(502, "Hugging Face refused the upload: %s" % e) from e
+
+
+@app.get("/api/jobs/{job_id}/chat-template")
+async def job_chat_template(request: Request, job_id: str) -> dict:
+    """The chat template baked into this run's own tokenizer, if it has one.
+
+    Read straight out of the saved zip rather than kept on the job, because
+    the tokenizer is the authoritative copy -- the same rule the runner and
+    the playground already follow. It exists so that fine-tuning a model this
+    studio built can preview the training text in the shape that model was
+    actually taught, instead of falling back to a generic rendering and
+    showing the user something the run will not produce.
+    """
+    _job_or_404(request, job_id)
+    path = config.ARTIFACT_DIR / ("%s.zip" % job_id)
+    if not path.exists():
+        return {"available": False, "reason": "This run has no saved model."}
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = {n.rsplit("/", 1)[-1]: n for n in z.namelist()}
+            if "tokenizer_config.json" not in names:
+                return {"available": False, "reason": "no tokenizer in the result"}
+            conf = json.loads(z.read(names["tokenizer_config.json"]))
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        return {"available": False, "reason": str(e)[:200]}
+    template = conf.get("chat_template")
+    if isinstance(template, dict):
+        template = template.get("default") or next(iter(template.values()), None)
+    if isinstance(template, list):        # transformers 5 ships a list of dicts
+        template = next((t.get("template") for t in template
+                         if isinstance(t, dict)), None)
+    return {"available": bool(template), "chat_template": template,
+            "eos_token": conf.get("eos_token")}
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -874,30 +1030,7 @@ def _explain_scratch(s: dict, counts: dict, verdict: dict, fit: dict) -> list[di
 # is a request routed over the same websocket the fleet already holds open,
 # and the reply streams back through the browser event stream token by token.
 
-def chat_spec(job: dict) -> dict:
-    """Everything a runner needs to serve this particular result.
-
-    The important field is `format`: the *exact* format the run was trained
-    with, carried through unchanged. Guessing it again here would let the
-    playground drift from the model, and a model given a shape it never saw
-    looks broken when it is not.
-    """
-    cfg = job["config"]
-    fmt = dict(cfg.get("format") or {})
-    if not fmt and job["kind"] == "pretrain_llm":
-        fmt = {"mode": "text"}
-
-    return {
-        "job_id": job["id"],
-        "kind": job["kind"],
-        "base_model": cfg.get("base_model"),
-        "format": fmt,
-        "style": hub.formatting.conversation_style(fmt),
-        "system_prompt": cfg.get("system_prompt") or "",
-        # Whether this run was actually taught to reason, so the playground
-        # offers the toggle only where it means something.
-        "reasoning": bool(fmt.get("reasoning")),
-    }
+chat_spec = serving.chat_spec
 
 
 def _pick_chat_runner(job: dict) -> tuple[str, dict]:

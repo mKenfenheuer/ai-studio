@@ -48,11 +48,20 @@ function row(j) {
       <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a></td>
       <td>${statusBadge(j.status)}${raw(
         j.status === "cancelled" && j.has_model
-          ? ` <span class="badge badge-ok">model kept</span>` : "")}</td>
+          ? ` <span class="badge badge-ok">model kept</span>` : "")}${raw(
+        j.checkpoint_step && ["failed", "cancelled"].includes(j.status)
+          ? ` <span class="badge badge-accent">can resume</span>` : "")}</td>
       <td style="min-width:120px">
         ${raw(["running", "assigned"].includes(j.status)
           ? `<div class="progress"><i style="width:${pct}%"></i></div>
              <span class="tiny muted">${j.step}/${j.total_steps || "?"}</span>`
+          : j.status === "queued" && j.queue_position
+          // Where it actually sits in the order work is handed out, which is
+          // not the order runs were created: the queue is dealt round-robin
+          // between people so one person's overnight batch cannot block
+          // everyone else's twenty-minute job.
+          ? `<span class="tiny muted">${j.queue_position} of ${
+               j.queue_length} waiting</span>`
           : `<span class="tiny muted">${esc(dur ? fmtDuration(dur) : "—")}</span>`)}
       </td>
       <td class="mono tiny hide-sm">${j.kind === "pretrain_llm"

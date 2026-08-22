@@ -23,21 +23,16 @@ Three things make it more than a wrapper around `generate()`:
 """
 from __future__ import annotations
 
-import os
-import shutil
 import threading
 import time
-import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
-
 from common import formatting
 
-from . import capabilities
+from . import artifacts, capabilities
 
-CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
+CACHE_DIR = artifacts.CACHE_DIR
 
 # How long a model may sit loaded with nobody talking to it. The GPU is shared
 # with training, and holding 6 GB for a conversation that ended an hour ago
@@ -71,29 +66,16 @@ class ModelHost:
 
     # ------------------------------------------------------------ loading
     def _artifact_dir(self, job_id: str) -> Path:
-        return CACHE_DIR / job_id
+        return artifacts.cached_dir(job_id)
 
     def _fetch(self, job_id: str, log: Callable[[str], None]) -> Path:
-        """Download and unpack this job's result, unless it is already here."""
-        dest = self._artifact_dir(job_id)
-        if (dest / "config.json").exists() or (dest / "adapter_config.json").exists():
-            return dest
+        """Download and unpack this job's result, unless it is already here.
 
-        log("Downloading the trained result from the controller…")
-        dest.mkdir(parents=True, exist_ok=True)
-        zip_path = dest.with_suffix(".zip")
-        url = "%s/api/jobs/%s/download" % (self.controller_url, job_id)
-        with httpx.stream("GET", url, timeout=600,
-                          headers={"X-Runner-Token": self.token}) as r:
-            r.raise_for_status()
-            with open(zip_path, "wb") as fh:
-                for chunk in r.iter_bytes(1 << 20):
-                    fh.write(chunk)
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(dest)
-        zip_path.unlink(missing_ok=True)
-        log("Result unpacked.")
-        return dest
+        Shared with training, which needs exactly the same thing to fine-tune
+        a model this studio produced. One cache, one set of rules about what a
+        half-finished download counts as -- see runner/artifacts.
+        """
+        return artifacts.fetch(self.controller_url, self.token, job_id, log)
 
     def unload(self) -> None:
         with self.lock:
@@ -171,6 +153,16 @@ class ModelHost:
                                                               dtype=dtype, **extra)
         else:
             base = spec.get("base_model")
+            if base_job := spec.get("base_model_job"):
+                # The base can be another run in this studio rather than a
+                # Hugging Face id -- someone fine-tuned a model they built
+                # here. Fetched the same way the adapter was, unless what that
+                # run produced was itself an adapter, in which case the base
+                # is still the Hub model underneath it.
+                fetched = artifacts.fetch(self.controller_url, self.token,
+                                          base_job, log)
+                if not (fetched / "adapter_config.json").exists():
+                    base = str(fetched)
             if not base:
                 raise ValueError(
                     "This result is an adapter, which needs the model it was "
@@ -206,6 +198,33 @@ class ModelHost:
         log("Ready.")
 
     # --------------------------------------------------------- generating
+    def render(self, spec: dict, messages: list, reasoning: bool = False,
+               log: Callable[[str], None] = lambda _s: None) -> tuple[dict, str]:
+        """The exact text this model is given, and the format it came from.
+
+        Its own method because two callers need it and they must not drift: a
+        chat in the playground, and an evaluation scoring the same model. If
+        the evaluation rendered prompts even slightly differently, every score
+        it produced would describe a model nobody is actually talking to.
+        """
+        fmt = dict(spec.get("format") or {})
+        # A fine-tune trained with "the model's own format" stores a flag
+        # rather than the template text, because the tokenizer is the
+        # authoritative copy. Resolve it here, against the tokenizer that
+        # is loaded.
+        if fmt.get("use_model_template") and not fmt.get("chat_template"):
+            if self.chat_template:
+                fmt["chat_template"] = self.chat_template
+            else:
+                log("This model carries no chat template; using the plain "
+                    "conversation format instead.")
+        fmt.setdefault("specials", self.specials)
+        if reasoning:
+            fmt["reasoning"] = True
+        return fmt, formatting.render_prompt(messages, fmt,
+                                             tools=spec.get("tools"),
+                                             reasoning=reasoning)
+
     def cancel(self) -> None:
         self._cancel.set()
 
@@ -220,25 +239,8 @@ class ModelHost:
             model, tok = self.model, self.tok
             self.last_used = time.time()
 
-            fmt = dict(spec.get("format") or {})
-            # A fine-tune trained with "the model's own format" stores a flag
-            # rather than the template text, because the tokenizer is the
-            # authoritative copy. Resolve it here, against the tokenizer that
-            # is loaded.
-            if fmt.get("use_model_template") and not fmt.get("chat_template"):
-                if self.chat_template:
-                    fmt["chat_template"] = self.chat_template
-                else:
-                    log("This model carries no chat template; using the plain "
-                        "conversation format instead.")
-            fmt.setdefault("specials", self.specials)
-
             want_reasoning = bool(params.get("reasoning"))
-            if want_reasoning:
-                fmt["reasoning"] = True
-            text = formatting.render_prompt(messages, fmt,
-                                            tools=spec.get("tools"),
-                                            reasoning=want_reasoning)
+            fmt, text = self.render(spec, messages, want_reasoning, log)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
 
@@ -345,7 +347,4 @@ class ModelHost:
 
 
 def clear_cache(job_id: str | None = None) -> None:
-    if job_id:
-        shutil.rmtree(CACHE_DIR / job_id, ignore_errors=True)
-    else:
-        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    artifacts.clear(job_id)

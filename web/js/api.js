@@ -115,6 +115,28 @@ export const api = {
     req(`/api/datasets/${encodeURIComponent(id)}/publish`,
         { method: "POST", body: JSON.stringify(body) }),
 
+  // ---- evaluations -----------------------------------------------------
+  evals:       () => req("/api/evals"),
+  eval:        (id) => req(`/api/evals/${encodeURIComponent(id)}`),
+  createEval:  (body) => req("/api/evals", { method: "POST", body: JSON.stringify(body) }),
+  evalFromDataset: (body) =>
+    req("/api/evals/from-dataset", { method: "POST", body: JSON.stringify(body) }),
+  updateEval:  (id, body) =>
+    req(`/api/evals/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  copyEval:    (id, body) =>
+    req(`/api/evals/${encodeURIComponent(id)}/copy`,
+        { method: "POST", body: JSON.stringify(body || {}) }),
+  deleteEval:  (id) => req(`/api/evals/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  runEval:     (id, body) =>
+    req(`/api/evals/${encodeURIComponent(id)}/run`,
+        { method: "POST", body: JSON.stringify(body) }),
+  evalScores:  (id) => req(`/api/evals/${encodeURIComponent(id)}/scores`),
+  evalScore:   (id, scoreId) =>
+    req(`/api/evals/${encodeURIComponent(id)}/scores/${encodeURIComponent(scoreId)}`),
+  deleteScore: (id, scoreId) =>
+    req(`/api/evals/${encodeURIComponent(id)}/scores/${encodeURIComponent(scoreId)}`,
+        { method: "DELETE" }),
+
   status:      () => req("/api/status"),
   runners:     () => req("/api/runners"),
   reprobe:     (id) => req(`/api/runners/${encodeURIComponent(id)}/reprobe`, { method: "POST" }),
@@ -128,6 +150,12 @@ export const api = {
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
         { method: "POST", body: JSON.stringify({ save }) }),
   deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // Put a stopped or failed run back on the queue, to carry on from its
+  // checkpoint rather than from step one.
+  resumeJob:   (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
+  jobChatTemplate: (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/chat-template`),
   createJob:   (body) => req("/api/jobs", { method: "POST", body: JSON.stringify(body) }),
 
   starters:    () => req("/api/hub/starters"),

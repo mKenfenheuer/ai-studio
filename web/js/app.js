@@ -14,6 +14,9 @@ import { usersView } from "./views/users.js";
 import { dataView } from "./views/data.js";
 import { datasetView } from "./views/dataset.js";
 import { generateView } from "./views/generate.js";
+import { evalsView } from "./views/evals.js";
+import { evalView } from "./views/evalview.js";
+import { compareView } from "./views/compare.js";
 
 const routes = [
   [/^\/$/,             dashboardView, "dashboard"],
@@ -29,6 +32,9 @@ const routes = [
   [/^\/data$/,         dataView,      "data"],
   [/^\/data\/(.+)$/,   datasetView,   "data"],
   [/^\/generate$/,     generateView,  "data"],
+  [/^\/evals$/,        evalsView,     "evals"],
+  [/^\/evals\/(.+)$/,  evalView,      "evals"],
+  [/^\/compare$/,      compareView,   "evals"],
 ];
 
 // Who is signed in. Views read it rather than each fetching /api/me.

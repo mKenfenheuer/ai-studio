@@ -27,7 +27,10 @@ COPY common /app/common
 EXPOSE 8420
 VOLUME ["/data"]
 
+# /api/health, not /api/status. The latter needs a session and carries the
+# join token, so it answers 401 to a healthcheck and marks a working
+# controller unhealthy forever.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8420/api/status').status_code==200 else 1)"
+    CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8420/api/health').status_code==200 else 1)"
 
 ENTRYPOINT ["python", "-m", "controller"]

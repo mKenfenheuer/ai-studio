@@ -21,6 +21,10 @@ from .. import auth, config, db
 PUBLIC_PATHS = {
     # A runner authenticates with the join token over the socket itself.
     "/api/runner/ws",
+    # Liveness only, and it carries nothing. A healthcheck that needs a
+    # session is a healthcheck that reports every healthy controller as sick,
+    # which is exactly what happened here until this line existed.
+    "/api/health",
     # The login screen has to be able to ask what it is looking at: is this a
     # fresh install that needs its first account, or a studio to log in to?
     "/api/auth/state",
@@ -34,6 +38,9 @@ RUNNER_TOKEN_PATHS = (
     "/artifact",
     "/download",
     "/dataset-file",
+    # Read by the deploy script on the host, which has the join token in the
+    # same .env that starts the containers and has no browser session.
+    "/in-flight",
 )
 
 

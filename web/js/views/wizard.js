@@ -141,6 +141,13 @@ export async function wizardView(mount) {
   const state = {
     mode: "finetune", step: 0, goal: "instructions", runnerId: null,
     model: null, modelDetail: resource(),
+    // A base model that is one of this studio's own finished runs rather than
+    // a Hugging Face id. Kept beside `model` instead of inside it because the
+    // two are resolved completely differently -- one is downloaded from the
+    // Hub, the other is fetched from the controller with the join token -- and
+    // collapsing them into one string is how a job id ends up being passed to
+    // `from_pretrained`.
+    sourceRun: null, myModels: resource(), sourceTemplate: resource(),
     // The data step, shared by both paths.
     dataset: null, configs: resource(), config: null, split: "train",
     // A dataset from this studio's library rather than from the Hub. It is
@@ -335,6 +342,17 @@ function stepModel(body, ctx) {
     ensure(state.modelDetail, state.model,
            () => api.modelDetail(state.model), draw);
   }
+  // Exactly the runs that produced a usable model, already filtered to what
+  // this account may see -- the same list the playground offers, for the same
+  // reason.
+  ensure(state.myModels, "all", () => api.playground(), draw);
+  if (state.sourceRun) {
+    // The template that model carries, read out of its own tokenizer, so the
+    // preview shows the shape the run will actually train on rather than a
+    // generic rendering of it.
+    ensure(state.sourceTemplate, state.sourceRun.id,
+           () => api.jobChatTemplate(state.sourceRun.id), draw);
+  }
 
   body.innerHTML = html`
     <div class="card" style="margin-bottom:14px">
@@ -367,6 +385,8 @@ function stepModel(body, ctx) {
       }).join(""))}
     </div>
 
+    ${raw(ownModelPanel(state))}
+
     <details class="adv">
       <summary>Or search all of Hugging Face</summary>
       <div class="card" style="margin-top:10px">
@@ -382,7 +402,25 @@ function stepModel(body, ctx) {
 
   on(body, "click", "[data-model]", (_e, t) => {
     state.model = t.dataset.model;
+    state.sourceRun = null;
+    state.sourceTemplate = resource();
     state.modelDetail = resource();
+    state.ftPlan = resource();
+    draw();
+  });
+
+  on(body, "click", "[data-own-model]", (_e, t) => {
+    const own = (state.myModels.data || []).find((m) => m.id === t.dataset.ownModel);
+    state.sourceRun = own || null;
+    state.model = null;
+    state.modelDetail = resource();
+    state.sourceTemplate = resource();
+    state.ftPlan = resource();
+    draw();
+  });
+
+  on(body, "click", "#clearOwnModel", () => {
+    state.sourceRun = null;
     state.ftPlan = resource();
     draw();
   });
@@ -400,6 +438,61 @@ function stepModel(body, ctx) {
       </tr>`).join(""))}</tbody></table></div>`
       : `<span class="muted tiny">Nothing matched that search.</span>`;
   });
+}
+
+function ownModelPanel(state) {
+  const r = state.myModels;
+  const rows = (r.data || []).filter((m) => !m.stopped_early || m.kind);
+  if (state.sourceRun) {
+    const src = state.sourceRun;
+    const tmpl = state.sourceTemplate;
+    return html`
+      <div class="card callout-ok" style="margin-top:14px">
+        <div class="row-between" style="gap:8px;flex-wrap:wrap">
+          <div>
+            <h3 style="margin:0">Starting from your own model</h3>
+            <p class="muted tiny" style="margin:4px 0 0">
+              <strong>${src.name}</strong> —
+              ${src.kind === "pretrain_llm"
+                ? "a complete model this studio built. It becomes the base, and this run teaches it your task."
+                : "an adapter. This run carries on training it, keeping everything it already learned."}
+            </p>
+            ${raw(src.kind !== "pretrain_llm" ? html`
+              <p class="muted tiny" style="margin:4px 0 0">Its base model,
+                <code>${esc(src.base_model || "—")}</code>, stays the same.</p>` : "")}
+            ${raw(tmpl.status === "ready" && !tmpl.data.available ? html`
+              <p class="muted tiny" style="margin:4px 0 0">It carries no chat
+                template of its own, so the plain readable format is used.</p>` : "")}
+          </div>
+          <button class="btn-sm" id="clearOwnModel">Use a Hugging Face model instead</button>
+        </div>
+      </div>`;
+  }
+  if (r.status === "loading") return "";
+  if (!rows.length) return "";
+  return html`
+    <details class="adv" style="margin-top:14px">
+      <summary>Or start from one of your own models
+        <span class="muted tiny">(${rows.length})</span></summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        A model this studio produced can be a base like any other. For a model
+        built from scratch this teaches it your task; for a fine-tune it
+        carries the same adapter on with new data instead of starting a
+        second one.</p>
+      <div class="grid grid-2" style="margin-top:10px">
+        ${raw(rows.map((m) => html`
+          <button class="pick" data-own-model="${m.id}">
+            <span class="t">${m.name}
+              <span class="badge">${m.kind === "pretrain_llm"
+                ? "from scratch" : "adapter"}</span>
+              ${raw(m.stopped_early
+                ? `<span class="badge badge-warn">stopped early</span>` : "")}
+            </span>
+            <span class="d">${m.kind === "pretrain_llm"
+              ? (m.size || "built here") : (m.base_model || "")}</span>
+          </button>`).join(""))}
+      </div>
+    </details>`;
 }
 
 function modelInfo(state) {
@@ -954,6 +1047,10 @@ function selectorPanel(state) {
 function previewKey(state, scratch) {
   return JSON.stringify([state.dataset, state.config, state.split,
                          state.formatMode, state.textField, state.model,
+                         // Included, or switching to a studio model would keep
+                         // showing the preview built for the previous base.
+                         state.sourceRun?.id,
+                         state.sourceTemplate?.status,
                          state.templateSource, state.customTemplate,
                          state.chatFormat, state.teachReasoning,
                          state.selectors, state.roleMap]);
@@ -983,7 +1080,17 @@ function previewRequest(state, scratch) {
   // cannot have. Building the format here rather than per-path is what lets a
   // conversation dataset train a model from nothing and then be talked to in
   // the same shape afterwards.
-  if (!scratch && state.templateSource === "model") {
+  if (!scratch && state.templateSource === "model" && state.sourceRun) {
+    // The model is one of ours, so its template is text we already fetched
+    // rather than something the controller can look up by id. Training still
+    // records `use_model_template`, and the runner reads it back off the same
+    // tokenizer -- so what the preview shows and what trains agree.
+    const t = state.sourceTemplate;
+    if (t.status === "ready" && t.data.chat_template) {
+      fmt.mode = "jinja";
+      fmt.template = t.data.chat_template;
+    }
+  } else if (!scratch && state.templateSource === "model") {
     fmt.use_model_template = true;
   } else if (scratch && state.templateSource !== "custom" && state.previewIsChat) {
     // A named format carries its own Jinja and its own reserved tokens; the
@@ -1007,6 +1114,9 @@ function previewRequest(state, scratch) {
     // A plain-text corpus still names its column; a conversation does not.
     text_field: (scratch && state.templateSource === "builtin"
                  && !state.previewIsChat) ? state.textField : null,
+    // A studio model is not on the Hub, so there is nothing to look its
+    // template up by. Its template is passed as text instead, fetched from
+    // the run itself -- see the chat_template branch above.
     base_model: scratch ? null : state.model,
   };
 }
@@ -1414,7 +1524,7 @@ function stepReview(body, ctx) {
   const caps = runner?.capabilities || {};
 
   if (state.mode === "finetune") {
-    const key = `${state.runnerId}|${state.model}|${state.goal}`;
+    const key = `${state.runnerId}|${state.model}|${state.sourceRun?.id}|${state.goal}`;
     ensure(state.ftPlan, key, () => api.plan({
       runner_id: state.runnerId,
       params_b: state.modelDetail.data?.params_b ?? null,
@@ -1456,7 +1566,8 @@ function finetuneReview(state, runner, caps) {
       <h3 style="margin:0 0 8px">Ready to train</h3>
       <dl class="kv">
         <dt>Teaching it to</dt><dd>${(GOALS.find((g) => g.id === state.goal) || {}).title}</dd>
-        <dt>Starting from</dt><dd class="mono">${state.model}</dd>
+        <dt>Starting from</dt><dd class="mono">${state.sourceRun
+          ? state.sourceRun.name : state.model}</dd>
         <dt>Learning from</dt><dd class="mono">${state.dataset}${
           state.config ? " · " + state.config : ""} · ${state.split}</dd>
         <dt>Running on</dt><dd>${runner?.name} — ${caps.device_name || ""}</dd>
@@ -1522,7 +1633,9 @@ function finetuneReview(state, runner, caps) {
     <div class="field card">
       <label for="jobName">Name this run</label>
       <input type="text" id="jobName"
-             value="${String(state.model || "").split("/").pop()} on ${
+             value="${state.sourceRun
+               ? `${state.sourceRun.name} (continued)`
+               : String(state.model || "").split("/").pop()} on ${
                String(state.dataset || "").split("/").pop()}">
       <div class="hint">Just so you can find it later.</div>
     </div>`;
@@ -1771,7 +1884,8 @@ function wireNav(mount, ctx) {
            : state.blocked ? "Fix the problems above before starting." : null),
   ] : [
     () => (!state.runnerId ? "Choose a machine to continue." : null),
-    () => (!state.model ? "Choose a model to continue." : null),
+    () => (!state.model && !state.sourceRun
+           ? "Choose a model to continue." : null),
     () => (!state.dataset ? "Choose a dataset to continue." : null),
     () => (state.ftPlan.status !== "ready" ? "Working out the settings…"
            : state.blocked ? "Choose a smaller model to continue." : null),
@@ -1861,7 +1975,9 @@ function buildJob(mount, state) {
     name, kind: "finetune_llm",
     config: {
       ...dataBits,
-      base_model: state.model,
+      ...(state.sourceRun
+        ? { base_model_job: state.sourceRun.id }
+        : { base_model: state.model }),
       params_b: state.modelDetail.data?.params_b ?? null,
       goal: state.goal,
       required_runner: state.runnerId,

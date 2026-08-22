@@ -15,9 +15,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from common.formatting import format_example
+from runner import artifacts, checkpoints
 from runner.capabilities import expert_kernel
 
 from . import source
+
+# How much of the training set is held back to measure honestly. A fine-tune
+# had no held-out set at all until now, which meant the only number on screen
+# was the one that goes down when a model memorises as readily as when it
+# learns. Capped as well as proportioned: 5% of a 200k-row dataset is 10k rows
+# nobody needs to evaluate on, and every one of them is an example not trained.
+VAL_FRACTION = 0.05
+VAL_ROWS_MAX = 256
+VAL_ROWS_MIN = 8
 
 # LoRA adapts attention (and often MLP) projections. Names differ per
 # architecture, so we match against what the model actually contains rather
@@ -141,6 +151,29 @@ def run(cfg: dict, ctx: Any) -> dict:
     out_dir = Path(ctx.workdir) / "adapter"
     caps = ctx.capabilities
 
+    # A model this studio produced, used as the base for a new run. Two
+    # different things arrive here wearing the same setting, and they are told
+    # apart by what is actually in the directory rather than by what the
+    # controller claimed: a complete model becomes the base, and an adapter
+    # becomes an adapter to carry on training on top of the base it was built
+    # for. Guessing from the job kind would be one more thing to keep in step.
+    resume = checkpoints.peek(ctx.job_id) \
+        if cfg.get("checkpointing_enabled", True) else None
+    load_adapter = Path(resume["path"]) / "adapter" if resume else None
+    if base_job := cfg.get("base_model_job"):
+        fetched = artifacts.fetch(ctx.controller_url, ctx.runner_token,
+                                  base_job, ctx.log)
+        if (fetched / "adapter_config.json").exists():
+            if load_adapter is None:
+                load_adapter = fetched
+                ctx.log("Carrying on from the adapter that run produced, "
+                        "rather than starting a new one. It keeps everything "
+                        "it already learned and adds this data on top.")
+        else:
+            base_model = str(fetched)
+            ctx.log("Fine-tuning a model this studio built, not one from "
+                    "Hugging Face.")
+
     # ---- resolve settings against what this machine can actually do ----
     dtype_name = cfg.get("dtype") or caps.get("recommended_dtype", "float32")
     use_4bit = bool(cfg.get("quantization") == "4bit")
@@ -243,18 +276,31 @@ def run(cfg: dict, ctx: Any) -> dict:
                     "alone -- moving it sends tokens to experts that were "
                     "never trained on them.")
 
-    targets = cfg.get("target_modules") or _pick_target_modules(
-        model, moe, adapt_experts)
-    ctx.log("Applying LoRA to: %s" % ", ".join(targets))
-    lconf = LoraConfig(
-        r=int(cfg.get("lora_r", 16)),
-        lora_alpha=int(cfg.get("lora_alpha", 32)),
-        lora_dropout=float(cfg.get("lora_dropout", 0.05)),
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=targets,
-    )
-    model = get_peft_model(model, lconf)
+    if load_adapter is not None and (load_adapter / "adapter_config.json").exists():
+        from peft import PeftModel
+        # is_trainable is the whole difference between continuing a fine-tune
+        # and looking at one. Without it PEFT loads the adapter frozen, the
+        # optimiser is handed an empty parameter list, and the run completes
+        # having changed nothing at all -- successfully, and to no effect.
+        model = PeftModel.from_pretrained(model, str(load_adapter),
+                                          is_trainable=True)
+        targets = list(getattr(model.peft_config.get("default"),
+                               "target_modules", []) or [])
+        ctx.log("Continuing an existing adapter on: %s"
+                % (", ".join(sorted(targets)) or "its recorded layers"))
+    else:
+        targets = cfg.get("target_modules") or _pick_target_modules(
+            model, moe, adapt_experts)
+        ctx.log("Applying LoRA to: %s" % ", ".join(targets))
+        lconf = LoraConfig(
+            r=int(cfg.get("lora_r", 16)),
+            lora_alpha=int(cfg.get("lora_alpha", 32)),
+            lora_dropout=float(cfg.get("lora_dropout", 0.05)),
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=targets,
+        )
+        model = get_peft_model(model, lconf)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     ctx.log("Training %s of %s parameters (%.2f%%)"
@@ -334,6 +380,22 @@ def run(cfg: dict, ctx: Any) -> dict:
                 remove_columns=ds.column_names, desc="Tokenizing")
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
+    val_ds = None
+    want_val = min(VAL_ROWS_MAX,
+                   int(len(ds) * float(cfg.get("val_fraction", VAL_FRACTION))))
+    if want_val >= VAL_ROWS_MIN and len(ds) - want_val >= 16:
+        parts = ds.train_test_split(test_size=want_val, seed=1234)
+        ds, val_ds = parts["train"], parts["test"]
+        ctx.log("Holding back %d of the %d examples to measure on. The model "
+                "never trains on these, so their loss is the one that tells "
+                "you whether it is learning your task or memorising your "
+                "examples." % (want_val, want_val + len(ds)))
+    elif len(ds) >= 16:
+        ctx.log("This dataset is too small to hold any of it back for "
+                "measurement, so there is only a training loss to go on. A "
+                "falling training loss on %d examples can mean memorisation "
+                "rather than learning." % len(ds), "warn")
+
     # ---- training ------------------------------------------------------
     from torch.utils.data import DataLoader
 
@@ -343,8 +405,10 @@ def run(cfg: dict, ctx: Any) -> dict:
     lr = float(cfg.get("learning_rate", 2e-4))
 
     loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=bs) if val_ds is not None else None
     steps_per_epoch = max(1, math.ceil(len(loader) / accum))
     total_steps = int(cfg.get("max_steps") or max(1, int(steps_per_epoch * epochs)))
+    eval_every = int(cfg.get("eval_every") or max(5, total_steps // 20))
 
     params = [p for p in model.parameters() if p.requires_grad]
     if caps.get("quantization", {}).get("optim_8bit") and cfg.get("optim_8bit", True):
@@ -372,17 +436,70 @@ def run(cfg: dict, ctx: Any) -> dict:
         # process. Reset it, or this run reports the previous run's peak.
         torch.cuda.reset_peak_memory_stats()
 
+    prior = _resume_state(resume, ctx, opt, scaler, use_scaler, torch) if resume else {}
+    start_step = int(prior.get("step") or 0)
+    if start_step:
+        ctx.log("Carrying on from the checkpoint at step %d of %d."
+                % (start_step, total_steps))
+        # Said plainly rather than left for someone to deduce from a chart.
+        # The weights and the optimiser come back exactly; the order the
+        # examples arrive in does not, because the loader reshuffles every
+        # epoch anyway. It changes nothing about the result and it would be
+        # dishonest to imply the resume is bit-for-bit.
+        ctx.log("The examples will be shuffled fresh rather than continuing "
+                "the exact order of the interrupted attempt. The adapter and "
+                "the optimiser resume exactly; only the order differs.")
+
     ctx.log("Starting training: %d steps, batch %d x %d accumulation, lr %.2e"
             % (total_steps, bs, accum, lr))
-    ctx.progress(0, total_steps, stage="training")
+    ctx.progress(start_step, total_steps, stage="training")
+
+    @torch.no_grad()
+    def evaluate() -> float | None:
+        """Loss on the examples the model never trains on."""
+        if val_loader is None:
+            return None
+        model.eval()
+        total, n = 0.0, 0
+        for vb in val_loader:
+            vb = {k: v.to(device) for k, v in vb.items()}
+            with torch.amp.autocast("cuda", dtype=torch_dtype,
+                                    enabled=device == "cuda"
+                                    and torch_dtype != torch.float32):
+                total += float(model(**vb).loss)
+            n += 1
+        model.train()
+        return total / max(n, 1)
 
     model.train()
-    step = 0
+    step = start_step
     micro = 0
     running: list[float] = []
+    first_loss = prior.get("first_loss")
+    best_val = prior.get("best_val")
+    last_val = None
+    prior_seconds = float(prior.get("duration_s") or 0.0)
     t_start = time.time()
     stop = False
     stopped_early = False
+    # One-element lists rather than plain names: these are written from inside
+    # the loop body and read after it, and a bare assignment there would shadow
+    # rather than update if this ever moves into a closure.
+    warned_overfit = [False]
+    best_val_step = [0]
+    saver = checkpoints.Saver(
+        ctx.job_id, ctx, every_s=float(cfg.get("checkpoint_every_s") or 600),
+        enabled=bool(cfg.get("checkpointing_enabled", True)))
+
+    def write_checkpoint(path):
+        model.save_pretrained(str(path / "adapter"))
+        torch.save({"optimizer": opt.state_dict(),
+                    "scaler": scaler.state_dict() if use_scaler else None},
+                   str(path / "trainer.pt"))
+        (path / "train.json").write_text(json.dumps({
+            "first_loss": first_loss, "best_val": best_val,
+            "duration_s": prior_seconds + (time.time() - t_start),
+        }), encoding="utf-8")
 
     while not stop:
         for batch in loader:
@@ -415,17 +532,45 @@ def run(cfg: dict, ctx: Any) -> dict:
 
             window = running[-accum:]
             avg = sum(window) / len(window)
+            if first_loss is None:
+                first_loss = avg
+            done_now = step - start_step
             elapsed = time.time() - t_start
+
+            if step % eval_every == 0 or step == total_steps:
+                last_val = evaluate()
+                if last_val is not None:
+                    best_val = last_val if best_val is None else min(best_val, last_val)
+                    if last_val > best_val * 1.05 and not warned_overfit[0]:
+                        warned_overfit[0] = True
+                        ctx.log("The held-out loss has started rising while the "
+                                "training loss falls. That is the model "
+                                "memorising your examples rather than learning "
+                                "from them -- the best result was at the low "
+                                "point, around step %d. Fewer passes, or more "
+                                "data, would help." % best_val_step[0], "warn")
+                    elif last_val == best_val:
+                        best_val_step[0] = step
+
             ctx.metric(step, {
                 "loss": round(avg, 5),
+                "val_loss": round(last_val, 5) if last_val is not None else None,
                 "perplexity": round(min(math.exp(min(avg, 20)), 1e6), 3),
                 "learning_rate": lr_at(step),
-                "steps_per_sec": round(step / max(elapsed, 1e-6), 3),
+                # Rates describe this attempt, not the resumed step number
+                # divided by the time since this process started.
+                "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
                 "vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
                 if device == "cuda" else None,
-                "eta_s": round((total_steps - step) * elapsed / max(step, 1)),
+                "eta_s": round((total_steps - step) * elapsed / max(done_now, 1)),
             })
+            last_val = None
             ctx.progress(step, total_steps, stage="training")
+
+            if saver.due(step):
+                saver.write(step, total_steps, write_checkpoint,
+                            {"kind": "finetune_llm", "loss": round(avg, 5)})
+                ctx.emit_meta({"checkpoint": {"step": step, "total": total_steps}})
 
             if ctx.should_cancel():
                 # An adapter stopped partway is still a usable adapter -- less
@@ -455,12 +600,20 @@ def run(cfg: dict, ctx: Any) -> dict:
     tok.save_pretrained(str(out_dir))
 
     summary = {
+        "kind": "finetune_llm",
         "final_loss": round(running[-1], 5) if running else None,
-        "initial_loss": round(running[0], 5) if running else None,
+        "initial_loss": round(first_loss, 5) if first_loss is not None else None,
+        # The number that answers "is this one better than last week's". A
+        # training loss cannot, because it falls just as happily when the model
+        # is memorising the examples it is being scored on.
+        "best_val_loss": round(best_val, 5) if best_val is not None else None,
+        "held_out_rows": len(val_ds) if val_ds is not None else 0,
         "steps": step,
         "planned_steps": total_steps,
         "stopped_early": stopped_early,
-        "duration_s": round(time.time() - t_start, 1),
+        "resumed_from_step": start_step or None,
+        "continued_from": cfg.get("base_model_job"),
+        "duration_s": round(prior_seconds + (time.time() - t_start), 1),
         "trainable_params": trainable,
         "base_model": base_model,
         "dtype": dtype_name,
@@ -477,4 +630,30 @@ def run(cfg: dict, ctx: Any) -> dict:
             % ("Stopped early." if stopped_early else "Done.",
                summary["initial_loss"] or 0, summary["final_loss"] or 0, step,
                " of the %d planned" % total_steps if stopped_early else ""))
+    if summary["best_val_loss"] is not None:
+        ctx.log("Best held-out loss %.4f, on %d examples it never trained on. "
+                "That is the number to compare against another run."
+                % (summary["best_val_loss"], summary["held_out_rows"]))
     return summary
+
+
+def _resume_state(resume: dict, ctx: Any, opt, scaler, use_scaler: bool,
+                  torch) -> dict:
+    """Read back an interrupted fine-tune. A broken one starts over, loudly."""
+    path = Path(resume["path"])
+    try:
+        out = json.loads((path / "train.json").read_text(encoding="utf-8"))
+        # weights_only=False: this holds an optimiser state, not just tensors.
+        # Written by this runner into its own data volume minutes ago.
+        blob = torch.load(str(path / "trainer.pt"), map_location="cpu",
+                          weights_only=False)
+        if blob.get("optimizer"):
+            opt.load_state_dict(blob["optimizer"])
+        if use_scaler and blob.get("scaler"):
+            scaler.load_state_dict(blob["scaler"])
+    except Exception as e:  # noqa: BLE001 - any failure means "start over"
+        ctx.log("The checkpoint for this run could not be read (%s), so it "
+                "starts again from the beginning." % e, "warn")
+        return {}
+    out["step"] = int(resume.get("step") or 0)
+    return out

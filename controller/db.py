@@ -131,6 +131,34 @@ CREATE TABLE IF NOT EXISTS shares (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_unique
     ON shares(resource_type, resource_id, subject_type, IFNULL(subject_id,''));
 CREATE INDEX IF NOT EXISTS idx_shares_subject ON shares(subject_type, subject_id);
+
+-- A saved set of prompts, kept so that "is this week's model better than last
+-- week's" has an answer that does not depend on remembering what you typed.
+-- The prompts are the fixed part of the experiment; the models change.
+CREATE TABLE IF NOT EXISTS evals (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    name        TEXT NOT NULL,
+    notes       TEXT,
+    items       TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evals_owner ON evals(owner_id);
+
+-- One row per (prompt set, model) scoring. Kept rather than derived from the
+-- evaluation run's artifact, because the comparison across weeks is the whole
+-- point and it has to survive the run that produced it being deleted.
+CREATE TABLE IF NOT EXISTS eval_scores (
+    id            TEXT PRIMARY KEY,
+    eval_id       TEXT NOT NULL,
+    model_job_id  TEXT NOT NULL,
+    run_job_id    TEXT,
+    created_at    REAL NOT NULL,
+    metrics       TEXT NOT NULL,
+    items         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_eval_scores ON eval_scores(eval_id, created_at);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -138,6 +166,16 @@ CREATE INDEX IF NOT EXISTS idx_shares_subject ON shares(subject_type, subject_id
 # each one is attempted and its "duplicate column" complaint ignored.
 _ADDED_COLUMNS = [
     ("jobs", "owner_id", "TEXT"),
+    # What the run reported when it ended. It was already written into the log
+    # as JSON, which was fine for reading one run and useless for comparing
+    # twenty: answering "which of these had the lowest held-out loss" meant
+    # parsing prose out of a log table.
+    ("jobs", "summary", "TEXT"),
+    # The furthest step a checkpoint exists for, and the machine holding it.
+    # Persisted rather than kept in memory so that a controller restart does
+    # not lose the one fact that decides whether a run resumes or starts over.
+    ("jobs", "checkpoint_step", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "checkpoint_runner", "TEXT"),
 ]
 
 _conn: sqlite3.Connection | None = None
@@ -242,6 +280,11 @@ def create_job(name: str, kind: str, cfg: dict, owner_id: str | None = None) -> 
 
 def _hydrate(r: dict) -> dict:
     r["config"] = json.loads(r["config"])
+    if r.get("summary"):
+        try:
+            r["summary"] = json.loads(r["summary"])
+        except (TypeError, ValueError):
+            r["summary"] = None
     return r
 
 
@@ -326,9 +369,60 @@ def requeue_jobs_for_runner(runner_id: str) -> tuple[list[str], list[str]]:
                " WHERE id=?", (now(), jid))
             rescued.append(jid)
         else:
-            ex("UPDATE jobs SET status='queued', runner_id=NULL, step=0 WHERE id=?", (jid,))
+            # step goes back to wherever a checkpoint exists, not to zero. The
+            # runner that holds it keeps its name on the row so the scheduler
+            # can send the work back to the one machine that can carry on
+            # rather than to whichever is free first.
+            ex("UPDATE jobs SET status='queued', runner_id=NULL,"
+               " step=COALESCE(checkpoint_step,0) WHERE id=?", (jid,))
             requeued.append(jid)
     return requeued, rescued
+
+
+def set_job_summary(job_id: str, summary: dict) -> None:
+    ex("UPDATE jobs SET summary=? WHERE id=?", (json.dumps(summary), job_id))
+
+
+def set_checkpoint(job_id: str, step: int, runner_id: str | None) -> None:
+    ex("UPDATE jobs SET checkpoint_step=?, checkpoint_runner=? WHERE id=?",
+       (int(step), runner_id, job_id))
+
+
+def clear_checkpoint(job_id: str) -> None:
+    ex("UPDATE jobs SET checkpoint_step=0, checkpoint_runner=NULL WHERE id=?",
+       (job_id,))
+
+
+def jobs_with_checkpoint_on(runner_id: str) -> list[str]:
+    return [r["id"] for r in q(
+        "SELECT id FROM jobs WHERE checkpoint_runner=? AND checkpoint_step>0",
+        (runner_id,))]
+
+
+def gpu_seconds_by_owner(window_s: float = 86400.0) -> dict[str | None, float]:
+    """How much machine time each person has had lately.
+
+    Counts only the part of each run that falls inside the window, and counts a
+    run still going as running up to now -- otherwise somebody eight hours into
+    an overnight job registers as having used nothing at all, which is the
+    exact case fair queueing exists for.
+    """
+    cutoff = now() - window_s
+    out: dict[str | None, float] = {}
+    rows = q("SELECT owner_id, started_at, finished_at FROM jobs"
+             " WHERE started_at IS NOT NULL"
+             "   AND COALESCE(finished_at, ?) > ?", (now(), cutoff))
+    for r in rows:
+        start = max(float(r["started_at"]), cutoff)
+        end = float(r["finished_at"] or now())
+        out[r["owner_id"]] = out.get(r["owner_id"], 0.0) + max(0.0, end - start)
+    return out
+
+
+def running_by_owner() -> dict[str | None, int]:
+    rows = q("SELECT owner_id, COUNT(*) AS n FROM jobs"
+             " WHERE status IN ('assigned','running') GROUP BY owner_id")
+    return {r["owner_id"]: int(r["n"]) for r in rows}
 
 
 # ------------------------------------------------- metrics / logs / files
@@ -345,6 +439,21 @@ def count_metrics(job_id: str) -> int:
 def clear_metrics(job_id: str) -> None:
     """Drop the measurements of an attempt that is being redone."""
     ex("DELETE FROM metrics WHERE job_id=?", (job_id,))
+
+
+def trim_metrics(job_id: str, after_step: int) -> int:
+    """Drop only the measurements past where a resumed run picks up.
+
+    A run that carries on from step 120 has a real curve up to 120 and a set of
+    readings from 121 onward belonging to an attempt that no longer exists.
+    Clearing everything would throw away the half of the chart that is still
+    true; keeping everything would draw the curve doubling back on itself.
+    """
+    c = connect()
+    cur = c.execute("DELETE FROM metrics WHERE job_id=? AND step > ?",
+                    (job_id, int(after_step)))
+    c.commit()
+    return cur.rowcount
 
 
 def get_metrics(job_id: str) -> list[dict]:
@@ -676,3 +785,118 @@ def visible_datasets(user: dict) -> list[dict]:
         r["mine"] = r["owner_id"] == user["id"]
         out.append(_hydrate_dataset(r))
     return out
+
+
+# ===========================================================================
+# Evaluations
+# ===========================================================================
+#
+# An "eval" here is a saved set of prompts, not a score. The score belongs to
+# the pair (prompt set, model) and lives in eval_scores, because the same
+# prompts are meant to be re-run against next week's model -- that is the
+# entire reason for saving them rather than typing them into the playground.
+
+def create_eval(owner_id: str | None, name: str, items: list[dict],
+                notes: str = "") -> str:
+    eid = new_id("ev")
+    ts = now()
+    ex("INSERT INTO evals (id,owner_id,name,notes,items,created_at,updated_at)"
+       " VALUES (?,?,?,?,?,?,?)",
+       (eid, owner_id, name, notes, json.dumps(items), ts, ts))
+    return eid
+
+
+def _hydrate_eval(r: dict) -> dict:
+    r["items"] = json.loads(r.get("items") or "[]")
+    return r
+
+
+def get_eval(eval_id: str) -> dict | None:
+    r = q1("SELECT * FROM evals WHERE id=?", (eval_id,))
+    return _hydrate_eval(r) if r else None
+
+
+def update_eval(eval_id: str, **fields: Any) -> None:
+    allowed = {"name", "notes", "items"}
+    sets, args = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError("refusing to update unknown column %r" % k)
+        sets.append("%s=?" % k)
+        args.append(json.dumps(v) if k == "items" else v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    args += [now(), eval_id]
+    ex("UPDATE evals SET %s WHERE id=?" % ",".join(sets), args)
+
+
+def delete_eval(eval_id: str) -> None:
+    c = connect()
+    c.execute("DELETE FROM eval_scores WHERE eval_id=?", (eval_id,))
+    c.execute("DELETE FROM evals WHERE id=?", (eval_id,))
+    c.commit()
+
+
+def visible_evals(user: dict) -> list[dict]:
+    where, args = _visible_clause(user, "eval", "e")
+    rows = q("SELECT e.*, u.display_name AS owner_name, u.username AS owner_username,"
+             " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='eval'"
+             "        AND s.resource_id = e.id) AS is_shared,"
+             " (SELECT COUNT(*) FROM eval_scores sc WHERE sc.eval_id = e.id)"
+             "   AS score_count"
+             " FROM evals e LEFT JOIN users u ON u.id = e.owner_id"
+             " WHERE " + where + " ORDER BY e.updated_at DESC", args)
+    out = []
+    for r in rows:
+        r["is_shared"] = bool(r["is_shared"])
+        r["mine"] = r["owner_id"] == user["id"]
+        out.append(_hydrate_eval(r))
+    return out
+
+
+def record_score(eval_id: str, model_job_id: str, run_job_id: str | None,
+                 metrics: dict, items: list[dict] | None) -> str:
+    sid = new_id("scr")
+    ex("INSERT INTO eval_scores (id,eval_id,model_job_id,run_job_id,created_at,"
+       "metrics,items) VALUES (?,?,?,?,?,?,?)",
+       (sid, eval_id, model_job_id, run_job_id, now(), json.dumps(metrics),
+        json.dumps(items or [])))
+    return sid
+
+
+def list_scores(eval_id: str, with_items: bool = False) -> list[dict]:
+    """Every scoring of this prompt set, newest first, one row per model run.
+
+    Joined against the job so a score keeps its meaning after the model it
+    describes has been renamed -- and so a deleted run shows as a score with
+    no run behind it rather than as a dangling id.
+    """
+    rows = q("SELECT sc.*, j.name AS model_name, j.kind AS model_kind,"
+             " j.finished_at AS model_finished_at, j.summary AS model_summary"
+             " FROM eval_scores sc LEFT JOIN jobs j ON j.id = sc.model_job_id"
+             " WHERE sc.eval_id=? ORDER BY sc.created_at DESC", (eval_id,))
+    out = []
+    for r in rows:
+        r["metrics"] = json.loads(r["metrics"] or "{}")
+        r["items"] = json.loads(r["items"] or "[]") if with_items else []
+        if r.get("model_summary"):
+            try:
+                r["model_summary"] = json.loads(r["model_summary"])
+            except (TypeError, ValueError):
+                r["model_summary"] = None
+        out.append(r)
+    return out
+
+
+def get_score(score_id: str) -> dict | None:
+    r = q1("SELECT * FROM eval_scores WHERE id=?", (score_id,))
+    if not r:
+        return None
+    r["metrics"] = json.loads(r["metrics"] or "{}")
+    r["items"] = json.loads(r["items"] or "[]")
+    return r
+
+
+def delete_score(score_id: str) -> None:
+    ex("DELETE FROM eval_scores WHERE id=?", (score_id,))

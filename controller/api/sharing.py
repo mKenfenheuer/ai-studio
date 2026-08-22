@@ -18,13 +18,14 @@ from .security import current_user, require_owner
 
 router = APIRouter(prefix="/api")
 
-KINDS = {"job": "run", "dataset": "dataset"}
+KINDS = {"job": "run", "dataset": "dataset", "eval": "prompt set"}
 
 
 def _resource(kind: str, resource_id: str) -> dict:
     if kind not in KINDS:
         raise HTTPException(404, "Nothing of that kind can be shared.")
-    row = db.get_job(resource_id) if kind == "job" else db.get_dataset(resource_id)
+    row = {"job": db.get_job, "dataset": db.get_dataset,
+           "eval": db.get_eval}[kind](resource_id)
     if not row:
         raise HTTPException(404, "No such %s." % KINDS[kind])
     return row
@@ -100,7 +101,7 @@ async def transfer(request: Request, kind: str, resource_id: str,
     if not target["active"]:
         raise HTTPException(400, "That account is disabled.")
 
-    table = "jobs" if kind == "job" else "datasets"
+    table = {"job": "jobs", "dataset": "datasets", "eval": "evals"}[kind]
     db.ex("UPDATE %s SET owner_id=? WHERE id=?" % table, (target["id"], resource_id))
     db.unshare(kind, resource_id, "user", target["id"])
     if row.get("owner_id") and row["owner_id"] != target["id"]:

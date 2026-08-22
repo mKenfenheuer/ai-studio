@@ -14,6 +14,12 @@ from fastapi import WebSocket
 
 from . import architectures, db, hub
 
+# How long a queued job waits for the machine holding its checkpoint before
+# giving up on the progress and running somewhere else. A container restart
+# takes seconds; ten minutes of silence means the machine is not coming back
+# in time to be worth waiting for.
+CHECKPOINT_WAIT_S = 600
+
 
 class Fleet:
     def __init__(self) -> None:
@@ -28,6 +34,9 @@ class Fleet:
         # Jobs already told the user they are waiting, so a queue that has to
         # wait an hour does not write an hour of identical log lines.
         self.declined: set[str] = set()
+        # runner_id -> the jobs that machine could carry on from a checkpoint.
+        self.checkpoints: dict[str, set[str]] = {}
+        self.gave_up_waiting: set[str] = set()
         self._wake = asyncio.Event()
 
     # ------------------------------------------------------------ plumbing
@@ -38,6 +47,11 @@ class Fleet:
         self.connections.pop(runner_id, None)
         self.busy.pop(runner_id, None)
         self.dispatched_at.pop(runner_id, None)
+        # Deliberately NOT clearing self.checkpoints here. The commonest reason
+        # a socket closes is a restart, and the disk that holds the checkpoints
+        # is still there. What the scheduler needs to know is "is that machine
+        # reachable", which it reads from self.connections; forgetting what the
+        # machine holds would only make the run start over once it came back.
 
     def wake(self) -> None:
         self._wake.set()
@@ -162,6 +176,77 @@ class Fleet:
                 pass
             self._wake.clear()
 
+    def fair_order(self, queued: list[dict]) -> list[dict]:
+        """The queue, rearranged so one person cannot hold up everyone else.
+
+        Strict first-come-first-served is the obvious rule and the wrong one
+        for a shared machine: somebody who queues eight overnight runs at five
+        o'clock owns the GPU until morning, and a colleague with a twenty-
+        minute job waits behind all eight. It is not that the eight runs are
+        unreasonable -- it is that "queued first" stopped being a fair way to
+        choose between people once there was more than one person.
+
+        So the queue is dealt round-robin between owners, one job each per
+        pass, and the order of the owners themselves is decided by who is
+        using the studio least right now: fewest runs in flight, then least
+        machine time in the last day, then longest wait as the tiebreak. A
+        single user sees exactly first-come-first-served, because with one
+        owner the round-robin degenerates to the original order.
+        """
+        if len({j.get("owner_id") for j in queued}) < 2:
+            return queued
+
+        running = db.running_by_owner()
+        used = db.gpu_seconds_by_owner()
+        groups: dict[Any, list[dict]] = {}
+        for j in queued:                       # already oldest-first
+            groups.setdefault(j.get("owner_id"), []).append(j)
+
+        owners = sorted(groups, key=lambda o: (running.get(o, 0),
+                                               used.get(o, 0.0),
+                                               groups[o][0]["created_at"]))
+        out: list[dict] = []
+        for i in range(max(len(v) for v in groups.values())):
+            for owner in owners:
+                if i < len(groups[owner]):
+                    out.append(groups[owner][i])
+        return out
+
+    def holder_of(self, job: dict) -> str | None:
+        """The machine that alone can carry this job on, or None.
+
+        A checkpoint is a directory on one runner's disk. Handing the job to a
+        different machine does not fail -- it quietly starts from the
+        beginning, which is the exact outcome checkpoints exist to prevent.
+        """
+        if not int(job.get("checkpoint_step") or 0):
+            return None
+        return job.get("checkpoint_runner") or None
+
+    def _eligible(self, job: dict, idle: list[str]) -> list[str]:
+        """Which of the idle machines may take this job."""
+        holder = self.holder_of(job)
+        if not holder:
+            return idle
+        if holder in idle:
+            return [holder]
+        if holder in self.connections:
+            return []          # connected but busy: worth waiting for
+        runner = db.get_runner(holder)
+        silent_for = time.time() - float((runner or {}).get("last_seen") or 0)
+        if silent_for < CHECKPOINT_WAIT_S:
+            return []          # probably restarting; it will be back
+        # Genuinely gone. Give up on the progress rather than the run.
+        if job["id"] not in self.gave_up_waiting:
+            self.gave_up_waiting.add(job["id"])
+            db.add_log(job["id"], "The machine holding this run's checkpoint "
+                       "(%s) has been away for %d minutes, so the run will "
+                       "start from the beginning on whichever machine is free."
+                       % ((runner or {}).get("name", "unknown"),
+                          silent_for // 60), "warn")
+        db.clear_checkpoint(job["id"])
+        return idle
+
     async def _dispatch_once(self) -> None:
         queued = db.queued_jobs()
         if not queued:
@@ -170,8 +255,8 @@ class Fleet:
         if not idle:
             return
 
-        for job in queued:
-            for runner_id in list(idle):
+        for job in self.fair_order(queued):
+            for runner_id in self._eligible(job, list(idle)):
                 runner = db.get_runner(runner_id)
                 if not runner:
                     continue
@@ -199,6 +284,47 @@ class Fleet:
                 await self.broadcast_ui({"type": "jobs_changed", "job_id": job["id"]})
                 break
 
+    def note_checkpoints(self, runner_id: str, job_ids: list[str]) -> None:
+        """Record what a machine can resume, and reconcile it with the database.
+
+        Both directions matter. A checkpoint the controller forgot (its
+        database was restored from a backup, or the column was added after the
+        run started) is recovered from the machine that has it. A checkpoint
+        the machine no longer has -- someone cleared the volume -- stops being
+        promised to a queued job that would then wait for it forever.
+        """
+        held = set(job_ids or [])
+        self.checkpoints[runner_id] = held
+        for jid in db.jobs_with_checkpoint_on(runner_id):
+            if jid not in held:
+                db.clear_checkpoint(jid)
+                db.add_log(jid, "The checkpoint for this run is no longer on "
+                           "%s, so starting it again would start from the "
+                           "beginning."
+                           % (db.get_runner(runner_id) or {}).get("name", "that machine"),
+                           "warn")
+
+    def queue_positions(self) -> dict[str, int]:
+        """Where each waiting job sits in the order work will actually be
+        handed out in. Shown in the UI, because a queue nobody can see the
+        shape of is indistinguishable from a queue that is stuck."""
+        return {j["id"]: i + 1 for i, j in enumerate(self.fair_order(db.queued_jobs()))}
+
+    def in_flight(self) -> list[dict]:
+        """Work that would be lost, or interrupted, by restarting right now."""
+        out = []
+        for job in db.q("SELECT * FROM jobs WHERE status IN ('assigned','running')"):
+            runner = db.get_runner(job["runner_id"]) if job["runner_id"] else None
+            out.append({
+                "id": job["id"], "name": job["name"], "kind": job["kind"],
+                "status": job["status"], "step": job["step"],
+                "total_steps": job["total_steps"],
+                "runner_id": job["runner_id"],
+                "runner": (runner or {}).get("name"),
+                "checkpoint_step": job["checkpoint_step"] or 0,
+            })
+        return out
+
     # ----------------------------------------------------- runner messages
     async def handle_runner_message(self, runner_id: str, msg: dict) -> None:
         kind = msg.get("type")
@@ -217,6 +343,8 @@ class Fleet:
 
         if kind == "heartbeat":
             db.touch_runner(runner_id, "busy" if msg.get("busy") else "online")
+            if (held := msg.get("checkpoints")) is not None:
+                self.note_checkpoints(runner_id, held)
             # The runner is the authority on what it is doing. Deriving this
             # from dispatch bookkeeping alone loses track the moment the
             # controller restarts, and then hands work to a machine that is
@@ -256,7 +384,19 @@ class Fleet:
             # for every step, so the chart draws itself backwards and the
             # "latest" reading comes from a run that no longer exists. The logs
             # keep the history; the measurements describe the live attempt.
-            if db.count_metrics(jid):
+            #
+            # A *resumed* attempt is the opposite case: the readings up to the
+            # checkpoint describe this run and are still true, and only the
+            # ones past it belong to the attempt that was lost.
+            resume_step = int(msg.get("resume_step") or 0)
+            if resume_step:
+                dropped = db.trim_metrics(jid, resume_step)
+                db.add_log(jid, "Carrying on from the checkpoint at step %d.%s"
+                           % (resume_step,
+                              " The %d readings from past that point belonged "
+                              "to the interrupted attempt and have been "
+                              "cleared." % dropped if dropped else ""))
+            elif db.count_metrics(jid):
                 db.clear_metrics(jid)
                 db.add_log(jid, "Starting again from the beginning; the "
                                 "measurements from the interrupted attempt "
@@ -294,7 +434,16 @@ class Fleet:
 
         elif kind == "job_meta":
             meta = msg.get("meta", {})
-            if sample := meta.get("sample"):
+            if ckpt := meta.get("checkpoint"):
+                # Persisted, not merely noted. This one fact decides whether an
+                # interrupted run resumes or starts over, and keeping it only
+                # in memory would lose it to the very controller restart that
+                # tends to cause the interruption.
+                db.set_checkpoint(jid, int(ckpt.get("step") or 0), runner_id)
+                self.checkpoints.setdefault(runner_id, set()).add(jid)
+                await self.broadcast_ui({"type": "job_checkpoint", "job_id": jid,
+                                         "step": int(ckpt.get("step") or 0)})
+            elif sample := meta.get("sample"):
                 # Generated text gets its own channel rather than being buried
                 # in the log. Watching noise turn into sentences is the clearest
                 # signal a from-scratch run gives that it is working, so it is
@@ -310,6 +459,24 @@ class Fleet:
         elif kind == "job_done":
             db.set_job_status(jid, "succeeded")
             summary = msg.get("summary") or {}
+            if summary.get("kind") == "evaluate":
+                # The per-prompt answers are filed against the prompt set, so
+                # the comparison outlives this run. Only the headline stays on
+                # the job, or a fifty-prompt scoring would put a megabyte of
+                # generated text in the jobs table.
+                from .api import evals
+                written = evals.record_scores(db.get_job(jid) or {"id": jid},
+                                              summary)
+                summary = {**summary,
+                           "scores": [{k: v for k, v in s.items() if k != "items"}
+                                      for s in summary.get("scores") or []]}
+                if written:
+                    db.add_log(jid, "Recorded %d score%s against the prompt "
+                               "set, ready to compare with later runs."
+                               % (written, "" if written == 1 else "s"))
+            db.set_job_summary(jid, summary)
+            db.clear_checkpoint(jid)
+            self.checkpoints.get(runner_id, set()).discard(jid)
             db.add_log(jid, "Finished successfully. %s" % json.dumps(summary)[:600])
             self.busy.pop(runner_id, None)
             db.touch_runner(runner_id, "online")
@@ -325,10 +492,14 @@ class Fleet:
             if summary := msg.get("summary"):
                 # A stopped run that kept its model has the same summary a
                 # finished one does, and everything downstream -- the
-                # playground, the download, the stats panel -- reads it from
-                # the log the same way.
+                # playground, the download, the stats panel, the comparison
+                # table -- reads it the same way.
+                db.set_job_summary(jid, summary)
                 db.add_log(jid, "Stopped, and the model was kept. %s"
                            % json.dumps(summary)[:600])
+            if kind == "job_cancelled":
+                db.clear_checkpoint(jid)
+                self.checkpoints.get(runner_id, set()).discard(jid)
             if tb := msg.get("traceback"):
                 db.add_log(jid, tb, "debug")
             self.busy.pop(runner_id, None)

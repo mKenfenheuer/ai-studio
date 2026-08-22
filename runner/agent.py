@@ -23,8 +23,8 @@ from typing import Any
 import httpx
 import websockets
 
-from . import capabilities, inference
-from .jobs import generate_data, lora_llm, scratch_llm
+from . import capabilities, checkpoints, inference
+from .jobs import evaluate, generate_data, lora_llm, scratch_llm
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -38,6 +38,10 @@ JOB_HANDLERS = {
     # progress, logs and a stop button, so it is a job like the others rather
     # than a script bolted to the side.
     "generate_dataset": generate_data.run,
+    # Same reasoning: scoring ten models on fifty prompts is an hour of GPU
+    # time, and it belongs in the queue with everything else competing for
+    # the same card.
+    "evaluate": evaluate.run,
 }
 
 
@@ -138,6 +142,9 @@ class Runner:
         return base + "/api/runner/ws"
 
     async def start(self) -> None:
+        if dropped := checkpoints.prune():
+            print("[runner] forgot %d checkpoint(s) nobody came back for: %s"
+                  % (len(dropped), ", ".join(dropped)))
         print("[runner] probing hardware, this takes a moment...")
         self.caps = await asyncio.get_event_loop().run_in_executor(None, capabilities.probe)
         print("[runner] %s | %s | %s" % (
@@ -168,6 +175,12 @@ class Runner:
                 "runner_id": self.runner_id,
                 "name": self.name,
                 "capabilities": self.caps,
+                # Which interrupted runs this machine can carry on. Sent on
+                # every connect, because the controller has no other way to
+                # know: a checkpoint is a directory on this disk, and sending
+                # the work to a machine that does not have it means starting
+                # from noise.
+                "checkpoints": checkpoints.list_ids(),
             }))
             first = json.loads(await ws.recv())
             if first.get("type") == "error":
@@ -206,11 +219,16 @@ class Runner:
             elif kind == "purge_model":
                 # The run was deleted. Drop the cached copy so the disk space
                 # actually comes back, and let go of it first if it happens to
-                # be the model currently loaded.
+                # be the model currently loaded. Its checkpoint goes too --
+                # keeping the ability to resume a run that no longer exists
+                # would be several gigabytes held for nothing.
                 if self.host:
                     if self.host.loaded_id == msg.get("job_id"):
                         self.host.unload()
                     inference.clear_cache(msg.get("job_id"))
+                checkpoints.discard(msg.get("job_id") or "")
+            elif kind == "discard_checkpoint":
+                checkpoints.discard(msg.get("job_id") or "")
 
     async def _send_loop(self, ws) -> None:
         """Drain the training thread's outbox onto the socket.
@@ -248,6 +266,7 @@ class Runner:
                 "busy": self.current is not None,
                 "job_id": self.current.job_id if self.current else None,
                 "serving": self.host.loaded_id if self.host else None,
+                "checkpoints": checkpoints.list_ids(),
             }))
             self._touch_liveness()
 
@@ -273,6 +292,12 @@ class Runner:
                              "reason": "runner already busy",
                              "current_job": self.current.job_id})
             return
+        if self.host and not self.generating and self.host.loaded_id:
+            # A model kept resident for the playground is holding VRAM the run
+            # about to start has been sized to use. Letting both sit on the
+            # card is how a plan that fitted becomes an out-of-memory crash
+            # two minutes in.
+            self.host.unload()
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders
         # an unset HF_TOKEN as an empty string, and passing "" to huggingface_hub
@@ -334,7 +359,14 @@ class Runner:
     def _run_job(self, job: dict, ctx: JobContext, workdir: str) -> None:
         jid = job["id"]
         try:
-            self.outbox.put({"type": "job_started", "job_id": jid})
+            # The step this attempt begins at travels with the "started"
+            # message, before any of the heavy machinery is imported. The
+            # controller uses it to decide whether the measurements already on
+            # the chart describe this run or an abandoned one, and it has to
+            # know that before the first new metric arrives.
+            state = checkpoints.peek(jid) or {}
+            self.outbox.put({"type": "job_started", "job_id": jid,
+                             "resume_step": int(state.get("step") or 0)})
             handler = JOB_HANDLERS.get(job["kind"])
             if handler is None:
                 raise ValueError("this runner cannot handle job type %r" % job["kind"])
@@ -348,14 +380,31 @@ class Runner:
             # as "succeeded" would put a half-trained model beside fully
             # trained ones with nothing to tell them apart, so it keeps the
             # stopped status and carries its summary with it.
+            # The result is uploaded and the run is over, so the safety net
+            # is now the largest thing on this disk with no purpose.
+            checkpoints.discard(jid)
             if result.get("stopped_early"):
                 self.outbox.put({"type": "job_cancelled", "job_id": jid,
                                  "summary": result, "saved": True})
             else:
                 self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
         except lora_llm.Cancelled:
+            checkpoints.discard(jid)
             self.outbox.put({"type": "job_cancelled", "job_id": jid, "saved": False})
         except Exception as e:  # noqa: BLE001
+            # Deliberately kept. A failure is the case a checkpoint is most
+            # worth having: an out-of-memory crash six hours in, a disk that
+            # filled, a library that raised on one bad batch. Throwing the
+            # checkpoint away here would make the one recoverable failure mode
+            # unrecoverable.
+            state = checkpoints.peek(jid)
+            if state:
+                self.outbox.put({
+                    "type": "job_log", "job_id": jid, "level": "warn",
+                    "line": "There is a checkpoint from step %d on this "
+                            "machine. Fix what went wrong and start the run "
+                            "again to carry on from there rather than from "
+                            "the beginning." % int(state.get("step") or 0)})
             self.outbox.put({
                 "type": "job_failed", "job_id": jid,
                 "error": _friendly_error(e, job.get("kind")),

@@ -4,6 +4,7 @@ import { LineChart } from "../chart.js";
 import { shareBox, wireShareBox } from "./share.js";
 
 const STAGES = {
+  evaluating: "Putting the prompts to each model…",
   loading_model: "Downloading and loading the model…",
   loading_dataset: "Downloading and preparing your data…",
   training_tokenizer: "Building a vocabulary from your text…",
@@ -69,11 +70,15 @@ export async function jobView(mount, [jobId]) {
   logs.forEach((l) => appendLog(logBox, l));
   logBox.scrollTop = logBox.scrollHeight;
 
+  // The last step a checkpoint exists for. Shown live rather than only on
+  // reload, because the question it answers -- "how much would I lose if this
+  // machine restarted right now" -- is only interesting while it is running.
+  let checkpointStep = job.checkpoint_step || 0;
   let latest = metrics[metrics.length - 1] || {};
   // The stage the runner last reported. paintStats runs on every metric and
   // must not claim "training" while the tokenizer is still being built.
   let stage = job.status === "running" ? "" : "training";
-  paintStats(mount, job, latest, scratch, stage);
+  paintStats(mount, job, latest, scratch, stage, checkpointStep);
 
   const unsub = events.subscribe(async (msg) => {
     if (msg.job_id && msg.job_id !== jobId) return;
@@ -87,7 +92,7 @@ export async function jobView(mount, [jobId]) {
         lrChart.push({ x: msg.step, y: msg.data.learning_rate });
       if (msg.data.expert_balance != null)
         expertChart?.push({ x: msg.step, y: msg.data.expert_balance });
-      paintStats(mount, job, latest, scratch, stage);
+      paintStats(mount, job, latest, scratch, stage, checkpointStep);
     } else if (msg.type === "job_sample") {
       samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
       paintSamples(mount, samples);
@@ -95,6 +100,9 @@ export async function jobView(mount, [jobId]) {
       const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
       appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
       if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_checkpoint") {
+      checkpointStep = msg.step;
+      paintProgress(mount, job, stage, null, null, checkpointStep);
     } else if (msg.type === "job_progress") {
       stage = msg.stage;
       if (stage === "training") { job.step = msg.step; job.total_steps = msg.total; }
@@ -102,7 +110,10 @@ export async function jobView(mount, [jobId]) {
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
       paintHeader(mount, job);
-      paintStats(mount, job, latest, scratch, stage);
+      paintStats(mount, job, latest, scratch, stage, checkpointStep);
+      // A run that just finished has a model to build on, and one that just
+      // failed has a checkpoint to carry on from. Both change this panel.
+      paintFurther();
     }
   });
 
@@ -117,6 +128,46 @@ export async function jobView(mount, [jobId]) {
     });
   };
   paintOwnerRow();
+
+  // Datasets are only needed by the "train this further" panel, which most
+  // visits never open, so the list is fetched after the page is on screen.
+  let datasets = [];
+  const paintFurther = () => {
+    const box = $("#furtherRow", mount);
+    if (box) box.innerHTML = furtherCard(job, datasets);
+  };
+  paintFurther();
+  if (job.artifacts?.length) {
+    api.datasets().then((d) => { datasets = d; paintFurther(); }).catch(() => {});
+  }
+
+  on(mount, "click", "#resumeBtn", async (_e, t) => {
+    t.disabled = true;
+    t.textContent = "Queueing…";
+    try {
+      const r = await api.resumeJob(jobId);
+      toast(`Carrying on from step ${r.from_step}.`, "ok");
+      job = await api.job(jobId);
+      paintStats(mount, job, latest, scratch, stage, checkpointStep);
+    } catch (e) { toast(e.message, "err"); t.disabled = false; }
+  });
+
+  on(mount, "submit", "#furtherForm", async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target).entries());
+    const btn = $("#furtherGo", mount);
+    btn.disabled = true;
+    btn.textContent = "Creating…";
+    try {
+      const { id } = await api.createJob(furtherJob(job, f));
+      toast("Queued.", "ok");
+      location.hash = `#/jobs/${id}`;
+    } catch (ex) {
+      toast(ex.message, "err");
+      btn.disabled = false;
+      btn.textContent = "Start the follow-on run";
+    }
+  });
 
   on(mount, "submit", "#publishForm", async (e) => {
     e.preventDefault();
@@ -195,6 +246,8 @@ function layout(job, scratch, experts = 0) {
     </div>
 
     <div id="errorCard"></div>
+    <div id="resumeCard"></div>
+    <div id="queueCard"></div>
     <div id="stopPanel"></div>
     <div id="progressCard"></div>
     <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
@@ -228,15 +281,17 @@ function layout(job, scratch, experts = 0) {
           <li><strong>Flat from the start</strong> — the learning rate may be too
             low, or the data may not be read correctly.</li>
           <li><strong>Jumping wildly</strong> — the learning rate is too high.</li>
-          ${raw(scratch ? html`
           <li><strong>Held-out rising while training falls</strong> — it has
-            started memorising the text instead of learning from it. Use more
-            data, or stop here.</li>` : html`
-          <li><strong>Falling to near zero</strong> — it is memorising rather than
-            learning. Use fewer passes.</li>`)}
+            started memorising ${scratch ? "the text" : "your examples"} instead
+            of learning from ${scratch ? "it" : "them"}. The best model was at
+            the low point; more data or fewer passes would help.</li>
+          <li>The held-out line is also the only loss worth comparing with
+            another run — <a href="#/compare">side by side here</a>.</li>
         </ul>
       </div>
     </div>
+
+    <div id="furtherRow"></div>
 
     <div class="grid grid-2" style="margin-bottom:14px" id="ownerRow"></div>
 
@@ -247,6 +302,106 @@ function layout(job, scratch, experts = 0) {
       </div>
       <div class="logbox" id="logBox"></div>
     </div>`;
+}
+
+function furtherCard(job, datasets) {
+  const usable = job.artifacts?.length
+    && ["succeeded", "cancelled"].includes(job.status);
+  if (!usable) return "";
+  const scratch = job.kind === "pretrain_llm";
+  if (!scratch && job.kind !== "finetune_llm") return "";
+
+  const cfg = job.config || {};
+  const arch = cfg.arch || {};
+  const perStep = scratch
+    ? (cfg.batch_size || 1) * (cfg.grad_accum || 1)
+      * (arch.max_position_embeddings || 0)
+    : 0;
+  const defaultSteps = job.total_steps || cfg.max_steps || 300;
+
+  return html`
+    <details class="card" style="margin-bottom:14px">
+      <summary><strong>Train this further</strong>
+        <span class="muted tiny"> — carry on from what it already knows</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        ${raw(scratch ? html`
+          This starts from the weights this run produced rather than from
+          noise, keeping its vocabulary and its shape — width, depth and
+          vocabulary are fixed once a model has been trained. More text, or
+          another pass over the same text, makes it better at the same job.`
+        : html`
+          This keeps the adapter this run produced and carries on training it
+          on new data. Everything it already learned stays; the new examples
+          are added on top. Its base model, <code>${esc(cfg.base_model || "—")}</code>,
+          stays the same.`)}</p>
+
+      <form id="furtherForm" style="margin-top:12px">
+        <div class="field">
+          <label for="furtherData">Text to learn from</label>
+          <select id="furtherData" name="studio_dataset">
+            <option value="">Keep the same source (${esc(
+              cfg.dataset_label || String(cfg.dataset || "").split("/").pop() || "—")})</option>
+            ${raw(datasets.map((d) => html`
+              <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
+          </select>
+          <div class="hint">Reading the same text again is a real option — a
+            model that has only seen its corpus once is undertrained — but new
+            text teaches it more.</div>
+        </div>
+        ${raw(scratch ? html`
+          <div class="field">
+            <label for="furtherSteps">How many more steps</label>
+            <input id="furtherSteps" name="max_steps" type="number"
+                   value="${defaultSteps}" min="10">
+            <div class="hint">${perStep
+              ? `About ${fmtNum(perStep)} tokens per step on this model.` : ""}
+              The learning rate starts high again and decays over these steps,
+              so a short follow-on run disturbs the model before it settles.</div>
+          </div>` : "")}
+        <div class="field">
+          <label for="furtherName">Name</label>
+          <input id="furtherName" name="name" type="text"
+                 value="${esc(job.name)} (continued)">
+        </div>
+        <button class="btn-primary btn-sm" type="submit" id="furtherGo">
+          Start the follow-on run</button>
+      </form>
+    </details>`;
+}
+
+/** The job body for a follow-on run. Copies the settings that must not change
+ *  and drops the ones that must be worked out again. */
+function furtherJob(job, form) {
+  const cfg = { ...(job.config || {}) };
+  // Recomputed for the new data, never inherited: a step budget worked out
+  // for one corpus is meaningless for another, and an inherited one would
+  // silently cap the new run.
+  delete cfg.max_steps;
+  delete cfg.token_budget;
+  delete cfg.studio_dataset;
+  delete cfg.source_run_name;
+
+  if (form.studio_dataset) {
+    cfg.studio_dataset = form.studio_dataset;
+    delete cfg.dataset;
+    delete cfg.dataset_config;
+    delete cfg.dataset_split;
+    delete cfg.dataset_label;
+    delete cfg.dataset_is_local;
+  }
+
+  if (job.kind === "pretrain_llm") {
+    cfg.continue_from = job.id;
+    cfg.max_steps = +form.max_steps || job.total_steps || 300;
+    const arch = cfg.arch || {};
+    const perStep = (cfg.batch_size || 1) * (cfg.grad_accum || 1)
+      * (arch.max_position_embeddings || 0);
+    if (perStep) cfg.token_budget = cfg.max_steps * perStep;
+  } else {
+    cfg.base_model_job = job.id;
+  }
+  return { name: form.name || undefined, kind: job.kind, config: cfg };
 }
 
 function publishCard(job) {
@@ -331,7 +486,8 @@ function paintHeader(mount, job) {
     ${statusBadge(job.status)}
     ${raw(kept ? `<span class="badge badge-ok">model kept</span>` : "")}
     ${raw(usable
-      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>` : "")}
+      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>
+         <a class="btn btn-sm" href="#/compare" title="Compare its held-out loss with other runs">⇄ Compare</a>` : "")}
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download</a>` : "")}
@@ -346,7 +502,8 @@ function paintHeader(mount, job) {
     : "";
 }
 
-function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null) {
+function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
+                       checkpointStep = 0) {
   const training = stage === "training" || stage === "";
   // Preparation stages count their own units -- documents scanned, tokens
   // collected -- so the bar follows those while they run, and the step counter
@@ -366,12 +523,63 @@ function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null) 
           ? `step ${step} of ${total}` : ""}</span>
       </div>
       <div class="progress"><i style="width:${pct}%"></i></div>
+      ${raw(checkpointStep ? html`
+        <p class="muted tiny" style="margin:8px 0 0">
+          Saved at step ${checkpointStep}. If this machine restarts, the run
+          carries on from there rather than starting over.</p>` : "")}
     </div>` : "";
 }
 
-function paintStats(mount, job, m, scratch, stage = "training") {
+function queueCard(job) {
+  if (job.status !== "queued") return "";
+  const pos = job.queue_position;
+  return html`
+    <div class="card callout" style="margin-bottom:16px">
+      <strong class="tiny">Waiting for a free machine</strong>
+      ${raw(pos ? html`
+        <p class="muted tiny" style="margin:6px 0 0">
+          ${pos === 1 ? "Next in line" : `Number ${pos}`} of
+          ${job.queue_length} waiting. The queue is dealt out between people
+          rather than strictly in the order runs were created, so one person
+          queueing several long runs does not hold up everyone else.</p>`
+        : html`<p class="muted tiny" style="margin:6px 0 0">
+          No machine that can run this is connected yet.</p>`)}
+    </div>`;
+}
+
+function resumeCard(job) {
+  const r = job.resumable;
+  if (!r) return "";
+  const lost = Math.max(0, (job.step || 0) - r.step);
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">This run can carry on</h3>
+      <p class="muted tiny" style="margin:0 0 10px">
+        There is a checkpoint at <strong>step ${fmtNum(r.step)}</strong>${
+          r.total ? ` of ${fmtNum(r.total)}` : ""} on
+        <strong>${r.runner || "its machine"}</strong>${
+          lost ? `, so ${fmtNum(lost)} steps would be redone` : ""}.
+        Starting it again picks up the weights and the optimiser exactly where
+        they were, rather than beginning from noise.</p>
+      ${raw(r.online
+        ? html`<button class="btn-primary btn-sm" id="resumeBtn">
+                 Carry on from step ${fmtNum(r.step)}</button>`
+        : html`<p class="muted tiny" style="margin:0">
+            <strong>${esc(r.runner || "That machine")}</strong> is not
+            connected, and the checkpoint is on its disk. Bring it back and
+            this button appears.</p>`)}
+    </div>`;
+}
+
+function paintStats(mount, job, m, scratch, stage = "training",
+                   checkpointStep = 0) {
   paintHeader(mount, job);
-  paintProgress(mount, job, stage);
+  paintProgress(mount, job, stage, null, null,
+                checkpointStep || job.checkpoint_step || 0);
+  const q = $("#queueCard", mount);
+  if (q) q.innerHTML = queueCard(job);
+  const rc = $("#resumeCard", mount);
+  if (rc) rc.innerHTML = resumeCard(job);
   const cards = scratch ? [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
     ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—", "on unseen text"],
@@ -382,6 +590,8 @@ function paintStats(mount, job, m, scratch, stage = "training") {
       ? fmtDuration(m.eta_s) : "—", "estimate"],
   ] : [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
+    ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—",
+     "on unseen examples"],
     ["Speed", m.steps_per_sec != null ? m.steps_per_sec.toFixed(2) + "/s" : "—", "steps per second"],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
     ["Time left", m.eta_s != null && job.status === "running"

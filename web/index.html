@@ -28,6 +28,7 @@
            row of monochrome marks. This one has no emoji variant. -->
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
       <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
+      <a href="#/evals" data-nav="evals"><span class="ico">◎</span><span class="lbl">Evaluate</span></a>
       <a href="#/runners" data-nav="runners"><span class="ico">▦</span><span class="lbl">Machines</span></a>
       <a href="#/settings" data-nav="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
     </nav>
@@ -133,7 +134,14 @@
         noise, rather than adjusting one that already works.</dd>
       <dt>Held-out loss</dt><dd>The loss measured on text the model was never
         trained on. The honest number: if it rises while training loss falls,
-        the model is memorising.</dd>
+        the model is memorising. It is also the only loss that means anything
+        when comparing two different runs.</dd>
+      <dt>Checkpoint</dt><dd>A snapshot of a run, saved every few minutes. If
+        the machine restarts, training carries on from the last one instead of
+        starting again from noise.</dd>
+      <dt>Prompt set</dt><dd>A saved list of questions, kept so that every
+        model you train can be asked the same ones. The only way to answer
+        &ldquo;is this better than last week's?&rdquo;</dd>
       <dt>Base model</dt><dd>A model that only continues text. It has not been
         taught to answer questions — that is what fine-tuning adds.</dd>
     </dl>

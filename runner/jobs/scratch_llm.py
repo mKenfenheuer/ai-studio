@@ -26,6 +26,7 @@ produces a run that appears to work and learns nothing:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import shutil
@@ -36,6 +37,7 @@ from typing import Any, Iterator
 from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
+from runner import artifacts, checkpoints
 from runner.capabilities import expert_kernel
 
 from . import source
@@ -75,10 +77,38 @@ def run(cfg: dict, ctx: Any) -> dict:
     token_budget = int(cfg.get("token_budget") or total_steps * tokens_per_step)
 
     out_dir = Path(ctx.workdir) / "model"
+    keep_checkpoints = bool(cfg.get("checkpointing_enabled", True))
+    resume = checkpoints.peek(ctx.job_id) if keep_checkpoints else None
+    prepared = checkpoints.prepared_dir(ctx.job_id) if keep_checkpoints else None
+
+    # ---- 0. an earlier model of our own, to carry on training -----------
+    #
+    # A finished model is a starting point, not only an endpoint. Training it
+    # further on more text is the cheapest way to improve one, and until now
+    # the only thing this app could not use as a base was a model it had
+    # built itself.
+    started_from = None
+    if source_job := cfg.get("continue_from"):
+        started_from = artifacts.fetch(ctx.controller_url, ctx.runner_token,
+                                       source_job, ctx.log)
+        arch = _arch_from_model(started_from, arch, ctx)
+        seq_len = int(arch["max_position_embeddings"])
+        tokens_per_step = batch * accum * seq_len
+        token_budget = int(cfg.get("token_budget") or total_steps * tokens_per_step)
 
     # ---- 1. tokenizer ---------------------------------------------------
     ctx.progress(0, 0, stage="training_tokenizer")
-    tok = _build_tokenizer(cfg, ctx)
+    tok = _reuse_tokenizer(started_from, prepared, ctx)
+    if tok is None:
+        tok = _build_tokenizer(cfg, ctx)
+        if prepared is not None:
+            # Saved before a single training step runs. Building a vocabulary
+            # is minutes of work that produces a *different* vocabulary every
+            # time it is done -- so a resume that retrained it would load the
+            # checkpoint's embedding table against a tokenizer that no longer
+            # agrees with it, and the model would emit fluent nonsense.
+            with contextlib.suppress(OSError, ValueError):
+                tok.save_pretrained(str(prepared / "tokenizer"))
     vocab_size = len(tok)
     if vocab_size != arch["vocab_size"]:
         # BPE can finish below the requested size on a small or repetitive
@@ -89,7 +119,13 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     # ---- 2. corpus -> one flat array of token ids -----------------------
     ctx.progress(0, 0, stage="tokenizing")
-    tokens = _tokenize_corpus(cfg, ctx, tok, token_budget, np)
+    fingerprint = {"dataset": cfg.get("dataset"), "split": cfg.get("dataset_split"),
+                   "field": cfg.get("text_field"), "vocab": vocab_size,
+                   "budget": token_budget, "format": cfg.get("format")}
+    tokens = _cached_corpus(prepared, fingerprint, np, ctx)
+    if tokens is None:
+        tokens = _tokenize_corpus(cfg, ctx, tok, token_budget, np)
+        _cache_corpus(prepared, fingerprint, tokens, np, ctx)
     if tokens.size < seq_len * 16:
         raise ValueError(
             "Only %d tokens could be read from this dataset, which is far too "
@@ -115,7 +151,12 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     # ---- 3. the model ---------------------------------------------------
     ctx.progress(0, 0, stage="building_model")
-    model, counts = _build_model(arch, ctx, torch, tok)
+    if started_from is not None:
+        model, counts = _load_model(started_from, arch, ctx, torch)
+    else:
+        model, counts = _build_model(arch, ctx, torch, tok)
+    if resume:
+        _load_weights(model, Path(resume["path"]), ctx, torch)
     model = model.to(device)
     model.config.use_cache = False
 
@@ -130,13 +171,23 @@ def run(cfg: dict, ctx: Any) -> dict:
         "token_budget": token_budget, "tokens_per_step": tokens_per_step,
         "dtype": dtype_name, "from_scratch": True,
     })
-    ctx.log("Built a %s-parameter model from random weights: %d layers, width "
-            "%d, %d heads, context %d."
-            % (_fmt(counts["total"]), arch["num_hidden_layers"],
+    ctx.log("%s %s-parameter model: %d layers, width %d, %d heads, context %d."
+            % ("Loaded a" if started_from else "Built a",
+               _fmt(counts["total"]), arch["num_hidden_layers"],
                arch["hidden_size"], arch["num_attention_heads"], seq_len))
-    ctx.log("Nothing in it knows anything yet -- every weight is noise. The "
-            "loss should start near %.1f, which is what pure guessing costs "
-            "with a %d-token vocabulary." % (math.log(vocab_size), vocab_size))
+    if resume:
+        ctx.log("Picking up from the checkpoint at step %d rather than starting "
+                "again. Everything before that step is work this run has "
+                "already done." % int(resume.get("step") or 0))
+    elif started_from:
+        ctx.log("This model already knows something -- it starts from what the "
+                "earlier run taught it, so expect the loss to begin near where "
+                "that run left off rather than near %.1f."
+                % math.log(vocab_size))
+    else:
+        ctx.log("Nothing in it knows anything yet -- every weight is noise. The "
+                "loss should start near %.1f, which is what pure guessing costs "
+                "with a %d-token vocabulary." % (math.log(vocab_size), vocab_size))
 
     # ---- 4. train -------------------------------------------------------
     return _train(cfg, ctx, model, tok, tokens, arch, {
@@ -145,6 +196,9 @@ def run(cfg: dict, ctx: Any) -> dict:
         "total_steps": total_steps, "tokens_per_step": tokens_per_step,
         "n_blocks": n_blocks, "n_val": n_val, "counts": counts,
         "checkpointing": checkpointing, "out_dir": out_dir,
+        "resume": resume, "keep_checkpoints": keep_checkpoints,
+        "started_from": str(started_from) if started_from else None,
+        "continue_from": cfg.get("continue_from"),
     }, np, torch)
 
 
@@ -495,6 +549,156 @@ def _build_model(arch: dict, ctx: Any, torch, tok=None):
     return model, counts
 
 
+def _arch_from_model(path: Path, arch: dict, ctx: Any) -> dict:
+    """The shape of a model we are about to carry on training.
+
+    Read off the model rather than taken from the plan, and not negotiable:
+    the weights on disk have one width, one depth and one vocabulary, and a
+    request to continue training them at some other size is not a request that
+    can be honoured. Saying so here beats a shape-mismatch traceback two
+    minutes in.
+    """
+    conf = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    fields = ("vocab_size", "hidden_size", "intermediate_size",
+              "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+              "max_position_embeddings", "num_local_experts",
+              "num_experts_per_tok", "router_aux_loss_coef",
+              "rms_norm_eps", "tie_word_embeddings")
+    out = dict(arch or {})
+    changed = []
+    for f in fields:
+        if conf.get(f) is not None:
+            if out.get(f) not in (None, conf[f]) and f in (
+                    "hidden_size", "num_hidden_layers", "vocab_size"):
+                changed.append(f)
+            out[f] = conf[f]
+    out["model_type"] = conf.get("model_type", out.get("model_type"))
+    if changed:
+        ctx.log("Continuing an existing model, so its own shape is used rather "
+                "than the one that was requested (%s). Width, depth and "
+                "vocabulary are fixed once a model has been trained."
+                % ", ".join(changed), "warn")
+    return out
+
+
+def _reuse_tokenizer(started_from: Path | None, prepared: Path | None, ctx: Any):
+    """The vocabulary this run must use, if one already exists for it."""
+    from transformers import AutoTokenizer
+
+    candidates = [(started_from, "the model being continued")]
+    if prepared is not None:
+        candidates.append((prepared / "tokenizer", "the interrupted attempt"))
+
+    for path, why in candidates:
+        if not path or not (Path(path) / "tokenizer_config.json").exists():
+            continue
+        try:
+            tok = AutoTokenizer.from_pretrained(str(path))
+        except (OSError, ValueError) as e:
+            ctx.log("Could not reuse the vocabulary from %s (%s); building a "
+                    "new one." % (why, e), "warn")
+            continue
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        # Documents are encoded whole and packed afterwards, so the real
+        # context limit must not truncate them here. Needed on every path that
+        # produces a tokenizer, including the ones that load one from disk.
+        tok.model_max_length = 10 ** 9
+        ctx.log("Reusing the %d-token vocabulary from %s." % (len(tok), why))
+        return tok
+    return None
+
+
+def _cached_corpus(prepared: Path | None, fingerprint: dict, np, ctx: Any):
+    """The tokenized corpus from an interrupted attempt, if it still applies.
+
+    The fingerprint check is what makes this safe rather than merely fast: the
+    same job id with a different dataset, vocabulary or budget describes
+    different tokens, and silently training on the old ones would be a bug
+    with no symptom other than a model that learned the wrong text.
+    """
+    if prepared is None:
+        return None
+    meta_file, data_file = prepared / "corpus.json", prepared / "tokens.npy"
+    if not (meta_file.exists() and data_file.exists()):
+        return None
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if meta.get("fingerprint") != fingerprint:
+        return None
+    try:
+        tokens = np.load(str(data_file), mmap_mode="r")
+    except (OSError, ValueError) as e:
+        ctx.log("The cached corpus could not be read (%s); reading the text "
+                "again." % e, "warn")
+        return None
+    ctx.log("Reusing the %s tokens already read for this run, so the resume "
+            "goes straight to training." % f"{tokens.size:,}")
+    return tokens
+
+
+def _cache_corpus(prepared: Path | None, fingerprint: dict, tokens, np,
+                  ctx: Any) -> None:
+    """Keep the tokenized corpus so a resume does not read the text twice.
+
+    Bounded, because this is a convenience and not the output of the run: past
+    a few gigabytes the disk cost stops being worth the minutes it saves, and
+    a full data volume would break the training it was meant to protect.
+    """
+    if prepared is None or tokens.nbytes > 4 * 1024 ** 3:
+        return
+    try:
+        np.save(str(prepared / "tokens.npy"), tokens)
+        (prepared / "corpus.json").write_text(
+            json.dumps({"fingerprint": fingerprint, "tokens": int(tokens.size)}),
+            encoding="utf-8")
+    except OSError as e:
+        ctx.log("Could not cache the tokenized text (%s). Training carries on."
+                % e, "warn")
+
+
+def _load_model(path: Path, arch: dict, ctx: Any, torch):
+    """Load one of this studio's own finished models, to train it further.
+
+    float32 is not a default carried over by accident. A model being trained
+    is the thing being updated, and fp16 master weights silently discard every
+    update smaller than one ulp -- the same trap the module docstring opens
+    with, and just as easy to fall into on the load path as on the build path.
+    """
+    from transformers import AutoModelForCausalLM
+
+    extra = {}
+    if is_moe(arch) and (kernel := expert_kernel(ctx.capabilities)):
+        extra["experts_implementation"] = kernel
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(path), dtype=torch.float32, **extra)
+    except (TypeError, ValueError) as e:
+        if not extra or "experts_implementation" not in str(e):
+            raise
+        model = AutoModelForCausalLM.from_pretrained(str(path), dtype=torch.float32)
+
+    embedding = model.get_input_embeddings().weight.numel()
+    total = sum(p.numel() for p in model.parameters())
+    counts = {"total": total, "embedding": embedding, "body": total - embedding,
+              "active": total, "experts": 0, "experts_per_token": 0}
+    if is_moe(arch):
+        expert_params = sum(p.numel() for n, p in model.named_parameters()
+                            if ".experts." in n)
+        E = int(arch["num_local_experts"])
+        k = min(int(arch.get("num_experts_per_tok") or 1), E)
+        counts.update(active=int(total - expert_params * (E - k) / E),
+                      experts=E, experts_per_token=k)
+    return model, counts
+
+
+def _load_weights(model, path: Path, ctx: Any, torch) -> None:
+    model.load_state_dict(torch.load(str(path / "model.pt"), map_location="cpu",
+                                     weights_only=True))
+
+
 def _param_groups(model, weight_decay: float):
     """Decay matrices, never norms or biases.
 
@@ -548,6 +752,16 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     rng.shuffle(all_blocks)
     val_idx, train_idx = all_blocks[:n_val], all_blocks[n_val:]
 
+    # The split is drawn from the freshly seeded generator, and only then is
+    # the saved stream position restored. Order matters: restore first and a
+    # resumed run gets a *different* held-out set, so its held-out loss stops
+    # being comparable with the first half of its own chart -- and some of the
+    # text it is now measured on is text it has already trained on.
+    resume = S.get("resume")
+    prior = _resume_state(resume, ctx) if resume else {}
+    if prior.get("rng"):
+        rng.bit_generator.state = prior["rng"]
+
     def get_batch(indices, size):
         picked = indices[rng.integers(0, len(indices), size)]
         starts = picked.astype(np.int64) * seq_len
@@ -578,6 +792,18 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     use_scaler = (autocast_dtype == torch.float16 and device == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     autocast_on = device == "cuda" and autocast_dtype != torch.float32
+
+    if prior.get("optimizer"):
+        # Adam without its moments is not Adam. Dropping the optimiser state
+        # and keeping only the weights makes a resumed run take several
+        # hundred steps of bad updates to recover the momentum estimates it
+        # already had, which shows up as a visible bump in the loss exactly
+        # where the checkpoint was.
+        opt.load_state_dict(prior["optimizer"])
+        if use_scaler and prior.get("scaler"):
+            scaler.load_state_dict(prior["scaler"])
+        if prior.get("torch_rng") is not None:
+            torch.set_rng_state(prior["torch_rng"])
 
     moe = is_moe(arch)
     aux_coef = float(arch.get("router_aux_loss_coef", 0.01)) if moe else 0.0
@@ -635,17 +861,40 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
 
     model.train()
     t_start = time.time()
-    tokens_seen = 0
-    first_loss = None
-    last_loss = None
-    best_val = None
-    worst_share = None
-    warned_router = False
+    start_step = int(prior.get("step") or 0)
+    tokens_seen = int(prior.get("tokens_seen") or 0)
+    first_loss = prior.get("first_loss")
+    last_loss = prior.get("last_loss")
+    best_val = prior.get("best_val")
+    worst_share = prior.get("worst_share")
+    warned_router = bool(prior.get("warned_router"))
+    # Time spent by the attempts that came before this one, so a resumed run
+    # reports how long it has taken in total rather than restarting its own
+    # clock and claiming an eight-hour job took twenty minutes.
+    prior_seconds = float(prior.get("duration_s") or 0.0)
     stopped_early = False
-    samples: list[dict] = []
-    step = 0
+    samples: list[dict] = list(prior.get("samples") or [])
+    step = start_step
+    saver = checkpoints.Saver(
+        ctx.job_id, ctx, every_s=float(cfg.get("checkpoint_every_s") or 600),
+        enabled=bool(S.get("keep_checkpoints", True)))
 
-    for step in range(1, total_steps + 1):
+    def write_checkpoint(path):
+        torch.save(model.state_dict(), str(path / "model.pt"))
+        torch.save({"optimizer": opt.state_dict(),
+                    "scaler": scaler.state_dict() if use_scaler else None,
+                    "rng": rng.bit_generator.state,
+                    "torch_rng": torch.get_rng_state()},
+                   str(path / "trainer.pt"))
+        (path / "train.json").write_text(json.dumps({
+            "tokens_seen": tokens_seen, "first_loss": first_loss,
+            "last_loss": last_loss, "best_val": best_val,
+            "worst_share": worst_share, "warned_router": warned_router,
+            "duration_s": prior_seconds + (time.time() - t_start),
+            "samples": samples[-6:],
+        }), encoding="utf-8")
+
+    for step in range(start_step + 1, total_steps + 1):
         for g in opt.param_groups:
             g["lr"] = lr_at(step - 1)
 
@@ -682,6 +931,7 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         first_loss = first_loss if first_loss is not None else avg
         last_loss = avg
         tokens_seen += S["tokens_per_step"]
+        done_now = step - start_step
         elapsed = time.time() - t_start
 
         val_loss = None
@@ -710,13 +960,22 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
             "learning_rate": lr_at(step - 1),
             "grad_norm": round(grad_norm, 4) if math.isfinite(grad_norm) else None,
             "tokens_seen": tokens_seen,
-            "steps_per_sec": round(step / max(elapsed, 1e-6), 3),
-            "tokens_per_sec": round(tokens_seen / max(elapsed, 1e-6)),
+            # Rates are for *this* attempt. Dividing the resumed step number
+            # by the time since this process started would report a machine
+            # several times faster than it is, and an ETA to match.
+            "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
+            "tokens_per_sec": round(
+                done_now * S["tokens_per_step"] / max(elapsed, 1e-6)),
             "vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
             if device == "cuda" else None,
-            "eta_s": round((total_steps - step) * elapsed / max(step, 1)),
+            "eta_s": round((total_steps - step) * elapsed / max(done_now, 1)),
         })
         ctx.progress(step, total_steps, stage="training")
+
+        if saver.due(step):
+            saver.write(step, total_steps, write_checkpoint,
+                        {"kind": "pretrain_llm", "loss": last_loss})
+            ctx.emit_meta({"checkpoint": {"step": step, "total": total_steps}})
 
         if step % sample_every == 0 or step == total_steps:
             text = _sample(model, tok, sample_prompt, device, S, torch, ctx)
@@ -748,9 +1007,37 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         "first_loss": first_loss, "last_loss": last_loss, "best_val": best_val,
         "tokens_seen": tokens_seen, "steps": step,
         "planned_steps": total_steps, "stopped_early": stopped_early,
-        "worst_expert_share": worst_share,
-        "duration_s": time.time() - t_start, "samples": samples,
+        "worst_expert_share": worst_share, "resumed_from": start_step or None,
+        "duration_s": prior_seconds + (time.time() - t_start), "samples": samples,
     })
+
+
+def _resume_state(resume: dict, ctx: Any) -> dict:
+    """Read back an interrupted attempt. A broken one starts over, loudly.
+
+    Anything unreadable here means the checkpoint cannot be trusted, and the
+    honest response is a fresh run rather than a half-restored optimiser
+    producing a curve nobody can explain.
+    """
+    import torch
+
+    path = Path(resume["path"])
+    out: dict = {}
+    try:
+        out = json.loads((path / "train.json").read_text(encoding="utf-8"))
+        # weights_only=False because this holds an optimiser state and a
+        # random-number generator state, not just tensors. The file was
+        # written by this runner into its own data volume a few minutes ago;
+        # if that is reachable by someone else, the checkpoint is not the
+        # thing to worry about.
+        out.update(torch.load(str(path / "trainer.pt"), map_location="cpu",
+                              weights_only=False))
+    except Exception as e:  # noqa: BLE001 - any failure means "start over"
+        ctx.log("The checkpoint for this run could not be read (%s), so it "
+                "starts again from the beginning." % e, "warn")
+        return {}
+    out["step"] = int(resume.get("step") or 0)
+    return out
 
 
 def _share_phrase(k: int, experts: int) -> str:
@@ -859,6 +1146,11 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
                                if stats.get("worst_expert_share") else None),
         "stopped_early": bool(stats.get("stopped_early")),
         "planned_steps": stats.get("planned_steps"),
+        # How this run got to where it is. A model that continued an earlier
+        # one is not comparable with a model of the same size trained once,
+        # and the comparison view needs to be able to say so.
+        "resumed_from_step": stats.get("resumed_from"),
+        "continued_from": S.get("continue_from"),
         "vocab_size": len(tok),
         "initial_loss": round(stats["first_loss"], 5) if stats["first_loss"] else None,
         "final_loss": round(stats["last_loss"], 5) if stats["last_loss"] else None,
@@ -886,6 +1178,11 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     summary["artifact_size"] = archive.stat().st_size
     summary["samples"] = stats["samples"][-3:]
 
+    if stats.get("resumed_from"):
+        ctx.log("This run was interrupted and carried on from its checkpoint at "
+                "step %d, so the %s figures below cover the whole run, not "
+                "just the part after the interruption."
+                % (stats["resumed_from"], "loss and token"))
     ctx.log("%s Loss %.4f -> %.4f over %s tokens (%.1f tokens per parameter)."
             % ("Stopped early." if stats.get("stopped_early") else "Done.",
                summary["initial_loss"] or 0, summary["final_loss"] or 0,

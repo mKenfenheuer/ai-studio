@@ -1,0 +1,301 @@
+"""Prompt sets, and the scores models get on them.
+
+The unit here is the **prompt set**, not the score. That is the whole design.
+A score belongs to a pair -- these prompts, that model -- and the reason the
+prompts are saved as a thing with a name and an owner is so the same ones can
+be put to next month's model. Save the score and you have a number nobody can
+reproduce; save the prompts and every future model is comparable with every
+past one.
+
+Scoring itself happens on a runner, as an ordinary queued job, so it inherits
+the queue, the log, the progress bar, the stop button and the sharing rules
+rather than reimplementing five of them. See runner/jobs/evaluate.py for what
+each measure is worth.
+"""
+from __future__ import annotations
+
+from fastapi import APIRouter, Body, HTTPException, Request
+
+from .. import config, datasets as dsets, db, serving
+from .security import current_user, require_edit, require_owner, require_view
+
+router = APIRouter(prefix="/api")
+
+# Set by the application once the fleet exists. The routes below queue work,
+# and queued work has to wake the scheduler.
+FLEET = None
+
+MAX_ITEMS = 500
+
+
+def _eval_or_404(request: Request, eval_id: str, need: str = "view") -> dict:
+    row = db.get_eval(eval_id)
+    if not row:
+        raise HTTPException(404, "No such prompt set.")
+    if need == "own":
+        require_owner(request, "eval", row)
+    elif need == "edit":
+        require_edit(request, "eval", row)
+    else:
+        require_view(request, "eval", row)
+    return row
+
+
+def _clean_items(raw: object) -> list[dict]:
+    """Prompts, as a list of usable rows, or a refusal that says what is wrong."""
+    if not isinstance(raw, list):
+        raise HTTPException(400, "Prompts must be a list.")
+    out = []
+    for entry in raw:
+        if isinstance(entry, str):
+            entry = {"prompt": entry}
+        if not isinstance(entry, dict):
+            continue
+        prompt = str(entry.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        out.append({"prompt": prompt,
+                    "expected": str(entry.get("expected") or "").strip(),
+                    "note": str(entry.get("note") or "").strip()})
+    if not out:
+        raise HTTPException(400, "There are no prompts in this set.")
+    if len(out) > MAX_ITEMS:
+        raise HTTPException(
+            400, "A prompt set is limited to %d prompts. Every model you "
+                 "compare has to answer all of them, so a set this large "
+                 "turns a comparison into an overnight job." % MAX_ITEMS)
+    return out
+
+
+def _decorate(row: dict, user: dict) -> dict:
+    row["access"] = db.access_level("eval", row["id"], row.get("owner_id"), user)
+    row["mine"] = row.get("owner_id") == user["id"]
+    owner = db.get_user(row["owner_id"]) if row.get("owner_id") else None
+    row["owner"] = db.public_user(owner) if owner else None
+    row["shares"] = db.list_shares("eval", row["id"])
+    return row
+
+
+# ---------------------------------------------------------------- prompts
+
+@router.get("/evals")
+async def list_evals(request: Request) -> list[dict]:
+    return db.visible_evals(current_user(request))
+
+
+@router.post("/evals")
+async def create_eval(request: Request, payload: dict = Body(...)) -> dict:
+    user = current_user(request)
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "Give this prompt set a name.")
+    items = _clean_items(payload.get("items") or [])
+    eid = db.create_eval(user["id"], name, items, payload.get("notes") or "")
+    return _decorate(db.get_eval(eid), user)
+
+
+@router.post("/evals/from-dataset")
+async def eval_from_dataset(request: Request, payload: dict = Body(...)) -> dict:
+    """Turn rows of a dataset into a prompt set.
+
+    The obvious source, and the one worth encouraging: the held-out part of
+    the data a model was fine-tuned on is exactly a set of prompts with known
+    good answers. Splitting a dataset and evaluating on the half that was
+    never trained on is the difference between measuring a model and
+    measuring its memory.
+    """
+    user = current_user(request)
+    ds = db.get_dataset(payload.get("dataset_id") or "")
+    if not ds:
+        raise HTTPException(404, "No such dataset.")
+    require_view(request, "dataset", ds)
+
+    limit = min(int(payload.get("limit") or 50), MAX_ITEMS)
+    prompt_field = payload.get("prompt_field")
+    answer_field = payload.get("answer_field")
+    rows = list(dsets.iter_rows(ds["id"], limit))
+    if not rows:
+        raise HTTPException(400, "That dataset has no rows to take.")
+
+    if not prompt_field:
+        prompt_field = next((f for f in ("instruction", "prompt", "question",
+                                         "input", "text")
+                             if f in rows[0]), None)
+    if not answer_field:
+        answer_field = next((f for f in ("output", "response", "answer",
+                                         "completion")
+                             if f in rows[0] and f != prompt_field), None)
+    if not prompt_field:
+        raise HTTPException(
+            400, "Could not tell which column holds the prompt. Its columns "
+                 "are: %s." % ", ".join(map(str, rows[0].keys())))
+
+    items = _clean_items([
+        {"prompt": r.get(prompt_field), "expected": r.get(answer_field) or ""}
+        for r in rows])
+    name = (payload.get("name") or "").strip() or ("%s (%d prompts)"
+                                                   % (ds["name"], len(items)))
+    notes = ("Taken from the dataset \"%s\"%s. Only meaningful as a measure if "
+             "the models being scored were not trained on these rows."
+             % (ds["name"],
+                " (%s -> %s)" % (prompt_field, answer_field) if answer_field else ""))
+    eid = db.create_eval(user["id"], name, items, notes)
+    return _decorate(db.get_eval(eid), user)
+
+
+@router.get("/evals/{eval_id}")
+async def get_eval(request: Request, eval_id: str) -> dict:
+    row = _eval_or_404(request, eval_id)
+    out = _decorate(row, current_user(request))
+    out["scores"] = db.list_scores(eval_id)
+    return out
+
+
+@router.patch("/evals/{eval_id}")
+async def update_eval(request: Request, eval_id: str,
+                      payload: dict = Body(...)) -> dict:
+    row = _eval_or_404(request, eval_id, "edit")
+    fields: dict = {}
+    if "name" in payload:
+        if not (payload.get("name") or "").strip():
+            raise HTTPException(400, "A prompt set needs a name.")
+        fields["name"] = payload["name"].strip()
+    if "notes" in payload:
+        fields["notes"] = payload.get("notes") or ""
+    if "items" in payload:
+        new_items = _clean_items(payload["items"])
+        if db.list_scores(eval_id) and new_items != row["items"]:
+            # Changing the prompts after models have been scored on them would
+            # leave a table of numbers that look comparable and are not. The
+            # honest move is a new set, which keeps the old scores meaningful.
+            raise HTTPException(
+                409, "Models have already been scored on these prompts. "
+                     "Changing them now would make those scores describe "
+                     "questions that were never asked. Copy this set instead.")
+        fields["items"] = new_items
+    db.update_eval(eval_id, **fields)
+    return _decorate(db.get_eval(eval_id), current_user(request))
+
+
+@router.post("/evals/{eval_id}/copy")
+async def copy_eval(request: Request, eval_id: str,
+                    payload: dict = Body(default=None)) -> dict:
+    row = _eval_or_404(request, eval_id)
+    user = current_user(request)
+    name = ((payload or {}).get("name") or "").strip() or (row["name"] + " (copy)")
+    eid = db.create_eval(user["id"], name, row["items"], row.get("notes") or "")
+    return _decorate(db.get_eval(eid), user)
+
+
+@router.delete("/evals/{eval_id}")
+async def delete_eval(request: Request, eval_id: str) -> dict:
+    _eval_or_404(request, eval_id, "own")
+    db.clear_shares("eval", eval_id)
+    db.delete_eval(eval_id)
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------- scores
+
+@router.get("/evals/{eval_id}/scores")
+async def get_scores(request: Request, eval_id: str) -> list[dict]:
+    _eval_or_404(request, eval_id)
+    return db.list_scores(eval_id)
+
+
+@router.get("/evals/{eval_id}/scores/{score_id}")
+async def get_score(request: Request, eval_id: str, score_id: str) -> dict:
+    _eval_or_404(request, eval_id)
+    score = db.get_score(score_id)
+    if not score or score["eval_id"] != eval_id:
+        raise HTTPException(404, "No such scoring.")
+    job = db.get_job(score["model_job_id"])
+    score["model_name"] = (job or {}).get("name")
+    return score
+
+
+@router.delete("/evals/{eval_id}/scores/{score_id}")
+async def delete_score(request: Request, eval_id: str, score_id: str) -> dict:
+    _eval_or_404(request, eval_id, "edit")
+    score = db.get_score(score_id)
+    if not score or score["eval_id"] != eval_id:
+        raise HTTPException(404, "No such scoring.")
+    db.delete_score(score_id)
+    return {"ok": True}
+
+
+@router.post("/evals/{eval_id}/run")
+async def run_eval(request: Request, eval_id: str,
+                   payload: dict = Body(...)) -> dict:
+    """Queue a job that puts these prompts to each of the chosen models."""
+    row = _eval_or_404(request, eval_id)
+    user = current_user(request)
+
+    wanted = payload.get("model_job_ids") or []
+    if not wanted:
+        raise HTTPException(400, "Choose at least one model to score.")
+    if len(wanted) > 8:
+        raise HTTPException(
+            400, "Score at most eight models at a time. Each one is loaded "
+                 "onto the card in turn, and a longer list is a job that runs "
+                 "for hours before it tells you anything.")
+
+    models = []
+    for job_id in wanted:
+        job = db.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "One of those runs does not exist.")
+        # The same 404-not-403 rule as everywhere else: a run you cannot see
+        # must not be distinguishable from one that is not there.
+        if not db.access_level("job", job_id, job.get("owner_id"), user):
+            raise HTTPException(404, "One of those runs does not exist.")
+        if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+            raise HTTPException(
+                400, "\"%s\" has no saved model, so there is nothing to "
+                     "score." % job["name"])
+        models.append({"job_id": job_id, "name": job["name"],
+                       "spec": serving.chat_spec(job)})
+
+    cfg = {
+        "eval_id": eval_id,
+        "eval_name": row["name"],
+        "items": row["items"],
+        "models": models,
+        "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
+        "temperature": float(payload.get("temperature") or 0.0),
+        "system_prompt": payload.get("system_prompt") or "",
+    }
+    if pinned := payload.get("runner_id"):
+        cfg["required_runner"] = pinned
+
+    name = "%s on %d model%s" % (row["name"], len(models),
+                                 "" if len(models) == 1 else "s")
+    jid = db.create_job(name, "evaluate", cfg, owner_id=user["id"])
+    db.add_log(jid, "Queued: %d prompt%s against %s."
+               % (len(row["items"]), "" if len(row["items"]) == 1 else "s",
+                  ", ".join(m["name"] for m in models)))
+    if FLEET is not None:
+        await FLEET.broadcast_ui({"type": "jobs_changed"})
+        FLEET.wake()
+    return {"id": jid}
+
+
+def record_scores(job: dict, summary: dict) -> int:
+    """File an evaluation run's results against the prompt set it used.
+
+    Called from the scheduler when the run reports done. Kept out of the
+    eval_runs table it might otherwise have earned: the comparison has to
+    outlive the job that produced it, so it hangs off the prompt set instead
+    of off the run.
+    """
+    eval_id = summary.get("eval_id")
+    if not eval_id or not db.get_eval(eval_id):
+        return 0
+    written = 0
+    for score in summary.get("scores") or []:
+        if score.get("metrics", {}).get("error"):
+            continue
+        db.record_score(eval_id, score.get("model_job_id") or "", job["id"],
+                        score.get("metrics") or {}, score.get("items") or [])
+        written += 1
+    return written
