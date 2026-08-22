@@ -221,7 +221,12 @@ tr:last-child td { border-bottom: none; }
 .callout-warn { border-left-color: var(--warn); background: var(--warn-bg); }
 .callout-err  { border-left-color: var(--err);  background: var(--err-bg); }
 .callout-ok   { border-left-color: var(--ok);   background: var(--ok-bg); }
-.callout strong { display: block; margin-bottom: 2px; }
+/* A callout's opening `strong` is its title and gets a line of its own.
+   Scoped to the first child on purpose: written as a descendant selector it
+   also caught `<strong>` used for ordinary emphasis inside the body, which
+   turned one paragraph into three lines with two orphaned fragments. Every
+   callout in this app puts its title first, so nothing else needs the rule. */
+.callout > strong:first-child { display: block; margin-bottom: 2px; }
 
 /* -------------------------------------------------------- progress */
 .progress { height: 7px; background: var(--surface-2); border-radius: 20px; overflow: hidden; }

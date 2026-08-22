@@ -210,8 +210,15 @@ def run(cfg: dict, ctx: Any) -> dict:
                        "metrics": metrics, "items": results})
         ctx.log("  %s" % _describe(metrics))
 
-    ctx.log(_verdict(scores))
+    verdict = _verdict(scores)
+    ctx.log(verdict)
     return {"kind": "evaluate", "eval_id": cfg.get("eval_id"),
+            "verdict": verdict,
+            # Whether the ranking this scoring produced is worth drawing as a
+            # ranking. Sent as a fact rather than left for the UI to re-derive
+            # from the verdict text, so the table and the log cannot end up
+            # disagreeing about whether there was a winner.
+            "decisive": _decisive(scores),
             "eval_name": cfg.get("eval_name"),
             "prompts": len(items), "scores": scores}
 
@@ -251,8 +258,55 @@ def _describe(m: dict) -> str:
     return ", ".join(parts)
 
 
+def _separation(best: dict, worst: dict) -> tuple[float, float, int] | None:
+    """How large the gap between two models is, next to the noise in it.
+
+    Compared prompt by prompt rather than average against average, because
+    every model answered the *same* prompts: some of them are simply harder
+    than others, and pairing cancels that out instead of letting it swamp the
+    difference being measured.
+
+    Returns (mean difference, standard error of that mean, prompts compared).
+    """
+    a = {i["prompt"]: i.get("expected_loss") for i in best.get("items") or []}
+    b = {i["prompt"]: i.get("expected_loss") for i in worst.get("items") or []}
+    diffs = [b[k] - a[k] for k in a
+             if a.get(k) is not None and b.get(k) is not None]
+    if len(diffs) < 3:
+        return None
+    n = len(diffs)
+    mean = sum(diffs) / n
+    var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+    return mean, (var / n) ** 0.5, n
+
+
+def _decisive(scores: list[dict]) -> bool:
+    """Did this scoring actually separate the models it compared?
+
+    False whenever the difference between best and worst is smaller than the
+    spread between prompts -- which is the usual case for two models that
+    differ by a little more training, and exactly when a table drawing a
+    winner would be inventing one.
+    """
+    usable = [s for s in scores if s["metrics"].get("expected_loss") is not None]
+    if len(usable) < 2:
+        return False
+    best = min(usable, key=lambda s: s["metrics"]["expected_loss"])
+    worst = max(usable, key=lambda s: s["metrics"]["expected_loss"])
+    sep = _separation(best, worst)
+    return bool(sep and sep[0] >= 2 * sep[1])
+
+
 def _verdict(scores: list[dict]) -> str:
-    """Say which one won, and on which measure, or say that nothing decided it."""
+    """Say which one won and by how much -- or that the prompts cannot tell.
+
+    The second half of that is the part worth writing carefully. A difference
+    of a tenth of a nat, averaged over four prompts, is not a result; it is
+    the spread between four prompts. Reporting it as a winner would be the
+    single easiest way for this feature to mislead somebody, so the size of
+    the difference is always judged against the noise in it rather than
+    against a threshold picked in advance.
+    """
     usable = [s for s in scores if s["metrics"].get("expected_loss") is not None]
     if len(usable) < 2:
         if len(scores) == 1:
@@ -262,15 +316,28 @@ def _verdict(scores: list[dict]) -> str:
         return ("Scored. Without expected answers there is no measure that can "
                 "rank these, only the text each one produced. Add expected "
                 "answers to the prompt set to get a number.")
+
     best = min(usable, key=lambda s: s["metrics"]["expected_loss"])
     worst = max(usable, key=lambda s: s["metrics"]["expected_loss"])
     gap = worst["metrics"]["expected_loss"] - best["metrics"]["expected_loss"]
-    if gap < 0.02:
-        return ("These models score within %.3f of each other on the expected "
-                "answers, which is close enough that this prompt set cannot "
-                "tell them apart. More prompts, or harder ones, would." % gap)
-    return ("Best on the expected answers: %s (%.4f, against %.4f for %s). "
-            "Lower is better -- it means the model found the answer you called "
-            "correct less surprising."
-            % (best["name"], best["metrics"]["expected_loss"],
-               worst["metrics"]["expected_loss"], worst["name"]))
+    head = ("Lowest loss on the expected answers: %s (%.4f, against %.4f for "
+            "%s)." % (best["name"], best["metrics"]["expected_loss"],
+                      worst["metrics"]["expected_loss"], worst["name"]))
+
+    sep = _separation(best, worst)
+    if sep is None:
+        return (head + " With so few prompts that is a difference between two "
+                "numbers, not a result. Add prompts before believing it.")
+    mean, se, n = sep
+    # Two standard errors is roughly the 95% mark. Below it, the difference
+    # between these models is smaller than the difference between prompts.
+    if mean < 2 * se:
+        return (head + " But prompt by prompt the gap is %.3f give or take "
+                "%.3f across %d prompts, which is smaller than the spread "
+                "between the prompts themselves. This set cannot tell these "
+                "two apart -- more prompts, or harder ones, would."
+                % (mean, se, n))
+    return (head + " Prompt by prompt the gap is %.3f give or take %.3f "
+            "across %d prompts, so it is a real difference and not noise. "
+            "Lower is better: it means the model found the answer you called "
+            "correct less surprising." % (mean, se, n))

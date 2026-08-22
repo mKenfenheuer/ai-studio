@@ -258,7 +258,21 @@ class Runner:
             msg = await loop.run_in_executor(None, _next)
             if msg is None:
                 continue
-            await ws.send(json.dumps(msg))
+            try:
+                await ws.send(json.dumps(msg))
+            except Exception:
+                # The socket died with this message already off the queue.
+                # Without this it is simply gone -- which is how restarting
+                # the controller during a run punched a single-step hole in
+                # that run's loss curve, found by counting the rows rather
+                # than by anything going wrong at the time.
+                #
+                # Re-queued at the tail, so it can arrive after messages that
+                # were produced later. Harmless here: metrics are stored
+                # against their own step number, and log lines carry their own
+                # timestamp, so neither depends on arrival order.
+                self.outbox.put(msg)
+                raise
 
     async def _heartbeat(self, ws) -> None:
         while True:

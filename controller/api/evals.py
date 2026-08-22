@@ -295,7 +295,14 @@ def record_scores(job: dict, summary: dict) -> int:
     for score in summary.get("scores") or []:
         if score.get("metrics", {}).get("error"):
             continue
+        # The verdict and whether it separated anything belong to the scoring,
+        # not to one model in it -- but they are stored per row because a row
+        # is what outlives the run, and the table that reads them has to know
+        # whether it may draw a winner.
+        metrics = {**(score.get("metrics") or {}),
+                   "verdict": summary.get("verdict"),
+                   "ranking_decisive": bool(summary.get("decisive"))}
         db.record_score(eval_id, score.get("model_job_id") or "", job["id"],
-                        score.get("metrics") or {}, score.get("items") or [])
+                        metrics, score.get("items") or [])
         written += 1
     return written

@@ -97,7 +97,7 @@ function layout(ev, candidates, openScore) {
       ${raw(ev.notes ? `<p class="sub">${esc(ev.notes)}</p>` : "")}
     </div>
 
-    ${raw(scoreTable(scores, answered))}
+    ${raw(scoreTable(scores, answered, (ev.items || []).length))}
     ${raw(openScore ? scoreDetail(openScore) : "")}
 
     <div class="grid grid-2" style="margin-bottom:14px">
@@ -169,7 +169,12 @@ function layout(ev, candidates, openScore) {
     <div id="shareRow">${raw(shareBox("eval", ev))}</div>`;
 }
 
-function scoreTable(scores, answered) {
+// Below this, a difference between two models is a difference between a
+// handful of prompts. The runner says so in words after each scoring; the
+// table has to stop drawing a winner's rosette on it.
+const ENOUGH_PROMPTS = 10;
+
+function scoreTable(scores, answered, total) {
   if (!scores.length) {
     return html`
       <div class="card empty" style="margin-bottom:14px">
@@ -187,6 +192,14 @@ function scoreTable(scores, answered) {
   // zero would make every model look identical -- the differences that matter
   // between two trained models are small in absolute terms.
   const span = (worst ?? 0) - (best ?? 0) || 1;
+  // Two conditions, and both are the runner's own judgement rather than this
+  // page's: enough prompts to be worth measuring, and a most-recent scoring
+  // whose difference actually survived being measured against the spread
+  // between prompts. Marking a winner the log has just called a coin toss
+  // would be the table contradicting its own evidence.
+  const latest = scores[0]?.metrics || {};
+  const decisive = total >= ENOUGH_PROMPTS && latest.ranking_decisive !== false;
+  const verdict = latest.verdict;
 
   return html`
     <div class="card" style="margin-bottom:14px;padding:0">
@@ -208,7 +221,7 @@ function scoreTable(scores, answered) {
         <tbody>
           ${raw(scores.map((s) => {
             const m = s.metrics || {};
-            const isBest = best !== null && m.expected_loss === best;
+            const isBest = decisive && best !== null && m.expected_loss === best;
             const width = m.expected_loss != null
               ? 12 + 88 * (1 - (m.expected_loss - best) / span) : 0;
             return html`
@@ -241,6 +254,23 @@ function scoreTable(scores, answered) {
           }).join(""))}
         </tbody>
       </table></div>
+      ${raw(verdict ? html`
+        <div class="callout ${decisive ? "callout-ok" : "callout-warn"}"
+             style="margin:0 16px 12px">
+          <strong>${decisive ? "The latest scoring separated them"
+                             : "The latest scoring could not separate them"}</strong>
+          ${verdict}
+          ${raw(!decisive && total < ENOUGH_PROMPTS ? html`
+            <div style="margin-top:6px">Around ${ENOUGH_PROMPTS} prompts is
+              where a comparison starts to be worth reading, and more is
+              better.</div>` : "")}
+        </div>` : !decisive && scores.length > 1 ? html`
+        <div class="callout callout-warn" style="margin:0 16px 12px">
+          <strong>${total} prompt${total === 1 ? "" : "s"} is not enough to
+          rank these.</strong> The gap between two trained models is usually
+          smaller than the gap between one prompt and the next, so with a set
+          this small the lowest number is as likely to be luck as skill.</div>`
+        : "")}
       <p class="muted tiny" style="padding:10px 16px 14px;margin:0">
         ${raw(answered
           ? html`<strong>Loss on expected</strong> is how surprised the model was

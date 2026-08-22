@@ -209,10 +209,11 @@ class Saver:
         # Announced once. After that it is routine, and a line every ten
         # minutes for eight hours is a log nobody reads.
         if self.count == 1:
+            mins = max(1, round(self.every_s / 60))
             self.ctx.log("Checkpoint saved at step %d: %.0f MB in %.2fs, and "
-                         "every %d minutes from here. An interruption now "
-                         "resumes from the last checkpoint instead of starting "
-                         "over."
+                         "%s from here. An interruption now resumes from the "
+                         "last checkpoint instead of starting over."
                          % (step, written / 1048576, time.time() - t0,
-                            round(self.every_s / 60)))
+                            "every minute" if mins == 1
+                            else "every %d minutes" % mins))
         return True
