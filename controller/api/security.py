@@ -48,10 +48,38 @@ def _wants_json(request: Request) -> bool:
     return request.url.path.startswith("/api/")
 
 
+def _bearer(request: Request) -> str | None:
+    header = request.headers.get("Authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip() or None
+    return None
+
+
 async def authenticate(request: Request, call_next):
     """Attach the caller's account to the request, or refuse it."""
     path = request.url.path
     request.state.user = None
+
+    # The OpenAI-compatible surface. A different door with a different key,
+    # because the caller is a script or a piece of home automation rather than
+    # a browser -- it has no cookie, no session and nowhere to keep one. The
+    # answers are shaped the way an OpenAI client expects, including the
+    # errors, or the client library turns a clear refusal into a parse error.
+    if path.startswith("/v1/"):
+        raw = _bearer(request)
+        user = db.api_key_owner(auth.api_key_hash(raw)) if raw else None
+        if not user:
+            # Falls back to a session so the studio's own pages can call this
+            # surface without minting a key to talk to itself.
+            user = auth.session_user(request.cookies.get(auth.SESSION_COOKIE))
+        if not user:
+            return JSONResponse(
+                {"error": {"message": "Missing or invalid API key. Create one "
+                                      "in your account settings.",
+                           "type": "invalid_request_error",
+                           "code": "invalid_api_key"}}, status_code=401)
+        request.state.user = user
+        return await call_next(request)
 
     if not path.startswith("/api/"):
         # The single-page app itself is served to anyone; it shows a login

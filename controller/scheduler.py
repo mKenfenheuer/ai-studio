@@ -27,6 +27,11 @@ class Fleet:
         self.busy: dict[str, str] = {}          # runner_id -> job_id
         self.ui_clients: set[WebSocket] = set()
         self.generations: dict[str, str] = {}   # request_id -> runner_id
+        # request_id -> a queue for a caller waiting on the reply over HTTP.
+        # The websocket relay is fire-and-forget, which is right for a browser
+        # watching tokens appear and useless for a request that has to return
+        # an answer.
+        self.waiters: dict[str, "asyncio.Queue"] = {}
         # When each runner was last handed work. A runner takes a moment to
         # pick a job up, and during that gap its heartbeat still says idle --
         # without this the scheduler would hand it a second job.
@@ -389,10 +394,20 @@ class Fleet:
         # SQLite would turn a chat into a few hundred transactions a minute.
         if kind in ("generate_delta", "generate_status", "generate_done",
                     "generate_error"):
-            # Passed through whole, reasoning field included.
-            await self.broadcast_ui({**msg, "type": msg["type"]})
+            rid = msg.get("request_id")
+            waiter = self.waiters.get(rid)
+            if waiter is not None:
+                # Somebody is awaiting this reply over HTTP rather than
+                # watching it in a browser. It goes to them and nowhere else:
+                # broadcasting an API caller's tokens to every open tab in the
+                # studio would put one person's conversation on another
+                # person's screen.
+                waiter.put_nowait(msg)
+            else:
+                # Passed through whole, reasoning field included.
+                await self.broadcast_ui({**msg, "type": msg["type"]})
             if kind in ("generate_done", "generate_error"):
-                self.generations.pop(msg.get("request_id"), None)
+                self.generations.pop(rid, None)
             return
 
         if kind == "heartbeat":

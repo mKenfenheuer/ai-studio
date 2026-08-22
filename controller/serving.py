@@ -24,9 +24,16 @@ def chat_spec(job: dict) -> dict:
     if not fmt and job["kind"] == "pretrain_llm":
         fmt = {"mode": "text"}
 
+    # A merged model is a complete model that happens to have been made by
+    # flattening an adapter into its base. The runner only distinguishes
+    # "complete model" from "adapter needing a base", so it is told the former
+    # -- carrying the merge's own kind through would send it looking for a
+    # base model that is already inside the weights.
+    kind = "pretrain_llm" if job["kind"] == "merge_adapter" else job["kind"]
+
     return {
         "job_id": job["id"],
-        "kind": job["kind"],
+        "kind": kind,
         "base_model": cfg.get("base_model"),
         # An adapter whose base is another run in this studio rather than a
         # Hugging Face id. The runner resolves it the same way it resolves the

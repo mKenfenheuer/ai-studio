@@ -94,9 +94,11 @@
         nudges it toward better answers. You watch the error go down.</p></div></div>
       <div class="help-step"><span class="n">4</span>
         <div><h4>Use the result</h4><p>Chat with it in the
-        <a href="#/play">Playground</a>, or download it. A fine-tune gives you a
-        small <em>adapter</em> file; a model built from scratch is a complete
-        model of its own.</p></div></div>
+        <a href="#/play">Playground</a>, score it against
+        <a href="#/evals">a set of prompts</a>, download it, or point other
+        software at it — this studio speaks the OpenAI API, so anything with a
+        &ldquo;base URL&rdquo; field can use your model. Get a key from
+        <a href="#/account">your account</a>.</p></div></div>
     </div>
 
     <h3>Building from scratch</h3>
@@ -142,6 +144,13 @@
       <dt>Prompt set</dt><dd>A saved list of questions, kept so that every
         model you train can be asked the same ones. The only way to answer
         &ldquo;is this better than last week's?&rdquo;</dd>
+      <dt>Adapter vs merged model</dt><dd>A fine-tune produces a small
+        <em>adapter</em> that only works alongside the model it was trained on.
+        <em>Merging</em> folds it in and gives you one complete model — bigger,
+        but it runs anywhere on its own.</dd>
+      <dt>Sweep</dt><dd>The same run launched several times with one setting
+        changed, so you can see which value was actually better instead of
+        guessing.</dd>
       <dt>Base model</dt><dd>A model that only continues text. It has not been
         taught to answer questions — that is what fine-tuning adds.</dd>
     </dl>

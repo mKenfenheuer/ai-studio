@@ -57,8 +57,12 @@ export async function usersView(mount) {
                         + "it before they can do anything.");
       if (!pw) return;
       try {
-        await api.resetUserPassword(t.dataset.reset, pw);
-        toast("Password reset. All their sessions were signed out.", "ok");
+        const r = await api.resetUserPassword(t.dataset.reset, pw);
+        toast("Password reset. Sessions signed out"
+              + (r.keys_revoked
+                 ? `, and ${r.keys_revoked} API key${r.keys_revoked === 1
+                    ? "" : "s"} revoked — anything using them stops working.`
+                 : "."), "ok");
         await refresh();
       } catch (ex) { toast(ex.message, "err"); }
     });

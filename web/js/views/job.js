@@ -149,7 +149,7 @@ export async function jobView(mount, [jobId]) {
   let datasets = [];
   const paintFurther = () => {
     const box = $("#furtherRow", mount);
-    if (box) box.innerHTML = furtherCard(job, datasets);
+    if (box) box.innerHTML = mergeCard(job) + furtherCard(job, datasets);
   };
   paintFurther();
   if (job.artifacts?.length) {
@@ -165,6 +165,25 @@ export async function jobView(mount, [jobId]) {
       job = await api.job(jobId);
       paintStats(mount, job, latest, scratch, stage, checkpointStep);
     } catch (e) { toast(e.message, "err"); t.disabled = false; }
+  });
+
+  on(mount, "submit", "#mergeForm", async (e) => {
+    e.preventDefault();
+    const btn = $("#mergeGo", mount);
+    btn.disabled = true;
+    btn.textContent = "Queueing…";
+    try {
+      const { id } = await api.createJob({
+        kind: "merge_adapter",
+        config: { source_job: jobId, dtype: $("#mergeDtype", mount).value },
+      });
+      toast("Queued.", "ok");
+      location.hash = `#/jobs/${id}`;
+    } catch (ex) {
+      toast(ex.message, "err");
+      btn.disabled = false;
+      btn.textContent = "Merge into a standalone model";
+    }
   });
 
   on(mount, "submit", "#furtherForm", async (e) => {
@@ -464,6 +483,43 @@ function furtherJob(job, form) {
     cfg.base_model_job = job.id;
   }
   return { name: form.name || undefined, kind: job.kind, config: cfg };
+}
+
+/** A fine-tune produces an adapter, which is the right thing to produce and
+ *  the wrong thing to hand somebody. */
+function mergeCard(job) {
+  if (job.kind !== "finetune_llm" || !job.artifacts?.length) return "";
+  if (!["succeeded", "cancelled"].includes(job.status)) return "";
+  return html`
+    <details class="card" style="margin-bottom:14px">
+      <summary><strong>Make a standalone model</strong>
+        <span class="muted tiny"> — one file set, no base model needed</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        This run produced an <em>adapter</em>: a few megabytes that mean
+        nothing without <code>${esc(job.config.base_model || "its base model")}</code>.
+        Merging folds it in and writes a complete model that loads on its own —
+        which is what you need to run it in Ollama, llama.cpp, or anywhere
+        outside this studio.</p>
+      <p class="muted tiny" style="margin:6px 0 0">
+        <strong>It will be the size of the base model</strong>, not of the
+        adapter. The adapter stays where it is and is still the better thing
+        to use inside the studio.</p>
+      <form id="mergeForm" style="margin-top:10px">
+        <div class="field">
+          <label for="mergeDtype">Precision</label>
+          <select id="mergeDtype" name="dtype">
+            <option value="float16">float16 — half the size, the usual choice</option>
+            <option value="bfloat16">bfloat16</option>
+            <option value="float32">float32 — exact, twice the size</option>
+          </select>
+          <div class="hint">The arithmetic is done in full precision either
+            way; this is only what gets written out.</div>
+        </div>
+        <button class="btn-primary btn-sm" type="submit" id="mergeGo">
+          Merge into a standalone model</button>
+      </form>
+    </details>`;
 }
 
 function publishCard(job) {

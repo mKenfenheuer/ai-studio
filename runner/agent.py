@@ -24,7 +24,7 @@ import httpx
 import websockets
 
 from . import capabilities, checkpoints, inference
-from .jobs import evaluate, generate_data, lora_llm, scratch_llm
+from .jobs import evaluate, generate_data, lora_llm, merge, scratch_llm
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -42,6 +42,9 @@ JOB_HANDLERS = {
     # time, and it belongs in the queue with everything else competing for
     # the same card.
     "evaluate": evaluate.run,
+    # Merging needs the base model resident and writes a file the size of it.
+    # Minutes rather than hours, but it is still the machine being occupied.
+    "merge_adapter": merge.run,
 }
 
 

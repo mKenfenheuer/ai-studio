@@ -159,6 +159,23 @@ CREATE TABLE IF NOT EXISTS eval_scores (
     items         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eval_scores ON eval_scores(eval_id, created_at);
+
+-- Keys for the OpenAI-compatible API. The key itself is never stored, only
+-- its SHA-256 -- the same rule sessions follow, for the same reason: reading
+-- this table must not hand anybody a working credential. `prefix` is the
+-- handful of visible characters that let a person tell two of their own keys
+-- apart without either of them being recoverable.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    key_hash    TEXT NOT NULL UNIQUE,
+    prefix      TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    last_used   REAL,
+    calls       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -603,6 +620,9 @@ def update_user(user_id: str, **fields: Any) -> None:
 def delete_user(user_id: str) -> None:
     c = connect()
     c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    # Keys do not outlive their owner. A run is somebody else's to inherit; a
+    # credential that still acts as a deleted account is not.
+    c.execute("DELETE FROM api_keys WHERE user_id=?", (user_id,))
     # Runs and datasets outlive their owner and become unowned rather than
     # being destroyed. Deleting an account should not silently delete a week
     # of somebody else's GPU time.
@@ -624,6 +644,55 @@ def adopt_ownerless(user_id: str) -> int:
     c.execute("UPDATE datasets SET owner_id=? WHERE owner_id IS NULL", (user_id,))
     c.commit()
     return n
+
+
+# ---------------------------------------------------------------- api keys
+
+def create_api_key(user_id: str, name: str, key_hash: str, prefix: str) -> str:
+    kid = new_id("key")
+    ex("INSERT INTO api_keys (id,user_id,name,key_hash,prefix,created_at)"
+       " VALUES (?,?,?,?,?,?)", (kid, user_id, name, key_hash, prefix, now()))
+    return kid
+
+
+def api_key_owner(key_hash: str) -> dict | None:
+    """The account a key belongs to, and a note that it was used.
+
+    The usage counter is written at most once a minute per key. An API meant
+    to be called from a script can be called several times a second, and a
+    database write per call to record "yes, still being used" would be the
+    most expensive part of serving a short reply.
+    """
+    row = q1("SELECT * FROM api_keys WHERE key_hash=?", (key_hash,))
+    if not row:
+        return None
+    user = get_user(row["user_id"])
+    if not user or not user["active"]:
+        return None
+    if now() - float(row["last_used"] or 0) > 60:
+        ex("UPDATE api_keys SET last_used=?, calls=calls+1 WHERE id=?",
+           (now(), row["id"]))
+    return user
+
+
+def list_api_keys(user_id: str) -> list[dict]:
+    return q("SELECT id,name,prefix,created_at,last_used,calls FROM api_keys"
+             " WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+
+
+def revoke_api_keys(user_id: str) -> int:
+    c = connect()
+    cur = c.execute("DELETE FROM api_keys WHERE user_id=?", (user_id,))
+    c.commit()
+    return cur.rowcount
+
+
+def delete_api_key(user_id: str, key_id: str) -> bool:
+    c = connect()
+    cur = c.execute("DELETE FROM api_keys WHERE id=? AND user_id=?",
+                    (key_id, user_id))
+    c.commit()
+    return cur.rowcount > 0
 
 
 def list_sessions(user_id: str) -> list[dict]:

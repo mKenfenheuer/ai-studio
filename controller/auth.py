@@ -187,6 +187,29 @@ def purge_expired_sessions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# API keys
+# ---------------------------------------------------------------------------
+#
+# Hashed, not encrypted. There is never a reason to read a key back -- it is
+# checked against, never displayed -- so the weaker of the two options is also
+# the wrong one. A plain SHA-256 rather than scrypt because unlike a password
+# this is 32 bytes of randomness: there is no dictionary to try it against,
+# and a per-call scrypt would make the API slower than the model.
+
+API_KEY_PREFIX = "sk-ais-"
+
+
+def new_api_key() -> tuple[str, str, str]:
+    """A fresh key, its hash, and the part that may be shown afterwards."""
+    raw = API_KEY_PREFIX + secrets.token_urlsafe(32)
+    return raw, _token_hash(raw), raw[:len(API_KEY_PREFIX) + 6]
+
+
+def api_key_hash(raw: str) -> str:
+    return _token_hash(raw)
+
+
+# ---------------------------------------------------------------------------
 # Secrets at rest
 # ---------------------------------------------------------------------------
 

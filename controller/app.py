@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import architectures as arch
 from . import config, datasets as dsets, db, diagnose, hfaccount, hub, serving
-from .api import accounts, data, evals, security, sharing
+from .api import accounts, data, evals, security, serving as serving_api, sharing
 from .scheduler import Fleet
 
 fleet = Fleet()
@@ -46,12 +46,14 @@ app.middleware("http")(security.authenticate)
 app.include_router(accounts.router)
 app.include_router(data.router)
 app.include_router(evals.router)
+app.include_router(serving_api.router)
 app.include_router(sharing.router)
 
 # The evaluation routes queue jobs, which means they need the live fleet. Set
 # here rather than imported the other way round, because the fleet is created
 # in this module and an import back into it would be a cycle.
 evals.FLEET = fleet
+serving_api.FLEET = fleet
 
 
 # ===========================================================================
@@ -296,7 +298,8 @@ async def _create_job(request: Request, payload: dict) -> str:
     # Training on top of something this studio already built. The permission
     # check is the point: without it, any run id pasted into this field would
     # hand out the weights of a model you are not allowed to see.
-    if source_id := (cfg.get("continue_from") or cfg.get("base_model_job")):
+    if source_id := (cfg.get("continue_from") or cfg.get("base_model_job")
+                     or cfg.get("source_job")):
         src = _job_or_404(request, source_id)
         if not (config.ARTIFACT_DIR / ("%s.zip" % source_id)).exists():
             raise HTTPException(400, "That run has no saved model to build on.")
@@ -323,6 +326,22 @@ async def _create_job(request: Request, payload: dict) -> str:
             raise HTTPException(400, "Choose some text to learn from.")
         if not cfg.get("arch"):
             raise HTTPException(400, "No model architecture was chosen.")
+    elif kind == "merge_adapter":
+        src = _job_or_404(request, cfg.get("source_job") or "")
+        if src["kind"] != "finetune_llm":
+            raise HTTPException(
+                400, "Only a fine-tune produces an adapter to merge. A model "
+                     "built from scratch is already standalone.")
+        if not (config.ARTIFACT_DIR / ("%s.zip" % src["id"])).exists():
+            raise HTTPException(400, "That run has no saved adapter.")
+        # Carried across so the merge does not depend on the adapter file
+        # recording its own base, which older adapters may not.
+        cfg.setdefault("base_model", src["config"].get("base_model"))
+        cfg.setdefault("base_model_job", src["config"].get("base_model_job"))
+        # The merged model answers in the shape the fine-tune was trained in,
+        # so the format travels with it or the playground would guess again.
+        cfg.setdefault("format", src["config"].get("format"))
+        cfg.setdefault("system_prompt", src["config"].get("system_prompt"))
     elif kind == "generate_dataset":
         if not (cfg.get("model") or {}).get("job_id") \
                 and not (cfg.get("model") or {}).get("base_model"):
@@ -500,6 +519,8 @@ async def get_sweep(request: Request, sweep_id: str) -> dict:
 
 def _default_job_name(cfg: dict, kind: str = "finetune_llm") -> str:
     data = str(cfg.get("dataset", "data")).split("/")[-1]
+    if kind == "merge_adapter":
+        return "%s, merged" % (cfg.get("source_run_name") or "Fine-tune")
     if kind == "pretrain_llm":
         a = cfg.get("arch") or {}
         label = (arch.preset(a.get("size_id", "")) or {}).get("label", "Model")
@@ -673,8 +694,8 @@ async def upload_artifact(job_id: str, file: UploadFile,
     # run produces a standalone model; a generation run produces data. Labelling
     # them apart matters because what you do with each is completely different.
     job = db.get_job(job_id)
-    kind = {"pretrain_llm": "model", "generate_dataset": "dataset"}.get(
-        (job or {}).get("kind"), "adapter")
+    kind = {"pretrain_llm": "model", "generate_dataset": "dataset",
+            "merge_adapter": "model"}.get((job or {}).get("kind"), "adapter")
     db.add_artifact(job_id, kind, dest.name, size)
 
     if kind == "dataset" and job:
@@ -791,7 +812,8 @@ async def download_artifact(request: Request, job_id: str):
         if not getattr(request.state, "runner", False) else db.get_job(job_id)
     safe = "".join(c for c in (job["name"] if job else job_id)
                    if c.isalnum() or c in "-_ ").strip().replace(" ", "-")
-    suffix = "model" if (job or {}).get("kind") == "pretrain_llm" else "adapter"
+    suffix = "model" if (job or {}).get("kind") in ("pretrain_llm",
+                                                    "merge_adapter") else "adapter"
     return FileResponse(path, media_type="application/zip",
                         filename="%s-%s.zip" % (safe or job_id, suffix))
 

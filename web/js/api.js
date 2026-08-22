@@ -54,6 +54,13 @@ export const api = {
         { method: "POST", body: JSON.stringify({ password }) }),
   deleteUser:  (id) => req(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
+  // ---- api keys --------------------------------------------------------
+  apiKeys:     () => req("/api/me/api-keys"),
+  createApiKey: (name) =>
+    req("/api/me/api-keys", { method: "POST", body: JSON.stringify({ name }) }),
+  deleteApiKey: (id) =>
+    req(`/api/me/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
   // ---- notifications ---------------------------------------------------
   notifyState: () => req("/api/me/notifications"),
   notifySet:   (body) =>

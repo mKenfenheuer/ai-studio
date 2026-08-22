@@ -168,6 +168,38 @@ async def revoke_sessions(request: Request) -> dict:
 # Hugging Face
 # ---------------------------------------------------------------------------
 
+@router.get("/me/api-keys")
+async def api_keys(request: Request) -> list[dict]:
+    return db.list_api_keys(current_user(request)["id"])
+
+
+@router.post("/me/api-keys")
+async def api_key_create(request: Request, payload: dict = Body(default=None)) -> dict:
+    """Mint a key. Shown once, here, and never again.
+
+    Stored as a SHA-256, so there is no version of this endpoint that could
+    show it a second time -- which is the property that makes a leaked
+    database not a set of working credentials.
+    """
+    user = current_user(request)
+    name = ((payload or {}).get("name") or "").strip() or "API key"
+    if len(db.list_api_keys(user["id"])) >= 20:
+        raise HTTPException(400, "That is twenty keys. Delete one you no "
+                                 "longer use before making another.")
+    raw, key_hash, prefix = auth.new_api_key()
+    kid = db.create_api_key(user["id"], name[:60], key_hash, prefix)
+    return {"id": kid, "name": name[:60], "prefix": prefix, "key": raw,
+            "note": "Copy this now. It is stored hashed and cannot be shown "
+                    "again -- if you lose it, delete it and make another."}
+
+
+@router.delete("/me/api-keys/{key_id}")
+async def api_key_delete(request: Request, key_id: str) -> dict:
+    if not db.delete_api_key(current_user(request)["id"], key_id):
+        raise HTTPException(404, "No such key.")
+    return {"ok": True}
+
+
 @router.get("/me/notifications")
 async def notify_state(request: Request) -> dict:
     return notify.settings_for(current_user(request))
@@ -341,7 +373,12 @@ async def reset_password(request: Request, user_id: str,
     db.update_user(user_id, password_hash=auth.hash_password(password),
                    must_change=1)
     auth.end_all_sessions(user_id)
-    return {"ok": True}
+    # And the API keys. An administrator resetting somebody's password means
+    # either they were locked out or the account is suspect, and in the second
+    # case a key left working is a session that survived the reset -- the very
+    # thing ending the sessions was for.
+    revoked = db.revoke_api_keys(user_id)
+    return {"ok": True, "keys_revoked": revoked}
 
 
 @router.delete("/users/{user_id}")

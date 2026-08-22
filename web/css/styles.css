@@ -665,3 +665,10 @@ details.card[open] > summary::before { content: "▾ "; }
 .finding .do    { color: var(--text-2); }
 .finding .do .lbl { color: var(--text-3); text-transform: uppercase;
                     font-size: 10.5px; letter-spacing: .05em; margin-right: 4px; }
+
+/* A copy-me block. `pre` so the line breaks are the ones written, and
+   scrollable on its own so a long curl line never widens the page. */
+.code { background: var(--surface-2); border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px 12px; margin: 8px 0 0;
+        font-family: var(--mono); line-height: 1.6; overflow-x: auto;
+        white-space: pre; color: var(--text); }

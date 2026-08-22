@@ -7,13 +7,53 @@ import { html, raw, esc, $, $$, on, toast, fmtAgo,
 export async function accountView(mount) {
   let me = await api.me();
   let alerts = await api.notifyState();
+  let keys = await api.apiKeys();
+  // The one time a key is visible. Held in memory only, and dropped as soon
+  // as the page is left -- there is nowhere it could be stored that would not
+  // be a worse place than the user's own password manager.
+  let freshKey = null;
 
   const draw = () => {
-    mount.innerHTML = layout(me, alerts);
+    mount.innerHTML = layout(me, alerts, keys, freshKey);
     wire();
   };
 
   function wire() {
+    on(mount, "submit", "#keyForm", async (e) => {
+      e.preventDefault();
+      const name = new FormData(e.target).get("name");
+      try {
+        freshKey = await api.createApiKey(name);
+        keys = await api.apiKeys();
+        draw();
+      } catch (ex) { toast(ex.message, "err"); }
+    });
+
+    on(mount, "click", "#copyKey", async () => {
+      const box = $("#freshKey", mount);
+      box.select();
+      try {
+        await navigator.clipboard.writeText(box.value);
+        toast("Copied.", "ok");
+      } catch {
+        // Clipboard access needs a secure context, which a studio reached
+        // over plain http on a local address is not. The text is selected,
+        // which is the fallback that always works.
+        toast("Select it and copy — this browser will not do it for us here.");
+      }
+    });
+
+    on(mount, "click", "[data-del-key]", async (_e, t) => {
+      if (!confirm("Delete this key?\n\nAnything using it stops working "
+                   + "immediately.")) return;
+      try {
+        await api.deleteApiKey(t.dataset.delKey);
+        keys = await api.apiKeys();
+        freshKey = null;
+        draw();
+      } catch (ex) { toast(ex.message, "err"); }
+    });
+
     on(mount, "submit", "#hookForm", async (e) => {
       e.preventDefault();
       const url = $("#hookUrl", mount).value.trim();
@@ -163,7 +203,7 @@ export async function accountView(mount) {
 
 // ---------------------------------------------------------------------------
 
-function layout(me, alerts) {
+function layout(me, alerts, keys, freshKey) {
   const hf = me.hf || {};
   return html`
     <div class="page-head">
@@ -222,9 +262,74 @@ function layout(me, alerts) {
       </div>
 
       <div>
+        ${raw(keysCard(keys, freshKey))}
         ${raw(alertCard(alerts))}
         ${raw(hfCard(hf))}
       </div>
+    </div>`;
+}
+
+/** Using your models from outside this app. */
+function keysCard(keys, fresh) {
+  const origin = location.origin;
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3>Use your models from other software</h3>
+      <p class="muted tiny">This studio speaks the OpenAI API, so anything with
+        a &ldquo;base URL&rdquo; and an API key field can talk to a model you
+        trained here — Home Assistant, a script, an editor plugin, or any
+        client library.</p>
+
+      <div class="field" style="margin-top:10px">
+        <label>Base URL</label>
+        <input type="text" class="mono" readonly value="${esc(origin)}/v1">
+        <div class="hint">Model names come from
+          <code>GET ${esc(origin)}/v1/models</code> — each finished run is one,
+          by its id or its name.</div>
+      </div>
+
+      ${raw(fresh ? html`
+        <div class="callout callout-ok">
+          <strong>Copy this now</strong>
+          It is stored hashed and cannot be shown again. If you lose it,
+          delete it and make another.
+          <div class="row" style="gap:6px;margin-top:8px">
+            <input type="text" class="mono" readonly id="freshKey"
+                   value="${esc(fresh.key)}" style="flex:1">
+            <button class="btn-sm" id="copyKey">Copy</button>
+          </div>
+        </div>` : "")}
+
+      <form id="keyForm" class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
+        <input type="text" name="name" placeholder="What is it for? e.g. Home Assistant"
+               style="flex:1;min-width:160px">
+        <button class="btn-primary btn-sm" type="submit">Create a key</button>
+      </form>
+
+      ${raw(keys.length ? html`
+        <table class="table" style="margin-top:10px"><tbody>
+          ${raw(keys.map((k) => html`
+            <tr>
+              <td>${k.name}
+                <div class="muted tiny mono">${k.prefix}…</div></td>
+              <td class="tiny muted">${k.last_used
+                ? `used ${fmtAgo(k.last_used)}` : "never used"}</td>
+              <td><button class="btn-sm btn-danger" data-del-key="${esc(k.id)}"
+                          title="Delete this key">✕</button></td>
+            </tr>`).join(""))}
+        </tbody></table>` : "")}
+
+      <details class="adv" style="margin-top:10px">
+        <summary>How to point something at it</summary>
+        <pre class="code tiny">curl ${esc(origin)}/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "your-run-name",
+       "messages": [{"role": "user", "content": "hello"}]}'</pre>
+        <p class="muted tiny">Streaming works too — send
+          <code>"stream": true</code>. A key acts as you: it can reach the runs
+          you can reach and no others.</p>
+      </details>
     </div>`;
 }
 
