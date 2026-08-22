@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common.formatting import format_example
+from common.formatting import detect_format, format_example
 from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import expert_kernel
 
@@ -348,6 +348,26 @@ def run(cfg: dict, ctx: Any) -> dict:
                     "warn")
 
     sample_row = ds[0] if len(ds) else {}
+
+    # "auto" is an instruction to work it out, not a description of anything.
+    # Left unresolved on the job, it is also what the playground and the API
+    # are handed later -- and they have no dataset to work it out from, so
+    # they render a bare question to a model that was trained on
+    # "### Instruction: ... ### Response:" and get an empty reply back.
+    #
+    # The trainer is the one place that can see both the data and the answer,
+    # so it resolves the shape here and reports it. What was trained and what
+    # is served then come from the same decision rather than from two guesses
+    # made with different information.
+    if fmt.get("mode", "auto") == "auto" and sample_row:
+        detected = detect_format(list(sample_row.keys()), [sample_row])
+        detected.pop("confidence", None)
+        fmt = {**detected, **{k: v for k, v in fmt.items() if k != "mode"}}
+        ctx.log("The shape of this data was worked out rather than given: "
+                "reading it as %s. That is recorded on the run, so the "
+                "playground speaks to the model the way it was taught."
+                % (fmt.get("mode") or "plain text"))
+
     preview = format_example(sample_row, fmt)
     if not preview:
         raise ValueError(
@@ -356,7 +376,13 @@ def run(cfg: dict, ctx: Any) -> dict:
             % ", ".join(map(str, sample_row.keys())))
     ctx.log("Example training text:\n%s" % preview[:600])
     ctx.emit_meta({"dataset_rows": len(ds), "dataset_columns": list(sample_row.keys()),
-                   "example_text": preview[:1000]})
+                   "example_text": preview[:1000],
+                   # Sent back so the controller can put it on the job. The
+                   # template itself is dropped: it can be tens of kilobytes,
+                   # and where it came from -- the model's own tokenizer -- is
+                   # already recorded by `use_model_template`.
+                   "resolved_format": {k: v for k, v in fmt.items()
+                                       if k not in ("chat_template", "specials")}})
 
     def tokenize(batch_rows: dict) -> dict:
         keys = list(batch_rows.keys())

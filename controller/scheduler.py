@@ -505,7 +505,21 @@ class Fleet:
 
         elif kind == "job_meta":
             meta = msg.get("meta", {})
-            if ckpt := meta.get("checkpoint"):
+            if resolved := meta.get("resolved_format"):
+                # The trainer worked out a shape the plan left as "auto". The
+                # job's own record is updated so that everything downstream --
+                # the playground, the API, a later fine-tune of this model --
+                # uses what was actually trained on.
+                job = db.get_job(jid)
+                if job and (job["config"].get("format") or {}).get(
+                        "mode", "auto") == "auto":
+                    cfg = dict(job["config"])
+                    cfg["format"] = {**(cfg.get("format") or {}), **resolved}
+                    db.update_job_config(jid, cfg)
+                    db.add_log(jid, "Recorded how this data reads (%s), so the "
+                               "finished model is spoken to the way it was "
+                               "taught." % (resolved.get("mode") or "plain text"))
+            elif ckpt := meta.get("checkpoint"):
                 # Persisted, not merely noted. This one fact decides whether an
                 # interrupted run resumes or starts over, and keeping it only
                 # in memory would lose it to the very controller restart that

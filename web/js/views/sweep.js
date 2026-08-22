@@ -97,7 +97,9 @@ function layout(s) {
                   ${raw(held != null ? html`
                     <strong>${held.toFixed(4)}</strong>
                     <div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>`
-                    : `<span class="muted tiny">${live ? "still running" : "not measured"}</span>`)}
+                    : `<span class="muted tiny">${
+                        r.status === "running" ? "still running"
+                          : live ? "waiting its turn" : "not measured"}</span>`)}
                 </td>
                 <td class="hide-sm">${sm.final_loss != null ? sm.final_loss.toFixed(4) : "—"}</td>
                 <td class="hide-sm">${sm.steps ? fmtNum(sm.steps) : (r.step || "—")}
