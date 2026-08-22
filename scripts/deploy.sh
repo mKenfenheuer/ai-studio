@@ -50,30 +50,41 @@ if [[ -z "$inflight" ]]; then
   # controller is already down, which is safe -- but it is a different fact
   # and it gets said rather than assumed.
   warn "The controller did not answer on port $PORT, so nothing could be checked."
-  warn "If a runner is training right now, this deploy will interrupt it."
-  [[ $force -eq 1 || "$target" == "status" ]] || die "Re-run with --force if you are sure."
+  # Restarting the controller interrupts nothing whether or not a run is in
+  # progress, so not being able to ask is not a reason to stop. Restarting a
+  # runner is the dangerous one, and that is where an unanswered check has to
+  # be treated as "assume the worst".
+  case "$target" in
+    status|controller) : ;;
+    *)
+      warn "If a runner is training right now, this deploy will interrupt it."
+      [[ $force -eq 1 ]] || die "Re-run with --force if you are sure."
+      ;;
+  esac
   busy=0
 else
   busy="$(printf '%s' "$inflight" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin)["busy"] else 0)')"
 fi
 
 describe() {
-  printf '%s' "$inflight" | python3 - <<'PY'
+  # The JSON goes in as an argument, not on stdin. `python3 - <<EOF` already
+  # uses stdin for the program itself, so piping data into it as well leaves
+  # the program reading an empty stream -- which json.load does not survive.
+  python3 -c "
 import json, sys
-d = json.load(sys.stdin)
-if not d["jobs"]:
-    print("  nothing is training right now")
-else:
-    for j in d["jobs"]:
-        step, total = j.get("step") or 0, j.get("total_steps") or 0
-        ck = j.get("checkpoint_step") or 0
-        cost = ("would restart from step %d, losing %d steps" % (ck, step - ck)) \
-            if ck else "has no checkpoint -- would restart from the beginning"
-        print("  %-42s %s  step %d/%s  %s"
-              % (j["name"][:42], j.get("runner") or "?", step, total or "?", cost))
-if d.get("queued"):
-    print("  %d job(s) waiting in the queue" % d["queued"])
-PY
+d = json.loads(sys.argv[1])
+if not d['jobs']:
+    print('  nothing is training right now')
+for j in d['jobs']:
+    step, total = j.get('step') or 0, j.get('total_steps') or 0
+    ck = j.get('checkpoint_step') or 0
+    cost = ('would resume from step %d, redoing %d' % (ck, step - ck)) if ck \
+        else 'has no checkpoint, so it would restart from the beginning'
+    print('  %-40s %-10s step %d/%s  %s'
+          % (j['name'][:40], j.get('runner') or '?', step, total or '?', cost))
+if d.get('queued'):
+    print('  %d job(s) waiting in the queue' % d['queued'])
+" "$inflight"
 }
 
 bold "Studio at http://127.0.0.1:$PORT"

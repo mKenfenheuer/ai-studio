@@ -130,9 +130,15 @@ def list_ids() -> list[str]:
         return []
 
 
-def size_bytes(job_id: str) -> int:
+def size_bytes(job_id: str, path: Path | None = None) -> int:
+    """Bytes on disk, for the whole job or for one generation.
+
+    The distinction is not pedantic: the prepared corpus dwarfs the checkpoint
+    itself, so reporting the total as "the checkpoint" tells the user a save
+    costs three times what it does.
+    """
     total = 0
-    for root, _dirs, files in os.walk(dir_for(job_id)):
+    for root, _dirs, files in os.walk(path or dir_for(job_id)):
         for f in files:
             try:
                 total += (Path(root) / f).stat().st_size
@@ -184,6 +190,7 @@ class Saver:
         try:
             gen = new_generation(self.job_id, step)
             writer(gen)
+            written = size_bytes(self.job_id, gen)
             commit(self.job_id, gen, {"step": step, "total": total,
                                       **(extra or {})})
         except Exception as e:  # noqa: BLE001 - a failed save must not kill a run
@@ -202,9 +209,10 @@ class Saver:
         # Announced once. After that it is routine, and a line every ten
         # minutes for eight hours is a log nobody reads.
         if self.count == 1:
-            self.ctx.log("Checkpoint saved at step %d (%.0f MB, %.1fs). From "
-                         "here on, an interruption resumes from the last "
-                         "checkpoint instead of starting over."
-                         % (step, size_bytes(self.job_id) / 1048576,
-                            time.time() - t0))
+            self.ctx.log("Checkpoint saved at step %d: %.0f MB in %.2fs, and "
+                         "every %d minutes from here. An interruption now "
+                         "resumes from the last checkpoint instead of starting "
+                         "over."
+                         % (step, written / 1048576, time.time() - t0,
+                            round(self.every_s / 60)))
         return True

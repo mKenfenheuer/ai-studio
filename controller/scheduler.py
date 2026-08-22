@@ -159,6 +159,43 @@ class Fleet:
                 await self.broadcast_ui({"type": "jobs_changed"})
                 self.wake()
 
+    async def reconcile_runner(self, runner_id: str,
+                               current_job: str | None) -> None:
+        """The machine has told us what it is doing. Believe it.
+
+        This closes a hole that only opens when a runner restarts *quickly*.
+        `reconcile_orphans` waits for a machine to fall silent past the
+        heartbeat deadline before touching its work -- which is right, because
+        a dropped socket does not mean training stopped. But a container that
+        is recreated and dials back in within the deadline never becomes
+        silent for long enough: its `last_seen` is refreshed by the reconnect,
+        the job stops qualifying as orphaned, and it sits marked "running" on
+        an idle machine forever.
+
+        The runner is the authority on what it is running, and it says so on
+        every connect and every heartbeat. Anything else the controller has
+        pinned to that machine is finished or gone.
+        """
+        requeued, rescued = db.requeue_jobs_for_runner(runner_id, current_job)
+        name = (db.get_runner(runner_id) or {}).get("name", "that machine")
+        for jid in rescued:
+            db.add_log(jid, "%s restarted just after uploading the result, so "
+                       "this run is complete." % name)
+        for jid in requeued:
+            self.declined.discard(jid)
+            job = db.get_job(jid) or {}
+            step = int(job.get("checkpoint_step") or 0)
+            db.add_log(jid, "%s restarted and is no longer running this, so it "
+                       "has gone back on the queue. %s"
+                       % (name,
+                          "It will carry on from its checkpoint at step %d."
+                          % step if step else
+                          "There is no checkpoint, so it starts from the "
+                          "beginning."), "warn")
+        if requeued or rescued:
+            await self.broadcast_ui({"type": "jobs_changed"})
+            self.wake()
+
     async def scheduler_loop(self) -> None:
         """Assign queued jobs to idle runners. Woken by events, with a periodic
         tick as a backstop so nothing can sit stuck if a wake-up is missed."""
@@ -366,7 +403,9 @@ class Fleet:
                                                  "job_id": jid})
             elif time.time() - self.dispatched_at.get(runner_id, 0) > 30:
                 # Genuinely idle, and not merely slow to pick up work just
-                # handed to it.
+                # handed to it. Anything the database still has running here
+                # is not running: say so and put it back on the queue.
+                await self.reconcile_runner(runner_id, None)
                 if self.busy.pop(runner_id, None) is not None:
                     self.wake()
             return

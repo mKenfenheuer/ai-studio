@@ -80,6 +80,16 @@ async def runner_ws(ws: WebSocket) -> None:
         fleet.note_checkpoints(runner_id, first.get("checkpoints") or [])
         fleet.attach(runner_id, ws)
         await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
+        # A runner says what it is training as it joins. A machine that has
+        # just restarted is training nothing, and anything this controller
+        # still has pinned to it needs to go back on the queue now rather than
+        # after a timeout that a fast restart never reaches.
+        #
+        # `busy` absent means "did not say", which is not the same as "no" --
+        # an older runner must not have its live work requeued underneath it.
+        if first.get("busy") is not None:
+            await fleet.reconcile_runner(
+                runner_id, first.get("job_id") if first.get("busy") else None)
         await fleet.broadcast_ui({"type": "runners_changed"})
         fleet.wake()
 

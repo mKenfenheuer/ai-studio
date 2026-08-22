@@ -1,10 +1,7 @@
-# Shell scripts and Dockerfiles run on Linux even when authored on Windows.
-# CRLF in a shebang line produces "bad interpreter: /usr/bin/env bash^M".
-*.sh        text eol=lf
+# Shell scripts run on Linux hosts. A CRLF working copy reaches them
+# through scp or a bind mount and fails at the shebang line with
+# "bash: No such file or directory", which is a confusing way to
+# learn about line endings. Kept LF everywhere, checkout included.
+*.sh text eol=lf
 Dockerfile* text eol=lf
-*.yml       text eol=lf
-*.py        text eol=lf
-*.js        text eol=lf
-*.css       text eol=lf
-*.html      text eol=lf
-*.md        text eol=lf
+*.yml text eol=lf

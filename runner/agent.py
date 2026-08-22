@@ -181,6 +181,14 @@ class Runner:
                 # the work to a machine that does not have it means starting
                 # from noise.
                 "checkpoints": checkpoints.list_ids(),
+                # And what it is training right now, which on a fresh start is
+                # nothing. The controller needs this at connect time, not at
+                # the next heartbeat: a container that restarts and dials back
+                # in within the heartbeat deadline is never silent long enough
+                # to be noticed any other way, and its job would sit marked
+                # "running" on a machine that has forgotten it.
+                "busy": self.current is not None,
+                "job_id": self.current.job_id if self.current else None,
             }))
             first = json.loads(await ws.recv())
             if first.get("type") == "error":

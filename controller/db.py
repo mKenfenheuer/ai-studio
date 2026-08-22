@@ -348,8 +348,9 @@ def orphaned_jobs() -> list[dict]:
         (cutoff,))]
 
 
-def requeue_jobs_for_runner(runner_id: str) -> tuple[list[str], list[str]]:
-    """A runner vanished mid-job. Decide what happens to its work.
+def requeue_jobs_for_runner(runner_id: str,
+                            except_job: str | None = None) -> tuple[list[str], list[str]]:
+    """A runner is no longer running work the controller thinks it is running.
 
     Returns (requeued, rescued).
 
@@ -358,12 +359,18 @@ def requeue_jobs_for_runner(runner_id: str) -> tuple[list[str], list[str]]:
     landing and the "done" message being processed. Requeuing that job throws
     away a completed model and starts a twenty-minute run again from noise,
     which is the worst possible response to work that already succeeded.
+
+    `except_job` is the run the machine says it *is* working on, which must
+    never be touched. Without it, a runner that reconnects mid-training would
+    have its own live job requeued underneath it.
     """
     rows = q("SELECT id FROM jobs WHERE runner_id=? AND status IN ('assigned','running')",
              (runner_id,))
     requeued, rescued = [], []
     for r in rows:
         jid = r["id"]
+        if except_job and jid == except_job:
+            continue
         if q1("SELECT id FROM artifacts WHERE job_id=? LIMIT 1", (jid,)):
             ex("UPDATE jobs SET status='succeeded', finished_at=COALESCE(finished_at,?)"
                " WHERE id=?", (now(), jid))
