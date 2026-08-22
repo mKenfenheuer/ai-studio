@@ -46,7 +46,9 @@ function row(j) {
   return html`
     <tr>
       <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a></td>
-      <td>${statusBadge(j.status)}</td>
+      <td>${statusBadge(j.status)}${raw(
+        j.status === "cancelled" && j.has_model
+          ? ` <span class="badge badge-ok">model kept</span>` : "")}</td>
       <td style="min-width:120px">
         ${raw(["running", "assigned"].includes(j.status)
           ? `<div class="progress"><i style="width:${pct}%"></i></div>
@@ -57,7 +59,7 @@ function row(j) {
         ? "from scratch" : (j.config.base_model || "—")}</td>
       <td class="tiny muted hide-sm">${fmtAgo(j.created_at)}</td>
       <td><div class="row" style="gap:5px">
-        ${raw(j.status === "succeeded"
+        ${raw(j.has_model && ["succeeded", "cancelled"].includes(j.status)
           ? `<a class="btn btn-sm btn-primary" href="#/play/${esc(j.id)}">Try</a>` : "")}
         <a class="btn btn-sm" href="#/jobs/${j.id}">Open</a>
         ${raw(["succeeded", "failed", "cancelled"].includes(j.status)

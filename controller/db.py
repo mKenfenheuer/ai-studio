@@ -163,8 +163,19 @@ def _hydrate(r: dict) -> dict:
 
 
 def list_jobs(limit: int = 100) -> list[dict]:
-    return [_hydrate(r) for r in
-            q("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
+    """Recent runs, each flagged with whether a model came out of it.
+
+    `has_model` rather than the status, because a run that was stopped early
+    and kept its model has one too. Anything offering to open, play with or
+    download a result has to ask that question, and asking it per row against
+    the artifacts table would be one query per job.
+    """
+    rows = q("SELECT j.*, EXISTS(SELECT 1 FROM artifacts a WHERE a.job_id = j.id)"
+             " AS has_model FROM jobs j ORDER BY j.created_at DESC LIMIT ?",
+             (limit,))
+    for r in rows:
+        r["has_model"] = bool(r["has_model"])
+    return [_hydrate(r) for r in rows]
 
 
 def get_job(job_id: str) -> dict | None:

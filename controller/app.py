@@ -222,20 +222,31 @@ async def job_logs(job_id: str, limit: int = 500) -> list[dict]:
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str) -> dict:
+async def cancel_job(job_id: str, payload: dict = Body(default=None)) -> dict:
+    """Stop a run, optionally keeping the model it has built so far.
+
+    `save` defaults to true. Stopping is reversible in the sense that the run
+    can be started again; deleting hours of GPU time is not, so the default is
+    the one that cannot lose anything. Discarding has to be asked for.
+    """
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(404, "No such job.")
     if job["status"] in ("succeeded", "failed", "cancelled"):
         return {"ok": True, "already": job["status"]}
+
+    save = bool((payload or {}).get("save", True))
     if job["runner_id"] and job["runner_id"] in fleet.connections:
         await fleet.send_to_runner(job["runner_id"],
-                                   {"type": "job_cancel", "job_id": job_id})
+                                   {"type": "job_cancel", "job_id": job_id,
+                                    "save": save})
     else:
         db.set_job_status(job_id, "cancelled")
-    db.add_log(job_id, "Cancellation requested.", "warn")
+    db.add_log(job_id, "Stopping, and keeping the model trained so far."
+               if save else "Stopping, and discarding the partly trained model.",
+               "warn")
     await fleet.broadcast_ui({"type": "jobs_changed"})
-    return {"ok": True}
+    return {"ok": True, "saving": save}
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -513,7 +524,8 @@ def _caps_for(runner_id: str | None) -> dict:
 
 @app.get("/api/scratch/sizes")
 async def scratch_sizes(runner_id: str = Query(...), minutes: float = 60,
-                        vocab_size: int = arch.DEFAULT_VOCAB) -> dict:
+                        vocab_size: int = arch.DEFAULT_VOCAB,
+                        experts: int = 0, experts_per_token: int = 0) -> dict:
     """Every model size scored against this machine and this much time.
 
     Returned together rather than one at a time because the trade-off is the
@@ -521,13 +533,19 @@ async def scratch_sizes(runner_id: str = Query(...), minutes: float = 60,
     large one does not *before* choosing, not eight hours afterwards.
     """
     caps = _caps_for(runner_id)
+    moe = {"enabled": True, "num_local_experts": experts,
+           "num_experts_per_tok": experts_per_token or arch.MOE_DEFAULT_ACTIVE} \
+        if experts > 1 else None
     return {
-        "sizes": arch.size_options(caps, minutes, vocab_size),
+        "sizes": arch.size_options(caps, minutes, vocab_size, moe),
         "time_budgets": TIME_BUDGETS,
         "vocab_presets": arch.VOCAB_PRESETS,
         "tokens_per_param_target": arch.TOKENS_PER_PARAM_TARGET,
         "max_scratch_params": arch.max_trainable_params(caps),
         "limits": arch.LIMITS,
+        "moe_limits": arch.MOE_LIMITS,
+        "moe_defaults": {"num_local_experts": arch.MOE_DEFAULT_EXPERTS,
+                         "num_experts_per_tok": arch.MOE_DEFAULT_ACTIVE},
         "presets": arch.SIZE_PRESETS,
     }
 
@@ -540,10 +558,12 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
     minutes = float(payload.get("minutes") or 60)
     vocab_size = int(payload.get("vocab_size") or arch.DEFAULT_VOCAB)
 
+    moe = payload.get("moe") or None
     if size_id == "custom":
-        architecture = arch.build_custom_arch(payload.get("custom") or {}, vocab_size)
+        architecture = arch.build_custom_arch(payload.get("custom") or {},
+                                              vocab_size, moe)
     else:
-        architecture = arch.build_arch(size_id, vocab_size)
+        architecture = arch.build_arch(size_id, vocab_size, moe=moe)
     if not architecture:
         raise HTTPException(400, "Unknown model size: %s" % size_id)
 
@@ -613,6 +633,8 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "settings": settings,
         "params": counts,
         "params_label": arch.fmt_params(counts["total"]),
+        "active_params_label": arch.fmt_params(counts["active"]),
+        "moe": arch.moe_spec(architecture),
         "verdict": verdict,
         "notes": notes,
         "issues": issues,
@@ -623,7 +645,7 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "tokens_per_step": fit["tokens_per_step"],
         "estimated_minutes": round(minutes, 1),
         "minutes_for_full": arch.time_for_tokens(
-            architecture, caps, counts["total"] * arch.TOKENS_PER_PARAM_TARGET),
+            architecture, caps, counts["effective"] * arch.TOKENS_PER_PARAM_TARGET),
         "explanations": _explain_scratch(settings, counts, verdict, fit),
     }
 
@@ -643,6 +665,20 @@ def _explain_scratch(s: dict, counts: dict, verdict: dict, fit: dict) -> list[di
          "why": "%d layers, %d wide. Every one of those numbers starts as noise "
                 "and has to be learned from the text you chose."
                 % (a["num_hidden_layers"], a["hidden_size"])},
+    ]
+    if counts.get("experts"):
+        out.append({
+            "setting": "Experts",
+            "value": "%d, %d per token" % (counts["experts"],
+                                           counts["experts_per_token"]),
+            "why": "Each block holds %d separate feed-forward networks and a "
+                   "router that picks %d of them for every token. All %s "
+                   "parameters sit in memory and have to be learned; only %s "
+                   "of them do the work on any given token."
+                   % (counts["experts"], counts["experts_per_token"],
+                      arch.fmt_params(counts["total"]),
+                      arch.fmt_params(counts["active"]))})
+    out += [
         {"setting": "Vocabulary", "value": "%s tokens" % f"{s['vocab_size']:,}",
          "why": "Built from your own text rather than borrowed. Even at this "
                 "size the vocabulary is %.0f%% of the model -- a borrowed one "
@@ -748,7 +784,10 @@ async def playground() -> list[dict]:
     """Finished runs you can talk to."""
     out = []
     for job in db.list_jobs(200):
-        if job["status"] != "succeeded":
+        # A run that was stopped early but kept its model belongs here too.
+        # The artifact on disk is the real test of whether there is something
+        # to talk to; the status only says how it got there.
+        if job["status"] not in ("succeeded", "cancelled"):
             continue
         if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
             continue
@@ -762,6 +801,7 @@ async def playground() -> list[dict]:
             "mode": spec["style"],          # kept for older cached scripts
             "system_prompt": spec["system_prompt"],
             "reasoning": spec["reasoning"],
+            "stopped_early": job["status"] == "cancelled",
         }
         if job["kind"] == "pretrain_llm":
             a = cfg.get("arch") or {}
@@ -810,8 +850,11 @@ async def chat(job_id: str, payload: dict = Body(...)) -> dict:
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(404, "No such run.")
-    if job["status"] != "succeeded":
-        raise HTTPException(400, "This run has not finished successfully.")
+    # Not "did it succeed" but "is there a model". A run stopped early that
+    # kept its model has one, and refusing to talk to it would make the
+    # keeping pointless.
+    if job["status"] not in ("succeeded", "cancelled"):
+        raise HTTPException(400, "This run has not finished.")
     if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
         raise HTTPException(400, "This run did not leave a downloadable model.")
     # A conversation, not a string. The playground keeps the turns so the model

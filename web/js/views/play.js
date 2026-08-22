@@ -96,6 +96,10 @@ function runCard(r) {
           ${r.kind === "pretrain_llm" ? "your own model" : "fine-tune"}</span>
         <span class="badge">${ui.title.toLowerCase()}</span>
         ${raw(r.system_prompt ? `<span class="badge badge-accent">has a system prompt</span>` : "")}
+        ${raw(r.stopped_early
+          ? `<span class="badge badge-warn" title="This run was stopped before
+               it finished, so the model had less practice than planned."
+             >stopped early</span>` : "")}
         <span class="badge">${esc(fmtAgo(r.finished_at))}</span>
       </span>
     </a>`;

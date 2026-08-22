@@ -217,15 +217,63 @@ def _slim_model(m: dict) -> dict:
         "pipeline_tag": m.get("pipeline_tag"),
         "tags": [t for t in m.get("tags", []) if not t.startswith("dataset:")][:10],
         "params_b": _params_from_name(m.get("id", "")),
+        "moe": is_moe_model(m.get("id", ""), m.get("config") or {}, m.get("tags")),
     }
 
 
 _PARAM_RE = re.compile(r"[-_/](\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+# Mixture-of-experts models are named for their experts: "Mixtral-8x7B" is
+# eight 7B experts, and the total is neither 7B nor 56B. Attention and
+# embeddings are shared rather than repeated, so the real figure lands around
+# 0.8 of the product -- 46.7B for 8x7B, 141B for 8x22B. Approximate, and far
+# closer than either number a reader would otherwise take from the name.
+_MOE_NAME_RE = re.compile(r"[-_/](\d+)\s*x\s*(\d+(?:\.\d+)?)\s*([bm])\b",
+                          re.IGNORECASE)
+# Families whose blocks are sparse. Matched on the model_type the Hub reports,
+# which is what a config actually carries.
+_MOE_TYPES = {
+    "mixtral", "qwen2_moe", "qwen3_moe", "olmoe", "deepseek_v2", "deepseek_v3",
+    "granitemoe", "phimoe", "dbrx", "jamba", "jetmoe", "minimax", "hunyuan_moe",
+    "llama4", "gpt_oss",
+}
+
+
+def is_moe_model(model_id: str, config: dict | None = None,
+                 tags: list | None = None) -> bool:
+    conf = config or {}
+    if str(conf.get("model_type", "")).lower() in _MOE_TYPES:
+        return True
+    for a in conf.get("architectures") or []:
+        low = str(a).lower()
+        if "moe" in low or "mixtral" in low:
+            return True
+    if _MOE_NAME_RE.search(model_id):
+        return True
+    low_id = model_id.lower()
+    return "moe" in low_id.split("/")[-1] or "mixtral" in low_id
 
 
 def _params_from_name(model_id: str) -> float | None:
     """Model IDs almost always encode their size ('Qwen2.5-3B-Instruct').
     A cheap heuristic that avoids an extra API round-trip per search result."""
+    if m := _MOE_NAME_RE.search(model_id):
+        try:
+            each = float(m.group(2))
+            if m.group(3).lower() == "m":
+                each /= 1000
+            return round(0.8 * int(m.group(1)) * each, 3)
+        except ValueError:
+            return None
+    if is_moe_model(model_id):
+        # The other naming convention: "OLMoE-1B-7B" is 1B active out of 7B
+        # total. Both numbers are in the name and only the larger one is about
+        # memory, so take the larger. Reading "1B" here and reporting a model
+        # that needs 14 GB as needing 2 is how someone starts a download that
+        # was never going to fit.
+        sizes = [float(x) for x in
+                 re.findall(r"[-_/](\d+(?:\.\d+)?)\s*b\b", model_id, re.IGNORECASE)]
+        if sizes:
+            return max(sizes)
     if m := _PARAM_RE.search(model_id.replace("B-", "B-")):
         try:
             return float(m.group(1))
@@ -250,13 +298,22 @@ async def model_detail(model_id: str) -> dict:
         if name.endswith((".safetensors", ".bin")) and "training_args" not in name:
             total_bytes += s.get("size") or 0
 
-    params_b = _params_from_name(model_id)
-    if not params_b and total_bytes:
-        # Weights are usually fp16/bf16, so bytes/2 approximates parameters.
+    moe = is_moe_model(model_id, m.get("config") or {}, m.get("tags"))
+    if total_bytes and moe:
+        # For a sparse model the files are the only honest source. The name
+        # gives experts, not totals, and getting this wrong understates the
+        # memory needed by several times -- which is the one error that ends
+        # in an out-of-memory crash an hour into a download.
         params_b = round(total_bytes / 2 / 1e9, 2)
+    else:
+        params_b = _params_from_name(model_id)
+        if not params_b and total_bytes:
+            # Weights are usually fp16/bf16, so bytes/2 approximates parameters.
+            params_b = round(total_bytes / 2 / 1e9, 2)
 
     return {
         "id": m.get("id"),
+        "moe": moe,
         "gated": bool(m.get("gated")),
         "pipeline_tag": m.get("pipeline_tag"),
         "downloads": m.get("downloads", 0),

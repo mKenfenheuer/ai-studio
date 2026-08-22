@@ -155,6 +155,9 @@ export async function wizardView(mount) {
     selectors: {}, roleMap: "", selectorFields: resource(),
     // From scratch.
     minutes: 60, size: null, vocab: 8192, custom: null,
+    // A mixture of experts is something done to whichever size was chosen,
+    // not a size of its own, so it lives beside the size rather than in it.
+    moe: { enabled: false, num_local_experts: 8, num_experts_per_tok: 2 },
     sizes: resource(), plan: resource(), ftPlan: resource(),
     overrides: {}, archOverrides: {},
     starting: false,
@@ -290,6 +293,7 @@ function stepGoal(body, { state, runners, draw }) {
       config: null, split: "train", preview: resource(), textField: null,
       formatMode: null, size: null, custom: null, sizes: resource(),
       plan: resource(), ftPlan: resource(), overrides: {}, archOverrides: {},
+      moe: { enabled: false, num_local_experts: 8, num_experts_per_tok: 2 },
     });
     draw();
   });
@@ -405,11 +409,20 @@ function modelInfo(state) {
         esc(fit.message)}</div>` : "")}
       <dl class="kv">
         <dt>Size</dt><dd>${d.params_b ? d.params_b + "B parameters" : "unknown"}</dd>
-        <dt>Architecture</dt><dd>${d.architecture || "—"}</dd>
+        <dt>Architecture</dt><dd>${d.architecture || "—"}${raw(
+          d.moe ? ` <span class="badge badge-accent">mixture of experts</span>` : "")}</dd>
         <dt>Downloads</dt><dd>${fmtNum(d.downloads)}</dd>
         ${raw(d.memory ? `<dt>Memory needed</dt><dd>${d.memory.fp16_gb} GB in
           16-bit · ${d.memory.int4_gb} GB in 4-bit</dd>` : "")}
       </dl>
+      ${raw(d.moe ? `<div class="callout" style="margin-top:10px">
+        <strong>This is a mixture-of-experts model</strong>Each block holds
+        several feed-forward networks and a router picks a couple of them per
+        token. Only some of it does the work on any given token, but
+        <em>all</em> of it has to be in memory — so judge it by the size above,
+        not by any smaller "active" figure in its name. The adapter goes on
+        attention, which every token passes through whatever the router
+        decides.</div>` : "")}
       ${raw(d.gated ? `<div class="callout callout-warn" style="margin-top:10px">
         <strong>This model is gated</strong>You must accept its licence on the
         Hugging Face model page, and add an access token in Settings, before
@@ -1079,9 +1092,11 @@ function trainingText(state, scratch) {
 
 function stepDesign(body, ctx) {
   const { state, draw } = ctx;
-  const key = `${state.runnerId}|${state.minutes}|${state.vocab}`;
+  const key = `${state.runnerId}|${state.minutes}|${state.vocab}|` +
+              JSON.stringify(state.moe);
   ensure(state.sizes, key,
-         () => api.scratchSizes(state.runnerId, state.minutes, state.vocab), draw);
+         () => api.scratchSizes(state.runnerId, state.minutes, state.vocab,
+                                state.moe), draw);
 
   if (state.sizes.status === "loading") {
     body.innerHTML = loading("Working out what this machine can train…");
@@ -1137,6 +1152,8 @@ function stepDesign(body, ctx) {
       </button>
     </div>
 
+    ${raw(moePanel(state))}
+
     <div id="designer">${raw(custom ? designer(state) : "")}</div>
 
     <details class="adv" ${custom ? "open" : ""}>
@@ -1172,6 +1189,19 @@ function stepDesign(body, ctx) {
     state.sizes = resource(); state.plan = resource();
     draw();
   });
+  on(body, "click", "[data-moe]", (_e, t) => {
+    state.moe = { ...state.moe, enabled: t.dataset.moe === "on" };
+    state.sizes = resource(); state.plan = resource();
+    draw();
+  });
+  // `change`, not `input`: every keystroke here re-scores all five sizes on
+  // the server, and a half-typed "1" on the way to "16" is a different model.
+  on(body, "change", "[data-moef]", (_e, t) => {
+    const v = Math.max(1, +t.value || 1);
+    state.moe = { ...state.moe, [t.dataset.moef]: v };
+    state.sizes = resource(); state.plan = resource();
+    draw();
+  });
   on(body, "click", "[data-size]", (_e, t) => {
     state.size = t.dataset.size;
     state.plan = resource();
@@ -1191,6 +1221,72 @@ function stepDesign(body, ctx) {
   if (custom) wireDesigner(body, ctx);
 }
 
+function moePanel(state) {
+  const m = state.moe;
+  const chosen = (state.sizes.data?.sizes || []).find((s) => s.id === state.size);
+  return html`
+    <details class="adv" ${m.enabled ? "open" : ""} style="margin-top:14px">
+      <summary>Make it a mixture of experts${raw(m.enabled
+        ? ` <span class="badge badge-accent">${m.num_local_experts} experts,
+             ${m.num_experts_per_tok} per token</span>` : "")}</summary>
+      <div class="card" style="margin-top:10px">
+        <p class="muted tiny" style="margin:0 0 10px">
+          Instead of one feed-forward network per block, the model gets several
+          — the <em>experts</em> — plus a small router that sends each token to
+          just a few of them. Parameters go up; the arithmetic per token
+          does not.</p>
+        <p class="muted tiny" style="margin:0 0 12px">
+          <strong>What it does not do is save memory.</strong> Every expert is
+          held on the card and every expert is trained, whether or not a
+          particular token visits it. And because each expert only learns from
+          the tokens the router sends it, the model needs considerably more
+          text than its shape suggests. On one GPU this is usually a worse
+          trade than simply choosing a bigger size — it is here because it is
+          how the large open models are built, and worth being able to try.</p>
+
+        <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
+          <button class="btn-sm ${!m.enabled ? "btn-primary" : ""}"
+                  data-moe="off">One network per block</button>
+          <button class="btn-sm ${m.enabled ? "btn-primary" : ""}"
+                  data-moe="on">Mixture of experts</button>
+        </div>
+
+        ${raw(!m.enabled ? "" : html`
+          <div class="grid grid-2">
+            <div class="field">
+              <label for="moeExperts">Experts per block</label>
+              <input id="moeExperts" data-moef="num_local_experts" type="number"
+                     min="2" max="64" value="${m.num_local_experts}">
+              <div class="hint">How many separate feed-forward networks each
+                block holds. Every one of them takes memory and has to be
+                trained.</div>
+            </div>
+            <div class="field">
+              <label for="moeActive">Used per token</label>
+              <input id="moeActive" data-moef="num_experts_per_tok" type="number"
+                     min="1" max="16" value="${m.num_experts_per_tok}">
+              <div class="hint">How many the router picks for each token. Two
+                is the usual choice; picking all of them makes it an ordinary
+                model that costs far more to run.</div>
+            </div>
+          </div>
+          ${raw(chosen ? html`
+            <div class="callout" style="margin-top:4px">
+              <strong>${esc(chosen.label)} as a mixture of experts</strong>
+              holds ${esc(chosen.params_label)} parameters and uses
+              ${esc(chosen.active_params_label)} of them on any given token.
+              Memory and the amount of text it needs follow the first number;
+              speed follows the second.
+              <em class="muted">Its weights and optimiser state alone take
+                ${chosen.weights_gb} GB, before a single batch. Read the
+                memory figure on the cards with care — a bigger model is given
+                a smaller batch to fit, so its total can come out lower while
+                the model itself is several times larger.</em>
+            </div>` : "")}`)}
+      </div>
+    </details>`;
+}
+
 function sizeCard(s, state) {
   // The bar is the argument: how much of the training a model of this size
   // actually gets, against how much it needs. A quarter-full bar makes
@@ -1204,6 +1300,9 @@ function sizeCard(s, state) {
             ${!s.fits ? "disabled" : ""} style="${!s.fits ? "opacity:.5" : ""}">
       <span class="t">${s.label}
         <span class="badge">${s.params_label} parameters</span>
+        ${raw(s.experts
+          ? `<span class="badge badge-accent">${esc(s.active_params_label)}
+               active</span>` : "")}
         ${raw(s.recommended ? `<span class="badge badge-ok">best for your time</span>` : "")}
         ${raw(!s.fits ? `<span class="badge badge-err">will not fit in memory</span>` : "")}
       </span>
@@ -1272,6 +1371,9 @@ function designSummary(state, plan) {
       <h4 style="margin:0 0 10px">This model</h4>
       <dl class="kv">
         <dt>Parameters</dt><dd>${plan.params_label}</dd>
+        ${raw(p.experts ? html`
+          <dt>Used per token</dt><dd>${plan.active_params_label}</dd>
+          <dt>Experts</dt><dd>${p.experts}, ${p.experts_per_token} per token</dd>` : "")}
         <dt>Of which vocabulary</dt><dd>${Math.round((p.embedding_share || 0) * 100)}%</dd>
         <dt>Memory needed</dt><dd>${plan.memory_gb} GB</dd>
         <dt>Batch</dt><dd>${plan.settings?.batch_size} × ${plan.settings?.grad_accum}
@@ -1388,6 +1490,17 @@ function finetuneReview(state, runner, caps) {
             </select>
             <div class="hint">Recommended here: ${caps.recommended_dtype}</div>
           </div>
+          ${raw(state.modelDetail.data?.moe
+            ? toggle("adapt_experts", "Also adapt the experts",
+                s.adapt_experts,
+                "Off puts the adapter on attention only, which every token "
+                + "passes through. On adapts the expert networks too, where "
+                + "each expert only learns from the tokens its router happened "
+                + "to send it — a much larger adapter that needs a lot more "
+                + "data to be worth it. Many models store their experts in a "
+                + "form no adapter can attach to; the run says so in its log "
+                + "and falls back to attention. The router is never adapted.")
+            : "")}
         </div>
       </details>
     </div>
@@ -1419,6 +1532,11 @@ function scratchReview(state, runner, caps) {
         <dt>Building</dt><dd>${plan.params_label} parameters from random weights —
           ${a.num_hidden_layers} layers, ${a.hidden_size} wide,
           ${a.num_attention_heads} heads, ${a.max_position_embeddings} context</dd>
+        ${raw(a.num_local_experts > 1 ? html`
+          <dt>Experts</dt><dd>${a.num_local_experts} per block,
+            ${a.num_experts_per_tok} used per token — ${plan.active_params_label}
+            of the ${plan.params_label} does the work on any one token, and all
+            of it has to be held and trained</dd>` : "")}
         <dt>Vocabulary</dt><dd>${fmtNum(a.vocab_size)} tokens, built from your text</dd>
         <dt>Learning from</dt><dd class="mono">${state.dataset}${
           state.config ? " · " + state.config : ""} · ${state.split}</dd>
@@ -1535,7 +1653,8 @@ const toggle = (k, label, on_, hint) => html`
 // Settings that must survive as text/float rather than being coerced to int.
 const FLOAT_SETTINGS = new Set(["learning_rate", "weight_decay", "grad_clip",
                                 "min_lr_ratio", "epochs"]);
-const BOOL_SETTINGS = new Set(["gradient_checkpointing", "optim_8bit"]);
+const BOOL_SETTINGS = new Set(["gradient_checkpointing", "optim_8bit",
+                               "adapt_experts"]);
 
 function wireOverrides(body, ctx) {
   const { state, draw } = ctx;
@@ -1576,13 +1695,14 @@ function refreshPlan(ctx, selector, render) {
 
 const planKey = (state) => JSON.stringify([
   state.runnerId, state.size, state.minutes, state.vocab,
-  state.custom, state.overrides, state.dataset, state.corpusTokens]);
+  state.custom, state.overrides, state.dataset, state.corpusTokens, state.moe]);
 
 function planPayload(state) {
   return {
     runner_id: state.runnerId,
     size: state.size,
     custom: state.custom,
+    moe: state.moe?.enabled ? state.moe : null,
     minutes: state.minutes,
     vocab_size: state.vocab,
     corpus_tokens: state.corpusTokens ?? null,

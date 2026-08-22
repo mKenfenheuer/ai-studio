@@ -322,6 +322,13 @@ class Fleet:
             db.set_job_status(jid, status, err)
             if err:
                 db.add_log(jid, err, "error")
+            if summary := msg.get("summary"):
+                # A stopped run that kept its model has the same summary a
+                # finished one does, and everything downstream -- the
+                # playground, the download, the stats panel -- reads it from
+                # the log the same way.
+                db.add_log(jid, "Stopped, and the model was kept. %s"
+                           % json.dumps(summary)[:600])
             if tb := msg.get("traceback"):
                 db.add_log(jid, tb, "debug")
             self.busy.pop(runner_id, None)

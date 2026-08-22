@@ -361,5 +361,24 @@ def _estimate_max_scratch(caps: dict) -> float | None:
     return round(usable / per_param / 1e6) or None
 
 
+def expert_kernel(caps: dict) -> str | None:
+    """Which of transformers' expert dispatch paths this machine can use.
+
+    None means "leave the library to choose". `"eager"` is forced on ROCm, and
+    the reason is worth recording because the library's own guard gets it
+    wrong: transformers 5 defaults to a grouped GEMM, asks
+    `_grouped_mm_can_dispatch()` whether that is available, is told yes on
+    ROCm because torch exposes the symbol, and then dies inside the forward
+    pass with "grouped gemm is not supported on ROCM". The fallback exists and
+    never fires, so it has to be chosen here instead.
+
+    Measured on gfx1030 with transformers 5.15: `grouped_mm` raises,
+    `batched_mm` runs every token through every expert and asked for 44 GB on
+    a model that fits in 5, and `eager` works and returns the router logits
+    the load-balancing loss needs. That leaves one option, not a preference.
+    """
+    return "eager" if caps.get("backend") == "rocm" else None
+
+
 if __name__ == "__main__":
     print(json.dumps(probe(), indent=2))

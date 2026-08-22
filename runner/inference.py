@@ -35,6 +35,8 @@ import httpx
 
 from common import formatting
 
+from . import capabilities
+
 CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
 
 # How long a model may sit loaded with nobody talking to it. The GPU is shared
@@ -115,6 +117,29 @@ class ModelHost:
         self.unload()
         return True
 
+    def _expert_kwargs(self) -> dict:
+        """`experts_implementation`, when this backend needs it and the
+        installed transformers understands it.
+
+        Checked against the signature rather than tried-and-retried, because a
+        retry here would mean downloading and loading a multi-gigabyte model
+        twice. See capabilities.expert_kernel for why it is needed at all.
+        """
+        from transformers import AutoModelForCausalLM
+        kernel = capabilities.expert_kernel(self.caps)
+        if not kernel:
+            return {}
+        try:
+            import inspect
+            params = inspect.signature(
+                AutoModelForCausalLM.from_pretrained).parameters
+            if "experts_implementation" not in params and \
+                    not any(p.kind == p.VAR_KEYWORD for p in params.values()):
+                return {}
+        except (TypeError, ValueError):
+            pass
+        return {"experts_implementation": kernel}
+
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -131,10 +156,19 @@ class ModelHost:
         if self.device == "cpu":
             dtype = torch.float32
 
+        # A mixture of experts has to be told which dispatch to use here too.
+        # Training got this right and serving did not, and the failure was
+        # invisible until a sparse model was actually talked to: the run
+        # finished, the model saved, and the first message came back
+        # "grouped gemm is not supported on ROCM". Anywhere a model is
+        # constructed needs this, not just the trainer.
+        extra = self._expert_kwargs()
+
         if spec.get("kind") == "pretrain_llm":
             log("Loading your model…")
             self.tok = AutoTokenizer.from_pretrained(str(path))
-            self.model = AutoModelForCausalLM.from_pretrained(str(path), dtype=dtype)
+            self.model = AutoModelForCausalLM.from_pretrained(str(path),
+                                                              dtype=dtype, **extra)
         else:
             base = spec.get("base_model")
             if not base:
@@ -147,7 +181,7 @@ class ModelHost:
                 if (path / "tokenizer_config.json").exists() \
                 else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
             self.model = AutoModelForCausalLM.from_pretrained(
-                base, dtype=dtype, token=spec.get("hf_token"))
+                base, dtype=dtype, token=spec.get("hf_token"), **extra)
             self.model = PeftModel.from_pretrained(self.model, str(path))
 
         if self.tok.pad_token is None:

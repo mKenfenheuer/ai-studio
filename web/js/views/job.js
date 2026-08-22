@@ -17,8 +17,9 @@ export async function jobView(mount, [jobId]) {
   const metrics = await api.jobMetrics(jobId);
   const logs = await api.jobLogs(jobId);
   const scratch = job.kind === "pretrain_llm";
+  const experts = +(job.config.arch?.num_local_experts || 0);
 
-  mount.innerHTML = layout(job, scratch);
+  mount.innerHTML = layout(job, scratch, experts);
 
   // Held-out loss shares the loss chart because it is the same measurement on
   // different data. That is the only case where a second series belongs on one
@@ -40,6 +41,17 @@ export async function jobView(mount, [jobId]) {
     color: "var(--text-3)",
     format: (v) => v.toExponential(1),
   });
+
+  // Only built for a mixture of experts, because for anything else it would
+  // be a chart of a constant.
+  const expertChart = experts > 1 ? new LineChart($("#expertChart", mount), {
+    title: "Busiest expert's share of the tokens",
+    height: 150,
+    color: "var(--warn)",
+    format: (v) => (v * 100).toFixed(0) + "%",
+  }) : null;
+  expertChart?.setData(metrics.filter((m) => m.expert_balance != null)
+    .map((m) => ({ x: m.step, y: m.expert_balance })));
 
   lossChart.setSeries("train",
     metrics.filter((m) => m.loss != null).map((m) => ({ x: m.step, y: m.loss })));
@@ -72,6 +84,8 @@ export async function jobView(mount, [jobId]) {
       if (msg.data.val_loss != null) lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
       if (msg.data.learning_rate != null)
         lrChart.push({ x: msg.step, y: msg.data.learning_rate });
+      if (msg.data.expert_balance != null)
+        expertChart?.push({ x: msg.step, y: msg.data.expert_balance });
       paintStats(mount, job, latest, scratch, stage);
     } else if (msg.type === "job_sample") {
       samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
@@ -93,10 +107,21 @@ export async function jobView(mount, [jobId]) {
 
   // Delegated, not bound directly: paintHeader() replaces the button element
   // every time a metric arrives, which would silently discard a direct listener.
-  on(mount, "click", "#cancelBtn", async () => {
-    if (!confirm("Stop this training run? Progress so far will be lost.")) return;
-    try { await api.cancelJob(jobId); toast("Stopping…"); }
-    catch (e) { toast(e.message, "err"); }
+  // Stopping is two different actions wearing one button, and the difference
+  // between them is hours of GPU time. A yes/no confirm can only ask the
+  // question it was written with, so it is replaced by the actual choice.
+  on(mount, "click", "#cancelBtn", () => {
+    $("#stopPanel", mount).innerHTML = stopPanel(job, latest, stage);
+  });
+  on(mount, "click", "#stopCancel", () => { $("#stopPanel", mount).innerHTML = ""; });
+
+  on(mount, "click", "[data-stop]", async (_e, t) => {
+    const save = t.dataset.stop === "keep";
+    $("#stopPanel", mount).innerHTML = "";
+    try {
+      await api.cancelJob(jobId, save);
+      toast(save ? "Stopping, and keeping the model…" : "Stopping…");
+    } catch (e) { toast(e.message, "err"); }
   });
 
   on(mount, "click", "#deleteBtn", async () => {
@@ -111,12 +136,14 @@ export async function jobView(mount, [jobId]) {
     } catch (e) { toast(e.message, "err"); }
   });
 
-  return () => { unsub(); lossChart.destroy(); lrChart.destroy(); };
+  return () => {
+    unsub(); lossChart.destroy(); lrChart.destroy(); expertChart?.destroy();
+  };
 }
 
 // ---------------------------------------------------------------------------
 
-function layout(job, scratch) {
+function layout(job, scratch, experts = 0) {
   const subtitle = scratch
     ? `from scratch · ${job.config.dataset}`
     : `${job.config.base_model} → ${job.config.dataset}`;
@@ -131,10 +158,24 @@ function layout(job, scratch) {
     </div>
 
     <div id="errorCard"></div>
+    <div id="stopPanel"></div>
     <div id="progressCard"></div>
     <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
 
     <div class="card" style="margin-bottom:14px"><div id="lossChart"></div></div>
+
+    ${raw(experts > 1 ? html`
+      <div class="card" style="margin-bottom:14px">
+        <div id="expertChart"></div>
+        <p class="muted tiny" style="margin:8px 0 0">
+          The share of tokens going to the single busiest of the
+          ${experts} experts. An even router gives
+          <strong>${(100 / experts).toFixed(0)}%</strong>; a line climbing well
+          above that means the router has picked favourites and the remaining
+          experts are being starved of the text they need. The loss curve will
+          not show you this — a collapsed mixture still learns, it just carries
+          most of its parameters dead.</p>
+      </div>` : "")}
 
     ${raw(scratch ? html`
       <div class="card" id="samplesCard" style="margin-bottom:14px"></div>` : "")}
@@ -169,12 +210,56 @@ function layout(job, scratch) {
     </div>`;
 }
 
+function stopPanel(job, latest, stage) {
+  const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
+  // There is only something to keep once training has actually begun.
+  // Before that the runner is still downloading text or building a
+  // vocabulary, and "keep the model" would be an offer of nothing.
+  const started = (latest?.step || job.step || 0) > 0
+    && (stage === "training" || stage === "");
+  const done = latest?.step || job.step || 0;
+  const total = job.total_steps || 0;
+
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop this run?</h3>
+      ${raw(started ? html`
+        <p class="muted tiny" style="margin:0 0 12px">
+          It has trained for <strong>${fmtNum(done)}</strong>${total
+            ? ` of ${fmtNum(total)}` : ""} steps. That work does not have to be
+          thrown away — a partly trained ${kind} is a real one, just less
+          practised than it would have been. Its learning rate never finished
+          decaying, so expect it to be a little rougher than the same run
+          taken to the end.</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="btn-primary btn-sm" data-stop="keep">
+            Stop and keep the ${kind}</button>
+          <button class="btn-danger btn-sm" data-stop="discard">
+            Stop and discard it</button>
+          <button class="btn-sm" id="stopCancel">Keep training</button>
+        </div>` : html`
+        <p class="muted tiny" style="margin:0 0 12px">
+          Training has not started yet — the runner is still preparing your
+          data, so there is no ${kind} to keep. Stopping now leaves nothing
+          behind.</p>
+        <div class="row" style="gap:8px">
+          <button class="btn-danger btn-sm" data-stop="discard">Stop the run</button>
+          <button class="btn-sm" id="stopCancel">Carry on</button>
+        </div>`)}
+    </div>`;
+}
+
 function paintHeader(mount, job) {
   const box = $("#headerActions", mount);
   const done = ["succeeded", "failed", "cancelled"].includes(job.status);
-  const usable = job.status === "succeeded" && job.artifacts?.length;
+  // A stopped run that kept its model is as usable as a finished one. The
+  // artifact is what decides that, not how the run ended.
+  const usable = job.artifacts?.length
+    && ["succeeded", "cancelled"].includes(job.status);
+  const kept = job.status === "cancelled" && job.artifacts?.length;
   box.innerHTML = html`
     ${statusBadge(job.status)}
+    ${raw(kept ? `<span class="badge badge-ok">model kept</span>` : "")}
     ${raw(usable
       ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>` : "")}
     ${raw(done && job.artifacts?.length

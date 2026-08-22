@@ -93,6 +93,98 @@ TOKENS_PER_PARAM_TARGET = 20     # Chinchilla-optimal
 BYTES_PER_TOKEN = 4.0            # rough English average for a small BPE vocab
 
 
+# ---------------------------------------------------------------------------
+# Mixture of experts
+# ---------------------------------------------------------------------------
+#
+# A mixture-of-experts layer replaces each block's single feed-forward network
+# with several, and a small router that sends every token to just a few of
+# them. The appeal is real: parameters grow with the number of experts while
+# the arithmetic per token grows only with how many are used.
+#
+# The appeal is also the trap, and it is worth being blunt about which half of
+# it applies to one consumer GPU:
+#
+#   * Memory follows the TOTAL parameter count. Every expert is resident,
+#     every expert carries fp32 master weights and two Adam moments. Eight
+#     experts is eight feed-forward networks in VRAM whether a token visits
+#     them or not. MoE does not make a model cheaper to hold -- it makes it
+#     much more expensive.
+#   * Compute follows the ACTIVE parameter count, which is where the win is,
+#     and it is a win against a *dense model of the same total size* -- not
+#     against the dense model you would otherwise have trained.
+#   * Data requirements follow the total count more than the active one. Each
+#     expert only learns from the tokens routed to it, so E experts split the
+#     corpus E/k ways. This is the failure nobody predicts: a MoE model that
+#     fits, trains, and produces worse text than the dense model it replaced,
+#     because each expert saw an eighth of the data.
+#
+# So MoE is offered here with the arithmetic exposed rather than hidden, and
+# validate_arch() says plainly when it is the wrong tool.
+
+MOE_DEFAULT_EXPERTS = 8
+MOE_DEFAULT_ACTIVE = 2
+# Load balancing. Without this term the router collapses within a few hundred
+# steps: whichever expert is marginally better early gets more tokens, trains
+# faster, and gets more still. 0.01 is the Mixtral and Switch-Transformer
+# value and there is no reason to differ.
+MOE_AUX_LOSS_COEF = 0.01
+
+MOE_LIMITS = {
+    "num_local_experts":  {"min": 2, "max": 64, "label": "Experts"},
+    "num_experts_per_tok": {"min": 1, "max": 16, "label": "Experts per token"},
+}
+
+
+def is_moe(arch: dict) -> bool:
+    return int(arch.get("num_local_experts") or 0) > 1
+
+
+def apply_moe(arch: dict, moe: dict | None) -> dict:
+    """Turn a dense architecture into a sparse one, or leave it alone.
+
+    MoE is deliberately orthogonal to size: it is something done *to* a chosen
+    shape, so that the cost of turning it on is visible as a change against a
+    model the user has already understood.
+    """
+    if not moe or not moe.get("enabled"):
+        return arch
+    experts = int(moe.get("num_local_experts") or MOE_DEFAULT_EXPERTS)
+    active = int(moe.get("num_experts_per_tok") or MOE_DEFAULT_ACTIVE)
+    out = {
+        **arch,
+        # Mixtral's names, because that is the config the runner builds. Using
+        # the library's own field names means nothing has to be translated
+        # between the plan shown here and the model that gets constructed.
+        "model_type": "mixtral",
+        "num_local_experts": experts,
+        "num_experts_per_tok": active,
+        "router_aux_loss_coef": float(
+            moe.get("router_aux_loss_coef", MOE_AUX_LOSS_COEF)),
+    }
+    # Each expert gets its own feed-forward width. Left at the dense default,
+    # eight experts multiply the model's largest component by eight; most MoE
+    # designs shrink each expert so that the total lands somewhere sane. Only
+    # applied when the caller did not say otherwise.
+    if moe.get("expert_intermediate_size"):
+        out["intermediate_size"] = int(moe["expert_intermediate_size"])
+    return out
+
+
+def moe_spec(arch: dict) -> dict | None:
+    """The MoE part of an architecture, as the UI passes it around."""
+    if not is_moe(arch):
+        return None
+    return {
+        "enabled": True,
+        "num_local_experts": int(arch["num_local_experts"]),
+        "num_experts_per_tok": int(arch.get("num_experts_per_tok") or 1),
+        "expert_intermediate_size": int(arch["intermediate_size"]),
+        "router_aux_loss_coef": float(
+            arch.get("router_aux_loss_coef", MOE_AUX_LOSS_COEF)),
+    }
+
+
 def _intermediate(dim: int) -> int:
     """SwiGLU uses three matrices instead of two, so the hidden width is
     scaled by 8/3 rather than 4 to keep the parameter count comparable."""
@@ -104,7 +196,7 @@ def preset(size_id: str) -> dict | None:
 
 
 def build_arch(size_id: str, vocab_size: int = DEFAULT_VOCAB,
-               seq_len: int | None = None) -> dict | None:
+               seq_len: int | None = None, moe: dict | None = None) -> dict | None:
     """Concrete architecture the runner can hand straight to transformers.
 
     Resolved here rather than on the runner so that the parameter count shown
@@ -114,7 +206,7 @@ def build_arch(size_id: str, vocab_size: int = DEFAULT_VOCAB,
     if not p:
         return None
     seq = int(seq_len or p["seq"])
-    return {
+    return apply_moe({
         "size_id": size_id,
         "model_type": "llama",
         "vocab_size": int(vocab_size),
@@ -128,15 +220,21 @@ def build_arch(size_id: str, vocab_size: int = DEFAULT_VOCAB,
         # head would add another vocab x width block for very little gain.
         "tie_word_embeddings": True,
         "rms_norm_eps": 1e-5,
-    }
+    }, moe)
 
 
 def count_params(arch: dict) -> dict:
-    """Exact parameter count for a Llama-shaped model.
+    """Exact parameter count for a Llama- or Mixtral-shaped model.
 
     Split into embedding and body because the ratio is the thing worth
     showing: when embeddings dominate, the vocabulary is too big for the
     model, and shrinking it buys real capacity for free.
+
+    For a mixture of experts there are two counts that both matter and mean
+    different things. `total` is what has to be held in memory and what has to
+    be learned; `active` is what each token actually passes through, and so
+    what sets the speed. Reporting only one of them is how MoE gets sold as
+    free capacity.
     """
     d = arch["hidden_size"]
     L = arch["num_hidden_layers"]
@@ -147,17 +245,60 @@ def count_params(arch: dict) -> dict:
     embedding = v * d
     if not arch.get("tie_word_embeddings", True):
         embedding *= 2
-    per_layer = (
+
+    attn = (
         d * d          # q
         + d * kv       # k
         + d * kv       # v
         + d * d        # o
-        + 3 * d * i    # gate, up, down
         + 2 * d        # two RMSNorms
     )
-    body = L * per_layer + d          # + final norm
-    return {"embedding": embedding, "body": body, "total": embedding + body,
-            "embedding_share": round(embedding / max(embedding + body, 1), 3)}
+    one_ffn = 3 * d * i                       # gate, up, down
+
+    experts = int(arch.get("num_local_experts") or 0)
+    if experts > 1:
+        chosen = min(int(arch.get("num_experts_per_tok") or 1), experts)
+        router = d * experts                  # one linear, width -> experts
+        ffn_total = experts * one_ffn + router
+        ffn_active = chosen * one_ffn + router
+    else:
+        chosen = 0
+        ffn_total = ffn_active = one_ffn
+
+    body = L * (attn + ffn_total) + d         # + final norm
+    body_active = L * (attn + ffn_active) + d
+    total = embedding + body
+    active = embedding + body_active
+
+    return {
+        "embedding": embedding, "body": body, "total": total,
+        "active": active,
+        "experts": experts if experts > 1 else 0,
+        "experts_per_token": chosen,
+        "expert_params": L * experts * one_ffn if experts > 1 else 0,
+        "effective": effective_params(total, active),
+        "embedding_share": round(embedding / max(total, 1), 3),
+    }
+
+
+def effective_params(total: int, active: int) -> int:
+    """The dense model a sparse one is worth, for the purpose of Chinchilla.
+
+    A MoE model does not learn like a dense model of its total size, nor like
+    one of its active size -- it sits between the two, and the geometric mean
+    is the approximation the scaling-law work on sparse models keeps arriving
+    at. It is a rule of thumb and is treated as one: it decides how much text
+    this app recommends, not whether anything runs.
+
+    The important consequence, and the reason it is worth computing at all:
+    turning on eight experts roughly doubles the amount of text the model
+    needs before it is worth its size. Someone who expects MoE to be free
+    capacity will otherwise train it on a dense model's budget and get a
+    worse result than they started with.
+    """
+    if active >= total:
+        return total
+    return int(round((float(total) * float(active)) ** 0.5))
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +314,8 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     fp32 master weights, fp32 gradients and two Adam moments -- 16 bytes per
     parameter before a single activation is stored.
     """
-    n = count_params(arch)["total"]
+    counts = count_params(arch)
+    n = counts["total"]
     d = arch["hidden_size"]
     L = arch["num_hidden_layers"]
     h = arch["num_attention_heads"]
@@ -181,6 +323,10 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
 
     # 4 (weights) + 4 (grads) + 8 (Adam m and v), or 2 bytes of state with an
     # 8-bit optimiser. Plus the half-precision copies autocast keeps around.
+    #
+    # Charged against the TOTAL parameter count, including every expert that
+    # no token happens to visit. A sparse model is sparse in arithmetic, never
+    # in memory, and this line is where that shows up.
     per_param = 10 if optim_8bit else 16
     state = n * (per_param + 2)
 
@@ -190,11 +336,20 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     # autocast keeps in fp32 rather than fp16 -- both RMSNorms and the rotary
     # inputs. Calibrated against two measured runs rather than derived, and it
     # is deliberately the conservative end of what they imply.
+    per_layer_bytes = 44.0
+    if is_moe(arch):
+        # Of those 44 bytes, the feed-forward network's share is the three
+        # i-wide tensors it keeps -- gate, up and the activation between them.
+        # A token that visits k experts keeps k copies of that, so this is the
+        # one term MoE genuinely multiplies. The attention half is untouched.
+        ffn_bytes = 6.0 * arch["intermediate_size"] / max(d, 1)
+        k = max(1, counts["experts_per_token"])
+        per_layer_bytes = (per_layer_bytes - ffn_bytes) + k * ffn_bytes
     if checkpointing:
         # Only layer inputs survive the forward pass; the rest is recomputed.
-        acts = tokens * d * L * 2 + tokens * d * 44
+        acts = tokens * d * L * 2 + tokens * d * per_layer_bytes
     else:
-        acts = tokens * d * L * 44
+        acts = tokens * d * L * per_layer_bytes
 
     attn = 0
     if not flash:
@@ -295,14 +450,66 @@ def _efficiency(dim: int, flash: bool = False) -> float:
     return 0.22 if dim <= 256 else 0.25 if dim <= 384 else 0.28 if dim <= 512 else 0.30
 
 
+def moe_time_multiplier(experts: int, active: int) -> float:
+    """How much longer a sparse block takes than the dense block it replaced.
+
+    The arithmetic predicts the opposite of what happens, so this is measured.
+    A sparse block does not do one big matmul; it sorts tokens by which expert
+    each was routed to and does one small matmul per expert. Small matmuls are
+    exactly what a GPU is bad at, and the sorting costs the same whether one
+    expert is chosen or four.
+
+    MEASURED on the RX 6900 XT (gfx1030, fp16), 8 layers at 512 wide, an
+    8k vocabulary, batch 8 x 512, twelve optimiser steps after warmup:
+
+        dense                 47,136 tok/s     1.00x time
+        4 experts, 2 active   25,303 tok/s     1.86x
+        8 experts, 1 active   19,543 tok/s     2.41x
+        8 experts, 2 active   17,652 tok/s     2.67x
+        16 experts, 2 active   9,324 tok/s     5.05x
+
+    Two things fall out of that, and both contradict the sales pitch:
+
+    * Cost is driven by how many experts EXIST, not by how many are used.
+      Going from 1 active expert to 2 -- doubling the arithmetic each token
+      does -- cost 11%. Adding experts that most tokens never touch cost far
+      more. The routing dominates the maths.
+
+    * There is no configuration here that beat the dense model. A sparse model
+      is quicker than a dense model OF THE SAME TOTAL SIZE, which is not the
+      choice anyone is actually making on one GPU.
+
+    Fitted as time/dense_time = 0.77 + 0.24*E + 0.26*(k-1), which reproduces
+    the five measurements to within 11% and is conservative in four of them.
+    The first attempt at this was 1/(1 + c*E) applied to the active parameter
+    count; it could not fit the data at all -- the implied c ranged over 3x --
+    which is what measuring it was for.
+    """
+    if experts <= 1:
+        return 1.0
+    return 0.77 + 0.24 * experts + 0.26 * (max(active, 1) - 1)
+
+
 def tokens_per_second(arch: dict, caps: dict) -> float | None:
     tflops = (caps.get("dtypes") or {}).get(caps.get("recommended_dtype", "float16"))
     if not tflops:
         return None
-    n = count_params(arch)["total"]
+    counts = count_params(arch)
     flash = bool((caps.get("attention") or {}).get("flash"))
-    # 6 FLOPs per parameter per token covers forward and backward.
-    return (tflops * 1e12 * _efficiency(arch["hidden_size"], flash)) / (6 * n)
+    eff = _efficiency(arch["hidden_size"], flash)
+
+    if counts["experts"] > 1:
+        # Measured against the same shape with one feed-forward network per
+        # block, not against the active parameter count. That was the first
+        # attempt and the data rejected it: routing overhead scales with how
+        # many experts exist, and the active count does not know how many
+        # exist. 6 FLOPs per parameter per token covers forward and backward.
+        dense = count_params({k: v for k, v in arch.items()
+                              if k != "num_local_experts"})
+        base = (tflops * 1e12 * eff) / (6 * dense["total"])
+        return base / moe_time_multiplier(counts["experts"],
+                                          counts["experts_per_token"])
+    return (tflops * 1e12 * eff) / (6 * counts["total"])
 
 
 def tokens_in_time(arch: dict, caps: dict, minutes: float) -> int | None:
@@ -336,7 +543,10 @@ _VERDICTS = [
 
 
 def training_verdict(arch: dict, tokens: int | None) -> dict:
-    n = count_params(arch)["total"]
+    # Measured against effective parameters, which for a dense model is just
+    # its size. For a sparse one it is the number that decides how much text
+    # the model needs -- not the active count, which would flatter it badly.
+    n = count_params(arch)["effective"]
     if not tokens:
         return {"verdict": "unknown", "tone": "", "ratio": None,
                 "message": "Cannot estimate speed on this machine."}
@@ -349,7 +559,8 @@ def training_verdict(arch: dict, tokens: int | None) -> dict:
             "message": _VERDICTS[-1][3]}
 
 
-def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB) -> list[dict]:
+def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
+                 moe: dict | None = None) -> list[dict]:
     """Every size, scored against this machine and this much patience.
 
     Returned as one list so the UI can show the trade-off directly: the user
@@ -362,7 +573,7 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB) ->
 
     out = []
     for p in SIZE_PRESETS:
-        arch = build_arch(p["id"], vocab_size)
+        arch = build_arch(p["id"], vocab_size, moe=moe)
         counts = count_params(arch)
         fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
                               checkpointing=False, flash=flash)
@@ -371,20 +582,31 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB) ->
                                   checkpointing=True, flash=flash)
             fit["checkpointing"] = True
         achievable = tokens_in_time(arch, caps, minutes)
-        recommended = int(counts["total"] * TOKENS_PER_PARAM_TARGET)
+        recommended = int(counts["effective"] * TOKENS_PER_PARAM_TARGET)
         out.append({
             **{k: p[k] for k in ("id", "label", "blurb", "expect")},
             "layers": p["layers"], "dim": p["dim"], "heads": p["heads"],
             "seq": arch["max_position_embeddings"],
             "params": counts["total"],
             "params_label": fmt_params(counts["total"]),
+            "active_params": counts["active"],
+            "active_params_label": fmt_params(counts["active"]),
+            "experts": counts["experts"],
+            "experts_per_token": counts["experts_per_token"],
             "embedding_share": counts["embedding_share"],
             "fits": fit["fits"],
             "batch_size": fit["batch_size"],
             "memory_gb": fit["memory"]["total_gb"],
+            # The weights-and-optimiser half of the memory, which is the only
+            # part that does not move when the batch size does. Two cards
+            # showing total memory can mislead badly: a sparse model has more
+            # weights, so the planner gives it a smaller batch, so its total
+            # can land BELOW the dense model's -- which reads as a saving and
+            # is the exact opposite of what happened.
+            "weights_gb": fit["memory"]["optimizer_gb"],
             "tokens_achievable": achievable,
             "tokens_recommended": recommended,
-            "coverage": round(achievable / recommended, 3) if achievable else None,
+            "coverage": round(achievable / max(recommended, 1), 3) if achievable else None,
             "minutes_for_full": time_for_tokens(arch, caps, recommended),
             **training_verdict(arch, achievable),
         })
@@ -463,12 +685,12 @@ def recommended_lr(dim: int) -> float:
     return round(min(2e-3, max(1e-4, 0.256 / max(dim, 1))), 6)
 
 
-def build_custom_arch(spec: dict, vocab_size: int) -> dict:
+def build_custom_arch(spec: dict, vocab_size: int, moe: dict | None = None) -> dict:
     """An architecture from raw numbers, with the derivable parts derived."""
     dim = int(spec.get("hidden_size") or 512)
     heads = int(spec.get("num_attention_heads") or max(1, dim // 64))
     kv = int(spec.get("num_key_value_heads") or heads)
-    return {
+    return apply_moe({
         "size_id": "custom",
         "model_type": "llama",
         "vocab_size": int(vocab_size),
@@ -480,7 +702,7 @@ def build_custom_arch(spec: dict, vocab_size: int) -> dict:
         "max_position_embeddings": int(spec.get("max_position_embeddings") or 512),
         "tie_word_embeddings": bool(spec.get("tie_word_embeddings", True)),
         "rms_norm_eps": 1e-5,
-    }
+    }, moe)
 
 
 def _issue(level, field, message, fix=None):
@@ -595,6 +817,8 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
                 "the usual 2.7x. It will work, and most of the parameters will "
                 "sit here." % ratio))
 
+    out += _validate_moe(arch, caps, minutes=minutes)
+
     # ---- can it actually run --------------------------------------------
     vram = caps.get("vram_gb")
     if vram:
@@ -642,6 +866,99 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
             "Around %s would suit this dataset." % f"{max(256, int(corpus_tokens / 400)):,}"))
 
     return out
+
+
+def _validate_moe(arch: dict, caps: dict, *, minutes: float | None = None) -> list[dict]:
+    """What a mixture of experts costs, said out loud before it is started.
+
+    Every rule here exists because the sales pitch for MoE ("more parameters
+    for the same compute") is true at scale and misleading on one GPU, and
+    because nothing about the failure is visible until the run has finished.
+    """
+    if not is_moe(arch):
+        return []
+    out: list[dict] = []
+    counts = count_params(arch)
+    E = counts["experts"]
+    # What was ASKED for, not what count_params clamped it to. Reading the
+    # clamped value here made the k > E check unreachable: the arithmetic
+    # quietly capped 8-per-token at 4 experts and the validator then agreed
+    # with itself that nothing was wrong -- while transformers would have
+    # crashed on the topk at step one.
+    k = int(arch.get("num_experts_per_tok") or 1)
+    d = arch["hidden_size"]
+
+    for field, bound in MOE_LIMITS.items():
+        v = int(arch.get(field) or 0)
+        if v < bound["min"] or v > bound["max"]:
+            out.append(_issue("error", field, "%s must be between %s and %s."
+                              % (bound["label"], bound["min"], bound["max"])))
+
+    if k > E:
+        out.append(_issue("error", "num_experts_per_tok",
+            "Each token would be sent to %d experts, but there are only %d."
+            % (k, E), "Use %d or fewer." % E))
+    elif k == E:
+        out.append(_issue("warn", "num_experts_per_tok",
+            "Every token goes through every expert, so nothing is sparse. This "
+            "is an ordinary model that costs %dx as much to run as its shape "
+            "suggests." % E,
+            "Two experts per token is the usual choice."))
+
+    # The one that actually decides whether this was a good idea.
+    if minutes:
+        budget = tokens_in_time(arch, caps, minutes) or 0
+        per_expert = budget * k / max(E, 1)
+        if budget and per_expert < counts["expert_params"] / max(E, 1) * 20:
+            out.append(_issue("warn", "num_local_experts",
+                "Each expert would see about %s tokens -- the router splits "
+                "your text %d ways and each expert only learns from its own "
+                "share. Expect %d half-taught feed-forward networks rather "
+                "than one well-taught one."
+                % (_human_tokens(per_expert), round(E / max(k, 1)), E),
+                "Fewer experts, or much more text."))
+
+    dense_active = fmt_params(counts["active"])
+    out.append(_issue("info", "num_local_experts",
+        "This model holds %s parameters and uses %s of them per token. Memory "
+        "and training data follow the first number; speed follows the second. "
+        "It is not a %s model that happens to be cheap."
+        % (fmt_params(counts["total"]), dense_active, dense_active)))
+
+    # Compared against what the same VRAM would have bought densely. This is
+    # the comparison the user is actually making and never gets shown.
+    slowdown = moe_time_multiplier(E, k)
+    if slowdown > 1.3:
+        out.append(_issue("warn", "num_local_experts",
+            "Measured on this kind of card, %d experts run about %.1fx slower "
+            "per token than one feed-forward network of the same shape -- "
+            "sorting tokens by expert costs more than the arithmetic it "
+            "saves. Nearly all of that is the number of experts, not how many "
+            "of them each token uses." % (E, slowdown),
+            "Fewer experts. Two per token costs almost nothing extra."))
+
+    if d < 384:
+        out.append(_issue("warn", "hidden_size",
+            "A mixture of experts at %d wide is mostly overhead. The experts "
+            "are too small for the GPU to run efficiently, and a dense model "
+            "of the same total size would train faster and learn more." % d,
+            "MoE starts paying off well above this size."))
+
+    if arch.get("router_aux_loss_coef", MOE_AUX_LOSS_COEF) <= 0:
+        out.append(_issue("warn", "router_aux_loss_coef",
+            "With no load-balancing term the router collapses: one expert wins "
+            "early, gets more tokens, trains faster, and the rest are never "
+            "used again.", "%.3f is the standard value." % MOE_AUX_LOSS_COEF))
+
+    return out
+
+
+def _human_tokens(n: float) -> str:
+    if n >= 1e9:
+        return "%.1f billion" % (n / 1e9)
+    if n >= 1e6:
+        return "%.0f million" % (n / 1e6)
+    return "%s" % f"{int(n):,}"
 
 
 def check_settings(settings: dict, arch: dict) -> list[dict]:

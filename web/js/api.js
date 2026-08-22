@@ -22,7 +22,10 @@ export const api = {
   job:         (id) => req(`/api/jobs/${encodeURIComponent(id)}`),
   jobMetrics:  (id) => req(`/api/jobs/${encodeURIComponent(id)}/metrics`),
   jobLogs:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/logs`),
-  cancelJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  // `save` decides whether the half-trained model survives the stop.
+  cancelJob:   (id, save = true) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
+        { method: "POST", body: JSON.stringify({ save }) }),
   deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createJob:   (body) => req("/api/jobs", { method: "POST", body: JSON.stringify(body) }),
 
@@ -46,9 +49,13 @@ export const api = {
 
   // Training from scratch. Sizes are scored against a specific machine and a
   // specific amount of patience, so both are part of the request.
-  scratchSizes: (runnerId, minutes, vocabSize) =>
+  scratchSizes: (runnerId, minutes, vocabSize, moe = null) =>
     req(`/api/scratch/sizes?runner_id=${encodeURIComponent(runnerId)}` +
-        `&minutes=${minutes}&vocab_size=${vocabSize}`),
+        `&minutes=${minutes}&vocab_size=${vocabSize}` +
+        (moe?.enabled
+          ? `&experts=${moe.num_local_experts}` +
+            `&experts_per_token=${moe.num_experts_per_tok}`
+          : "")),
   scratchPlan: (body) =>
     req("/api/scratch/plan", { method: "POST", body: JSON.stringify(body) }),
 

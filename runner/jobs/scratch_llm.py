@@ -36,6 +36,7 @@ from typing import Any, Iterator
 from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
+from runner.capabilities import expert_kernel
 
 from .lora_llm import Cancelled
 
@@ -368,6 +369,13 @@ def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):
         if filled >= token_budget:
             exhausted = False
             break
+        if ctx.should_cancel():
+            # Nothing exists to keep yet -- there is no model until the corpus
+            # is read -- so stopping here always discards, whichever way the
+            # user answered. Checked at all because tokenizing a large corpus
+            # is minutes of work, and a Stop button that does nothing for four
+            # of them reads as a broken Stop button.
+            raise Cancelled()
         if docs % 50_000 == 0:
             ctx.progress(min(filled, token_budget), token_budget, stage="tokenizing")
             ctx.log("  %s tokens from %s documents (%.0f k tokens/s)"
@@ -389,10 +397,14 @@ def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):
 # Model
 # ===========================================================================
 
-def _build_model(arch: dict, ctx: Any, torch, tok=None):
-    from transformers import AutoModelForCausalLM, LlamaConfig
+def is_moe(arch: dict) -> bool:
+    return int(arch.get("num_local_experts") or 0) > 1
 
-    conf = LlamaConfig(
+
+def _build_model(arch: dict, ctx: Any, torch, tok=None):
+    from transformers import AutoModelForCausalLM, LlamaConfig, MixtralConfig
+
+    shared = dict(
         vocab_size=arch["vocab_size"],
         hidden_size=arch["hidden_size"],
         intermediate_size=arch["intermediate_size"],
@@ -411,12 +423,61 @@ def _build_model(arch: dict, ctx: Any, torch, tok=None):
         attention_dropout=0.0,
         use_cache=False,
     )
+
+    if is_moe(arch):
+        conf = MixtralConfig(
+            num_local_experts=int(arch["num_local_experts"]),
+            num_experts_per_tok=int(arch.get("num_experts_per_tok") or 2),
+            router_aux_loss_coef=float(arch.get("router_aux_loss_coef", 0.01)),
+            # Not decorative. The load-balancing loss is only computed when the
+            # router's logits are returned, and without that term the router
+            # collapses onto one expert within a few hundred steps: whichever
+            # expert is marginally better early receives more tokens, trains
+            # faster, and receives more still. The run does not fail -- it
+            # quietly becomes a dense model carrying seven dead copies of a
+            # feed-forward network.
+            output_router_logits=True,
+            sliding_window=None,
+            **shared,
+        )
+        if kernel := expert_kernel(ctx.capabilities):
+            # Older transformers has no such setting and simply carries the
+            # attribute along harmlessly; there the eager loop is the only
+            # implementation anyway.
+            conf._experts_implementation = kernel
+            ctx.log("Using the %r expert kernel, which is the one that works "
+                    "on this backend." % kernel, "debug")
+    else:
+        conf = LlamaConfig(**shared)
+
     # from_config, not from_pretrained: random initialisation is the point.
     model = AutoModelForCausalLM.from_config(conf)
 
     embedding = model.get_input_embeddings().weight.numel()
     total = sum(p.numel() for p in model.parameters())
-    counts = {"total": total, "embedding": embedding, "body": total - embedding}
+    counts = {"total": total, "embedding": embedding, "body": total - embedding,
+              "active": total, "experts": 0, "experts_per_token": 0}
+
+    if is_moe(arch):
+        # Counted off the built model rather than recomputed from the config,
+        # so it cannot drift from what was actually constructed.
+        expert_params = sum(p.numel() for n, p in model.named_parameters()
+                            if ".experts." in n)
+        E = int(arch["num_local_experts"])
+        k = min(int(arch.get("num_experts_per_tok") or 1), E)
+        counts["active"] = int(total - expert_params * (E - k) / E)
+        counts["experts"] = E
+        counts["experts_per_token"] = k
+        ctx.log("Mixture of experts: %d experts per block, %d chosen for each "
+                "token. %s parameters in memory, %s of them used per token."
+                % (E, k, _fmt(total), _fmt(counts["active"])))
+        ctx.log("All %d experts are trained, but each one only learns from the "
+                "tokens the router sends it -- roughly %s of your text. "
+                "Watch the balance figure below: at %.2f every expert is "
+                "getting an equal share, and much above that means the router "
+                "has picked favourites."
+                % (E, _share_phrase(k, E), 1.0 / E))
+
     share = embedding / max(total, 1)
     if share > 0.4:
         ctx.log("The vocabulary accounts for %.0f%% of this model's parameters. "
@@ -510,18 +571,45 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     autocast_on = device == "cuda" and autocast_dtype != torch.float32
 
+    moe = is_moe(arch)
+    aux_coef = float(arch.get("router_aux_loss_coef", 0.01)) if moe else 0.0
+    experts_per_tok = int(arch.get("num_experts_per_tok") or 1) if moe else 0
+
+    def split_loss(out):
+        """The language-modelling loss on its own, separated from the router's.
+
+        With load balancing switched on, `out.loss` is the sum of the two. Left
+        combined, the number on the chart is not comparable with a dense run's
+        and the perplexity derived from it is simply wrong -- inflated by a
+        term that has nothing to do with predicting text.
+        """
+        aux = getattr(out, "aux_loss", None)
+        if aux is None:
+            return out.loss, None
+        return out.loss - aux_coef * aux.to(out.loss.device), aux
+
     @torch.no_grad()
-    def evaluate(iters: int = 12) -> float | None:
+    def evaluate(iters: int = 12) -> tuple[float | None, float | None]:
+        """Held-out loss, and how evenly the router is spreading its work."""
         if len(val_idx) == 0:
-            return None
+            return None, None
         model.eval()
         losses = []
+        busiest = []
         for _ in range(iters):
             ids = get_batch(val_idx, min(batch, len(val_idx)))
             with torch.amp.autocast("cuda", dtype=autocast_dtype, enabled=autocast_on):
-                losses.append(model(input_ids=ids, labels=ids).loss.item())
+                out = model(input_ids=ids, labels=ids)
+            lm_loss, _ = split_loss(out)
+            losses.append(lm_loss.item())
+            if moe:
+                share = _expert_share(getattr(out, "router_logits", None),
+                                      experts_per_tok, torch)
+                if share is not None:
+                    busiest.append(share)
         model.train()
-        return sum(losses) / len(losses)
+        return (sum(losses) / len(losses),
+                sum(busiest) / len(busiest) if busiest else None)
 
     if device == "cuda":
         # The peak-memory counter is a high-water mark for the whole process,
@@ -543,7 +631,11 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     first_loss = None
     last_loss = None
     best_val = None
+    worst_share = None
+    warned_router = False
+    stopped_early = False
     samples: list[dict] = []
+    step = 0
 
     for step in range(1, total_steps + 1):
         for g in opt.param_groups:
@@ -551,15 +643,22 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
 
         opt.zero_grad(set_to_none=True)
         accum_loss = 0.0
+        accum_router = 0.0
         for _ in range(accum):
             ids = get_batch(train_idx, batch)
             with torch.amp.autocast("cuda", dtype=autocast_dtype, enabled=autocast_on):
-                loss = model(input_ids=ids, labels=ids).loss / accum
+                out = model(input_ids=ids, labels=ids)
+            # The router's balancing term is trained through, but reported
+            # apart: `loss` on the chart stays the cost of predicting text.
+            lm_loss, aux = split_loss(out)
+            loss = out.loss / accum
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            accum_loss += loss.item() * accum
+            accum_loss += lm_loss.item()
+            if aux is not None:
+                accum_router += aux.item()
 
         if use_scaler:
             scaler.unscale_(opt)
@@ -578,14 +677,27 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         elapsed = time.time() - t_start
 
         val_loss = None
+        expert_share = None
         if step % eval_every == 0 or step == total_steps:
-            val_loss = evaluate()
+            val_loss, expert_share = evaluate()
             if val_loss is not None:
                 best_val = val_loss if best_val is None else min(best_val, val_loss)
+            if expert_share is not None:
+                worst_share = max(worst_share or 0.0, expert_share)
+                even = 1.0 / max(S["counts"]["experts"], 1)
+                if expert_share > even * 2.5 and not warned_router:
+                    warned_router = True
+                    ctx.log("The router is sending %.0f%% of tokens to a single "
+                            "expert, where an even split would be %.0f%%. The "
+                            "other experts are being starved of the text they "
+                            "need to learn from."
+                            % (expert_share * 100, even * 100), "warn")
 
         ctx.metric(step, {
             "loss": round(avg, 5),
             "val_loss": round(val_loss, 5) if val_loss is not None else None,
+            "router_loss": round(accum_router / accum, 5) if moe else None,
+            "expert_balance": round(expert_share, 4) if expert_share is not None else None,
             "perplexity": round(min(math.exp(min(avg, 20)), 1e6), 2),
             "learning_rate": lr_at(step - 1),
             "grad_norm": round(grad_norm, 4) if math.isfinite(grad_norm) else None,
@@ -609,14 +721,71 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
                                           "prompt": sample_prompt}})
 
         if ctx.should_cancel():
-            raise Cancelled()
+            # Stopping does not have to mean throwing the work away. A model
+            # halfway through its schedule is a real model -- undertrained,
+            # and worth keeping when the alternative is four hours of GPU time
+            # deleted on the way out. Which of the two happens is the user's
+            # choice, made when they press the button, and carried here.
+            if not ctx.should_save():
+                raise Cancelled()
+            stopped_early = True
+            ctx.log("Stopping at step %d of %d, and keeping the model as it "
+                    "stands. Its learning rate never finished decaying, so it "
+                    "is a little rougher than the same model trained to the "
+                    "end would be." % (step, total_steps), "warn")
+            break
 
     # ---- save -----------------------------------------------------------
     return _save(cfg, ctx, model, tok, arch, S, {
         "first_loss": first_loss, "last_loss": last_loss, "best_val": best_val,
-        "tokens_seen": tokens_seen, "steps": total_steps,
+        "tokens_seen": tokens_seen, "steps": step,
+        "planned_steps": total_steps, "stopped_early": stopped_early,
+        "worst_expert_share": worst_share,
         "duration_s": time.time() - t_start, "samples": samples,
     })
+
+
+def _share_phrase(k: int, experts: int) -> str:
+    """"a half", not "one 2th". The fraction of the corpus one expert sees."""
+    words = {1: "all", 2: "a half", 3: "a third", 4: "a quarter", 5: "a fifth",
+             6: "a sixth", 8: "an eighth", 10: "a tenth", 16: "a sixteenth"}
+    ratio = experts / max(k, 1)
+    if ratio in words:
+        return words[ratio]
+    if ratio.is_integer():
+        return "one %dth" % int(ratio)
+    return "about %.0f%%" % (100 / ratio)
+
+
+def _effective_params(counts: dict) -> int:
+    total = int(counts.get("total") or 0)
+    active = int(counts.get("active") or total)
+    return total if active >= total else int(round((total * active) ** 0.5))
+
+
+def _expert_share(router_logits, top_k: int, torch) -> float | None:
+    """The share of tokens going to the single busiest expert.
+
+    One number, and the only one that says whether the mixture is working. An
+    even router gives 1/E; a collapsed one gives something close to 1, and a
+    collapsed router is invisible in the loss curve -- the model still learns,
+    it just learns with one expert doing the work and the rest carried dead.
+    """
+    if not router_logits:
+        return None
+    counts = None
+    routed = 0
+    for logits in router_logits:
+        if logits is None or logits.numel() == 0:
+            continue
+        flat = logits.reshape(-1, logits.shape[-1]).float()
+        picked = flat.topk(min(top_k, flat.shape[-1]), dim=-1).indices.reshape(-1)
+        hist = torch.bincount(picked, minlength=flat.shape[-1]).float()
+        counts = hist if counts is None else counts + hist
+        routed += picked.numel()
+    if counts is None or not routed:
+        return None
+    return float(counts.max().item() / routed)
 
 
 def _sample(model, tok, prompt: str, device: str, S: dict, torch, ctx) -> str | None:
@@ -655,8 +824,10 @@ def _sample(model, tok, prompt: str, device: str, S: dict, torch, ctx) -> str | 
 
 def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     out_dir = S["out_dir"]
-    ctx.progress(S["total_steps"], S["total_steps"], stage="saving")
-    ctx.log("Saving the finished model.")
+    ctx.progress(stats.get("steps") or S["total_steps"], S["total_steps"],
+                 stage="saving")
+    ctx.log("Saving the model as it stands." if stats.get("stopped_early")
+            else "Saving the finished model.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model.config.use_cache = True
@@ -671,15 +842,28 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
         "kind": "pretrain_llm",
         "architecture": arch,
         "params_total": S["counts"]["total"],
+        "params_active": S["counts"].get("active", S["counts"]["total"]),
         "params_body": S["counts"]["body"],
         "params_embedding": S["counts"]["embedding"],
+        "experts": S["counts"].get("experts") or None,
+        "experts_per_token": S["counts"].get("experts_per_token") or None,
+        "worst_expert_share": (round(stats["worst_expert_share"], 4)
+                               if stats.get("worst_expert_share") else None),
+        "stopped_early": bool(stats.get("stopped_early")),
+        "planned_steps": stats.get("planned_steps"),
         "vocab_size": len(tok),
         "initial_loss": round(stats["first_loss"], 5) if stats["first_loss"] else None,
         "final_loss": round(stats["last_loss"], 5) if stats["last_loss"] else None,
         "best_val_loss": round(stats["best_val"], 5) if stats["best_val"] else None,
         "final_perplexity": round(math.exp(min(stats["last_loss"] or 20, 20)), 2),
         "tokens_seen": stats["tokens_seen"],
-        "tokens_per_param": round(stats["tokens_seen"] / max(S["counts"]["total"], 1), 2),
+        # Against effective parameters, so a sparse model is judged by the
+        # dense one it is worth rather than by either of its own two counts.
+        # Same geometric mean the controller plans with -- see
+        # controller/architectures.effective_params, which is where the
+        # reasoning for it lives.
+        "tokens_per_param": round(
+            stats["tokens_seen"] / max(_effective_params(S["counts"]), 1), 2),
         "steps": stats["steps"],
         "duration_s": round(stats["duration_s"], 1),
         "dataset": cfg.get("dataset"),
@@ -694,9 +878,20 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     summary["artifact_size"] = archive.stat().st_size
     summary["samples"] = stats["samples"][-3:]
 
-    ctx.log("Done. Loss %.4f -> %.4f over %s tokens (%.1f tokens per parameter)."
-            % (summary["initial_loss"] or 0, summary["final_loss"] or 0,
+    ctx.log("%s Loss %.4f -> %.4f over %s tokens (%.1f tokens per parameter)."
+            % ("Stopped early." if stats.get("stopped_early") else "Done.",
+               summary["initial_loss"] or 0, summary["final_loss"] or 0,
                f"{stats['tokens_seen']:,}", summary["tokens_per_param"]))
+    if stats.get("stopped_early"):
+        ctx.log("It completed %d of the %d steps that were planned. The model "
+                "works and can be talked to; it simply had less practice than "
+                "the plan called for."
+                % (stats["steps"], stats.get("planned_steps") or 0))
+    if summary.get("worst_expert_share"):
+        E = summary.get("experts") or 1
+        ctx.log("Busiest expert took %.0f%% of the tokens at its worst, against "
+                "%.0f%% for a perfectly even split."
+                % (summary["worst_expert_share"] * 100, 100.0 / E))
     return summary
 
 

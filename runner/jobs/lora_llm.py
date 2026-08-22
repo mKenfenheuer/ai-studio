@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from common.formatting import format_example
+from runner.capabilities import expert_kernel
 
 # LoRA adapts attention (and often MLP) projections. Names differ per
 # architecture, so we match against what the model actually contains rather
@@ -28,21 +29,103 @@ _TARGET_CANDIDATES = [
 ]
 
 
+# The router. Never adapted, whatever else is: it decides which expert each
+# token reaches, it is a single tiny matrix, and moving it during a small
+# fine-tune re-routes tokens to experts that were never trained on them.
+_ROUTER_NAMES = {"gate", "router", "wg", "gate_proj_router"}
+
+_MOE_CONFIG_KEYS = ("num_local_experts", "num_experts", "n_routed_experts",
+                    "moe_num_experts")
+
+
 class Cancelled(Exception):
     """Raised when the controller asks for the job to stop."""
 
 
-def _pick_target_modules(model) -> list[str]:
+def _fmt(n: int) -> str:
+    if n >= 1e9:
+        return "%.1fB" % (n / 1e9)
+    if n >= 1e6:
+        return "%.0fM" % (n / 1e6)
+    return "%.0fK" % (n / 1e3)
+
+
+def moe_report(model) -> dict | None:
+    """Whether this base model is a mixture of experts, and how large a one."""
+    conf = getattr(model, "config", None)
+    if conf is None:
+        return None
+    experts = next((int(getattr(conf, k)) for k in _MOE_CONFIG_KEYS
+                    if getattr(conf, k, None)), 0)
+    if experts < 2:
+        return None
+    active = int(getattr(conf, "num_experts_per_tok", 0)
+                 or getattr(conf, "moe_top_k", 0) or 0)
+    expert_params = sum(p.numel() for n, p in model.named_parameters()
+                        if ".experts." in n)
+    total = sum(p.numel() for p in model.parameters())
+    return {
+        "experts": experts,
+        "experts_per_token": active or None,
+        "expert_params": expert_params,
+        "total_params": total,
+        "expert_share": round(expert_params / max(total, 1), 3),
+    }
+
+
+def expert_targets(model) -> list[str]:
+    """Names of expert weights LoRA is actually able to wrap, if any.
+
+    Often none, and that is a fact about the model's layout rather than a
+    policy. Transformers 5 stores Mixtral's experts as fused 3-D tensors --
+    `experts.gate_up_proj` of shape (experts, 2*ffn, width) inside a single
+    `MixtralExperts` module -- so there is no `nn.Linear` to attach an adapter
+    to. Older releases, and some other families, keep one Linear per expert
+    and can be adapted.
+
+    Detected by looking for Linear layers under an `.experts.` path rather
+    than by matching known names, because the answer changes with the library
+    version. Asserting a name list here would have produced a setting that
+    reported success and adapted nothing.
+    """
+    import torch.nn as nn
+    return sorted({n.split(".")[-1] for n, m in model.named_modules()
+                   if isinstance(m, nn.Linear) and ".experts." in n
+                   and n.split(".")[-1] not in _ROUTER_NAMES})
+
+
+def _pick_target_modules(model, moe: dict | None = None,
+                         adapt_experts: bool = False) -> list[str]:
     present = {name.split(".")[-1] for name, _ in model.named_modules()}
+
+    attention = []
     for group in _TARGET_CANDIDATES:
         hit = [m for m in group if m in present]
         if len(hit) >= 2:
-            return hit
-    # Last resort: every Linear that is not the output head.
+            attention = hit
+            break
+
+    if moe:
+        # Attention only, unless asked otherwise. In a MoE model the attention
+        # projections are shared by every token regardless of routing, so an
+        # adapter there is trained by all of the data. An adapter on the
+        # experts is trained by only the fraction of tokens routed to that
+        # expert -- on a small fine-tuning set, several experts may see almost
+        # nothing, and those adapters are then fitted to a handful of examples.
+        # It also multiplies the adapter's size by the number of experts.
+        targets = list(attention)
+        if adapt_experts:
+            targets += expert_targets(model)
+        return [t for t in targets if t not in _ROUTER_NAMES] or sorted(present)[:4]
+
+    if attention:
+        return attention
+
+    # Last resort: every Linear that is not the output head or a router.
     import torch.nn as nn
     names = {n.split(".")[-1] for n, m in model.named_modules()
              if isinstance(m, nn.Linear) and "head" not in n and "lm_head" not in n}
-    return sorted(names)[:6]
+    return sorted(names - _ROUTER_NAMES)[:6]
 
 
 def run(cfg: dict, ctx: Any) -> dict:
@@ -98,7 +181,20 @@ def run(cfg: dict, ctx: Any) -> dict:
     else:
         load_kwargs["dtype"] = torch_dtype
 
-    model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
+    # A mixture-of-experts base model needs the expert dispatch this backend
+    # can actually run -- see capabilities.expert_kernel for what goes wrong
+    # otherwise. Passed only when it is needed, and retried without it if the
+    # installed transformers is too old to know the argument, so that a
+    # dense model on an old library is never affected by any of this.
+    kernel = expert_kernel(caps)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model, **({"experts_implementation": kernel} if kernel else {}),
+            **load_kwargs)
+    except (TypeError, ValueError) as e:
+        if not kernel or "experts_implementation" not in str(e):
+            raise
+        model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
     if not use_4bit:
         model = model.to(device)
     model.config.use_cache = False
@@ -109,7 +205,44 @@ def run(cfg: dict, ctx: Any) -> dict:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    targets = cfg.get("target_modules") or _pick_target_modules(model)
+    moe = moe_report(model)
+    adapt_experts = bool(cfg.get("adapt_experts"))
+    if moe:
+        ctx.log("This is a mixture-of-experts model: %d experts per block%s, "
+                "and %.0f%% of its weight sits in them."
+                % (moe["experts"],
+                   ", %d used per token" % moe["experts_per_token"]
+                   if moe["experts_per_token"] else "",
+                   moe["expert_share"] * 100))
+        ctx.log("Every expert has to be held in memory even though each token "
+                "only passes through a few, so this needs the memory of its "
+                "full %s parameters, not of the fraction that does the work."
+                % _fmt(moe["total_params"]))
+        if adapt_experts and not expert_targets(model):
+            # Said out loud rather than quietly ignored. The setting was asked
+            # for, cannot be honoured on this model, and a run that reports
+            # "training the experts" while training only attention would be a
+            # lie that nothing downstream could catch.
+            adapt_experts = False
+            ctx.log("You asked to adapt the experts, and this model does not "
+                    "allow it: its experts are stored as one fused block of "
+                    "weights per layer rather than as separate layers, and "
+                    "there is nothing for an adapter to attach to. Training "
+                    "attention only instead.", "warn")
+        if adapt_experts:
+            ctx.log("Adapting the experts as well as attention, as asked. Each "
+                    "expert's adapter only learns from the tokens routed to "
+                    "that expert, so this needs noticeably more data than the "
+                    "same fine-tune on a dense model.", "warn")
+        else:
+            ctx.log("Fine-tuning attention only. Attention is shared by every "
+                    "token whatever the router decides, so all of your data "
+                    "trains all of the adapter. The router itself is left "
+                    "alone -- moving it sends tokens to experts that were "
+                    "never trained on them.")
+
+    targets = cfg.get("target_modules") or _pick_target_modules(
+        model, moe, adapt_experts)
     ctx.log("Applying LoRA to: %s" % ", ".join(targets))
     lconf = LoraConfig(
         r=int(cfg.get("lora_r", 16)),
@@ -126,7 +259,8 @@ def run(cfg: dict, ctx: Any) -> dict:
             % (f"{trainable:,}", f"{total:,}", 100 * trainable / max(total, 1)))
     ctx.emit_meta({"trainable_params": trainable, "total_params": total,
                    "target_modules": targets, "dtype": dtype_name,
-                   "quantized": use_4bit, "max_seq_len": max_seq})
+                   "quantized": use_4bit, "max_seq_len": max_seq,
+                   "moe": moe, "adapt_experts": adapt_experts if moe else None})
 
     # ---- dataset -------------------------------------------------------
     ctx.progress(0, 0, stage="loading_dataset")
@@ -245,6 +379,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     running: list[float] = []
     t_start = time.time()
     stop = False
+    stopped_early = False
 
     while not stop:
         for batch in loader:
@@ -290,7 +425,17 @@ def run(cfg: dict, ctx: Any) -> dict:
             ctx.progress(step, total_steps, stage="training")
 
             if ctx.should_cancel():
-                raise Cancelled()
+                # An adapter stopped partway is still a usable adapter -- less
+                # trained than planned, and a great deal better than nothing
+                # when the alternative is discarding the run. The user chose
+                # which of those they wanted when they pressed Stop.
+                if not ctx.should_save():
+                    raise Cancelled()
+                stopped_early = True
+                ctx.log("Stopping at step %d of %d, and keeping the adapter as "
+                        "it stands." % (step, total_steps), "warn")
+                stop = True
+                break
             if step >= total_steps:
                 stop = True
                 break
@@ -299,8 +444,9 @@ def run(cfg: dict, ctx: Any) -> dict:
         break
 
     # ---- save ----------------------------------------------------------
-    ctx.progress(total_steps, total_steps, stage="saving")
-    ctx.log("Saving adapter to %s" % out_dir)
+    ctx.progress(step, total_steps, stage="saving")
+    ctx.log("Saving the adapter as it stands." if stopped_early
+            else "Saving adapter to %s" % out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
@@ -309,11 +455,14 @@ def run(cfg: dict, ctx: Any) -> dict:
         "final_loss": round(running[-1], 5) if running else None,
         "initial_loss": round(running[0], 5) if running else None,
         "steps": step,
+        "planned_steps": total_steps,
+        "stopped_early": stopped_early,
         "duration_s": round(time.time() - t_start, 1),
         "trainable_params": trainable,
         "base_model": base_model,
         "dtype": dtype_name,
         "quantized": use_4bit,
+        "moe": moe,
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -321,6 +470,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=out_dir)
     summary["artifact_path"] = str(archive)
     summary["artifact_size"] = archive.stat().st_size
-    ctx.log("Done. Loss %.4f -> %.4f over %d steps."
-            % (summary["initial_loss"] or 0, summary["final_loss"] or 0, step))
+    ctx.log("%s Loss %.4f -> %.4f over %d steps%s."
+            % ("Stopped early." if stopped_early else "Done.",
+               summary["initial_loss"] or 0, summary["final_loss"] or 0, step,
+               " of the %d planned" % total_steps if stopped_early else ""))
     return summary

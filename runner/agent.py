@@ -53,13 +53,23 @@ class JobContext:
         self.hf_token = hf_token
         self._outbox = outbox
         self._cancel = threading.Event()
+        # Set alongside the cancel flag, never after it: a training loop that
+        # reads "should I stop" and "should I keep it" as two separate events
+        # can see the first before the second is written, and quietly throw
+        # away a model the user asked to keep. Written first, read second.
+        self._save_on_stop = False
         self._last_metric_step = -1
 
-    def cancel(self) -> None:
+    def cancel(self, save: bool = False) -> None:
+        self._save_on_stop = bool(save)
         self._cancel.set()
 
     def should_cancel(self) -> bool:
         return self._cancel.is_set()
+
+    def should_save(self) -> bool:
+        """Whether a stop was asked to keep the half-trained model."""
+        return self._save_on_stop
 
     def _put(self, msg: dict) -> None:
         msg["job_id"] = self.job_id
@@ -171,7 +181,7 @@ class Runner:
                 self._start_job(msg["job"])
             elif kind == "job_cancel":
                 if self.current and self.current.job_id == msg.get("job_id"):
-                    self.current.cancel()
+                    self.current.cancel(save=bool(msg.get("save")))
             elif kind == "reprobe":
                 self.caps = await asyncio.get_event_loop().run_in_executor(
                     None, capabilities.probe)
@@ -323,9 +333,18 @@ class Runner:
             if path := result.pop("artifact_path", None):
                 ctx.log("Uploading result to the controller...")
                 self._upload(jid, path)
-            self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
+            # A run that was stopped and saved returns normally and has a real
+            # model behind it, but it is not a run that finished. Reporting it
+            # as "succeeded" would put a half-trained model beside fully
+            # trained ones with nothing to tell them apart, so it keeps the
+            # stopped status and carries its summary with it.
+            if result.get("stopped_early"):
+                self.outbox.put({"type": "job_cancelled", "job_id": jid,
+                                 "summary": result, "saved": True})
+            else:
+                self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
         except lora_llm.Cancelled:
-            self.outbox.put({"type": "job_cancelled", "job_id": jid})
+            self.outbox.put({"type": "job_cancelled", "job_id": jid, "saved": False})
         except Exception as e:  # noqa: BLE001
             self.outbox.put({
                 "type": "job_failed", "job_id": jid,
