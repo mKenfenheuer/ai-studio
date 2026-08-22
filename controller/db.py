@@ -63,7 +63,82 @@ CREATE TABLE IF NOT EXISTS artifacts (
     size_bytes  INTEGER NOT NULL,
     created_at  REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id             TEXT PRIMARY KEY,
+    username       TEXT NOT NULL UNIQUE,
+    display_name   TEXT NOT NULL,
+    password_hash  TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'member',
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_at     REAL NOT NULL,
+    last_login     REAL,
+    must_change    INTEGER NOT NULL DEFAULT 0,
+    -- Encrypted, and never returned by any endpoint. See controller/auth.
+    hf_token_enc   TEXT,
+    hf_username    TEXT,
+    hf_fullname    TEXT,
+    hf_avatar      TEXT,
+    hf_orgs        TEXT,
+    hf_can_write   INTEGER NOT NULL DEFAULT 0,
+    hf_checked_at  REAL
+);
+
+-- The cookie's SHA-256, not the cookie. A leaked database is not a set of
+-- working logins.
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    last_used   REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS datasets (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    name        TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    origin      TEXT,
+    rows        INTEGER NOT NULL DEFAULT 0,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    columns     TEXT,
+    format      TEXT,
+    notes       TEXT,
+    parent_id   TEXT,
+    recipe      TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_datasets_owner ON datasets(owner_id);
+
+-- Sharing. A run or a dataset belongs to the person who made it and is
+-- invisible to everyone else until they say otherwise; this table is how they
+-- say otherwise. `subject_type='everyone'` means everyone with an account on
+-- this studio, which is a different and much smaller claim than "public".
+CREATE TABLE IF NOT EXISTS shares (
+    id             TEXT PRIMARY KEY,
+    resource_type  TEXT NOT NULL,
+    resource_id    TEXT NOT NULL,
+    subject_type   TEXT NOT NULL,
+    subject_id     TEXT,
+    level          TEXT NOT NULL DEFAULT 'view',
+    created_at     REAL NOT NULL,
+    created_by     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_unique
+    ON shares(resource_type, resource_id, subject_type, IFNULL(subject_id,''));
+CREATE INDEX IF NOT EXISTS idx_shares_subject ON shares(subject_type, subject_id);
 """
+
+# Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
+# EXISTS", and an existing studio must not lose its runs to an upgrade, so
+# each one is attempted and its "duplicate column" complaint ignored.
+_ADDED_COLUMNS = [
+    ("jobs", "owner_id", "TEXT"),
+]
 
 _conn: sqlite3.Connection | None = None
 
@@ -78,6 +153,13 @@ def connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
         _conn.executescript(_SCHEMA)
+        for table, column, decl in _ADDED_COLUMNS:
+            try:
+                _conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                              % (table, column, decl))
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         _conn.commit()
     return _conn
 
@@ -150,10 +232,11 @@ def get_runner(runner_id: str) -> dict | None:
 
 # ------------------------------------------------------------------- jobs
 
-def create_job(name: str, kind: str, cfg: dict) -> str:
+def create_job(name: str, kind: str, cfg: dict, owner_id: str | None = None) -> str:
     jid = new_id("job")
-    ex("INSERT INTO jobs (id,name,kind,status,config,created_at) VALUES (?,?,?,'queued',?,?)",
-       (jid, name, kind, json.dumps(cfg), now()))
+    ex("INSERT INTO jobs (id,name,kind,status,config,created_at,owner_id)"
+       " VALUES (?,?,?,'queued',?,?,?)",
+       (jid, name, kind, json.dumps(cfg), now(), owner_id))
     return jid
 
 
@@ -171,7 +254,9 @@ def list_jobs(limit: int = 100) -> list[dict]:
     the artifacts table would be one query per job.
     """
     rows = q("SELECT j.*, EXISTS(SELECT 1 FROM artifacts a WHERE a.job_id = j.id)"
-             " AS has_model FROM jobs j ORDER BY j.created_at DESC LIMIT ?",
+             " AS has_model, u.display_name AS owner_name, u.username AS owner_username"
+             " FROM jobs j LEFT JOIN users u ON u.id = j.owner_id"
+             " ORDER BY j.created_at DESC LIMIT ?",
              (limit,))
     for r in rows:
         r["has_model"] = bool(r["has_model"])
@@ -309,3 +394,285 @@ def delete_job(job_id: str) -> list[str]:
 
 def list_artifacts(job_id: str) -> list[dict]:
     return q("SELECT * FROM artifacts WHERE job_id=? ORDER BY created_at", (job_id,))
+
+
+# ===========================================================================
+# Accounts
+# ===========================================================================
+#
+# `password_hash` and `hf_token_enc` never leave this module by accident:
+# public_user() is what every endpoint returns, and it is a whitelist rather
+# than a blacklist so a column added later is private until someone decides
+# otherwise.
+
+_PUBLIC_USER_FIELDS = ("id", "username", "display_name", "role", "active",
+                       "created_at", "last_login", "must_change")
+
+
+def public_user(user: dict | None) -> dict | None:
+    if not user:
+        return None
+    out = {k: user.get(k) for k in _PUBLIC_USER_FIELDS}
+    out["active"] = bool(out.get("active"))
+    out["must_change"] = bool(out.get("must_change"))
+    out["hf"] = {
+        "connected": bool(user.get("hf_token_enc")),
+        "username": user.get("hf_username"),
+        "fullname": user.get("hf_fullname"),
+        "avatar": user.get("hf_avatar"),
+        "orgs": json.loads(user.get("hf_orgs") or "[]"),
+        "can_write": bool(user.get("hf_can_write")),
+        "checked_at": user.get("hf_checked_at"),
+    }
+    return out
+
+
+def count_users() -> int:
+    row = q1("SELECT COUNT(*) AS n FROM users")
+    return int(row["n"]) if row else 0
+
+
+def count_admins(active_only: bool = True) -> int:
+    sql = "SELECT COUNT(*) AS n FROM users WHERE role='admin'"
+    if active_only:
+        sql += " AND active=1"
+    row = q1(sql)
+    return int(row["n"]) if row else 0
+
+
+def get_user(user_id: str) -> dict | None:
+    return q1("SELECT * FROM users WHERE id=?", (user_id,))
+
+
+def get_user_by_name(username: str) -> dict | None:
+    return q1("SELECT * FROM users WHERE username=?", ((username or "").lower(),))
+
+
+def list_users() -> list[dict]:
+    return q("SELECT * FROM users ORDER BY role, username")
+
+
+def create_user(username: str, display_name: str, password_hash: str,
+                role: str = "member", must_change: bool = False) -> str:
+    uid = new_id("usr")
+    ex("INSERT INTO users (id,username,display_name,password_hash,role,active,"
+       "created_at,must_change) VALUES (?,?,?,?,?,1,?,?)",
+       (uid, username.lower(), display_name or username, password_hash,
+        role, now(), 1 if must_change else 0))
+    return uid
+
+
+def update_user(user_id: str, **fields: Any) -> None:
+    allowed = {"display_name", "role", "active", "password_hash", "last_login",
+               "must_change", "hf_token_enc", "hf_username", "hf_fullname",
+               "hf_avatar", "hf_orgs", "hf_can_write", "hf_checked_at"}
+    sets, args = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError("refusing to update unknown column %r" % k)
+        sets.append("%s=?" % k)
+        args.append(v)
+    if not sets:
+        return
+    args.append(user_id)
+    ex("UPDATE users SET %s WHERE id=?" % ",".join(sets), args)
+
+
+def delete_user(user_id: str) -> None:
+    c = connect()
+    c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    # Runs and datasets outlive their owner and become unowned rather than
+    # being destroyed. Deleting an account should not silently delete a week
+    # of somebody else's GPU time.
+    c.execute("UPDATE jobs SET owner_id=NULL WHERE owner_id=?", (user_id,))
+    c.execute("UPDATE datasets SET owner_id=NULL WHERE owner_id=?", (user_id,))
+    c.execute("DELETE FROM users WHERE id=?", (user_id,))
+    c.commit()
+
+
+def adopt_ownerless(user_id: str) -> int:
+    """Give everything that predates accounts to the first administrator.
+
+    Without this, upgrading a running studio would hide every existing run
+    behind a "not yours" filter and look exactly like data loss.
+    """
+    c = connect()
+    cur = c.execute("UPDATE jobs SET owner_id=? WHERE owner_id IS NULL", (user_id,))
+    n = cur.rowcount
+    c.execute("UPDATE datasets SET owner_id=? WHERE owner_id IS NULL", (user_id,))
+    c.commit()
+    return n
+
+
+def list_sessions(user_id: str) -> list[dict]:
+    return q("SELECT created_at,last_used,expires_at,user_agent FROM sessions"
+             " WHERE user_id=? ORDER BY last_used DESC", (user_id,))
+
+
+# ===========================================================================
+# Datasets
+# ===========================================================================
+
+def create_dataset(owner_id: str | None, name: str, source: str, **fields: Any) -> str:
+    did = new_id("ds")
+    ts = now()
+    ex("INSERT INTO datasets (id,owner_id,name,source,origin,rows,bytes,columns,"
+       "format,notes,parent_id,recipe,created_at,updated_at)"
+       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+       (did, owner_id, name, source, fields.get("origin"),
+        int(fields.get("rows") or 0), int(fields.get("bytes") or 0),
+        json.dumps(fields.get("columns") or []),
+        json.dumps(fields.get("format") or {}),
+        fields.get("notes"), fields.get("parent_id"),
+        json.dumps(fields.get("recipe") or {}), ts, ts))
+    return did
+
+
+def _hydrate_dataset(r: dict) -> dict:
+    r["columns"] = json.loads(r.get("columns") or "[]")
+    r["format"] = json.loads(r.get("format") or "{}")
+    r["recipe"] = json.loads(r.get("recipe") or "{}")
+    return r
+
+
+def get_dataset(dataset_id: str) -> dict | None:
+    r = q1("SELECT * FROM datasets WHERE id=?", (dataset_id,))
+    return _hydrate_dataset(r) if r else None
+
+
+def list_datasets(owner_id: str | None = None) -> list[dict]:
+    sql = ("SELECT d.*, u.display_name AS owner_name FROM datasets d"
+           " LEFT JOIN users u ON u.id = d.owner_id")
+    args: tuple = ()
+    if owner_id:
+        sql += " WHERE d.owner_id = ?"
+        args = (owner_id,)
+    sql += " ORDER BY d.updated_at DESC"
+    return [_hydrate_dataset(r) for r in q(sql, args)]
+
+
+def update_dataset(dataset_id: str, **fields: Any) -> None:
+    allowed = {"name", "notes", "rows", "bytes", "columns", "format", "origin"}
+    sets, args = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError("refusing to update unknown column %r" % k)
+        sets.append("%s=?" % k)
+        args.append(json.dumps(v) if k in ("columns", "format") else v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    args.append(now())
+    args.append(dataset_id)
+    ex("UPDATE datasets SET %s WHERE id=?" % ",".join(sets), args)
+
+
+def delete_dataset(dataset_id: str) -> None:
+    ex("DELETE FROM datasets WHERE id=?", (dataset_id,))
+
+
+# ===========================================================================
+# Sharing
+# ===========================================================================
+
+LEVELS = {"view": 1, "edit": 2}
+
+
+def share(resource_type: str, resource_id: str, subject_type: str,
+          subject_id: str | None, level: str, by: str | None) -> None:
+    ex("INSERT INTO shares (id,resource_type,resource_id,subject_type,subject_id,"
+       "level,created_at,created_by) VALUES (?,?,?,?,?,?,?,?)"
+       " ON CONFLICT(resource_type,resource_id,subject_type,IFNULL(subject_id,''))"
+       " DO UPDATE SET level=excluded.level",
+       (new_id("shr"), resource_type, resource_id, subject_type, subject_id,
+        level, now(), by))
+
+
+def unshare(resource_type: str, resource_id: str, subject_type: str,
+            subject_id: str | None) -> None:
+    ex("DELETE FROM shares WHERE resource_type=? AND resource_id=?"
+       " AND subject_type=? AND IFNULL(subject_id,'')=?",
+       (resource_type, resource_id, subject_type, subject_id or ""))
+
+
+def list_shares(resource_type: str, resource_id: str) -> list[dict]:
+    return q("SELECT s.*, u.username, u.display_name FROM shares s"
+             " LEFT JOIN users u ON u.id = s.subject_id"
+             " WHERE s.resource_type=? AND s.resource_id=?"
+             " ORDER BY s.subject_type, u.username",
+             (resource_type, resource_id))
+
+
+def clear_shares(resource_type: str, resource_id: str) -> None:
+    ex("DELETE FROM shares WHERE resource_type=? AND resource_id=?",
+       (resource_type, resource_id))
+
+
+def access_level(resource_type: str, resource_id: str, owner_id: str | None,
+                 user: dict | None) -> str | None:
+    """"edit", "view", or None: what this user may do with this thing.
+
+    Owner and administrator get edit. Otherwise the best of whatever has been
+    shared with them directly or with everyone. Unowned resources -- the ones
+    that predate accounts -- are visible to all, because hiding a studio's own
+    history behind an owner that does not exist helps nobody.
+    """
+    if not user:
+        return None
+    if owner_id is None:
+        return "edit" if user.get("role") == "admin" else "view"
+    if owner_id == user["id"] or user.get("role") == "admin":
+        return "edit"
+    rows = q("SELECT level, subject_type FROM shares WHERE resource_type=?"
+             " AND resource_id=? AND (subject_type='everyone'"
+             " OR (subject_type='user' AND subject_id=?))",
+             (resource_type, resource_id, user["id"]))
+    best = None
+    for r in rows:
+        if best is None or LEVELS[r["level"]] > LEVELS[best]:
+            best = r["level"]
+    return best
+
+
+def _visible_clause(user: dict, resource_type: str, alias: str) -> tuple[str, list]:
+    """SQL fragment selecting the rows this user is allowed to see."""
+    if user.get("role") == "admin":
+        return "1=1", []
+    return (
+        "({a}.owner_id = ? OR {a}.owner_id IS NULL OR EXISTS ("
+        "  SELECT 1 FROM shares s WHERE s.resource_type = ?"
+        "    AND s.resource_id = {a}.id"
+        "    AND (s.subject_type='everyone'"
+        "         OR (s.subject_type='user' AND s.subject_id = ?))))".format(a=alias),
+        [user["id"], resource_type, user["id"]])
+
+
+def visible_jobs(user: dict, limit: int = 100) -> list[dict]:
+    where, args = _visible_clause(user, "job", "j")
+    rows = q("SELECT j.*, EXISTS(SELECT 1 FROM artifacts a WHERE a.job_id = j.id)"
+             " AS has_model, u.display_name AS owner_name, u.username AS owner_username,"
+             " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='job'"
+             "        AND s.resource_id = j.id) AS is_shared"
+             " FROM jobs j LEFT JOIN users u ON u.id = j.owner_id"
+             " WHERE " + where + " ORDER BY j.created_at DESC LIMIT ?",
+             args + [limit])
+    for r in rows:
+        r["has_model"] = bool(r["has_model"])
+        r["is_shared"] = bool(r["is_shared"])
+        r["mine"] = r["owner_id"] == user["id"]
+    return [_hydrate(r) for r in rows]
+
+
+def visible_datasets(user: dict) -> list[dict]:
+    where, args = _visible_clause(user, "dataset", "d")
+    rows = q("SELECT d.*, u.display_name AS owner_name, u.username AS owner_username,"
+             " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='dataset'"
+             "        AND s.resource_id = d.id) AS is_shared"
+             " FROM datasets d LEFT JOIN users u ON u.id = d.owner_id"
+             " WHERE " + where + " ORDER BY d.updated_at DESC", args)
+    out = []
+    for r in rows:
+        r["is_shared"] = bool(r["is_shared"])
+        r["mine"] = r["owner_id"] == user["id"]
+        out.append(_hydrate_dataset(r))
+    return out

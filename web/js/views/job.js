@@ -1,6 +1,7 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast } from "../util.js";
 import { LineChart } from "../chart.js";
+import { shareBox, wireShareBox } from "./share.js";
 
 const STAGES = {
   loading_model: "Downloading and loading the model…",
@@ -105,6 +106,40 @@ export async function jobView(mount, [jobId]) {
     }
   });
 
+  const paintOwnerRow = () => {
+    const box = $("#ownerRow", mount);
+    if (!box) return;
+    const hasModel = job.artifacts?.length;
+    box.innerHTML = shareBox("job", job) + (hasModel ? publishCard(job) : "");
+    wireShareBox(mount, "job", job, async () => {
+      job = await api.job(jobId);
+      paintOwnerRow();
+    });
+  };
+  paintOwnerRow();
+
+  on(mount, "submit", "#publishForm", async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target).entries());
+    const btn = $("#pubGo", mount);
+    btn.disabled = true;
+    btn.textContent = "Uploading to Hugging Face…";
+    try {
+      const r = await api.publishJob(jobId, {
+        repo_id: f.repo_id, private: f.visibility === "private" });
+      $("#publishResult", mount).innerHTML =
+        `<div class="callout callout-ok"><strong>Published</strong>
+          <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a></div>`;
+      toast("Published.", "ok");
+    } catch (ex) {
+      $("#publishResult", mount).innerHTML =
+        `<div class="callout callout-err">${esc(ex.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Publish to Hugging Face";
+    }
+  });
+
   // Delegated, not bound directly: paintHeader() replaces the button element
   // every time a metric arrives, which would silently discard a direct listener.
   // Stopping is two different actions wearing one button, and the difference
@@ -144,9 +179,11 @@ export async function jobView(mount, [jobId]) {
 // ---------------------------------------------------------------------------
 
 function layout(job, scratch, experts = 0) {
-  const subtitle = scratch
-    ? `from scratch · ${job.config.dataset}`
-    : `${job.config.base_model} → ${job.config.dataset}`;
+  const source = job.config.dataset_label || job.config.dataset;
+  const subtitle = job.kind === "generate_dataset"
+    ? `writing data with ${job.config.model?.base_model || "your own model"}`
+    : scratch ? `from scratch · ${source}`
+              : `${job.config.base_model} → ${source}`;
   return html`
     <div class="page-head">
       <a href="#/jobs" class="tiny">← All runs</a>
@@ -201,12 +238,45 @@ function layout(job, scratch, experts = 0) {
       </div>
     </div>
 
+    <div class="grid grid-2" style="margin-bottom:14px" id="ownerRow"></div>
+
     <div class="card">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">Newest at the bottom</span>
       </div>
       <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function publishCard(job) {
+  const base = (job.kind === "pretrain_llm"
+    ? job.name : (job.config.base_model || "model").split("/").pop() + "-tuned");
+  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "").slice(0, 60) || "my-model";
+  return html`
+    <div class="card">
+      <h3>Publish to Hugging Face</h3>
+      <p class="muted tiny">Uploads ${job.kind === "pretrain_llm"
+        ? "the model" : "the adapter"} and a model card to your own account.
+        Needs a connected account with write access —
+        <a href="#/account">set that up here</a>.</p>
+      <form id="publishForm" style="margin-top:10px">
+        <div class="field">
+          <label for="pubRepo">Repository</label>
+          <input id="pubRepo" name="repo_id" type="text" class="mono" required
+                 placeholder="your-name/${esc(slug)}">
+        </div>
+        <div class="field">
+          <label for="pubVis">Visibility</label>
+          <select id="pubVis" name="visibility">
+            <option value="private">Private</option>
+            <option value="public">Public — anyone can download it</option>
+          </select>
+        </div>
+        <button class="btn-sm" type="submit" id="pubGo">Publish to Hugging Face</button>
+      </form>
+      <div id="publishResult"></div>
     </div>`;
 }
 

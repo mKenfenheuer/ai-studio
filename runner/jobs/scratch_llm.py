@@ -38,6 +38,7 @@ from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
 from runner.capabilities import expert_kernel
 
+from . import source
 from .lora_llm import Cancelled
 
 EOS = "<|endoftext|>"
@@ -260,6 +261,7 @@ def _iter_texts(cfg: dict, ctx: Any) -> Iterator[str]:
 
     name = cfg["dataset"]
     field = cfg.get("text_field") or "text"
+    local = source.is_studio_dataset(cfg)
     # A corpus is not always a column of prose. Conversations, instruction
     # pairs and hand-written templates all work here too, rendered by exactly
     # the same code the fine-tuner uses -- a model learning language from
@@ -270,8 +272,14 @@ def _iter_texts(cfg: dict, ctx: Any) -> Iterator[str]:
     if conf := cfg.get("dataset_config"):
         kwargs["name"] = conf
 
+    if local:
+        # A studio dataset is one JSONL file, already on disk after the fetch.
+        # Nothing to stream from the Hub and no config or split to resolve.
+        ds = load_dataset("json", data_files=source.local_copy(cfg, ctx),
+                          split="train")
+        kwargs = {}
     try:
-        ds = load_dataset(name, streaming=True, **kwargs)
+        ds = ds if local else load_dataset(name, streaming=True, **kwargs)
     except Exception as e:  # noqa: BLE001 - not every dataset can stream
         ctx.log("Streaming is not available for this dataset (%s); downloading "
                 "it in full instead." % type(e).__name__, "warn")

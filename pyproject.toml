@@ -15,6 +15,14 @@ dependencies = [
     # tokenizer_config.json. The controller renders them so a preview shows
     # exactly what the runner will train on.
     "jinja2>=3.1",
+    # Encrypting the Hugging Face token each user entrusts to the studio.
+    # Pure-Python bindings with wheels everywhere -- the "dependency-light"
+    # rule above is about GPU stacks, not about refusing to use a real cipher.
+    "cryptography>=42.0",
+    # Publishing a finished model or dataset to the Hub. Uploading a
+    # multi-gigabyte repository correctly means LFS, chunking and retries, and
+    # this is the library that already does all three.
+    "huggingface-hub>=0.25",
 ]
 
 [project.optional-dependencies]

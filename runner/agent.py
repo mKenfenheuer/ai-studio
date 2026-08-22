@@ -24,7 +24,7 @@ import httpx
 import websockets
 
 from . import capabilities, inference
-from .jobs import lora_llm, scratch_llm
+from .jobs import generate_data, lora_llm, scratch_llm
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -34,6 +34,10 @@ RECONNECT_MAX_S = 30
 JOB_HANDLERS = {
     "finetune_llm": lora_llm.run,
     "pretrain_llm": scratch_llm.run,
+    # Writing a dataset with a model is a GPU job of hours that wants
+    # progress, logs and a stop button, so it is a job like the others rather
+    # than a script bolted to the side.
+    "generate_dataset": generate_data.run,
 }
 
 
@@ -46,11 +50,16 @@ class JobContext:
     """
 
     def __init__(self, job_id: str, outbox: queue.Queue, workdir: str,
-                 caps: dict, hf_token: str | None):
+                 caps: dict, hf_token: str | None,
+                 controller_url: str = "", runner_token: str = ""):
         self.job_id = job_id
         self.workdir = workdir
         self.capabilities = caps
         self.hf_token = hf_token
+        # A job that generates data has to load a finished model, which means
+        # fetching it from the controller exactly as the playground does.
+        self.controller_url = controller_url
+        self.runner_token = runner_token
         self._outbox = outbox
         self._cancel = threading.Event()
         # Set alongside the cancel flag, never after it: a training loop that
@@ -270,7 +279,8 @@ class Runner:
         # builds the header "Bearer " and fails every download with
         # "Illegal header value". Absent must mean None, not "".
         token = (job.get("hf_token") or os.environ.get("HF_TOKEN") or "").strip() or None
-        ctx = JobContext(job["id"], self.outbox, workdir, self.caps, token)
+        ctx = JobContext(job["id"], self.outbox, workdir, self.caps, token,
+                         self.controller_url, self.token)
         self.current = ctx
         threading.Thread(target=self._run_job, args=(job, ctx, workdir),
                          daemon=True, name="job-%s" % job["id"]).start()

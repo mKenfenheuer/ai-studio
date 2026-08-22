@@ -8,6 +8,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎛️</text></svg>">
 </head>
 <body>
+<div id="gate" class="gate" hidden></div>
 <div id="app">
   <aside class="sidebar">
     <div class="brand">
@@ -26,11 +27,19 @@
            renders as a colour glyph on most phones, which is out of place in a
            row of monochrome marks. This one has no emoji variant. -->
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
+      <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
       <a href="#/runners" data-nav="runners"><span class="ico">▦</span><span class="lbl">Machines</span></a>
       <a href="#/settings" data-nav="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
     </nav>
 
     <div class="sidebar-foot">
+      <a class="who" href="#/account" id="whoami" hidden>
+        <span class="who-avatar" id="whoAvatar">?</span>
+        <span class="who-text">
+          <span class="who-name" id="whoName">…</span>
+          <span class="who-role" id="whoRole"></span>
+        </span>
+      </a>
       <div class="fleet-pill">
         <span class="dot dot-idle" data-fleet-dot></span>
         <span data-fleet-text>connecting…</span>

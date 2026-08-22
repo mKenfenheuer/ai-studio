@@ -14,7 +14,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import architectures as arch
-from . import config, db, hub
+from . import config, datasets as dsets, db, hfaccount, hub
+from .api import accounts, data, security, sharing
 from .scheduler import Fleet
 
 fleet = Fleet()
@@ -23,6 +24,7 @@ fleet = Fleet()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
+    dsets.ensure_dirs()
     db.connect()
     # Any runner marked online in a previous process is stale until it dials in.
     for r in db.q("SELECT id FROM runners WHERE status != 'offline'"):
@@ -35,6 +37,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Studio", version="0.1.0", lifespan=lifespan)
+
+# Registered before anything else so that no route can be reached without
+# passing it. Order matters here: middleware added later runs first, and the
+# authentication gate must run before any handler.
+app.middleware("http")(security.authenticate)
+
+app.include_router(accounts.router)
+app.include_router(data.router)
+app.include_router(sharing.router)
 
 
 # ===========================================================================
@@ -95,6 +106,17 @@ async def runner_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
+    """Live updates for a signed-in browser.
+
+    Middleware does not run for websockets, so the cookie is checked here by
+    hand. Without this the event stream would be the one door in the building
+    with no lock on it -- and it carries job names, dataset names and progress
+    for everyone in the studio.
+    """
+    from . import auth
+    if not auth.session_user(ws.cookies.get(auth.SESSION_COOKIE)):
+        await ws.close(code=4401)
+        return
     await ws.accept()
     fleet.ui_clients.add(ws)
     try:
@@ -111,12 +133,17 @@ async def events_ws(ws: WebSocket) -> None:
 # ===========================================================================
 
 @app.get("/api/status")
-async def status() -> dict:
+async def status(request: Request) -> dict:
     runners = db.list_runners()
+    user = security.current_user(request)
     return {
         "version": "0.1.0",
-        "join_token": config.join_token(),
-        "hf_token_set": bool(config.HF_TOKEN),
+        # The join token lets a machine attach to the studio and read the work
+        # on it. Members can see that machines exist; only an administrator
+        # gets the credential that adds one.
+        "join_token": config.join_token() if user["role"] == "admin" else None,
+        "hf_token_set": bool(hfaccount.token_for(user)),
+        "hf_token_is_yours": bool(user.get("hf_token_enc")),
         "runners_online": sum(1 for r in runners if r["status"] != "offline"),
         "runners_total": len(runners),
         "jobs_running": len(db.q("SELECT id FROM jobs WHERE status='running'")),
@@ -147,14 +174,56 @@ async def reprobe(runner_id: str) -> dict:
 # ===========================================================================
 
 @app.get("/api/jobs")
-async def get_jobs(limit: int = 100) -> list[dict]:
-    return db.list_jobs(limit)
+async def get_jobs(request: Request, limit: int = 100) -> list[dict]:
+    return db.visible_jobs(security.current_user(request), limit)
+
+
+def _job_or_404(request: Request, job_id: str, need: str = "view") -> dict:
+    """Fetch a run and check the caller may have it.
+
+    Every route below goes through this. Anything that reaches a job by id
+    without it is a bug, and the reason it is a helper rather than a repeated
+    two lines is that the repeated two lines are the ones people forget.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "No such run.")
+    if need == "own":
+        security.require_owner(request, "job", job)
+    elif need == "edit":
+        security.require_edit(request, "job", job)
+    else:
+        security.require_view(request, "job", job)
+    return job
+
+
+def _check_generation_source(request: Request, cfg: dict) -> None:
+    """You may only generate data with a model you are allowed to use."""
+    if source := (cfg.get("model") or {}).get("job_id"):
+        src = db.get_job(source)
+        if not src:
+            raise HTTPException(404, "That model does not exist.")
+        security.require_view(request, "job", src)
 
 
 @app.post("/api/jobs")
-async def create_job(payload: dict = Body(...)) -> dict:
+async def create_job(request: Request, payload: dict = Body(...)) -> dict:
+    user = security.current_user(request)
     kind = payload.get("kind", "finetune_llm")
     cfg = payload.get("config") or {}
+    # A dataset from the studio's own library travels as a URL the runner can
+    # fetch with its join token, so a private dataset never has to be public
+    # to be trained on.
+    if studio_id := cfg.get("studio_dataset"):
+        d = db.get_dataset(studio_id)
+        if not d:
+            raise HTTPException(404, "No such dataset.")
+        security.require_view(request, "dataset", d)
+        cfg["dataset"] = "%s/api/datasets/%s/dataset-file" % (
+            str(request.base_url).rstrip("/"), studio_id)
+        cfg["dataset_is_local"] = True
+        cfg["dataset_label"] = d["name"]
+
     if kind == "finetune_llm":
         for field in ("base_model", "dataset"):
             if not cfg.get(field):
@@ -164,8 +233,16 @@ async def create_job(payload: dict = Body(...)) -> dict:
             raise HTTPException(400, "Choose some text to learn from.")
         if not cfg.get("arch"):
             raise HTTPException(400, "No model architecture was chosen.")
+    elif kind == "generate_dataset":
+        if not (cfg.get("model") or {}).get("job_id") \
+                and not (cfg.get("model") or {}).get("base_model"):
+            raise HTTPException(400, "Choose a model to write the data with.")
+        if not int(cfg.get("count") or 0):
+            raise HTTPException(400, "How many rows should it write?")
+        _check_generation_source(request, cfg)
     else:
         raise HTTPException(400, "Unknown kind of training run: %s" % kind)
+
     # Reject work that provably cannot run, at creation time. The scheduler
     # would otherwise skip it silently and the job would sit "queued" forever
     # with nothing telling the user why.
@@ -180,9 +257,12 @@ async def create_job(payload: dict = Body(...)) -> dict:
             raise HTTPException(400, "This will not run on '%s': %s" % (runner["name"], why))
 
     name = payload.get("name") or _default_job_name(cfg, kind)
-    if config.HF_TOKEN:
-        cfg.setdefault("hf_token", config.HF_TOKEN)
-    jid = db.create_job(name, kind, cfg)
+    # The creator's own Hugging Face token, falling back to the studio's. A
+    # run downloads gated models as the person who started it, not as a shared
+    # identity nobody can attribute.
+    if token := hfaccount.token_for(user):
+        cfg.setdefault("hf_token", token)
+    jid = db.create_job(name, kind, cfg, owner_id=user["id"])
     db.add_log(jid, "Job created and queued.")
     await fleet.broadcast_ui({"type": "jobs_changed"})
     fleet.wake()
@@ -200,10 +280,14 @@ def _default_job_name(cfg: dict, kind: str = "finetune_llm") -> str:
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str) -> dict:
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "No such job.")
+async def get_job(request: Request, job_id: str) -> dict:
+    job = _job_or_404(request, job_id)
+    user = security.current_user(request)
+    job["access"] = db.access_level("job", job_id, job.get("owner_id"), user)
+    job["mine"] = job.get("owner_id") == user["id"]
+    owner = db.get_user(job["owner_id"]) if job.get("owner_id") else None
+    job["owner"] = db.public_user(owner) if owner else None
+    job["shares"] = db.list_shares("job", job_id)
     job["artifacts"] = db.list_artifacts(job_id)
     job["runner"] = db.get_runner(job["runner_id"]) if job["runner_id"] else None
     # Never hand the runner's copy of the HF token back to the browser.
@@ -212,26 +296,27 @@ async def get_job(job_id: str) -> dict:
 
 
 @app.get("/api/jobs/{job_id}/metrics")
-async def job_metrics(job_id: str) -> list[dict]:
+async def job_metrics(request: Request, job_id: str) -> list[dict]:
+    _job_or_404(request, job_id)
     return db.get_metrics(job_id)
 
 
 @app.get("/api/jobs/{job_id}/logs")
-async def job_logs(job_id: str, limit: int = 500) -> list[dict]:
+async def job_logs(request: Request, job_id: str, limit: int = 500) -> list[dict]:
+    _job_or_404(request, job_id)
     return db.get_logs(job_id, limit)
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str, payload: dict = Body(default=None)) -> dict:
+async def cancel_job(request: Request, job_id: str,
+                     payload: dict = Body(default=None)) -> dict:
     """Stop a run, optionally keeping the model it has built so far.
 
     `save` defaults to true. Stopping is reversible in the sense that the run
     can be started again; deleting hours of GPU time is not, so the default is
     the one that cannot lose anything. Discarding has to be asked for.
     """
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "No such job.")
+    job = _job_or_404(request, job_id, "edit")
     if job["status"] in ("succeeded", "failed", "cancelled"):
         return {"ok": True, "already": job["status"]}
 
@@ -250,11 +335,10 @@ async def cancel_job(job_id: str, payload: dict = Body(default=None)) -> dict:
 
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job(job_id: str) -> dict:
+async def delete_job(request: Request, job_id: str) -> dict:
     """Delete a run, its metrics, its logs and its model file."""
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "No such run.")
+    job = _job_or_404(request, job_id, "own")
+    db.clear_shares("job", job_id)
     if job["status"] in ("queued", "assigned", "running"):
         # Deleting the row of a job a runner is still working on would leave
         # the runner training something that no longer exists, and its next
@@ -292,20 +376,91 @@ async def upload_artifact(job_id: str, file: UploadFile,
             fh.write(chunk)
             size += len(chunk)
     # A fine-tune produces an adapter that needs its base model; a from-scratch
-    # run produces a standalone model. Labelling them apart matters because the
-    # instructions for using them are completely different.
+    # run produces a standalone model; a generation run produces data. Labelling
+    # them apart matters because what you do with each is completely different.
     job = db.get_job(job_id)
-    kind = "model" if (job or {}).get("kind") == "pretrain_llm" else "adapter"
+    kind = {"pretrain_llm": "model", "generate_dataset": "dataset"}.get(
+        (job or {}).get("kind"), "adapter")
     db.add_artifact(job_id, kind, dest.name, size)
+
+    if kind == "dataset" and job:
+        # Rows written by a model are only useful once they are a dataset you
+        # can look at, clean and train on. Doing that here, rather than making
+        # the user download a zip and upload it again, is the whole point of
+        # generation being part of the studio.
+        try:
+            created = _register_generated(job, dest)
+            db.add_log(job_id, "Saved as the dataset \"%s\" (%s rows). It is "
+                       "yours, and private until you share it."
+                       % (created["name"], f"{created['rows']:,}"))
+        except Exception as e:  # noqa: BLE001 - the rows are safe in the zip
+            db.add_log(job_id, "The rows were generated but could not be saved "
+                       "as a dataset (%s). The zip on this run still has them."
+                       % e, "error")
     return {"ok": True, "size": size}
 
 
+def _register_generated(job: dict, archive: Path) -> dict:
+    """Unpack a generation run's JSONL and enter it in the dataset library."""
+    import tempfile
+    import zipfile
+
+    cfg = job.get("config") or {}
+    with tempfile.TemporaryDirectory(prefix="aistudio_gen_") as tmp:
+        with zipfile.ZipFile(archive) as z:
+            for member in z.namelist():
+                if member.endswith(".jsonl") and "/" not in member \
+                        and not member.startswith(".."):
+                    z.extract(member, tmp)
+                    src = Path(tmp) / member
+                    break
+            else:
+                raise ValueError("no rows in the archive")
+        rows = list(dsets.rows_from_upload(src.name, src.read_bytes()))
+
+    return dsets.register(
+        job.get("owner_id"),
+        cfg.get("dataset_name") or ("Generated by %s" % job["name"]),
+        "generated", iter(rows), origin=job["id"],
+        notes="Written by a model on %s. Read a sample before training on it: "
+              "generated data can be fluent and wrong at the same time."
+              % time.strftime("%d %b %Y"),
+        recipe={"steps": ["Generated by run %s (%s mode)"
+                          % (job["id"], cfg.get("mode") or "?")]})
+
+
+@app.post("/api/jobs/{job_id}/publish")
+async def publish_job(request: Request, job_id: str,
+                      payload: dict = Body(...)) -> dict:
+    """Push a finished model to the publisher's own Hugging Face account.
+
+    Anyone who can see the run may publish it, and it goes to *their* account
+    using *their* token -- so what appears on the Hub is attributed to the
+    person who put it there, which is the only attribution that is true.
+    """
+    job = _job_or_404(request, job_id)
+    user = security.current_user(request)
+    if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+        raise HTTPException(400, "This run has no saved model to publish.")
+    try:
+        return await hfaccount.publish_job(
+            user, job, (payload.get("repo_id") or "").strip(),
+            bool(payload.get("private", True)), payload.get("message") or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001 - hub failures are not ours to classify
+        raise HTTPException(502, "Hugging Face refused the upload: %s" % e) from e
+
+
 @app.get("/api/jobs/{job_id}/download")
-async def download_artifact(job_id: str):
+async def download_artifact(request: Request, job_id: str):
     path = config.ARTIFACT_DIR / ("%s.zip" % job_id)
     if not path.exists():
         raise HTTPException(404, "No result file for this job yet.")
-    job = db.get_job(job_id)
+    # A runner fetching a model to serve presents the join token; a person
+    # downloading one presents a session and has to be allowed the run.
+    job = _job_or_404(request, job_id) \
+        if not getattr(request.state, "runner", False) else db.get_job(job_id)
     safe = "".join(c for c in (job["name"] if job else job_id)
                    if c.isalnum() or c in "-_ ").strip().replace(" ", "-")
     suffix = "model" if (job or {}).get("kind") == "pretrain_llm" else "adapter"
@@ -780,10 +935,10 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
 
 
 @app.get("/api/playground")
-async def playground() -> list[dict]:
+async def playground(request: Request) -> list[dict]:
     """Finished runs you can talk to."""
     out = []
-    for job in db.list_jobs(200):
+    for job in db.visible_jobs(security.current_user(request), 200):
         # A run that was stopped early but kept its model belongs here too.
         # The artifact on disk is the real test of whether there is something
         # to talk to; the status only says how it got there.
@@ -811,7 +966,7 @@ async def playground() -> list[dict]:
 
 
 @app.get("/api/jobs/{job_id}/system-prompt")
-async def job_system_prompt(job_id: str) -> dict:
+async def job_system_prompt(request: Request, job_id: str) -> dict:
     """The system prompt this run was trained with.
 
     Recorded on the job when it was created, and looked up from the dataset
@@ -820,9 +975,7 @@ async def job_system_prompt(job_id: str) -> dict:
     with a system prompt behaves noticeably worse without it, so it is worth
     going back for.
     """
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "No such run.")
+    job = _job_or_404(request, job_id)
     cfg = job["config"]
     if cfg.get("system_prompt"):
         return {"system_prompt": cfg["system_prompt"], "source": "recorded"}
@@ -846,10 +999,8 @@ async def job_system_prompt(job_id: str) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/chat")
-async def chat(job_id: str, payload: dict = Body(...)) -> dict:
-    job = db.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "No such run.")
+async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict:
+    job = _job_or_404(request, job_id)
     # Not "did it succeed" but "is there a model". A run stopped early that
     # kept its model has one, and refusing to talk to it would make the
     # keeping pointless.

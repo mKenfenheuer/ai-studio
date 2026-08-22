@@ -143,6 +143,10 @@ export async function wizardView(mount) {
     model: null, modelDetail: resource(),
     // The data step, shared by both paths.
     dataset: null, configs: resource(), config: null, split: "train",
+    // A dataset from this studio's library rather than from the Hub. It is
+    // fetched by the runner with the join token, so a private dataset never
+    // has to be published to be trained on.
+    studioDataset: null,
     preview: resource(), textField: null, formatMode: null,
     // How a conversation becomes training text. "model" uses the base model's
     // own chat template, which is what an instruct model was trained to expect
@@ -162,6 +166,16 @@ export async function wizardView(mount) {
     overrides: {}, archOverrides: {},
     starting: false,
   };
+
+  try {
+    const handed = sessionStorage.getItem("aistudio.dataset");
+    if (handed) {
+      const d = JSON.parse(handed);
+      sessionStorage.removeItem("aistudio.dataset");
+      state.studioDataset = d;
+      state.dataset = d.name;
+    }
+  } catch { /* nothing was handed over */ }
 
   const runners = (await api.runners()).filter((r) => r.status !== "offline");
   const starters = await api.starters();
@@ -1794,11 +1808,13 @@ function wireNav(mount, ctx) {
 
 function buildJob(mount, state) {
   const name = $("#jobName", mount)?.value || undefined;
-  const dataBits = {
-    dataset: state.dataset,
-    dataset_config: state.config || null,
-    dataset_split: state.split || "train",
-  };
+  const dataBits = state.studioDataset
+    ? { studio_dataset: state.studioDataset.id }
+    : {
+      dataset: state.dataset,
+      dataset_config: state.config || null,
+      dataset_split: state.split || "train",
+    };
 
   // Whatever the preview proved, recorded on the job. The Playground reads it
   // back so it speaks to the finished model in the shape the model learned,

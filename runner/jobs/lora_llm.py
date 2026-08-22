@@ -17,6 +17,8 @@ from typing import Any, Callable
 from common.formatting import format_example
 from runner.capabilities import expert_kernel
 
+from . import source
+
 # LoRA adapts attention (and often MLP) projections. Names differ per
 # architecture, so we match against what the model actually contains rather
 # than hardcoding one family's naming.
@@ -265,9 +267,10 @@ def run(cfg: dict, ctx: Any) -> dict:
     # ---- dataset -------------------------------------------------------
     ctx.progress(0, 0, stage="loading_dataset")
     ds_name = cfg["dataset"]
-    ctx.log("Loading dataset: %s" % ds_name)
+    ctx.log("Loading dataset: %s" % (cfg.get("dataset_label") or ds_name))
     if cfg.get("dataset_is_local"):
-        ds = load_dataset("json", data_files=ds_name, split="train")
+        ds = load_dataset("json", data_files=source.local_copy(cfg, ctx),
+                          split="train")
     else:
         ds = load_dataset(ds_name, cfg.get("dataset_config") or None,
                           split=cfg.get("dataset_split") or "train",

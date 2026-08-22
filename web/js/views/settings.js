@@ -1,28 +1,36 @@
 import { api } from "../api.js";
-import { html, raw, $, on, toast } from "../util.js";
+import { html, raw, esc, $, on, toast } from "../util.js";
+import { session } from "../app.js";
 
 export async function settingsView(mount) {
   const status = await api.status();
+  const admin = session.user?.role === "admin";
   mount.innerHTML = html`
     <div class="page-head"><h1>Settings</h1>
       <p class="sub">Studio-wide configuration.</p></div>
 
     <div class="card" style="margin-bottom:14px">
-      <h3>Hugging Face access token</h3>
-      <p class="muted tiny">Needed only for <em>gated</em> models such as Llama or
-        Gemma, where you must accept a licence first. It also raises download
-        rate limits.</p>
+      <h3>Hugging Face</h3>
+      <p class="muted tiny">Needed for <em>gated</em> models such as Llama or
+        Gemma, for better download rate limits, and to publish what you
+        train.</p>
       <div class="callout ${status.hf_token_set ? "callout-ok" : "callout-warn"}">
-        <strong>${status.hf_token_set ? "A token is configured" : "No token configured"}</strong>
-        ${raw(status.hf_token_set
-          ? "Gated models can be downloaded."
-          : `Set it on the controller and restart:
-             <code class="mono">HF_TOKEN=hf_xxx</code>. It is deliberately not
-             editable from this page, so a browser session can never read or
-             change your credentials.`)}
+        <strong>${status.hf_token_is_yours ? "Using your own account"
+          : status.hf_token_set ? "Using the studio's shared token"
+          : "No Hugging Face access"}</strong>
+        ${raw(status.hf_token_is_yours
+          ? `Downloads and publishing run as you.
+             <a href="#/account">Manage it on your account page.</a>`
+          : status.hf_token_set
+          ? `This studio has a token set in its environment, and everyone
+             here shares it. <a href="#/account">Connect your own account</a>
+             to publish models under your name.`
+          : `<a href="#/account">Connect your Hugging Face account</a> to
+             download gated models and publish what you train.`)}
       </div>
     </div>
 
+    ${raw(!admin ? "" : html`
     <div class="card" style="margin-bottom:14px">
       <h3>Join token</h3>
       <p class="muted tiny">Machines present this to join the studio. Anyone with
@@ -34,7 +42,7 @@ export async function settingsView(mount) {
       </div>
       <div class="hint">To rotate it, delete <code class="mono">data/join_token</code>
         on the controller and restart. Every machine must then rejoin.</div>
-    </div>
+    </div>`)}
 
     <div class="card">
       <h3>About</h3>
@@ -42,10 +50,21 @@ export async function settingsView(mount) {
         <dt>Version</dt><dd>${status.version}</dd>
         <dt>Machines</dt><dd>${status.runners_online} online / ${status.runners_total} known</dd>
         <dt>Controller</dt><dd class="mono">${location.origin}</dd>
+        <dt>Signed in as</dt><dd>${esc(session.user?.display_name || "?")}
+          ${raw(admin ? `<span class="badge badge-accent">administrator</span>` : "")}</dd>
       </dl>
+      ${raw(admin ? `<a class="btn btn-sm" href="#/users"
+        style="margin-top:10px">Manage people</a>` : "")}
+      <button class="btn-sm btn-danger" id="signOut"
+              style="margin-top:10px">Sign out</button>
     </div>`;
 
-  $("#reveal", mount).addEventListener("click", (e) => {
+  $("#signOut", mount).addEventListener("click", async () => {
+    await api.logout().catch(() => {});
+    location.reload();
+  });
+
+  $("#reveal", mount)?.addEventListener("click", (e) => {
     const i = $("#tok", mount);
     const show = i.type === "password";
     i.type = show ? "text" : "password";

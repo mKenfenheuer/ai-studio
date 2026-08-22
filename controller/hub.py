@@ -6,6 +6,7 @@ the model's real file sizes and comparing them against each runner's VRAM.
 """
 from __future__ import annotations
 
+import contextvars
 import re
 from typing import Any
 
@@ -166,15 +167,33 @@ STARTER_CORPORA = [
 _client: httpx.AsyncClient | None = None
 
 
+# Whose Hub credentials this request should use.
+#
+# A ContextVar rather than a parameter threaded through fifteen signatures.
+# Each request runs in its own context, so a value set by the middleware is
+# visible to everything that request calls and to nothing else -- which is
+# exactly the scoping wanted, and is not true of a module-level global.
+CURRENT_TOKEN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hf_token", default=None)
+
+
 def client() -> httpx.AsyncClient:
+    """A Hub client carrying the signed-in user's token, if they have one.
+
+    The connection pool is shared and the Authorization header is not: it is
+    set per request below, because one cached client with somebody's token
+    baked into it would quietly make every other user's searches run as them.
+    """
     global _client
     if _client is None:
-        headers = {"User-Agent": "ai-studio/0.1"}
-        if config.HF_TOKEN:
-            headers["Authorization"] = "Bearer %s" % config.HF_TOKEN
-        _client = httpx.AsyncClient(timeout=30, headers=headers,
-                                    follow_redirects=True)
+        _client = httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                    headers={"User-Agent": "ai-studio/0.1"})
     return _client
+
+
+def auth_headers() -> dict:
+    token = CURRENT_TOKEN.get() or config.HF_TOKEN
+    return {"Authorization": "Bearer %s" % token} if token else {}
 
 
 async def search_models(query: str = "", limit: int = 30,
@@ -188,7 +207,7 @@ async def search_models(query: str = "", limit: int = 30,
     }
     if query:
         params["search"] = query
-    r = await client().get(HF_API + "/models", params=params)
+    r = await client().get(HF_API + "/models", params=params, headers=auth_headers())
     r.raise_for_status()
     return [_slim_model(m) for m in r.json()]
 
@@ -197,7 +216,7 @@ async def search_datasets(query: str = "", limit: int = 30) -> list[dict]:
     params: dict[str, Any] = {"limit": limit, "sort": "downloads", "direction": -1}
     if query:
         params["search"] = query
-    r = await client().get(HF_API + "/datasets", params=params)
+    r = await client().get(HF_API + "/datasets", params=params, headers=auth_headers())
     r.raise_for_status()
     return [{
         "id": d.get("id"),
@@ -288,7 +307,7 @@ def _params_from_name(model_id: str) -> float | None:
 
 
 async def model_detail(model_id: str) -> dict:
-    r = await client().get("%s/models/%s" % (HF_API, model_id))
+    r = await client().get("%s/models/%s" % (HF_API, model_id), headers=auth_headers())
     r.raise_for_status()
     m = r.json()
 
@@ -383,7 +402,7 @@ async def dataset_preview(dataset_id: str, config_name: str | None = None,
     if not config_name:
         try:
             r = await client().get(DATASETS_SERVER + "/splits",
-                                   params={"dataset": dataset_id})
+                                   params={"dataset": dataset_id}, headers=auth_headers())
             r.raise_for_status()
             splits = r.json().get("splits", [])
             if splits:
@@ -395,7 +414,7 @@ async def dataset_preview(dataset_id: str, config_name: str | None = None,
             config_name = "default"
     params["config"] = config_name or "default"
 
-    r = await client().get(DATASETS_SERVER + "/first-rows", params=params)
+    r = await client().get(DATASETS_SERVER + "/first-rows", params=params, headers=auth_headers())
     if r.status_code != 200:
         return {"available": False, "reason": "No preview available for this dataset.",
                 "dataset": dataset_id}
@@ -435,7 +454,7 @@ async def dataset_configs(dataset_id: str) -> dict:
     source = "datasets-server"
     try:
         r = await client().get(DATASETS_SERVER + "/splits",
-                               params={"dataset": dataset_id})
+                               params={"dataset": dataset_id}, headers=auth_headers())
         r.raise_for_status()
         for row in r.json().get("splits", []):
             by_config.setdefault(row["config"], []).append(row["split"])
@@ -469,7 +488,7 @@ async def dataset_configs(dataset_id: str) -> dict:
 async def _configs_from_card(dataset_id: str) -> dict[str, list[str]]:
     """Configurations as declared in the dataset repository's own card."""
     try:
-        r = await client().get("%s/datasets/%s" % (HF_API, dataset_id))
+        r = await client().get("%s/datasets/%s" % (HF_API, dataset_id), headers=auth_headers())
         r.raise_for_status()
         declared = ((r.json().get("cardData") or {}).get("configs")) or []
     except (httpx.HTTPError, ValueError):
@@ -697,7 +716,7 @@ async def model_chat_template(model_id: str) -> dict:
 
     url = "https://huggingface.co/%s/resolve/main/tokenizer_config.json" % model_id
     try:
-        r = await client().get(url)
+        r = await client().get(url, headers=auth_headers())
         r.raise_for_status()
         conf = r.json()
     except (httpx.HTTPError, ValueError) as e:

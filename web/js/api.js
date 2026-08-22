@@ -1,10 +1,30 @@
 // REST calls plus the live event socket.
 
+// Raised when the server says "sign in". The shell listens for it and puts
+// the gate back up, so a session that expires mid-session does not turn into
+// a page full of red error cards.
+export class NotSignedIn extends Error {}
+
+let onUnauthorized = null;
+export function handleUnauthorized(fn) { onUnauthorized = fn; }
+
 async function req(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
+    // Cookies are same-origin already; stated explicitly so that a future
+    // deployment serving the UI from another host does not silently stop
+    // authenticating.
+    credentials: "same-origin",
     ...opts,
   });
+  if (res.status === 401 || (res.status === 403 && path !== "/api/auth/state")) {
+    let body = {};
+    try { body = await res.clone().json(); } catch { /* not JSON */ }
+    if (res.status === 401 || body.must_change) {
+      if (onUnauthorized) onUnauthorized(body);
+      if (res.status === 401) throw new NotSignedIn(body.detail || "Please sign in.");
+    }
+  }
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
     try { detail = (await res.json()).detail || detail; } catch { /* non-JSON body */ }
@@ -14,6 +34,87 @@ async function req(path, opts = {}) {
 }
 
 export const api = {
+  // ---- accounts --------------------------------------------------------
+  authState:   () => req("/api/auth/state"),
+  login:       (body) => req("/api/auth/login", { method: "POST", body: JSON.stringify(body) }),
+  setup:       (body) => req("/api/auth/setup", { method: "POST", body: JSON.stringify(body) }),
+  logout:      () => req("/api/auth/logout", { method: "POST" }),
+  me:          () => req("/api/me"),
+  updateMe:    (body) => req("/api/me", { method: "PATCH", body: JSON.stringify(body) }),
+  changePassword: (body) =>
+    req("/api/me/password", { method: "POST", body: JSON.stringify(body) }),
+  revokeSessions: () => req("/api/me/sessions/revoke", { method: "POST" }),
+
+  users:       () => req("/api/users"),
+  createUser:  (body) => req("/api/users", { method: "POST", body: JSON.stringify(body) }),
+  updateUser:  (id, body) =>
+    req(`/api/users/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  resetUserPassword: (id, password) =>
+    req(`/api/users/${encodeURIComponent(id)}/password`,
+        { method: "POST", body: JSON.stringify({ password }) }),
+  deleteUser:  (id) => req(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // ---- hugging face ----------------------------------------------------
+  hfState:     () => req("/api/me/huggingface"),
+  hfConnect:   (token) =>
+    req("/api/me/huggingface", { method: "POST", body: JSON.stringify({ token }) }),
+  hfDisconnect: () => req("/api/me/huggingface", { method: "DELETE" }),
+  hfRepos:     (kind = "models") =>
+    req(`/api/me/huggingface/repos?kind=${encodeURIComponent(kind)}`),
+  hfDeleteRepo: (repoId, kind = "models") =>
+    req(`/api/me/huggingface/repos?repo_id=${encodeURIComponent(repoId)}&kind=${kind}`,
+        { method: "DELETE" }),
+  publishJob:  (id, body) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/publish`,
+        { method: "POST", body: JSON.stringify(body) }),
+
+  // ---- sharing ---------------------------------------------------------
+  shares:      (kind, id) => req(`/api/${kind}s/${encodeURIComponent(id)}/shares`),
+  addShare:    (kind, id, body) =>
+    req(`/api/${kind}s/${encodeURIComponent(id)}/shares`,
+        { method: "POST", body: JSON.stringify(body) }),
+  removeShare: (kind, id, subjectType, subjectId) =>
+    req(`/api/${kind}s/${encodeURIComponent(id)}/shares?subject_type=${subjectType}`
+        + (subjectId ? `&subject_id=${encodeURIComponent(subjectId)}` : ""),
+        { method: "DELETE" }),
+  transfer:    (kind, id, userId) =>
+    req(`/api/${kind}s/${encodeURIComponent(id)}/transfer`,
+        { method: "POST", body: JSON.stringify({ user_id: userId }) }),
+
+  // ---- datasets --------------------------------------------------------
+  datasets:    () => req("/api/datasets"),
+  dataset:     (id) => req(`/api/datasets/${encodeURIComponent(id)}`),
+  datasetInspect: (id) => req(`/api/datasets/${encodeURIComponent(id)}/inspect`),
+  datasetRows: (id, offset = 0, limit = 25) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/rows?offset=${offset}&limit=${limit}`),
+  importDataset: (body) =>
+    req("/api/datasets/import", { method: "POST", body: JSON.stringify(body) }),
+  uploadDataset: (file, name) => {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`/api/datasets/upload?name=${encodeURIComponent(name || "")}`,
+                 { method: "POST", body: form, credentials: "same-origin" })
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+        return r.json();
+      });
+  },
+  renameDataset: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  transformDataset: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/transform`,
+        { method: "POST", body: JSON.stringify(body) }),
+  splitDataset: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/split`,
+        { method: "POST", body: JSON.stringify(body) }),
+  mergeDatasets: (body) =>
+    req("/api/datasets/merge", { method: "POST", body: JSON.stringify(body) }),
+  deleteDataset: (id) =>
+    req(`/api/datasets/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  publishDataset: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/publish`,
+        { method: "POST", body: JSON.stringify(body) }),
+
   status:      () => req("/api/status"),
   runners:     () => req("/api/runners"),
   reprobe:     (id) => req(`/api/runners/${encodeURIComponent(id)}/reprobe`, { method: "POST" }),
@@ -76,15 +177,34 @@ class EventStream {
     this.subs = new Set();
     this.ws = null;
     this.backoff = 1000;
+    // Not connected on construction any more: the socket needs a session, and
+    // an unauthenticated one is closed by the server the moment it opens. Left
+    // to reconnect on its own that becomes a permanent retry loop behind the
+    // login screen.
+    this.wanted = false;
+  }
+  start() {
+    if (this.wanted) return;
+    this.wanted = true;
     this.connect();
   }
+  stop() {
+    this.wanted = false;
+    try { this.ws?.close(); } catch { /* already gone */ }
+    this.ws = null;
+  }
   connect() {
+    if (!this.wanted) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.ws = new WebSocket(`${proto}://${location.host}/api/events`);
     this.ws.onopen = () => { this.backoff = 1000; this.emit({ type: "_connected" }); };
     this.ws.onmessage = (e) => { this.emit(JSON.parse(e.data)); };
-    this.ws.onclose = () => {
+    this.ws.onclose = (e) => {
       this.emit({ type: "_disconnected" });
+      // 4401 is this server saying "you are not signed in". Retrying that is
+      // pointless; the page is about to show the login screen anyway.
+      if (e && e.code === 4401) { this.wanted = false; return; }
+      if (!this.wanted) return;
       setTimeout(() => this.connect(), this.backoff);
       this.backoff = Math.min(this.backoff * 2, 15000);
     };

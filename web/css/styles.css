@@ -489,3 +489,87 @@ details.reasoning .txt {
     transition-duration: .001ms !important;
   }
 }
+
+/* ===========================================================================
+   Accounts
+   =========================================================================== */
+
+/* The sign-in screen covers the whole viewport rather than sitting inside the
+   app shell: a sidebar of links that all answer 401 is worse than no sidebar. */
+.gate {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  overflow: auto;
+}
+.gate-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 22%);
+}
+.gate-brand {
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--text-2);
+  margin-bottom: 18px;
+}
+.gate-card h1 { margin: 0 0 4px; font-size: 22px; }
+.gate-card .field { margin-top: 14px; }
+.gate-card button[type="submit"] { width: 100%; margin-top: 18px; }
+
+/* The identity chip in the sidebar foot. */
+.who {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+}
+.who:hover { background: var(--surface-2); }
+.who-avatar {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+  font-size: 13px;
+}
+.who-text { display: flex; flex-direction: column; min-width: 0; }
+.who-name {
+  font-size: 13px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.who-role { font-size: 11px; color: var(--text-3); }
+
+/* Checkboxes with a label beside them, used throughout the dataset tools. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+.check input { width: auto; margin: 0; }
+
+.grid-4 { display: grid; gap: 12px; grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 860px) { .grid-4 { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 560px) { .grid-4 { grid-template-columns: 1fr; } }
