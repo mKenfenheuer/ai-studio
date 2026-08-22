@@ -319,7 +319,6 @@ def _verdict(scores: list[dict]) -> str:
 
     best = min(usable, key=lambda s: s["metrics"]["expected_loss"])
     worst = max(usable, key=lambda s: s["metrics"]["expected_loss"])
-    gap = worst["metrics"]["expected_loss"] - best["metrics"]["expected_loss"]
     head = ("Lowest loss on the expected answers: %s (%.4f, against %.4f for "
             "%s)." % (best["name"], best["metrics"]["expected_loss"],
                       worst["metrics"]["expected_loss"], worst["name"]))

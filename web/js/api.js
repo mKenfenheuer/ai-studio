@@ -54,6 +54,13 @@ export const api = {
         { method: "POST", body: JSON.stringify({ password }) }),
   deleteUser:  (id) => req(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
+  // ---- notifications ---------------------------------------------------
+  notifyState: () => req("/api/me/notifications"),
+  notifySet:   (body) =>
+    req("/api/me/notifications", { method: "POST", body: JSON.stringify(body) }),
+  notifyTest:  () => req("/api/me/notifications/test", { method: "POST" }),
+  notifyClear: () => req("/api/me/notifications", { method: "DELETE" }),
+
   // ---- hugging face ----------------------------------------------------
   hfState:     () => req("/api/me/huggingface"),
   hfConnect:   (token) =>

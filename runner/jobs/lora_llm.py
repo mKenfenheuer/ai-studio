@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from common.formatting import format_example
-from runner import artifacts, checkpoints
+from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import expert_kernel
 
 from . import source
@@ -486,7 +485,14 @@ def run(cfg: dict, ctx: Any) -> dict:
     # the loop body and read after it, and a bare assignment there would shadow
     # rather than update if this ever moves into a closure.
     warned_overfit = [False]
-    best_val_step = [0]
+    final_val = [None]
+    stopper = earlystop.Stopper(
+        ctx, int(cfg.get("early_stop_patience") or earlystop.PATIENCE_FINETUNE),
+        enabled=bool(cfg.get("early_stop", True)) and val_loader is not None,
+        kind="adapter")
+    stopper.best = prior.get("best_val")
+    stopper.best_step = int(prior.get("best_step") or 0)
+    keep_best = bool(cfg.get("checkpointing_enabled", True))
     saver = checkpoints.Saver(
         ctx.job_id, ctx, every_s=float(cfg.get("checkpoint_every_s") or 600),
         enabled=bool(cfg.get("checkpointing_enabled", True)))
@@ -497,9 +503,12 @@ def run(cfg: dict, ctx: Any) -> dict:
                     "scaler": scaler.state_dict() if use_scaler else None},
                    str(path / "trainer.pt"))
         (path / "train.json").write_text(json.dumps({
-            "first_loss": first_loss, "best_val": best_val,
+            "first_loss": first_loss, "best_val": stopper.best,
+            "best_step": stopper.best_step,
             "duration_s": prior_seconds + (time.time() - t_start),
         }), encoding="utf-8")
+
+    stopper.announce(eval_every)
 
     while not stop:
         for batch in loader:
@@ -541,6 +550,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 last_val = evaluate()
                 if last_val is not None:
                     best_val = last_val if best_val is None else min(best_val, last_val)
+                    final_val[0] = last_val
                     if last_val > best_val * 1.05 and not warned_overfit[0]:
                         warned_overfit[0] = True
                         ctx.log("The held-out loss has started rising while the "
@@ -548,9 +558,15 @@ def run(cfg: dict, ctx: Any) -> dict:
                                 "memorising your examples rather than learning "
                                 "from them -- the best result was at the low "
                                 "point, around step %d. Fewer passes, or more "
-                                "data, would help." % best_val_step[0], "warn")
-                    elif last_val == best_val:
-                        best_val_step[0] = step
+                                "data, would help." % stopper.best_step, "warn")
+                    verdict = stopper.update(step, last_val)
+                    if verdict == "improved" and keep_best and step < total_steps:
+                        checkpoints.save_best(
+                            ctx.job_id, step,
+                            lambda pth: model.save_pretrained(str(pth / "adapter")),
+                            {"val_loss": last_val})
+                    elif verdict == "stop":
+                        stop = True
 
             ctx.metric(step, {
                 "loss": round(avg, 5),
@@ -572,6 +588,12 @@ def run(cfg: dict, ctx: Any) -> dict:
                             {"kind": "finetune_llm", "loss": round(avg, 5)})
                 ctx.emit_meta({"checkpoint": {"step": step, "total": total_steps}})
 
+            if stop:
+                # Set by the stopper: the held-out loss stopped improving.
+                # Not `stopped_early`, which means a person pressed Stop and
+                # turns the run into a cancelled one -- this run succeeded,
+                # sooner than planned.
+                break
             if ctx.should_cancel():
                 # An adapter stopped partway is still a usable adapter -- less
                 # trained than planned, and a great deal better than nothing
@@ -590,6 +612,39 @@ def run(cfg: dict, ctx: Any) -> dict:
         else:
             continue
         break
+
+    # ---- keep the best adapter, which is not always the last one --------
+    kept_step = None
+    if stopper.should_restore(final_val[0], step):
+        best = checkpoints.peek(ctx.job_id, "best") if keep_best else None
+        if best and (Path(best["path"]) / "adapter" / "adapter_model.safetensors").exists():
+            try:
+                from safetensors.torch import load_file
+                weights = load_file(str(Path(best["path"]) / "adapter"
+                                        / "adapter_model.safetensors"))
+                # PEFT names its saved tensors without the wrapper prefix that
+                # the live module tree uses, so they are matched by suffix
+                # rather than assumed to line up.
+                live = dict(model.named_parameters())
+                loaded = 0
+                for name, tensor in weights.items():
+                    key = next((k for k in live
+                                if k.endswith(name.replace("base_model.model.", ""))
+                                or k == name), None)
+                    if key is not None:
+                        with torch.no_grad():
+                            live[key].copy_(tensor.to(live[key].device,
+                                                      live[key].dtype))
+                        loaded += 1
+                if loaded < len(weights):
+                    raise ValueError("only %d of %d adapter tensors matched"
+                                     % (loaded, len(weights)))
+                stopper.note_kept(final_val[0], step)
+                kept_step = stopper.best_step
+            except Exception as e:  # noqa: BLE001 - the trained adapter is fine
+                ctx.log("The better adapter from step %d could not be read "
+                        "(%s), so this run keeps the one it ended with."
+                        % (stopper.best_step, e), "warn")
 
     # ---- save ----------------------------------------------------------
     ctx.progress(step, total_steps, stage="saving")
@@ -613,6 +668,8 @@ def run(cfg: dict, ctx: Any) -> dict:
         "stopped_early": stopped_early,
         "resumed_from_step": start_step or None,
         "continued_from": cfg.get("base_model_job"),
+        "kept_from_step": kept_step,
+        "early_stopped": stopper.stopped,
         "duration_s": round(prior_seconds + (time.time() - t_start), 1),
         "trainable_params": trainable,
         "base_model": base_model,

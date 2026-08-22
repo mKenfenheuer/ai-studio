@@ -37,7 +37,7 @@ from typing import Any, Iterator
 from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
-from runner import artifacts, checkpoints
+from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import expert_kernel
 
 from . import source
@@ -694,6 +694,30 @@ def _load_model(path: Path, arch: dict, ctx: Any, torch):
     return model, counts
 
 
+def _load_pretrained_into(model, path: Path, torch) -> None:
+    """Copy a saved snapshot's weights into the live model.
+
+    Loaded into the model already on the GPU rather than by constructing a
+    second one: the point in the run where this happens is the point of peak
+    memory, and building a duplicate model to throw the first one away is how
+    a run that trained perfectly fails on the last line.
+    """
+    from safetensors.torch import load_file
+
+    files = sorted(path.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError("no weights in %s" % path)
+    state: dict = {}
+    for f in files:
+        state.update(load_file(str(f)))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Tied embeddings legitimately leave `lm_head.weight` out of the file.
+    real = [k for k in missing if "lm_head" not in k]
+    if real or unexpected:
+        raise ValueError("snapshot does not match this model (%d missing, "
+                         "%d unexpected)" % (len(real), len(unexpected)))
+
+
 def _load_weights(model, path: Path, ctx: Any, torch) -> None:
     model.load_state_dict(torch.load(str(path / "model.pt"), map_location="cpu",
                                      weights_only=True))
@@ -873,11 +897,31 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
     # clock and claiming an eight-hour job took twenty minutes.
     prior_seconds = float(prior.get("duration_s") or 0.0)
     stopped_early = False
+    last_val = prior.get("best_val")
     samples: list[dict] = list(prior.get("samples") or [])
     step = start_step
     saver = checkpoints.Saver(
         ctx.job_id, ctx, every_s=float(cfg.get("checkpoint_every_s") or 600),
         enabled=bool(S.get("keep_checkpoints", True)))
+    stopper = earlystop.Stopper(
+        ctx, int(cfg.get("early_stop_patience") or earlystop.PATIENCE_PRETRAIN),
+        enabled=bool(cfg.get("early_stop", True)) and n_val > 0,
+        kind="model")
+    stopper.best = prior.get("best_val")
+    stopper.best_step = int(prior.get("best_step") or 0)
+    # The best snapshot is only worth going back for if it can still be read.
+    # A run resumed on a machine that has the checkpoint but lost the `best`
+    # directory should keep training, not promise a model it cannot produce.
+    keep_best = bool(S.get("keep_checkpoints", True))
+
+    stopper.announce(eval_every)
+
+    def write_best(path):
+        model.config.use_cache = True
+        try:
+            model.save_pretrained(str(path), safe_serialization=True)
+        finally:
+            model.config.use_cache = False
 
     def write_checkpoint(path):
         torch.save(model.state_dict(), str(path / "model.pt"))
@@ -888,8 +932,9 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
                    str(path / "trainer.pt"))
         (path / "train.json").write_text(json.dumps({
             "tokens_seen": tokens_seen, "first_loss": first_loss,
-            "last_loss": last_loss, "best_val": best_val,
-            "worst_share": worst_share, "warned_router": warned_router,
+            "last_loss": last_loss, "worst_share": worst_share,
+            "warned_router": warned_router,
+            "best_val": stopper.best, "best_step": stopper.best_step,
             "duration_s": prior_seconds + (time.time() - t_start),
             "samples": samples[-6:],
         }), encoding="utf-8")
@@ -936,10 +981,21 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
 
         val_loss = None
         expert_share = None
+        stop_now = False
         if step % eval_every == 0 or step == total_steps:
             val_loss, expert_share = evaluate()
+            last_val = val_loss if val_loss is not None else last_val
             if val_loss is not None:
                 best_val = val_loss if best_val is None else min(best_val, val_loss)
+                verdict = stopper.update(step, val_loss)
+                if verdict == "improved" and keep_best and step < total_steps:
+                    # Written on improvement rather than at the end, because
+                    # the point of the snapshot is that the run may not get
+                    # back to this quality.
+                    checkpoints.save_best(ctx.job_id, step, write_best,
+                                          {"val_loss": val_loss})
+                elif verdict == "stop":
+                    stop_now = True
             if expert_share is not None:
                 worst_share = max(worst_share or 0.0, expert_share)
                 even = 1.0 / max(S["counts"]["experts"], 1)
@@ -987,6 +1043,14 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
                 ctx.emit_meta({"sample": {"step": step, "text": text,
                                           "prompt": sample_prompt}})
 
+        if stop_now:
+            # Deliberately NOT `stopped_early`. That flag means "a person
+            # pressed Stop", and the agent turns it into a cancelled run. A
+            # run that stopped because it had finished improving did not get
+            # cancelled -- it succeeded, sooner than planned, which is the
+            # whole point.
+            break
+
         if ctx.should_cancel():
             # Stopping does not have to mean throwing the work away. A model
             # halfway through its schedule is a real model -- undertrained,
@@ -1002,8 +1066,29 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
                     "end would be." % (step, total_steps), "warn")
             break
 
+    # ---- keep the best model, which is not always the last one ----------
+    kept_step = None
+    if stopper.should_restore(last_val, step):
+        best = checkpoints.peek(ctx.job_id, "best") if keep_best else None
+        if best:
+            try:
+                _load_pretrained_into(model, Path(best["path"]), torch)
+                stopper.note_kept(last_val, step)
+                kept_step = stopper.best_step
+            except Exception as e:  # noqa: BLE001 - the trained model is still fine
+                ctx.log("The better snapshot from step %d could not be read "
+                        "(%s), so this run keeps the weights it ended with."
+                        % (stopper.best_step, e), "warn")
+        else:
+            ctx.log("The held-out loss was better at step %d than at the end, "
+                    "but no snapshot of it was kept -- checkpointing is off "
+                    "for this run. Keeping the final weights."
+                    % stopper.best_step, "warn")
+
     # ---- save -----------------------------------------------------------
     return _save(cfg, ctx, model, tok, arch, S, {
+        "kept_from_step": kept_step,
+        "early_stopped": stopper.stopped,
         "first_loss": first_loss, "last_loss": last_loss, "best_val": best_val,
         "tokens_seen": tokens_seen, "steps": step,
         "planned_steps": total_steps, "stopped_early": stopped_early,
@@ -1151,6 +1236,10 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
         # and the comparison view needs to be able to say so.
         "resumed_from_step": stats.get("resumed_from"),
         "continued_from": S.get("continue_from"),
+        # Which step the weights actually came from, when that is not the last
+        # one, and whether the run ended by itself.
+        "kept_from_step": stats.get("kept_from_step"),
+        "early_stopped": bool(stats.get("early_stopped")),
         "vocab_size": len(tok),
         "initial_loss": round(stats["first_loss"], 5) if stats["first_loss"] else None,
         "final_loss": round(stats["last_loss"], 5) if stats["last_loss"] else None,

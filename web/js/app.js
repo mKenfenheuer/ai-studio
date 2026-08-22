@@ -98,7 +98,39 @@ async function refreshFleet() {
 
 events.subscribe((msg) => {
   if (["runners_changed", "jobs_changed", "_connected"].includes(msg.type)) refreshFleet();
+  if (msg.type === "job_finished") announce(msg);
 });
+
+// ---- "your run has finished" --------------------------------------------
+// Only when this tab is not the one being looked at. A notification for
+// something already visible on screen is noise, and the surest way to get
+// somebody to turn notifications off is to send them one they did not need.
+function announce(msg) {
+  const finished = msg.status === "succeeded";
+  const s = msg.summary || {};
+  const detail = msg.status === "failed"
+    ? String(msg.error || "It failed.").slice(0, 140)
+    : [s.best_val_loss != null ? `held-out loss ${s.best_val_loss.toFixed(4)}` : null,
+       s.steps ? `${s.steps.toLocaleString()} steps` : null,
+       s.early_stopped ? "stopped early, at its best point" : null,
+      ].filter(Boolean).join(" · ");
+
+  toast(`${msg.name}: ${finished ? "finished" : msg.status}`,
+        msg.status === "failed" ? "err" : "ok");
+
+  if (document.visibilityState === "visible") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(
+      `${finished ? "✓" : msg.status === "failed" ? "✕" : "■"} ${msg.name}`,
+      { body: detail || `The run ${msg.status}.`, tag: msg.job_id });
+    n.onclick = () => {
+      window.focus();
+      location.hash = `#/jobs/${msg.job_id}`;
+      n.close();
+    };
+  } catch { /* the browser may refuse; the toast already happened */ }
+}
 
 // ---- help drawer --------------------------------------------------------
 $$("#helpToggle, #helpToggleMobile").forEach((b) =>

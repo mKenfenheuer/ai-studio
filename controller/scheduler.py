@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import WebSocket
 
-from . import architectures, db, hub
+from . import architectures, db, hub, notify
 
 # How long a queued job waits for the machine holding its checkpoint before
 # giving up on the progress and running somewhere else. A container restart
@@ -144,7 +144,6 @@ class Fleet:
         runner has had several heartbeats to say otherwise.
         """
         for job in db.orphaned_jobs():
-            jid = job["id"]
             if job["runner_id"] in self.connections:
                 continue
             requeued, rescued = db.requeue_jobs_for_runner(job["runner_id"])
@@ -341,6 +340,24 @@ class Fleet:
                            % (db.get_runner(runner_id) or {}).get("name", "that machine"),
                            "warn")
 
+    async def announce_end(self, job_id: str, status: str) -> None:
+        """A run has ended. Tell the browsers, and tell whoever owns it.
+
+        One place, so the three ways a run can end cannot each grow their own
+        slightly different idea of what "ended" means.
+        """
+        job = db.get_job(job_id) or {"id": job_id}
+        await self.broadcast_ui({
+            "type": "job_finished", "job_id": job_id, "status": status,
+            "name": job.get("name"), "kind": job.get("kind"),
+            "error": job.get("error"),
+            "summary": {k: (job.get("summary") or {}).get(k)
+                        for k in ("best_val_loss", "final_loss", "steps",
+                                  "early_stopped", "kept_from_step")},
+        })
+        await self.broadcast_ui({"type": "jobs_changed", "job_id": job_id})
+        notify.fire(job, status)
+
     def queue_positions(self) -> dict[str, int]:
         """Where each waiting job sits in the order work will actually be
         handed out in. Shown in the UI, because a queue nobody can see the
@@ -519,7 +536,7 @@ class Fleet:
             db.add_log(jid, "Finished successfully. %s" % json.dumps(summary)[:600])
             self.busy.pop(runner_id, None)
             db.touch_runner(runner_id, "online")
-            await self.broadcast_ui({"type": "jobs_changed", "job_id": jid})
+            await self.announce_end(jid, "succeeded")
             self.wake()
 
         elif kind in ("job_failed", "job_cancelled"):
@@ -543,7 +560,7 @@ class Fleet:
                 db.add_log(jid, tb, "debug")
             self.busy.pop(runner_id, None)
             db.touch_runner(runner_id, "online")
-            await self.broadcast_ui({"type": "jobs_changed", "job_id": jid})
+            await self.announce_end(jid, status)
             self.wake()
 
         elif kind == "job_rejected":

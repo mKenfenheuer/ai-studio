@@ -85,3 +85,13 @@ export function toast(message, kind = "") {
   document.getElementById("toasts").appendChild(el);
   setTimeout(() => el.remove(), kind === "err" ? 7000 : 4000);
 }
+
+/** Ask for notification permission, but only where it makes sense to ask.
+ *  Browsers refuse the request unless it follows a click, and they penalise
+ *  sites that ask on load, so this is called from the account page. */
+export async function askForNotifications() {
+  if (!("Notification" in window)) return "unsupported";
+  if (Notification.permission !== "default") return Notification.permission;
+  try { return await Notification.requestPermission(); }
+  catch { return "denied"; }
+}

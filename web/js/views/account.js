@@ -1,16 +1,65 @@
-/** Your account: your name, your password, and your Hugging Face connection. */
+/** Your account: your name, your password, how you are told a run ended,
+ *  and your Hugging Face connection. */
 import { api } from "../api.js";
-import { html, raw, esc, $, $$, on, toast, fmtAgo } from "../util.js";
+import { html, raw, esc, $, $$, on, toast, fmtAgo,
+         askForNotifications } from "../util.js";
 
 export async function accountView(mount) {
   let me = await api.me();
+  let alerts = await api.notifyState();
 
   const draw = () => {
-    mount.innerHTML = layout(me);
+    mount.innerHTML = layout(me, alerts);
     wire();
   };
 
   function wire() {
+    on(mount, "submit", "#hookForm", async (e) => {
+      e.preventDefault();
+      const url = $("#hookUrl", mount).value.trim();
+      if (!url) return toast("Paste the address first.", "err");
+      try {
+        alerts = await api.notifySet({ url });
+        toast("Saved. Send a test to be sure it arrives.", "ok");
+        draw();
+      } catch (ex) { toast(ex.message, "err"); }
+    });
+
+    on(mount, "click", "#hookTest", async (_e, t) => {
+      t.disabled = true;
+      t.textContent = "Sending…";
+      const r = await api.notifyTest().catch((ex) => ({ ok: false, detail: ex.message }));
+      $("#hookResult", mount).innerHTML = r.ok
+        ? `<div class="callout callout-ok"><strong>It arrived</strong>
+             The endpoint answered ${esc(r.detail)}.</div>`
+        : `<div class="callout callout-err"><strong>It did not arrive</strong>
+             ${esc(r.detail)}</div>`;
+      t.disabled = false;
+      t.textContent = "Send a test";
+    });
+
+    on(mount, "click", "#hookClear", async () => {
+      try { alerts = await api.notifyClear(); toast("Removed.", "ok"); draw(); }
+      catch (ex) { toast(ex.message, "err"); }
+    });
+
+    on(mount, "change", "[data-alert-event]", async () => {
+      const events = $$("[data-alert-event]:checked", mount)
+        .map((c) => c.dataset.alertEvent);
+      try { alerts = await api.notifySet({ events }); }
+      catch (ex) { toast(ex.message, "err"); }
+    });
+
+    on(mount, "click", "#askNotify", async () => {
+      const r = await askForNotifications();
+      if (r !== "granted") {
+        toast(r === "denied"
+          ? "Your browser blocked it. That has to be changed in its site settings."
+          : "Notifications are not available in this browser.", "err");
+      }
+      draw();
+    });
+
     on(mount, "submit", "#nameForm", async (e) => {
       e.preventDefault();
       const v = $("#displayName", mount).value.trim();
@@ -114,7 +163,7 @@ export async function accountView(mount) {
 
 // ---------------------------------------------------------------------------
 
-function layout(me) {
+function layout(me, alerts) {
   const hf = me.hf || {};
   return html`
     <div class="page-head">
@@ -173,7 +222,73 @@ function layout(me) {
       </div>
 
       <div>
+        ${raw(alertCard(alerts))}
         ${raw(hfCard(hf))}
+      </div>
+    </div>`;
+}
+
+/** Being told a run ended, without having to sit and watch it. */
+function alertCard(a) {
+  const browserState = typeof Notification === "undefined" ? "unsupported"
+    : Notification.permission;
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3>Tell me when a run ends</h3>
+      <p class="muted tiny">A run here takes hours. Nothing has to be open for
+        the webhook to reach you.</p>
+
+      <form id="hookForm" style="margin-top:10px">
+        <div class="field">
+          <label for="hookUrl">Webhook address</label>
+          <input id="hookUrl" name="url" type="url" class="mono"
+                 placeholder="${a.configured ? esc(a.url_hint)
+                                : "https://ntfy.sh/your-topic"}">
+          <div class="hint">One JSON POST per event. Works with ntfy, Slack,
+            Discord, Gotify, Home Assistant, or your own script — it carries
+            the run&rsquo;s name, how it ended and its held-out loss, plus a
+            <code>text</code> field for services that only render one.
+            ${raw(a.configured
+              ? "Stored encrypted and never shown again, because whoever "
+                + "holds this address can post as you."
+              : "")}</div>
+        </div>
+        <div class="row" style="gap:6px;flex-wrap:wrap">
+          <button class="btn-primary btn-sm" type="submit">
+            ${a.configured ? "Replace it" : "Save"}</button>
+          ${raw(a.configured ? html`
+            <button class="btn-sm" type="button" id="hookTest">Send a test</button>
+            <button class="btn-sm btn-danger" type="button" id="hookClear">Remove</button>`
+            : "")}
+        </div>
+      </form>
+      <div id="hookResult"></div>
+
+      <div style="margin-top:12px">
+        <strong class="tiny">Tell me about</strong>
+        ${raw(Object.entries(a.available_events || {}).map(([id, label]) => html`
+          <label class="check" style="margin-top:4px">
+            <input type="checkbox" data-alert-event="${id}"
+                   ${a.events.includes(id) ? "checked" : ""}>
+            <span>when ${label}</span>
+          </label>`).join(""))}
+      </div>
+
+      <div style="margin-top:12px">
+        <strong class="tiny">In this browser</strong>
+        <p class="muted tiny" style="margin:4px 0 6px">${
+          browserState === "granted"
+            ? "On. A notification appears when a run ends and this tab is not "
+              + "the one you are looking at."
+            : browserState === "denied"
+            ? "Blocked. Your browser is refusing notifications for this site; "
+              + "that has to be changed in its own site settings."
+            : browserState === "unsupported"
+            ? "This browser does not offer notifications."
+            : "Off. Runs still finish quietly, and the webhook above still "
+              + "works."}</p>
+        ${raw(browserState === "default"
+          ? `<button class="btn-sm" id="askNotify">Allow notifications</button>` : "")}
       </div>
     </div>`;
 }

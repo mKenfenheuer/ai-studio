@@ -47,19 +47,26 @@ def dir_for(job_id: str) -> Path:
     return CHECKPOINT_DIR / job_id
 
 
-def _state_file(job_id: str) -> Path:
-    return dir_for(job_id) / "state.json"
+def _state_file(job_id: str, name: str = "state") -> Path:
+    return dir_for(job_id) / ("%s.json" % name)
 
 
-def peek(job_id: str) -> dict | None:
+def peek(job_id: str, name: str = "state") -> dict | None:
     """What a resume would start from, or None if there is nothing to resume.
 
     Cheap on purpose -- it reads one small file. The agent calls it before
     starting a job, so it can tell the controller which step this attempt is
     beginning at before any of the heavy machinery is imported.
+
+    `name` selects which pointer to follow. There are two: "state" is the
+    latest checkpoint, which a resume continues from; "best" is the one that
+    scored lowest on held-out data, which is the model actually worth keeping.
+    They are usually different, and conflating them would mean either
+    resuming from a stale point or shipping a model that had already started
+    getting worse.
     """
     try:
-        state = json.loads(_state_file(job_id).read_text(encoding="utf-8"))
+        state = json.loads(_state_file(job_id, name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     payload = dir_for(job_id) / str(state.get("dir") or "")
@@ -85,32 +92,51 @@ def prepared_dir(job_id: str) -> Path:
     return d
 
 
-def new_generation(job_id: str, step: int) -> Path:
+def new_generation(job_id: str, step: int, prefix: str = "ckpt") -> Path:
     """A fresh directory to write a checkpoint into. Not current until committed."""
-    d = dir_for(job_id) / ("ckpt-%08d" % int(step))
+    d = dir_for(job_id) / ("%s-%08d" % (prefix, int(step)))
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def commit(job_id: str, generation: Path, state: dict) -> None:
-    """Make this generation the one a resume will find, then drop the old one.
+def commit(job_id: str, generation: Path, state: dict,
+           name: str = "state") -> None:
+    """Make this generation the one `peek(name)` will find, then drop the old.
 
     The replace is the whole point: until this line runs, an interrupted save
     leaves the previous checkpoint intact and current.
     """
-    previous = peek(job_id)
+    previous = peek(job_id, name)
     body = dict(state)
     body["dir"] = generation.name
     body["saved_at"] = time.time()
 
-    tmp = _state_file(job_id).with_suffix(".json.tmp")
+    tmp = _state_file(job_id, name).with_suffix(".json.tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(body, indent=2), encoding="utf-8")
-    os.replace(tmp, _state_file(job_id))
+    os.replace(tmp, _state_file(job_id, name))
 
     if previous and previous.get("dir") != generation.name:
         shutil.rmtree(dir_for(job_id) / str(previous["dir"]), ignore_errors=True)
+
+
+def save_best(job_id: str, step: int, writer, state: dict) -> Path | None:
+    """Keep a copy of the model as it stands, as the best seen so far.
+
+    Written to disk rather than held in memory on purpose. A snapshot of a
+    1B-parameter model is four gigabytes of float32, and the machine holding
+    it is the same one training on it -- taking that out of system RAM to
+    protect against overfitting would cause a different failure than the one
+    it prevents.
+    """
+    try:
+        gen = new_generation(job_id, step, prefix="best")
+        writer(gen)
+        commit(job_id, gen, {"step": step, **state}, name="best")
+        return gen
+    except Exception:  # noqa: BLE001 - never let bookkeeping kill a run
+        return None
 
 
 def discard(job_id: str) -> None:
@@ -122,6 +148,11 @@ def list_ids() -> list[str]:
 
     Reported to the controller so that work goes back to the machine holding
     its progress rather than to whichever one happens to be free first.
+
+    Keyed on "state.json", not on the directory existing: a run that has only
+    ever written a *best* snapshot has nothing to resume from, and offering it
+    as resumable would send the work to this machine and then start it from
+    the beginning anyway.
     """
     try:
         return sorted(d.name for d in CHECKPOINT_DIR.iterdir()

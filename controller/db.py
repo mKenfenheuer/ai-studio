@@ -176,6 +176,11 @@ _ADDED_COLUMNS = [
     # not lose the one fact that decides whether a run resumes or starts over.
     ("jobs", "checkpoint_step", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "checkpoint_runner", "TEXT"),
+    # A webhook URL is a credential -- whoever holds a Slack or ntfy one can
+    # post as you -- so it is encrypted at rest like the Hugging Face token,
+    # and no endpoint returns it in full.
+    ("users", "notify_url_enc", "TEXT"),
+    ("users", "notify_events", "TEXT"),
 ]
 
 _conn: sqlite3.Connection | None = None
@@ -581,7 +586,8 @@ def create_user(username: str, display_name: str, password_hash: str,
 def update_user(user_id: str, **fields: Any) -> None:
     allowed = {"display_name", "role", "active", "password_hash", "last_login",
                "must_change", "hf_token_enc", "hf_username", "hf_fullname",
-               "hf_avatar", "hf_orgs", "hf_can_write", "hf_checked_at"}
+               "hf_avatar", "hf_orgs", "hf_can_write", "hf_checked_at",
+               "notify_url_enc", "notify_events"}
     sets, args = [], []
     for k, v in fields.items():
         if k not in allowed:

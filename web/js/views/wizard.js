@@ -79,6 +79,14 @@ const SCRATCH_FIELDS = [
    + "number that can tell you it is memorising."],
   ["sample_every", "Write a sample every", "number",
    "How often the model is asked to write something, so you can watch it learn."],
+  ["early_stop", "Stop when it stops improving", "bool",
+   "Ends the run once the held-out loss has gone several checks without "
+   + "getting better, and keeps whichever version scored best rather than "
+   + "whichever came last. The last weights are usually not the best ones."],
+  ["early_stop_patience", "Checks before giving up", "number",
+   "How many held-out measurements in a row may fail to improve before the "
+   + "run ends. Counted in checks, not steps, so it means the same thing in a "
+   + "300-step run and a 30,000-step one."],
   ["seed", "Random seed", "number",
    "Fixes the shuffling and the initial weights, so a run can be repeated."],
   ["max_corpus_tokens", "Maximum text held in memory", "number",
@@ -1760,13 +1768,6 @@ const explainCard = (e) => html`
     <p class="muted tiny" style="margin:6px 0 0">${e.why}</p>
   </div>`;
 
-const fields = (rows) => rows.map(([k, label, v, type, hint]) => html`
-  <div class="field">
-    <label for="f_${k}">${label}</label>
-    <input id="f_${k}" data-setting="${k}" type="${type}" value="${v}">
-    ${raw(hint ? `<div class="hint">${esc(hint)}</div>` : "")}
-  </div>`).join("");
-
 const toggle = (k, label, on_, hint) => html`
   <div class="field">
     <label for="f_${k}">${label}</label>
@@ -1777,11 +1778,26 @@ const toggle = (k, label, on_, hint) => html`
     <div class="hint">${hint}</div>
   </div>`;
 
+// A settings row renders as an input unless it is a yes/no, which renders as
+// the same On/Off control used elsewhere. Dispatching here rather than at each
+// call site keeps the field list a plain declaration -- `type: "bool"` fed to
+// an <input> silently becomes a text box that accepts anything.
+const fields = (rows) => rows.map(([k, label, v, type, hint]) =>
+  (type === "bool"
+    ? toggle(k, label, !!v && v !== "0" && v !== "false", hint)
+    : html`
+  <div class="field">
+    <label for="f_${k}">${label}</label>
+    <input id="f_${k}" data-setting="${k}" type="${type}" value="${v}">
+    ${raw(hint ? `<div class="hint">${esc(hint)}</div>` : "")}
+  </div>`)).join("");
+
+
 // Settings that must survive as text/float rather than being coerced to int.
 const FLOAT_SETTINGS = new Set(["learning_rate", "weight_decay", "grad_clip",
                                 "min_lr_ratio", "epochs"]);
 const BOOL_SETTINGS = new Set(["gradient_checkpointing", "optim_8bit",
-                               "adapt_experts"]);
+                               "adapt_experts", "early_stop"]);
 
 function wireOverrides(body, ctx) {
   const { state, draw } = ctx;

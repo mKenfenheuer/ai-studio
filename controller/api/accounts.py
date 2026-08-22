@@ -1,11 +1,12 @@
 """Signing in, your own account, and administering other people's."""
 from __future__ import annotations
 
+import json
 import time
 
 from fastapi import APIRouter, Body, HTTPException, Request, Response
 
-from .. import auth, db, hfaccount
+from .. import auth, db, hfaccount, notify
 from .security import current_user, require_admin
 
 router = APIRouter(prefix="/api")
@@ -166,6 +167,42 @@ async def revoke_sessions(request: Request) -> dict:
 # ---------------------------------------------------------------------------
 # Hugging Face
 # ---------------------------------------------------------------------------
+
+@router.get("/me/notifications")
+async def notify_state(request: Request) -> dict:
+    return notify.settings_for(current_user(request))
+
+
+@router.post("/me/notifications")
+async def notify_set(request: Request, payload: dict = Body(...)) -> dict:
+    """Set the webhook, the events, or both."""
+    user = current_user(request)
+    fields: dict = {}
+    if "url" in payload:
+        url = (payload.get("url") or "").strip()
+        if url and not url.startswith(("http://", "https://")):
+            raise HTTPException(400, "That does not look like a web address. "
+                                     "It should start with http:// or https://.")
+        fields["notify_url_enc"] = auth.encrypt_secret(url) if url else None
+    if "events" in payload:
+        wanted = [e for e in (payload.get("events") or []) if e in notify.EVENTS]
+        fields["notify_events"] = json.dumps(wanted)
+    if fields:
+        db.update_user(user["id"], **fields)
+    return notify.settings_for(db.get_user(user["id"]))
+
+
+@router.post("/me/notifications/test")
+async def notify_test(request: Request) -> dict:
+    """Prove the webhook works now, rather than at 3am when a run ends."""
+    return await notify.send_test(db.get_user(current_user(request)["id"]))
+
+
+@router.delete("/me/notifications")
+async def notify_clear(request: Request) -> dict:
+    db.update_user(current_user(request)["id"], notify_url_enc=None)
+    return notify.settings_for(db.get_user(current_user(request)["id"]))
+
 
 @router.get("/me/huggingface")
 async def hf_state(request: Request) -> dict:

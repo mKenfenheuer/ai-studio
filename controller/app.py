@@ -776,6 +776,11 @@ async def plan(payload: dict = Body(...)) -> dict:
             "learning_rate": 2e-4, "lora_r": lora_r, "lora_alpha": lora_r * 2,
             "lora_dropout": 0.05, "gradient_checkpointing": True,
             "max_steps": min(steps, 2000),
+            # On by default here because a fine-tune on a few hundred examples
+            # starts memorising within a couple of passes, and the run has no
+            # way to know that without being told to watch for it.
+            "early_stop": True,
+            "early_stop_patience": 4,
         },
         "fit": fit,
         "explanations": _explain(dtype, quant, batch, accum, epochs, caps),
@@ -795,6 +800,11 @@ def _explain(dtype: str, quant: str, batch: int, accum: int,
         {"setting": "Passes over data", "value": str(epochs),
          "why": "Small datasets need more passes to learn; large ones risk "
                 "memorising instead of generalising."},
+        {"setting": "Stop when it stops improving", "value": "on",
+         "why": "Some of your examples are held back and never trained on. "
+                "When the model stops getting better at those, training ends "
+                "and the best version is the one kept -- the last one is "
+                "usually not the best."},
     ]
     if quant == "4bit":
         out.append({"setting": "Compression", "value": "4-bit",
@@ -941,6 +951,13 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "optim_8bit": optim_8bit,
         "eval_every": max(20, steps // 25),
         "sample_every": max(40, steps // 10),
+        # A safety net rather than an expected outcome. Pretraining on a large
+        # corpus improves for as long as there is text left, so this will
+        # almost never fire -- it exists for the case where the corpus is
+        # small enough to be memorised, which the planner warns about
+        # separately and which is common on one graphics card.
+        "early_stop": True,
+        "early_stop_patience": 8,
         "sample_prompt": payload.get("sample_prompt") or "Once upon a time",
         "text_field": payload.get("text_field") or "text",
     }

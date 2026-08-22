@@ -211,7 +211,7 @@ async def merge_datasets(request: Request, payload: dict = Body(...)) -> dict:
 
 @router.delete("/{dataset_id}")
 async def delete_dataset(request: Request, dataset_id: str) -> dict:
-    d = _get(request, dataset_id, "own")
+    _get(request, dataset_id, "own")     # permission check; the row is not needed
     children = db.q("SELECT id, name FROM datasets WHERE parent_id=?", (dataset_id,))
     ds.delete_files(dataset_id)
     db.clear_shares("dataset", dataset_id)
