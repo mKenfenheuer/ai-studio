@@ -42,9 +42,14 @@ const GOALS = [
     hint: "Very reliable, even with small datasets." },
 ];
 
+// The format step is its own step in both paths, and not an afterthought at
+// the bottom of the data step, because it is the decision that decides whether
+// the finished model can be talked to at all. Trained in a shape the model has
+// never seen, everything else on this screen is wasted -- so it is asked
+// exactly once, explicitly, and nothing continues until it is answered.
 const STEP_NAMES = {
-  finetune: ["Goal", "Model", "Data", "Review"],
-  scratch: ["Goal", "Text", "Design", "Review"],
+  finetune: ["Goal", "Model", "Data", "Format", "Review"],
+  scratch: ["Goal", "Text", "Format", "Design", "Review"],
 };
 
 const VERDICT_CLASS = { ok: "badge-ok", warn: "badge-warn", err: "badge-err" };
@@ -168,15 +173,28 @@ export async function wizardView(mount) {
     // A dataset from this studio's library rather than from the Hub. It is
     // fetched by the runner with the join token, so a private dataset never
     // has to be published to be trained on.
-    studioDataset: null,
+    studioDataset: null, myDatasets: resource(),
     preview: resource(), textField: null, formatMode: null,
-    // How a conversation becomes training text. "model" uses the base model's
-    // own chat template, which is what an instruct model was trained to expect
-    // and therefore the right default; "custom" is a Jinja template the user
-    // writes; "builtin" is a plain readable rendering.
-    templateSource: "model", customTemplate: "", builtin: resource(),
-    // Which set of message-boundary tokens a from-scratch model is taught.
+    // How a row becomes training text. "model" uses the base model's own chat
+    // template, which is what an instruct model was trained to expect and
+    // therefore the right suggestion; "format" is one of the named chat
+    // formats, chosen by `chatFormat`; "builtin" is the plain rendering of
+    // whatever shape the data already has; "custom" is a Jinja template the
+    // user writes.
+    //
+    // Deliberately null. There is no safe default here -- the same wizard
+    // fine-tunes an instruct model, continues one of this studio's own runs
+    // and builds a model from nothing, and the right answer differs for all
+    // three. It is suggested, and it is not decided until it is clicked.
+    templateSource: null, customTemplate: "", builtin: resource(),
+    // Which set of message-boundary tokens the run is written in.
     chatFormat: "chatml", formats: resource(), teachReasoning: false,
+    // The base model's own template, fetched so the step can say whether the
+    // model has one before the choice is made rather than after it.
+    modelTemplate: resource(),
+    // What the rows turned out to be, remembered across the preview being
+    // refetched: {key, mode}. See rememberShape.
+    shape: null,
     // Explicit paths for datasets auto-detection reads wrongly.
     selectors: {}, roleMap: "", selectorFields: resource(),
     // From scratch.
@@ -305,8 +323,8 @@ function shell(state, runners, names, known = []) {
   return html`
     <div class="page-head">
       <h1>New training run</h1>
-      <p class="sub">Four steps. Everything technical is chosen for you, and
-        every choice is explained — and every one can be changed.</p>
+      <p class="sub">${names.length} steps. Everything technical is chosen for
+        you, and every choice is explained — and every one can be changed.</p>
     </div>
     <div class="steps">${raw(chips)}</div>
     <div id="stepBody"></div>
@@ -393,6 +411,11 @@ function stepGoal(body, { state, runners, draw }) {
       model: null, modelDetail: resource(), dataset: null, configs: resource(),
       config: null, split: "train", preview: resource(), textField: null,
       formatMode: null, size: null, custom: null, sizes: resource(),
+      // The format is asked again as well: "the model's own" means nothing
+      // once there is no model, and a from-scratch run reserves its tokens
+      // from a decision this one has not made yet.
+      templateSource: null, customTemplate: "", teachReasoning: false,
+      modelTemplate: resource(), sourceRun: null, sourceTemplate: resource(),
       plan: resource(), ftPlan: resource(), overrides: {}, archOverrides: {},
       moe: { enabled: false, num_local_experts: 8, num_experts_per_tok: 2 },
     });
@@ -486,6 +509,9 @@ function stepModel(body, ctx) {
     state.sourceTemplate = resource();
     state.modelDetail = resource();
     state.ftPlan = resource();
+    // A different model is a different "the model's own format", so the
+    // format is asked again rather than silently carried over.
+    forgetTemplate(state);
     draw();
   });
 
@@ -496,12 +522,14 @@ function stepModel(body, ctx) {
     state.modelDetail = resource();
     state.sourceTemplate = resource();
     state.ftPlan = resource();
+    forgetTemplate(state);
     draw();
   });
 
   on(body, "click", "#clearOwnModel", () => {
     state.sourceRun = null;
     state.ftPlan = resource();
+    forgetTemplate(state);
     draw();
   });
 
@@ -626,7 +654,23 @@ function stepData(body, ctx) {
   const scratch = state.mode === "scratch";
   const catalogue = scratch ? (starters.corpora || []) : starters.datasets;
 
-  if (state.dataset) {
+  if (state.dataset && state.studioDataset) {
+    // A dataset from this studio's own library knows its own splits, and
+    // there is nothing to look up on the Hub -- asking the Hub about a name
+    // it has never heard of is how this step used to show "no preview
+    // available" for every dataset somebody brought in themselves.
+    const names = Object.keys(state.studioDataset.splits || {});
+    if (state.configs.key !== state.dataset) {
+      state.configs = { key: state.dataset, status: "ready", error: null,
+                        data: { configs: [], studio: true,
+                                splits: names.length ? names : ["train"] } };
+      state.config = "";
+      if (!names.includes(state.split)) state.split = names[0] || "train";
+    }
+    ensure(state.preview, previewKey(state, scratch),
+           () => api.trainingPreview(previewRequest(state, scratch)), draw);
+    rememberShape(state);
+  } else if (state.dataset) {
     ensure(state.configs, state.dataset,
            () => api.datasetConfigs(state.dataset), draw);
     // Adopt the dataset's default configuration the moment we learn it.
@@ -641,16 +685,15 @@ function stepData(body, ctx) {
     if (c.status === "ready") {
       ensure(state.preview, previewKey(state, scratch),
              () => api.trainingPreview(previewRequest(state, scratch)), draw);
-      if (state.preview.status === "ready") {
-        state.previewIsChat = state.preview.data.format?.mode === "chat";
-      }
+      rememberShape(state);
     }
   }
-  // Fetched once, and only used to seed the editor when someone chooses to
-  // write their own.
-  if (!scratch) ensure(state.builtin, "builtin", () => api.builtinTemplate(), draw);
-  if (scratch) ensure(state.formats, "formats", () => api.chatFormats(), draw);
   ensure(state.selectorFields, "sel", () => api.selectorFields(), draw);
+  // Your own datasets, which is where most real training data lives once
+  // anybody has used this app for a week. They were reachable only from the
+  // dataset page's "Train on this" button, which meant that starting from the
+  // wizard -- the obvious way to start -- could not see them at all.
+  ensure(state.myDatasets, "all", () => api.datasets(), draw);
 
   body.innerHTML = html`
     <div class="card" style="margin-bottom:14px">
@@ -667,9 +710,15 @@ function stepData(body, ctx) {
               + "sloppy ones.")}</p>
     </div>
 
+    ${raw(libraryPicker(state, scratch))}
+
+    <h3 style="margin:18px 0 8px">${state.myDatasets.status === "ready"
+      && (state.myDatasets.data || []).length
+      ? "Or start from one of these" : "Start from one of these"}</h3>
     <div class="grid grid-2">
       ${raw(catalogue.map((d) => html`
-        <button class="pick ${state.dataset === d.id ? "selected" : ""}" data-ds="${d.id}"
+        <button class="pick ${state.dataset === d.id && !state.studioDataset
+                              ? "selected" : ""}" data-ds="${d.id}"
                 data-config="${d.config || ""}" data-field="${d.text_field || ""}"
                 data-tokens="${d.approx_tokens || ""}"
                 data-prompt="${d.sample_prompt || ""}">
@@ -695,8 +744,33 @@ function stepData(body, ctx) {
 
     <div style="margin-top:14px">${raw(dataDetail(state, scratch))}</div>`;
 
+  on(body, "click", "[data-studio-ds]", (_e, t) => {
+    const d = (state.myDatasets.data || []).find((x) => x.id === t.dataset.studioDs);
+    if (!d) return;
+    state.studioDataset = { id: d.id, name: d.name, splits: d.splits || {} };
+    state.dataset = d.name;
+    state.configs = resource();
+    state.preview = resource();
+    state.config = "";
+    state.split = Object.keys(d.splits || {})[0] || "train";
+    state.textField = (d.format || {}).text_field || null;
+    state.formatMode = null;
+    // Roughly four characters to a token. Approximate, and it only feeds the
+    // warning about a corpus running out before the token budget does -- a
+    // place where the right answer is "about this many" rather than silence.
+    state.corpusTokens = d.bytes ? Math.round(d.bytes / 4) : null;
+    state.samplePrompt = null;
+    forgetTemplate(state);
+    state.plan = resource();
+    state.sizes = resource();
+    draw();
+  });
+
   on(body, "click", "[data-ds]", (_e, t) => {
     state.dataset = t.dataset.ds;
+    // A Hub dataset is not one of ours: leaving this set would send the job a
+    // studio dataset id alongside a Hugging Face name.
+    state.studioDataset = null;
     state.configs = resource();
     state.preview = resource();
     state.config = t.dataset.config || null;
@@ -708,8 +782,9 @@ function stepData(body, ctx) {
     // exhaust the dataset, the second is what the model is asked to continue.
     state.corpusTokens = +t.dataset.tokens || null;
     state.samplePrompt = t.dataset.prompt || null;
-    state.templateSource = "model";
-    state.customTemplate = "";
+    // Different data, different shape: a format chosen for conversations is
+    // the wrong answer for a column of prose, so the next step asks again.
+    forgetTemplate(state);
     state.plan = resource();
     state.sizes = resource();
     draw();
@@ -733,45 +808,7 @@ function stepData(body, ctx) {
   on(body, "change", "#formatSelect", (_e, t) => {
     state.formatMode = t.value || null; state.preview = resource(); draw();
   });
-  on(body, "click", "#teachReasoning", (_e, t) => {
-    state.teachReasoning = !state.teachReasoning;
-    state.preview = resource();
-    draw();
-  });
-  on(body, "click", "[data-chatfmt]", (_e, t) => {
-    state.chatFormat = t.dataset.chatfmt;
-    state.templateSource = "builtin";
-    state.preview = resource();
-    draw();
-  });
-  on(body, "click", "[data-tmplsrc]", (_e, t) => {
-    state.templateSource = t.dataset.tmplsrc;
-    if (state.templateSource === "custom" && !state.customTemplate) {
-      // Start from something that already works rather than a blank box.
-      const b = state.builtin.data || {};
-      const det = state.preview.data?.format || {};
-      state.customTemplate = det.mode === "chat"
-        ? (b.template || "") : (b.instruction_template || "");
-    }
-    state.preview = resource();
-    draw();
-  });
-  // Applied on demand, not per keystroke: re-rendering four examples on every
-  // character would fight the cursor and hammer the dataset server.
-  // Expanding rewrites one paragraph in place. Going through draw() would
-  // re-render the step and fold it straight back up.
-  on(body, "click", "[data-expand]", (_e, t) => {
-    const card = t.closest(".sample");
-    const para = card && card.querySelector(".txt");
-    const idx = [...body.querySelectorAll(".sample")].indexOf(card);
-    const full = state.preview.data?.rendered?.[idx]?.text;
-    if (!para || full == null) return;
-    const wasExpanded = para.dataset.full === "0";
-    para.textContent = wasExpanded ? shorten(full) : full;
-    para.dataset.full = wasExpanded ? "1" : "0";
-    t.textContent = wasExpanded
-      ? "Show all " + fmtNum(full.length) + " characters" : "Show less";
-  });
+  wireExpand(body, state);
   on(body, "click", "#applySelectors", () => {
     const next = {};
     $$("[data-selector]", body).forEach((el) => {
@@ -783,13 +820,6 @@ function stepData(body, ctx) {
     state.preview = resource();
     draw();
   });
-  on(body, "click", "#applyTemplate", () => {
-    const box = $("#templateBox", body);
-    if (box) state.customTemplate = box.value;
-    state.preview = resource();
-    draw();
-  });
-
   wireSearch(body, "ds", async (q) => {
     const rows = await api.searchDatasets(q);
     return rows.length ? html`<div class="table-wrap"><table>
@@ -802,6 +832,54 @@ function stepData(body, ctx) {
   });
 }
 
+/** The datasets in this studio's own library.
+ *
+ *  First, not last: once anybody has imported, uploaded or generated
+ *  anything, their own data is the likeliest answer to "what shall I train
+ *  on" -- and it is the only data on this screen that nobody else has
+ *  already trained a model on.
+ */
+function libraryPicker(state, scratch) {
+  const r = state.myDatasets;
+  if (r.status === "loading" || r.status === "idle") {
+    return loading("Looking at your dataset library…");
+  }
+  if (r.status === "error") return "";
+  const mine = r.data || [];
+  if (!mine.length) {
+    return html`
+      <div class="callout" style="margin-bottom:14px">
+        <strong>Your library is empty</strong>
+        Anything you <a href="#/data">import, upload or generate</a> appears
+        here and can be trained on directly — including the splits you gave
+        it.
+      </div>`;
+  }
+
+  return html`
+    <h3 style="margin:0 0 8px">From your library</h3>
+    <div class="grid grid-2">
+      ${raw(mine.map((d) => {
+        const splits = Object.entries(d.splits || {});
+        return html`
+          <button class="pick ${state.studioDataset?.id === d.id ? "selected" : ""}"
+                  data-studio-ds="${d.id}">
+            <span class="t">${d.name}
+              <span class="badge">${fmtNum(d.rows)} rows</span>
+              ${raw(d.mine ? "" : `<span class="badge badge-accent">shared</span>`)}
+            </span>
+            <span class="d">
+              ${raw(splits.length > 1
+                ? splits.map(([n, c]) =>
+                    `<span class="badge">${esc(n)} ${fmtNum(c)}</span>`).join(" ")
+                : "")}
+              ${raw(d.origin ? `<span class="mono tiny">${esc(d.origin)}</span>` : "")}
+            </span>
+          </button>`;
+      }).join(""))}
+    </div>`;
+}
+
 function dataDetail(state, scratch) {
   if (!state.dataset) return "";
   const c = state.configs;
@@ -811,7 +889,8 @@ function dataDetail(state, scratch) {
 
   const configs = c.data.configs || [];
   const chosen = configs.find((x) => x.name === state.config) || configs[0];
-  const splits = chosen?.splits || ["train"];
+  const splits = c.data.studio
+    ? (c.data.splits || ["train"]) : (chosen?.splits || ["train"]);
 
   return html`
     <div class="card">
@@ -843,123 +922,433 @@ function dataDetail(state, scratch) {
         </div>
         ${raw(previewControls(state, scratch))}
       </div>
+      ${raw(selectorPanel(state))}
     </div>
 
-    <div style="margin-top:14px">${raw(templatePanel(state, scratch))}</div>
     <div style="margin-top:14px">${raw(trainingText(state, scratch))}</div>`;
 }
 
-const TEMPLATE_SOURCES = [
-  { id: "model", title: "The model's own format",
-    desc: "Every instruct model was trained to expect one exact layout, and "
-        + "ships it in its own files. Using it is almost always right — give a "
-        + "model a shape it has never seen and it ignores half of what you "
-        + "taught it." },
-  { id: "builtin", title: "Plain and readable",
-    desc: "Roles written out as text. Fine for a base model, and easy to read "
-        + "when you are checking the data rather than the format." },
-  { id: "custom", title: "Write it yourself",
-    desc: "A Jinja template with the conversation and tools handed to it. Full "
-        + "control, for a layout neither of the others produces." },
-];
+// ===========================================================================
+// Step — the shape the training text is written in
+//
+// One decision, asked once, for every kind of run. A model is only as usable
+// as the format it was taught: give an instruct model a layout it has never
+// seen and it ignores half of what you taught it, and give a from-scratch
+// model no boundary tokens and generation has nothing dependable to stop on.
+// So there is no silent default here. The right answer is suggested -- loudly
+// -- and the run does not continue until it has been chosen.
+// ===========================================================================
 
-function templatePanel(state, scratch) {
+/** Un-decide the format. Called wherever the thing it was decided *about*
+ *  changes: the base model, the dataset, or the kind of run itself. */
+function forgetTemplate(state) {
+  state.templateSource = null;
+  state.customTemplate = "";
+  state.teachReasoning = false;
+  state.preview = resource();
+}
+
+/** The dataset itself, without any decision made about it. What shape the
+ *  rows are depends on this and nothing else. */
+function dataKey(state) {
+  return JSON.stringify([state.dataset, state.config, state.split]);
+}
+
+/** Remember what shape a dataset turned out to be.
+ *
+ *  Kept on the state rather than read out of the preview each time, because
+ *  the preview is emptied while the next one is in flight -- and the shape of
+ *  the rows does not change just because we are asking about a different
+ *  template. Without this the suggestion flickers, and the request that goes
+ *  out during the gap is built from a shape nobody detected. */
+function rememberShape(state) {
   const p = state.preview;
-  const det = p.status === "ready" ? (p.data.format || {}) : {};
-  const isChat = det.mode === "chat";
-  const src = state.templateSource;
-  // A model being built from scratch has no "own format" to borrow -- it has
-  // never been trained on anything. It learns whichever shape it is shown, so
-  // the choice is between the plain rendering and one written by hand.
-  const sources = scratch
-    ? TEMPLATE_SOURCES.filter((t) => t.id !== "model")
-    : TEMPLATE_SOURCES;
-  if (scratch && !isChat && src === "model") state.templateSource = "builtin";
+  if (p.status !== "ready") return;
+  const mode = p.data.detected_format?.mode || p.data.format?.mode;
+  if (mode && mode !== "auto") state.shape = { key: dataKey(state), mode };
+}
+
+/** What shape the rows are: "chat", "instruction", "text" -- or "unknown"
+ *  while nothing has been read yet, which is not the same as "text" and must
+ *  not be guessed as it.
+ *
+ *  Taken from the *detected* format rather than from the rendered one, because
+ *  the rendered one is a consequence of the request we sent -- asking it what
+ *  shape the data is would be asking our own last answer back. */
+function dataShape(state) {
+  if (state.formatMode) {
+    return state.formatMode === "jinja" ? "chat" : state.formatMode;
+  }
+  const known = state.shape;
+  return known && known.key === dataKey(state) ? known.mode : "unknown";
+}
+
+/** The base model's own template, from whichever place it lives in.
+ *  A Hub model ships it in tokenizer_config.json; one of this studio's own
+ *  runs carries it inside the saved tokenizer, read back out of the zip. */
+function ownTemplate(state) {
+  const own = !!state.sourceRun;
+  const r = own ? state.sourceTemplate : state.modelTemplate;
+  return {
+    name: own ? state.sourceRun.name : state.model,
+    waiting: r.status === "loading" || r.status === "idle",
+    failed: r.status === "error",
+    available: r.status === "ready" && !!r.data.available,
+    template: (r.status === "ready" && r.data.chat_template) || "",
+    reason: (r.status === "ready" && r.data.reason)
+      || "This model ships no chat template of its own, which usually means "
+       + "it is a base model rather than an instruct one.",
+  };
+}
+
+/** The choice, as one string, so a grid of buttons can compare against it. */
+function selectedKey(state) {
+  return state.templateSource === "format"
+    ? "format:" + state.chatFormat : state.templateSource;
+}
+
+/** The chosen format, in a sentence, for the review step. */
+function templateLabel(state) {
+  const formats = state.formats.data?.formats || [];
+  switch (state.templateSource) {
+    case "model":
+      return state.sourceRun
+        ? `${state.sourceRun.name}'s own chat template`
+        : `${state.model}'s own chat template`;
+    case "format": {
+      const f = formats.find((x) => x.id === state.chatFormat);
+      return (f ? f.label : state.chatFormat) + " — "
+        + (state.mode === "scratch"
+           ? "its boundary tokens reserved in the vocabulary"
+           : "rendered as that format publishes it")
+        + (state.teachReasoning ? ", reasoning before the answer" : "");
+    }
+    case "custom":
+      return "a Jinja template you wrote";
+    case "builtin":
+      return dataShape(state) === "text"
+        ? "raw text, exactly as the column holds it"
+        : "the plain readable rendering";
+    default:
+      return "not chosen";
+  }
+}
+
+/** What this particular run should almost certainly be trained in.
+ *  A suggestion only: it is drawn as one, and it is not the answer until it
+ *  has been clicked. */
+function suggestedKey(state, scratch) {
+  const fallback = "format:" + (state.formats.data?.default || "chatml");
+  if (!scratch) {
+    // The model's own, unless it has none -- a base model, most often, which
+    // has never been taught any layout and can therefore be taught one here.
+    const own = ownTemplate(state);
+    return own.waiting || own.available ? "model" : fallback;
+  }
+  // From scratch there is no "own" template: the model learns whichever shape
+  // it is shown. Conversations get boundary tokens; prose is left as prose --
+  // and a corpus nothing could be read from is prose until proven otherwise,
+  // which is what a from-scratch corpus almost always is.
+  const shape = dataShape(state);
+  return shape === "text" || shape === "unknown" ? "builtin" : fallback;
+}
+
+function chooseTemplate(state, key) {
+  if (key.startsWith("format:")) {
+    state.templateSource = "format";
+    state.chatFormat = key.slice("format:".length);
+  } else {
+    state.templateSource = key;
+    // Reasoning is a property of a named format's own layout -- its think
+    // block or its analysis channel. Nothing else here has one to teach.
+    state.teachReasoning = false;
+  }
+  if (state.templateSource === "custom" && !state.customTemplate) {
+    // Start from something that already works rather than a blank box.
+    const b = state.builtin.data || {};
+    state.customTemplate = dataShape(state) === "instruction"
+      ? (b.instruction_template || "") : (b.template || "");
+  }
+  state.preview = resource();
+}
+
+function stepTemplate(body, ctx) {
+  const { state, draw } = ctx;
+  const scratch = state.mode === "scratch";
+
+  ensure(state.formats, "formats", () => api.chatFormats(), draw);
+  ensure(state.builtin, "builtin", () => api.builtinTemplate(), draw);
+  if (!scratch && state.model) {
+    ensure(state.modelTemplate, state.model,
+           () => api.modelTemplate(state.model), draw);
+  }
+  if (!scratch && state.sourceRun) {
+    ensure(state.sourceTemplate, state.sourceRun.id,
+           () => api.jobChatTemplate(state.sourceRun.id), draw);
+  }
+  // The same preview the data step asked for, under the same key: the choice
+  // made here changes the key, and the rendered examples below re-render with
+  // the format actually chosen rather than with a generic one.
+  if (state.dataset && state.configs.status === "ready") {
+    ensure(state.preview, previewKey(state, scratch),
+           () => api.trainingPreview(previewRequest(state, scratch)), draw);
+    rememberShape(state);
+  }
+
+  body.innerHTML = html`
+    ${raw(formatIntro(state, scratch))}
+    ${raw(formatGrid(state, scratch))}
+    ${raw(state.templateSource === "format" ? reasoningPanel(state) : "")}
+    ${raw(customEditor(state))}
+    ${raw(formatNotes(state))}
+    <div style="margin-top:14px">${raw(trainingText(state, scratch))}</div>`;
+
+  on(body, "click", "[data-tmpl]", (_e, t) => {
+    chooseTemplate(state, t.dataset.tmpl);
+    draw();
+  });
+  on(body, "click", "#teachReasoning", () => {
+    state.teachReasoning = !state.teachReasoning;
+    state.preview = resource();
+    draw();
+  });
+  on(body, "click", "#applyTemplate", () => {
+    const box = $("#templateBox", body);
+    if (box) state.customTemplate = box.value;
+    state.preview = resource();
+    draw();
+  });
+  wireExpand(body, state);
+}
+
+function formatIntro(state, scratch) {
+  const chosen = state.templateSource;
+  const shape = dataShape(state);
+  const own = scratch ? null : ownTemplate(state);
+  const source = state.preview.status === "ready"
+    ? state.preview.data.template_source : null;
 
   return html`
-    <div class="card">
-      <div class="row-between" style="margin-bottom:4px">
-        <h3 style="margin:0">How a row becomes training text</h3>
-        ${raw(p.status === "ready" && p.data.template_source
-          ? `<span class="badge badge-accent">using: ${esc(p.data.template_source)}</span>` : "")}
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="gap:8px;flex-wrap:wrap">
+        <div>
+          <h3 style="margin:0">How a row becomes training text</h3>
+          <p class="muted tiny" style="margin:2px 0 0;max-width:70ch">
+            ${raw(scratch
+              ? "Your model will only ever speak the shape it is trained in — "
+              + "there is no other source for it. Choose that shape now: it "
+              + "decides which boundary tokens the new vocabulary reserves, "
+              + "and it is what the Playground will speak to the finished "
+              + "model afterwards."
+              : "Every instruct model was trained to expect one exact layout, "
+              + "and it is the one thing that has to be right. Trained in a "
+              + "shape it has never seen, a model ignores much of what you "
+              + "taught it — and nothing in the loss curve tells you so.")}</p>
+        </div>
+        ${raw(chosen && source
+          ? `<span class="badge badge-accent">using: ${esc(source)}</span>` : "")}
       </div>
-      ${raw(scratch && isChat ? html`
-        <div class="callout" style="margin:0 0 12px">
-          <strong>A conversation, learned from nothing</strong>
-          This dataset is a conversation, and a model built from scratch can
-          learn its shape along with the language — the roles below become part
-          of what it writes. Whatever you choose here is exactly what the
-          Playground will speak to it afterwards.
-        </div>` : "")}
-      ${raw(isChat ? html`
-        <p class="muted tiny" style="margin:0 0 10px">
-          This is a conversation dataset. Roles found:
-          ${raw((det.roles || []).map((r) =>
-            `<span class="badge">${esc(r)}</span>`).join(" "))}
-          ${raw(det.tools_field
-            ? `<span class="badge badge-accent">tool definitions in
-               "${esc(det.tools_field)}"</span>` : "")}
-          ${raw(det.has_tool_calls
-            ? `<span class="badge badge-accent">tool calls</span>` : "")}
-        </p>` : html`
-        <p class="muted tiny" style="margin:0 0 10px">
-          Rows are read as ${det.mode || "…"}. Change the template below if
-          that is not the shape you want the model to learn.</p>`)}
 
-      ${raw(scratch && isChat
-        ? formatPicker(state)
-        : html`<div class="grid grid-3">
-        ${raw(sources.map((t) => html`
-          <button class="pick ${src === t.id ? "selected" : ""}" data-tmplsrc="${t.id}">
-            <span class="t">${t.title}
-              ${raw(t.id === "model" ? `<span class="badge badge-ok">recommended</span>` : "")}
-            </span>
-            <span class="d">${t.desc}</span>
-          </button>`).join(""))}
-      </div>`)}
+      ${raw(chosen ? "" : html`
+        <div class="callout callout-warn" style="margin:12px 0 0">
+          <strong>Choose one to continue</strong>
+          This is not decided for you, because the right answer depends on
+          where the model came from and what your rows look like. The one
+          marked <em>suggested</em> is right for almost every run of this kind.
+        </div>`)}
 
-      ${raw(p.status === "ready" && p.data.template_note ? html`
-        <div class="callout callout-warn" style="margin-top:12px">
-          <strong>No template on this model</strong>${p.data.template_note}
-          Falling back to the plain readable form.
+      ${raw(!scratch && own && own.waiting ? html`
+        <p class="muted tiny" style="margin:12px 0 0">Reading
+          ${own.name || "the model"}'s own template…</p>` : "")}
+      ${raw(!scratch && own && !own.waiting && !own.available ? html`
+        <div class="callout" style="margin:12px 0 0">
+          <strong>${own.name || "This model"} has no template of its own</strong>
+          ${own.reason} Pick the layout you want it taught instead — anything
+          here works, as long as you talk to it the same way afterwards.
         </div>` : "")}
 
-      ${raw(src === "custom" ? html`
-        <div class="field" style="margin-top:12px">
-          <label for="templateBox">Jinja template</label>
-          <textarea id="templateBox" rows="10" spellcheck="false"
-                    class="mono">${state.customTemplate}</textarea>
-          <div class="hint">
-            Available: <code>messages</code> (each with
-            <code>role</code>, <code>content</code>, <code>tool_calls</code>,
-            <code>train</code>), <code>tools</code>, and every column of the row
-            by name. Example:
-            <code>{% for m in messages %}{{ m.role }}: {{ m.content }}
-            {% endfor %}</code>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <button class="btn-primary btn-sm" id="applyTemplate">Apply and preview</button>
-          </div>
-        </div>` : "")}
-
-      ${raw(p.status === "ready" && (p.data.system_prompts || []).length ? html`
-        <details class="adv" style="margin-top:10px">
-          <summary>System prompt found in this data</summary>
-          <p class="muted tiny" style="margin:8px 0 4px">Kept with the run, and
-            offered again in the Playground — a model trained with a system
-            prompt behaves differently without it.</p>
-          <p class="txt mono tiny" style="white-space:pre-wrap;max-height:180px;
-             overflow:auto;background:var(--surface-2);padding:10px;
-             border-radius:8px">${p.data.system_prompts[0].slice(0, 1500)}</p>
-        </details>` : "")}
-
-      ${raw(selectorPanel(state))}
-
-      ${raw(p.status === "ready" && p.data.template_error ? html`
-        <div class="callout callout-err" style="margin-top:12px">
-          <strong>That template did not work</strong>${p.data.template_error}
-        </div>` : "")}
+      ${raw(shape === "unknown" ? "" : html`
+        <p class="muted tiny" style="margin:12px 0 0">
+          Your rows are read as <span class="badge">${shape}</span>
+          ${raw(shape === "instruction"
+            ? " — instruction and response columns, which whichever format you "
+            + "choose below turns into a one-turn conversation." : "")}
+          ${raw(shape === "text"
+            ? " — a column of prose, with no turns in it to lay out." : "")}
+          ${raw(shape === "chat"
+            ? " — turns, already laid out, waiting for a format to write them "
+            + "in." : "")}
+        </p>`)}
     </div>`;
+}
+
+function formatGrid(state, scratch) {
+  const r = state.formats;
+  if (r.status === "loading" || r.status === "idle") {
+    return loading("Loading the formats…");
+  }
+  if (r.status === "error") return failed(r.error);
+  // Nothing is offered until the rows have been read once. Which layouts make
+  // sense, and which of them is suggested, both depend on what the data
+  // actually is -- and a suggestion that changes under the cursor is worse
+  // than one that arrives a second later.
+  if (["loading", "idle"].includes(state.preview.status)) {
+    return loading("Reading a few real rows to see what shape they are…");
+  }
+  const formats = r.data.formats || [];
+  const shape = dataShape(state);
+  const picked = selectedKey(state);
+  const suggested = suggestedKey(state, scratch);
+
+  // Dashed while it is only a suggestion, solid once it has been chosen: a
+  // step that must be answered must not look as though it already was.
+  const mark = (key) => (picked === key ? "selected"
+    : !picked && suggested === key ? "suggested" : "");
+  const tile = (key, title, desc, extra = "") => html`
+    <button class="pick ${mark(key)}" data-tmpl="${key}">
+      <span class="t">${title}
+        ${raw(suggested === key
+          ? `<span class="badge badge-ok">recommended</span>` : "")}
+      </span>
+      <span class="d">${desc}</span>
+      ${raw(extra)}
+    </button>`;
+
+  const tiles = [];
+
+  if (!scratch) {
+    const own = ownTemplate(state);
+    tiles.push(tile("model", "The model's own format",
+      own.available
+        ? `The layout ${own.name} was trained to expect, taken from its own `
+        + `tokenizer. Almost always the right answer when you are improving `
+        + `a model that already talks.`
+        : `Taken from the model's own tokenizer — ${own.waiting
+            ? "still reading it" : "this one does not ship one"}.`,
+      own.available && own.template ? html`
+        <span class="mono tiny" style="display:block;background:var(--surface-2);
+              padding:7px 9px;border-radius:6px;white-space:pre-wrap;
+              word-break:break-all;color:var(--text-2);max-height:96px;
+              overflow:auto">${own.template.slice(0, 400)}${
+                own.template.length > 400 ? " …" : ""}</span>` : ""));
+  }
+
+  formats.forEach((f) => {
+    tiles.push(tile("format:" + f.id, f.label, f.blurb, html`
+      <span class="mono tiny" style="display:block;background:var(--surface-2);
+            padding:7px 9px;border-radius:6px;white-space:pre-wrap;
+            word-break:break-all;color:var(--text-2)">${f.sample}</span>
+      <span class="row" style="gap:5px;flex-wrap:wrap">
+        <span class="badge">${f.token_count} token${f.token_count > 1 ? "s" : ""}</span>
+        ${raw(f.specials.map((t) => `<span class="badge">${esc(t)}</span>`).join(""))}
+      </span>`));
+  });
+
+  tiles.push(tile("builtin",
+    shape === "text" ? "Raw text, exactly as it is" : "Plain and readable",
+    shape === "text"
+      ? "No chat layout at all: the column you chose is fed to the model "
+      + "unchanged. The right answer for a corpus of prose, and the only one "
+      + "that does not teach the model a shape its text never contains."
+      : "Roles written out as ordinary words, with nothing reserved. Fine for "
+      + "a base model, and the easiest to read while you are checking the "
+      + "data rather than the format."));
+
+  tiles.push(tile("custom", "Write it yourself",
+    "A Jinja template, handed the conversation and any tools. Full control, "
+    + "for a layout none of the others produces — and no reserved tokens, so "
+    + "anything you invent is split into ordinary pieces by the tokenizer."));
+
+  return html`
+    ${raw(formatCaveat(state, scratch, shape))}
+    <div class="grid grid-2">${raw(tiles.join(""))}</div>`;
+}
+
+/** The one thing that is different about naming a format on each path. */
+function formatCaveat(state, scratch, shape) {
+  if (scratch && shape === "text") {
+    return html`
+      <div class="callout" style="margin:0 0 12px">
+        <strong>This corpus has no conversations in it</strong>
+        Choosing a chat format still reserves its boundary tokens in the
+        vocabulary and writes its layout onto the finished tokenizer — useful
+        if you mean to fine-tune this model on conversations afterwards, and
+        misleading if you do not, because the model will never have been shown
+        those tokens. Raw text is the honest choice for prose.
+      </div>`;
+  }
+  if (scratch) {
+    return html`
+      <div class="callout" style="margin:0 0 12px">
+        <strong>Why the tokens matter</strong>
+        Written as plain text, "assistant" is just a word — the model has to
+        guess where a turn ends from punctuation, and generation has nothing
+        dependable to stop on. These formats reserve <em>single, atomic
+        tokens</em> for the boundaries before the vocabulary is trained, which
+        only a from-scratch run can do: adding tokens to an existing model's
+        tokenizer would leave its embedding table the wrong size.
+      </div>`;
+  }
+  // Nothing to change *from* when the model arrived without a format of its
+  // own, and telling somebody they are departing from a layout that does not
+  // exist is worse than saying nothing.
+  if (!ownTemplate(state).available) return "";
+  return html`
+    <div class="callout" style="margin:0 0 12px">
+      <strong>Anything other than the model's own is a change of language</strong>
+      A named format below is rendered exactly as it is published, and it
+      trains perfectly well — but its boundary tokens are only single tokens if
+      this model's tokenizer already knows them, and the model has to unlearn
+      the layout it arrived with. Worth it when you are standardising on one
+      format across models; not worth it otherwise.
+    </div>`;
+}
+
+function customEditor(state) {
+  if (state.templateSource !== "custom") return "";
+  return html`
+    <div class="card" style="margin-top:14px">
+      <div class="field" style="margin:0">
+        <label for="templateBox">Jinja template</label>
+        <textarea id="templateBox" rows="10" spellcheck="false"
+                  class="mono">${state.customTemplate}</textarea>
+        <div class="hint">
+          Available: <code>messages</code> (each with <code>role</code>,
+          <code>content</code>, <code>tool_calls</code>, <code>train</code>),
+          <code>tools</code>, and every column of the row by name. Example:
+          <code>{% for m in messages %}{{ m.role }}: {{ m.content }}
+          {% endfor %}</code>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn-primary btn-sm" id="applyTemplate">Apply and preview</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function formatNotes(state) {
+  const p = state.preview;
+  if (p.status !== "ready") return "";
+  return html`
+    ${raw(p.data.template_note ? html`
+      <div class="callout callout-warn" style="margin-top:12px">
+        <strong>No template on this model</strong>${p.data.template_note}
+        Falling back to the plain readable form.
+      </div>` : "")}
+    ${raw(p.data.template_error ? html`
+      <div class="callout callout-err" style="margin-top:12px">
+        <strong>That template did not work</strong>${p.data.template_error}
+      </div>` : "")}
+    ${raw((p.data.system_prompts || []).length ? html`
+      <details class="adv" style="margin-top:10px">
+        <summary>System prompt found in this data</summary>
+        <p class="muted tiny" style="margin:8px 0 4px">Kept with the run, and
+          offered again in the Playground — a model trained with a system
+          prompt behaves differently without it.</p>
+        <p class="txt mono tiny" style="white-space:pre-wrap;max-height:180px;
+           overflow:auto;background:var(--surface-2);padding:10px;
+           border-radius:8px">${p.data.system_prompts[0].slice(0, 1500)}</p>
+      </details>` : "")}`;
 }
 
 // How much of an example is shown before it is folded. Long enough to see
@@ -975,65 +1364,17 @@ function shorten(text) {
     + text.slice(-tail);
 }
 
-function formatPicker(state) {
-  const r = state.formats;
-  if (r.status === "loading") return loading("Loading the formats…");
-  if (r.status === "error") return failed(r.error);
-  if (r.status !== "ready") return "";
-  const formats = r.data.formats || [];
-
-  return html`
-    <div class="callout" style="margin:0 0 12px">
-      <strong>Why this matters</strong>
-      Written as plain text, "assistant" is just a word — the model has to
-      guess where a turn ends from punctuation, and generation has nothing
-      dependable to stop on. These formats reserve <em>single, atomic tokens</em>
-      for the boundaries before the vocabulary is trained, which only a
-      from-scratch run can do: adding tokens to an existing model's tokenizer
-      would leave its embedding table the wrong size.
-    </div>
-    <div class="grid grid-2">
-      ${raw(formats.map((f) => html`
-        <button class="pick ${state.chatFormat === f.id ? "selected" : ""}"
-                data-chatfmt="${f.id}">
-          <span class="t">${f.label}
-            <span class="badge">${f.token_count} token${f.token_count > 1 ? "s" : ""}</span>
-            ${raw(f.id === "chatml" ? `<span class="badge badge-ok">recommended</span>` : "")}
-          </span>
-          <span class="d">${f.blurb}</span>
-          <span class="mono tiny" style="display:block;background:var(--surface-2);
-                padding:7px 9px;border-radius:6px;white-space:pre-wrap;
-                word-break:break-all;color:var(--text-2)">${f.sample}</span>
-          <span class="row" style="gap:5px;flex-wrap:wrap">
-            ${raw(f.specials.map((t) =>
-              `<span class="badge">${esc(t)}</span>`).join(""))}
-          </span>
-        </button>`).join(""))}
-    </div>
-    ${raw(reasoningPanel(state, formats))}
-
-    <details class="adv" style="margin-top:10px">
-      <summary>Or write the layout yourself</summary>
-      <p class="muted tiny" style="margin:8px 0 0">Choosing "write it yourself"
-        below gives you the Jinja, but no reserved tokens — anything you invent
-        is split into ordinary pieces by the tokenizer. Use one of the formats
-        above unless you have a reason not to.</p>
-      <div class="row" style="margin-top:8px">
-        <button class="btn-sm ${state.templateSource === "custom" ? "btn-primary" : ""}"
-                data-tmplsrc="custom">Write it yourself</button>
-        ${raw(state.templateSource === "custom"
-          ? `<button class="btn-sm" data-tmplsrc="builtin">Back to a standard format</button>` : "")}
-      </div>
-    </details>`;
-}
-
-function reasoningPanel(state, formats) {
+/** Reasoning is a property of the chosen format's own layout -- ChatML's
+ *  think block, Harmony's analysis channel -- so it is offered here, beside
+ *  the format, and only when the data has any reasoning to learn from. */
+function reasoningPanel(state) {
+  const formats = state.formats.data?.formats || [];
   const det = state.preview.status === "ready"
     ? (state.preview.data.format || {}) : {};
   const chosen = formats.find((f) => f.id === state.chatFormat) || {};
-  const on = state.teachReasoning;
+  const on_ = state.teachReasoning;
   return html`
-    <div class="card" style="margin-top:12px;box-shadow:none;background:var(--surface-2)">
+    <div class="card" style="margin-top:14px;box-shadow:none;background:var(--surface-2)">
       <div class="row-between" style="flex-wrap:wrap;gap:8px">
         <div style="flex:1;min-width:240px">
           <strong class="tiny">Teach it to reason before answering</strong>
@@ -1046,13 +1387,13 @@ function reasoningPanel(state, formats) {
               + "learn from. Turning this on would only teach the model to "
               + "open an empty block.")}
           </p>
-          ${raw(on && chosen.reasoning_note
+          ${raw(on_ && chosen.reasoning_note
             ? `<p class="muted tiny" style="margin:6px 0 0"><em>${
                 esc(chosen.label)}: ${esc(chosen.reasoning_note)}</em></p>` : "")}
         </div>
-        <button class="btn-sm ${on ? "btn-primary" : ""}" id="teachReasoning"
+        <button class="btn-sm ${on_ ? "btn-primary" : ""}" id="teachReasoning"
                 ${det.has_reasoning ? "" : "disabled"}>
-          ${on ? "On" : "Off"}
+          ${on_ ? "On" : "Off"}
         </button>
       </div>
     </div>`;
@@ -1125,7 +1466,8 @@ function selectorPanel(state) {
 }
 
 function previewKey(state, scratch) {
-  return JSON.stringify([state.dataset, state.config, state.split,
+  return JSON.stringify([state.dataset, state.studioDataset?.id,
+                         state.config, state.split,
                          state.formatMode, state.textField, state.model,
                          // Included, or switching to a studio model would keep
                          // showing the preview built for the previous base.
@@ -1133,6 +1475,11 @@ function previewKey(state, scratch) {
                          state.sourceTemplate?.status,
                          state.templateSource, state.customTemplate,
                          state.chatFormat, state.teachReasoning,
+                         // The request differs by the shape of the rows, and
+                         // the shape is only known once one preview has come
+                         // back. Keyed on it, that first answer corrects the
+                         // request instead of standing as the last word.
+                         dataShape(state),
                          state.selectors, state.roleMap]);
 }
 
@@ -1153,37 +1500,52 @@ function selectorsFor(state) {
   return Object.keys(sel).length ? sel : null;
 }
 
-function previewRequest(state, scratch) {
+/** The format decision, in the shape the controller and the runner read.
+ *
+ *  One function for the preview request and for the job that is finally
+ *  created, because the whole promise of the preview is that what you were
+ *  shown is what trains. Two copies of this logic were two chances to differ.
+ *
+ *  `forJob` is the one honest difference: for one of this studio's own models
+ *  the preview needs the template as *text* (the controller cannot look a job
+ *  id up on the Hub), while the job records `use_model_template` and lets the
+ *  runner read it back off the very tokenizer it loads.
+ */
+function formatOverlay(state, forJob = false) {
   const fmt = {};
-  if (state.formatMode) fmt.mode = state.formatMode;
-  // The same three sources for both paths, minus the one a from-scratch model
-  // cannot have. Building the format here rather than per-path is what lets a
-  // conversation dataset train a model from nothing and then be talked to in
-  // the same shape afterwards.
-  if (!scratch && state.templateSource === "model" && state.sourceRun) {
-    // The model is one of ours, so its template is text we already fetched
-    // rather than something the controller can look up by id. Training still
-    // records `use_model_template`, and the runner reads it back off the same
-    // tokenizer -- so what the preview shows and what trains agree.
+  const src = state.templateSource;
+  const shape = dataShape(state);
+
+  if (src === "model" && state.sourceRun && !forJob) {
     const t = state.sourceTemplate;
     if (t.status === "ready" && t.data.chat_template) {
       fmt.mode = "jinja";
       fmt.template = t.data.chat_template;
     }
-  } else if (!scratch && state.templateSource === "model") {
+  } else if (src === "model") {
     fmt.use_model_template = true;
-  } else if (scratch && state.templateSource !== "custom" && state.previewIsChat) {
-    // A named format carries its own Jinja and its own reserved tokens; the
-    // controller resolves the name so the preview shows what will be trained.
+  } else if (src === "format") {
+    // Recorded by name, never as expanded Jinja: a from-scratch run needs the
+    // name to know which tokens to reserve in the vocabulary it trains, and
+    // the playground needs it to know where a reply stops.
     fmt.chat_format = state.chatFormat;
-    fmt.mode = "chat";
+    // Prose has no turns to lay out. The format still travels with the run --
+    // it decides the reserved tokens -- but the rows are read as text.
+    if (shape === "chat" || shape === "instruction") fmt.mode = "chat";
     if (state.teachReasoning) fmt.reasoning = true;
-  } else if (state.templateSource === "custom" && state.customTemplate) {
+  } else if (src === "custom" && state.customTemplate) {
     // "jinja" rather than a chat template, so the same box works whether or
     // not the dataset is a conversation.
     fmt.mode = "jinja";
     fmt.template = state.customTemplate;
   }
+  return fmt;
+}
+
+function previewRequest(state, scratch) {
+  const fmt = {};
+  if (state.formatMode) fmt.mode = state.formatMode;
+  Object.assign(fmt, formatOverlay(state));
   const sel = selectorsFor(state);
   if (sel) fmt.selectors = sel;
   return {
@@ -1191,13 +1553,19 @@ function previewRequest(state, scratch) {
     config: state.config,
     split: state.split,
     format: Object.keys(fmt).length ? fmt : null,
-    // A plain-text corpus still names its column; a conversation does not.
-    text_field: (scratch && state.templateSource === "builtin"
-                 && !state.previewIsChat) ? state.textField : null,
+    // A column of prose still names its column; a conversation does not. A
+    // from-scratch corpus nothing has been read from yet is treated as prose,
+    // which is what a corpus almost always is.
+    text_field: (dataShape(state) === "text"
+                 || (scratch && dataShape(state) === "unknown"))
+      ? state.textField : null,
     // A studio model is not on the Hub, so there is nothing to look its
     // template up by. Its template is passed as text instead, fetched from
-    // the run itself -- see the chat_template branch above.
+    // the run itself -- see formatOverlay.
     base_model: scratch ? null : state.model,
+    // And a studio *dataset* is not on the Hub either: the controller reads
+    // its rows off the disk, from the split chosen above.
+    studio_dataset: state.studioDataset?.id || null,
   };
 }
 
@@ -1264,13 +1632,18 @@ function trainingText(state, scratch) {
       </div>` : "")}
     <div class="card">
       <div class="row-between" style="margin-bottom:6px">
-        <h3 style="margin:0">Exactly what the model will read</h3>
+        <h3 style="margin:0">${state.templateSource
+          ? "Exactly what the model will read"
+          : "What these rows contain"}</h3>
         <span class="badge badge-accent">${p.data.split}</span>
       </div>
       <p class="muted tiny">Not the raw columns — the finished text, built by
         the same code that will build the training batches.
-        ${raw(scratch ? "The model reads these one after another, with no gaps."
-                      : "Everything below, including the headings, is learned.")}</p>
+        ${raw(state.templateSource
+          ? (scratch ? "The model reads these one after another, with no gaps."
+                     : "Everything below, including the headings, is learned.")
+          : "Rendered plainly for now: the next step decides the layout these "
+          + "are actually written in.")}</p>
       <div class="samples" style="max-height:380px">
         ${raw(rendered.map((r, i) => html`
           <div class="sample">
@@ -1792,6 +2165,7 @@ function finetuneReview(state, runner, caps) {
           ? state.sourceRun.name : state.model}</dd>
         <dt>Learning from</dt><dd class="mono">${state.dataset}${
           state.config ? " · " + state.config : ""} · ${state.split}</dd>
+        <dt>Written as</dt><dd>${templateLabel(state)}</dd>
         <dt>Running on</dt><dd>${runner?.name} — ${caps.device_name || ""}</dd>
         ${raw(plan.estimated_minutes
           ? `<dt>Rough duration</dt><dd>about ${esc(fmtDuration(plan.estimated_minutes * 60))}</dd>`
@@ -1891,6 +2265,7 @@ function scratchReview(state, runner, caps) {
         <dt>Vocabulary</dt><dd>${fmtNum(a.vocab_size)} tokens, built from your text</dd>
         <dt>Learning from</dt><dd class="mono">${state.dataset}${
           state.config ? " · " + state.config : ""} · ${state.split}</dd>
+        <dt>Speaking</dt><dd>${templateLabel(state)}</dd>
         <dt>Running on</dt><dd>${runner?.name} — ${caps.device_name || ""}</dd>
         <dt>Training time</dt><dd>about ${fmtDuration(
           (plan.estimated_minutes ?? state.minutes) * 60)}${
@@ -2169,6 +2544,26 @@ function gateNext(blocked, hintText) {
   if (hint) hint.textContent = blocked ? hintText : "";
 }
 
+/** "Show all N characters" on a rendered example.
+ *
+ *  Rewrites the one paragraph in place rather than going through draw(),
+ *  which would re-render the step and fold it straight back up. Shared by the
+ *  two steps that show the rendered rows. */
+function wireExpand(body, state) {
+  on(body, "click", "[data-expand]", (_e, t) => {
+    const card = t.closest(".sample");
+    const para = card && card.querySelector(".txt");
+    const idx = [...body.querySelectorAll(".sample")].indexOf(card);
+    const full = state.preview.data?.rendered?.[idx]?.text;
+    if (!para || full == null) return;
+    const wasExpanded = para.dataset.full === "0";
+    para.textContent = wasExpanded ? shorten(full) : full;
+    para.dataset.full = wasExpanded ? "1" : "0";
+    t.textContent = wasExpanded
+      ? "Show all " + fmtNum(full.length) + " characters" : "Show less";
+  });
+}
+
 function wireSearch(body, prefix, run) {
   const box = $(`#${prefix}Results`, body);
   const input = $(`#${prefix}Search`, body);
@@ -2183,8 +2578,8 @@ function wireSearch(body, prefix, run) {
 }
 
 const STEPS = {
-  finetune: [stepGoal, stepModel, stepData, stepReview],
-  scratch: [stepGoal, stepData, stepDesign, stepReview],
+  finetune: [stepGoal, stepModel, stepData, stepTemplate, stepReview],
+  scratch: [stepGoal, stepData, stepTemplate, stepDesign, stepReview],
 };
 
 // ===========================================================================
@@ -2198,9 +2593,15 @@ function wireNav(mount, ctx) {
 
   const names = STEP_NAMES[state.mode];
   const last = names.length - 1;
+  // One per step, in order. The format step has no default answer on purpose:
+  // it is the one decision that quietly ruins a finished model, so it is
+  // asked rather than assumed.
+  const noFormat = () => (!state.templateSource
+    ? "Choose the format your training text is written in." : null);
   const blockers = state.mode === "scratch" ? [
     () => (!state.runnerId ? "Choose a machine to continue." : null),
     () => (!state.dataset ? "Choose some text to continue." : null),
+    noFormat,
     () => (!state.size ? "Choose a size to continue." : null),
     () => (state.plan.status !== "ready" ? "Working out the settings…"
            : state.blocked ? "Fix the problems above before starting." : null),
@@ -2209,6 +2610,7 @@ function wireNav(mount, ctx) {
     () => (!state.model && !state.sourceRun
            ? "Choose a model to continue." : null),
     () => (!state.dataset ? "Choose a dataset to continue." : null),
+    noFormat,
     () => (state.ftPlan.status !== "ready" ? "Working out the settings…"
            : state.blocked ? "Choose a smaller model to continue." : null),
   ];
@@ -2279,7 +2681,10 @@ function parseSweep(state) {
 function buildJob(mount, state) {
   const name = $("#jobName", mount)?.value || undefined;
   const dataBits = state.studioDataset
-    ? { studio_dataset: state.studioDataset.id }
+    // The split travels with a studio dataset too: it is one file holding
+    // every split, and the runner reads the one named here.
+    ? { studio_dataset: state.studioDataset.id,
+        dataset_split: state.split || "train" }
     : {
       dataset: state.dataset,
       dataset_config: state.config || null,
@@ -2291,22 +2696,15 @@ function buildJob(mount, state) {
   // and the remembered system prompt is offered there as a starting point.
   const trained = { ...(state.preview.data?.format || {}) };
   delete trained.specials;
-  if (state.templateSource === "model" && state.mode === "finetune") {
-    trained.use_model_template = true;
-    delete trained.chat_template;
-  } else if (state.templateSource === "custom" && state.customTemplate) {
-    trained.mode = "jinja";
-    trained.template = state.customTemplate;
-  }
-  // The format is recorded by name, not as expanded Jinja: the runner needs
-  // the name to know which tokens to reserve in the vocabulary it trains.
-  if (state.mode === "scratch" && state.previewIsChat
-      && state.templateSource !== "custom") {
-    trained.chat_format = state.chatFormat;
-    trained.mode = "chat";
-    if (state.teachReasoning) trained.reasoning = true;
-    delete trained.chat_template;
-  }
+  // The expanded Jinja is dropped: it can be tens of kilobytes, and the
+  // decision that produced it -- a name, or the model's own tokenizer -- is
+  // recorded instead, so the runner and the playground resolve it the same
+  // way this preview did.
+  delete trained.chat_template;
+  delete trained.use_model_template;
+  delete trained.chat_format;
+  delete trained.reasoning;
+  Object.assign(trained, formatOverlay(state, true));
   const sel = selectorsFor(state);
   if (sel) trained.selectors = sel;
   const systemPrompt = (state.preview.data?.system_prompts || [])[0] || "";

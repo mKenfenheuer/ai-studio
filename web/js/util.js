@@ -23,10 +23,34 @@ export const raw = (value) => ({ __raw: true, value });
 export const $ = (sel, root = document) => root.querySelector(sel);
 export const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+/** A delegated listener that survives the view being redrawn.
+ *
+ *  Every view here renders by replacing the contents of one mount and then
+ *  re-wiring it, and delegation is what makes that work: the listener sits on
+ *  the mount, which is not replaced. But that is also the trap. Registering
+ *  again on the next redraw added a *second* listener to the same node, and a
+ *  third, and a tenth — so one click ran the handler ten times.
+ *
+ *  It showed up as a delete confirmation that would not go away: the first
+ *  answer deleted the dataset, and the nine stacked copies of the same
+ *  handler each asked again, then failed against a dataset that was already
+ *  gone. So this keeps exactly one listener per (root, event, selector) and
+ *  points it at the newest handler — which closes over the newest state, and
+ *  is what re-wiring was trying to achieve in the first place.
+ */
 export function on(root, event, selector, handler) {
+  const key = event + " " + selector;
+  const registry = root.__delegated || (root.__delegated = new Map());
+  const existing = registry.get(key);
+  if (existing) {
+    existing.handler = handler;
+    return;
+  }
+  const entry = { handler };
+  registry.set(key, entry);
   root.addEventListener(event, (e) => {
     const t = e.target.closest(selector);
-    if (t && root.contains(t)) handler(e, t);
+    if (t && root.contains(t)) entry.handler(e, t);
   });
 }
 

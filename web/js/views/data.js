@@ -9,6 +9,25 @@ const SOURCE = {
   generated: ["badge badge-ok", "written by a model"],
 };
 
+// How a text file is cut into rows -- not to be confused with a dataset's
+// train/validation splits, which is why this is called a mode. The same names
+// the controller takes, and a sentence each, because "paragraphs" and
+// "chunks" produce datasets that train very differently and the difference is
+// not visible afterwards.
+const TEXT_MODES = [
+  ["auto", "Whatever the file suggests",
+   "Paragraphs when the file has blank lines between them, otherwise one row "
+   + "per line."],
+  ["paragraphs", "One row per paragraph",
+   "Split on blank lines. Right for articles, transcripts and books."],
+  ["lines", "One row per line",
+   "Right for a file where every line is already one example."],
+  ["chunks", "Fixed-size chunks",
+   "Cut long documents into pieces of about the length you train on."],
+  ["document", "One row per file",
+   "The whole file as a single example. Only sensible with many files."],
+];
+
 export async function dataView(mount) {
   let items = await api.datasets();
   let filter = "";
@@ -26,15 +45,45 @@ export async function dataView(mount) {
       $("#dsList", mount).innerHTML = listing(items, filter);
     });
 
+    on(mount, "click", "#lookUp", async () => {
+      const id = ($("#imId", mount)?.value || "").trim();
+      const box = $("#imSplits", mount);
+      if (!id) return toast("Which dataset?", "err");
+      box.innerHTML = `<span class="muted tiny">Asking Hugging Face…</span>`;
+      try {
+        const r = await api.datasetConfigs(id);
+        box.innerHTML = splitPicker(r);
+      } catch (ex) {
+        box.innerHTML = `<div class="callout callout-err">${esc(ex.message)}</div>`;
+      }
+    });
+
+    // Choosing a configuration changes which splits exist, so the tick boxes
+    // are rebuilt rather than left showing the previous one's.
+    on(mount, "change", "#imCfgPick", (_e, t) => {
+      const chosen = JSON.parse(t.selectedOptions[0].dataset.splits || "[]");
+      $("#imSplitList", mount).innerHTML = splitBoxes(chosen);
+    });
+
     on(mount, "submit", "#importForm", async (e) => {
       e.preventDefault();
       const f = Object.fromEntries(new FormData(e.target).entries());
+      const splits = [...mount.querySelectorAll("[data-split]:checked")]
+        .map((c) => c.dataset.split);
       const btn = $("#importGo", mount);
       btn.disabled = true;
       btn.textContent = "Fetching rows…";
       try {
-        const d = await api.importDataset({ ...f, limit: +f.limit || 5000 });
-        toast(`Imported ${fmtNum(d.rows)} rows.`, "ok");
+        const d = await api.importDataset({
+          ...f,
+          config: $("#imCfgPick", mount)?.value || f.config,
+          // Nothing ticked and nothing typed means everything there is --
+          // the server looks up which splits exist. Same for the row count:
+          // blank is all of them, not a demo-sized slice of one split.
+          splits: splits.length ? splits : splitList(f.split),
+          limit: +f.limit || 0 });
+        toast(`Imported ${fmtNum(d.rows)} rows across ${
+          Object.keys(d.splits || {}).length} split(s).`, "ok");
         location.hash = `#/data/${d.id}`;
       } catch (ex) {
         toast(ex.message, "err");
@@ -43,19 +92,68 @@ export async function dataView(mount) {
       }
     });
 
-    on(mount, "change", "#fileInput", async (_e, t) => {
-      const file = t.files[0];
-      if (!file) return;
+    // The two ways in are the same upload: the picker and the drop zone both
+    // hand over a FileList, and everything after that is one path.
+    async function upload(files) {
+      if (!files || !files.length) return;
       const box = $("#uploadStatus", mount);
-      box.innerHTML = `<span class="muted tiny">Reading ${esc(file.name)}…</span>`;
+      const label = files.length === 1
+        ? files[0].name : `${files.length} files`;
+      box.innerHTML = `<div class="callout" style="margin-top:10px">
+        <strong>Reading ${esc(label)}…</strong>
+        Large files take a moment — the rows are parsed here, not on your
+        machine.</div>`;
+      const name = files.length === 1
+        ? files[0].name.replace(/\.[^.]+$/, "") : "";
       try {
-        const d = await api.uploadDataset(file, file.name.replace(/\.[^.]+$/, ""));
-        toast(`Read ${fmtNum(d.rows)} rows.`, "ok");
+        const d = await api.uploadDataset(files, name, uploadOptions());
+        const skipped = (d.skipped || []).length;
+        toast(`${d.added ? `Added ${fmtNum(d.added)} rows` : `Read ${fmtNum(d.rows)} rows`}${
+          skipped ? ` — ${skipped} file(s) skipped` : ""}.`, skipped ? "warn" : "ok");
         location.hash = `#/data/${d.id}`;
       } catch (ex) {
-        box.innerHTML = `<div class="callout callout-err">${esc(ex.message)}</div>`;
+        box.innerHTML = `<div class="callout callout-err" style="margin-top:10px">
+          <strong>That did not import</strong>${esc(ex.message)}</div>`;
       }
+    }
+
+    function uploadOptions() {
+      const mode = $("#splitMode", mount)?.value || "auto";
+      const into = $("#uploadInto", mount)?.value || "";
+      return {
+        // How prose is cut into rows, and -- a different thing entirely --
+        // which split of the dataset these rows belong to.
+        text_split: mode,
+        chunk_chars: $("#chunkChars", mount)?.value || 2000,
+        overlap: $("#chunkOverlap", mount)?.value || 200,
+        header: $("#csvHeader", mount)?.value || "auto",
+        split: ($("#uploadSplit", mount)?.value || "train").trim() || "train",
+        ...(into ? { into } : {}),
+      };
+    }
+
+    on(mount, "change", "#fileInput", (_e, t) => upload(t.files));
+
+    on(mount, "change", "#splitMode", (_e, t) => {
+      const row = TEXT_MODES.find((s) => s[0] === t.value);
+      $("#splitHint", mount).textContent = row ? row[2] : "";
+      $("#chunkFields", mount).hidden = t.value !== "chunks";
     });
+
+    const zone = $("#dropZone", mount);
+    if (zone) {
+      // Both handlers must preventDefault or the browser navigates to the
+      // file instead, which loses the page and the upload with it.
+      ["dragenter", "dragover"].forEach((ev) => zone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        zone.classList.add("over");
+      }));
+      ["dragleave", "drop"].forEach((ev) => zone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        zone.classList.remove("over");
+      }));
+      zone.addEventListener("drop", (e) => upload(e.dataTransfer?.files));
+    }
 
     on(mount, "click", "#mergeGo", async () => {
       const picked = [...mount.querySelectorAll("[data-pick]:checked")]
@@ -100,43 +198,107 @@ function layout(items, filter) {
     <div class="grid grid-3" style="margin-bottom:16px;align-items:start">
       <div class="card">
         <h3>Import from Hugging Face</h3>
-        <p class="muted tiny">Pulls the rows here so you can look at them,
-          clean them and split them before training.</p>
+    <p class="muted tiny">Pulls the rows here so you can look at them,
+          clean them and split them before training. By default it brings in
+          <strong>every split, in full</strong> — a big dataset takes a few
+          minutes.</p>
         <form id="importForm" style="margin-top:10px">
           <div class="field">
             <label for="imId">Dataset</label>
             <input id="imId" name="dataset" type="text" class="mono" required
                    placeholder="tatsu-lab/alpaca">
           </div>
-          <div class="grid grid-3">
+          <div class="grid grid-2">
             <div class="field">
-              <label for="imCfg">Config</label>
-              <input id="imCfg" name="config" type="text" placeholder="default">
+              <label for="imSplit">Splits</label>
+              <input id="imSplit" name="split" type="text" placeholder="all of them">
+              <div class="hint">Blank means every split it has. Or look them
+                up and tick the ones you want.</div>
             </div>
             <div class="field">
-              <label for="imSplit">Split</label>
-              <input id="imSplit" name="split" type="text" value="train">
-            </div>
-            <div class="field">
-              <label for="imLimit">Rows</label>
-              <input id="imLimit" name="limit" type="number" value="5000"
-                     min="1" max="200000">
+              <label for="imLimit">Rows per split</label>
+              <input id="imLimit" name="limit" type="number" placeholder="all"
+                     min="1" max="2000000">
+              <div class="hint">Blank means all of them.</div>
             </div>
           </div>
-          <button class="btn-sm btn-primary" type="submit" id="importGo">Import</button>
+          <div id="imSplits"></div>
+          <div class="row" style="gap:6px;margin-top:8px">
+            <button class="btn-sm" type="button" id="lookUp">Look up its splits</button>
+            <button class="btn-sm btn-primary" type="submit" id="importGo">Import</button>
+          </div>
         </form>
       </div>
 
       <div class="card">
-        <h3>Upload a file</h3>
-        <p class="muted tiny">JSONL, JSON, CSV, TSV or plain text — one example
-          per line. The shape is worked out from the content, not the
-          extension.</p>
-        <div class="field" style="margin-top:10px">
-          <label for="fileInput" class="btn btn-sm">Choose a file…</label>
-          <input id="fileInput" type="file" hidden
-                 accept=".jsonl,.json,.csv,.tsv,.txt,text/plain,application/json">
+        <h3>Upload your own files</h3>
+        <p class="muted tiny">JSONL, JSON, CSV, TSV, plain text, Markdown,
+          HTML, Word (.docx) — or a .zip of any of those. Drop several at
+          once and they become one dataset, each row tagged with the file it
+          came from.</p>
+
+        <div id="dropZone" class="dropzone">
+          <strong class="tiny">Drop files here</strong>
+          <span class="muted tiny">or</span>
+          <label for="fileInput" class="btn btn-sm">Choose files…</label>
+          <input id="fileInput" type="file" hidden multiple
+                 accept=".jsonl,.ndjson,.json,.csv,.tsv,.txt,.md,.markdown,.htm,.html,.docx,.zip,.pdf,text/plain,application/json">
         </div>
+
+        <details class="adv" style="margin-top:10px">
+          <summary>How to cut text files into rows</summary>
+          <div class="field" style="margin-top:8px">
+            <label for="splitMode">Prose becomes</label>
+            <select id="splitMode">
+              ${raw(TEXT_MODES.map(([v, l, hint]) => `<option value="${v}">${esc(l)}</option>`).join(""))}
+            </select>
+            <div class="hint" id="splitHint">${TEXT_MODES[0][2]}</div>
+          </div>
+          <div class="grid grid-2" id="chunkFields" hidden>
+            <div class="field">
+              <label for="chunkChars">Chunk size</label>
+              <input id="chunkChars" type="number" value="2000" min="200" step="100">
+              <div class="hint">Characters. Breaks at the nearest sentence.</div>
+            </div>
+            <div class="field">
+              <label for="chunkOverlap">Overlap</label>
+              <input id="chunkOverlap" type="number" value="200" min="0" step="50">
+              <div class="hint">Repeated from the end of the one before.</div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="uploadSplit">These rows are the</label>
+            <input id="uploadSplit" type="text" value="train" list="splitNames">
+            <datalist id="splitNames">
+              <option value="train"><option value="validation"><option value="test">
+            </datalist>
+            <div class="hint">A dataset holds all of its splits together.
+              Upload the training data, then upload the test set with
+              <em>test</em> here and add it to the same dataset below.</div>
+          </div>
+          <div class="field">
+            <label for="uploadInto">Add to an existing dataset</label>
+            <select id="uploadInto">
+              <option value="">No — make a new one</option>
+              ${raw(items.filter((d) => d.mine).map((d) => html`
+                <option value="${d.id}">${d.name}</option>`).join(""))}
+            </select>
+            <div class="hint">The only operation here that changes a dataset
+              in place, because the other half of a dataset is not a new
+              dataset.</div>
+          </div>
+          <div class="field">
+            <label for="csvHeader">First row of a CSV</label>
+            <select id="csvHeader">
+              <option value="auto">Work it out</option>
+              <option value="yes">Is the column names</option>
+              <option value="no">Is data</option>
+            </select>
+          </div>
+          <p class="muted tiny" style="margin:0">Only affects text and CSV.
+            JSONL, JSON and the rest already say where a row ends.</p>
+        </details>
+
         <div id="uploadStatus"></div>
       </div>
 
@@ -162,6 +324,47 @@ function layout(items, filter) {
       </div>
       <div id="dsList">${raw(listing(items, filter))}</div>
     </div>`;
+}
+
+/** "a, b" as a list; blank entries ignored. */
+function splitList(text) {
+  return (text || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** The configurations and splits a Hub dataset actually has. */
+function splitPicker(r) {
+  const configs = r.configs || [];
+  if (!configs.length) {
+    return html`<div class="callout callout-warn" style="margin-top:8px">
+      <strong>Could not read its splits</strong>${r.reason
+        || "Type the split name instead."}</div>`;
+  }
+  const first = configs[0];
+  return html`
+    <div class="field" style="margin-top:8px">
+      <label for="imCfgPick">Collection</label>
+      <select id="imCfgPick" name="config">
+        ${raw(configs.map((c) => html`
+          <option value="${c.name}" data-splits="${JSON.stringify(c.splits || [])}"${
+            c.name === r.default_config ? " selected" : ""}>${c.name}</option>`).join(""))}
+      </select>
+    </div>
+    <div id="imSplitList">${raw(splitBoxes(
+      (configs.find((c) => c.name === r.default_config) || first).splits || []))}</div>`;
+}
+
+/** One tick box per split, with train pre-ticked because it always exists and
+ *  is always wanted; the others are the point of asking. */
+function splitBoxes(splits) {
+  if (!splits.length) return `<span class="muted tiny">No splits listed.</span>`;
+  return html`
+    <p class="muted tiny" style="margin:8px 0 4px">Bring in:</p>
+    ${raw(splits.map((name) => html`
+      <label class="check"><input type="checkbox" data-split="${name}" checked>
+        ${name}</label>`).join(""))}
+    <p class="muted tiny" style="margin:4px 0 0">They arrive as one dataset,
+      each row remembering which split it came from — which is what makes a
+      held-out score mean anything later.</p>`;
 }
 
 function listing(items, filter) {

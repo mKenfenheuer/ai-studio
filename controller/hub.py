@@ -587,7 +587,8 @@ def _clip(text: str) -> str:
 async def training_preview(dataset_id: str, config_name: str | None,
                            split: str, fmt: dict | None,
                            text_field: str | None = None,
-                           base_model: str | None = None) -> dict:
+                           base_model: str | None = None,
+                           rows_source: dict | None = None) -> dict:
     """Show the exact strings the model will be trained on.
 
     Not the raw columns -- the rendered result, after the instruction template
@@ -595,20 +596,31 @@ async def training_preview(dataset_id: str, config_name: str | None,
     reading the right column in the wrong shape, is the most expensive mistake
     available here, and it is invisible until you look at the finished text.
     """
-    base = await dataset_preview(dataset_id, config_name, split)
+    # `rows_source` is a dataset from this studio's own library, already read
+    # off the disk by the caller. Everything after this point is identical --
+    # the whole value of this function is that one renderer answers for every
+    # dataset, wherever the rows came from.
+    base = rows_source or await dataset_preview(dataset_id, config_name, split)
     if not base.get("available"):
         return base
 
     rows = base["rows"]
     resolved = dict(fmt or base["detected_format"])
     if text_field:
-        resolved = {"mode": "text", "text_field": text_field}
+        # Merged, not substituted. A named chat format travels with a
+        # from-scratch run even when the corpus itself is a column of prose --
+        # the format decides which boundary tokens the new vocabulary reserves,
+        # and dropping it here would show a preview built from a different
+        # decision than the one the run is started with.
+        resolved = {**resolved, "mode": "text", "text_field": text_field}
 
     # Fill in the model's own template when the caller asked for it. Done here
     # rather than in the browser so the preview and the runner start from the
     # same source, and so a model without one is reported honestly instead of
     # silently falling back.
-    if resolved.get("use_model_template") and base_model and \
+    if resolved.get("mode") == "text":
+        base["template_source"] = "raw text"
+    elif resolved.get("use_model_template") and base_model and \
             not resolved.get("chat_template"):
         found = await model_chat_template(base_model)
         if found.get("available"):

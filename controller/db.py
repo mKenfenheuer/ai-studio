@@ -246,6 +246,17 @@ _ADDED_COLUMNS = [
     # and no endpoint returns it in full.
     ("users", "notify_url_enc", "TEXT"),
     ("users", "notify_events", "TEXT"),
+    # Keys for hosted models -- OpenAI, Azure, Anthropic, anything that speaks
+    # their shape. One encrypted JSON object per user rather than a column per
+    # provider, because the set of providers is a list in code and adding one
+    # should not mean migrating the database. Encrypted like the Hugging Face
+    # token, for the same reason: it is somebody's billable credential.
+    ("users", "model_providers_enc", "TEXT"),
+    # {"train": 9000, "validation": 1000}. A dataset holds its splits in a
+    # reserved column on each row; this is the tally, taken once when the file
+    # is written so that no page has to count two million rows to draw a
+    # badge. NULL means a dataset from before splits, which is all one split.
+    ("datasets", "splits", "TEXT"),
     # Where this account comes from. NULL means a password on this studio;
     # anything else is the id of a row in `idp`, and the account signs in
     # through that provider instead.
@@ -684,7 +695,8 @@ def update_user(user_id: str, **fields: Any) -> None:
     allowed = {"display_name", "role", "active", "password_hash", "last_login",
                "must_change", "hf_token_enc", "hf_username", "hf_fullname",
                "hf_avatar", "hf_orgs", "hf_can_write", "hf_checked_at",
-               "notify_url_enc", "notify_events", "provider", "external_id",
+               "notify_url_enc", "notify_events", "model_providers_enc",
+               "provider", "external_id",
                "email", "avatar_url", "job_title", "department", "groups",
                "synced_at", "pending", "username"}
     sets, args = [], []
@@ -1027,6 +1039,11 @@ def _hydrate_dataset(r: dict) -> dict:
     r["columns"] = json.loads(r.get("columns") or "[]")
     r["format"] = json.loads(r.get("format") or "{}")
     r["recipe"] = json.loads(r.get("recipe") or "{}")
+    # {name: rows}. Absent on datasets written before splits existed, which
+    # are one unnamed split of everything -- said here rather than at each of
+    # the half-dozen places that read it.
+    r["splits"] = json.loads(r.get("splits") or "null") or (
+        {"train": r.get("rows") or 0} if r.get("rows") else {})
     return r
 
 
@@ -1047,13 +1064,15 @@ def list_datasets(owner_id: str | None = None) -> list[dict]:
 
 
 def update_dataset(dataset_id: str, **fields: Any) -> None:
-    allowed = {"name", "notes", "rows", "bytes", "columns", "format", "origin"}
+    allowed = {"name", "notes", "rows", "bytes", "columns", "format", "origin",
+               "splits", "recipe"}
     sets, args = [], []
     for k, v in fields.items():
         if k not in allowed:
             raise ValueError("refusing to update unknown column %r" % k)
         sets.append("%s=?" % k)
-        args.append(json.dumps(v) if k in ("columns", "format") else v)
+        args.append(json.dumps(v)
+                    if k in ("columns", "format", "splits", "recipe") else v)
     if not sets:
         return
     sets.append("updated_at=?")

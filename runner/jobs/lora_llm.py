@@ -146,7 +146,13 @@ def run(cfg: dict, ctx: Any) -> dict:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    base_model = cfg["base_model"]
+    # Not cfg["base_model"]. A run built on a model this studio trained from
+    # scratch has no Hub id at all -- the base is the artifact fetched below,
+    # and the controller deliberately records only `base_model_job` for it.
+    # Reading the key outright raised KeyError('base_model') here, thirteen
+    # lines before the code that would have filled it in, and the run died in
+    # a tenth of a second with nothing but the word "base_model" to show.
+    base_model = cfg.get("base_model")
     out_dir = Path(ctx.workdir) / "adapter"
     caps = ctx.capabilities
 
@@ -172,6 +178,14 @@ def run(cfg: dict, ctx: Any) -> dict:
             base_model = str(fetched)
             ctx.log("Fine-tuning a model this studio built, not one from "
                     "Hugging Face.")
+
+    # Said here rather than left to `from_pretrained(None)`, which reports it
+    # as a type error about a path it was never given.
+    if not base_model:
+        raise ValueError(
+            "This run has no base model to train on. It is an adapter, which "
+            "needs the model it was built for, and that model is not recorded "
+            "on the run it continues.")
 
     # ---- resolve settings against what this machine can actually do ----
     dtype_name = cfg.get("dtype") or caps.get("recommended_dtype", "float32")
@@ -316,6 +330,19 @@ def run(cfg: dict, ctx: Any) -> dict:
     if cfg.get("dataset_is_local"):
         ds = load_dataset("json", data_files=source.local_copy(cfg, ctx),
                           split="train")
+        # A studio dataset is one file holding every split, with the split
+        # named on each row. "train" is the whole file for a dataset that has
+        # no splits, so the filter only bites where splits actually exist.
+        want = (cfg.get("dataset_split") or "").strip()
+        if want and "split" in (ds.column_names or []):
+            before = len(ds)
+            ds = ds.filter(lambda r: (r.get("split") or "train") == want)
+            ctx.log("Training on the %s split: %s of %s rows."
+                    % (want, f"{len(ds):,}", f"{before:,}"))
+            if not len(ds):
+                raise ValueError(
+                    "That dataset has no rows in a split called %r. Check the "
+                    "split chosen for this run." % want)
     else:
         ds = load_dataset(ds_name, cfg.get("dataset_config") or None,
                           split=cfg.get("dataset_split") or "train",

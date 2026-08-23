@@ -4,14 +4,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import (APIRouter, Body, HTTPException, Query, Request, Response,
-                     UploadFile)
+from fastapi import (APIRouter, Body, File, HTTPException, Query, Request,
+                     Response, UploadFile)
 from fastapi.responses import FileResponse
 
 from common import formatting
 
 from .. import datasets as ds
-from .. import db, hfaccount
+from .. import db, hfaccount, hub
 from .security import current_user, require_edit, require_owner, require_view
 
 router = APIRouter(prefix="/api/datasets")
@@ -60,19 +60,61 @@ async def inspect_dataset(request: Request, dataset_id: str,
     return ds.inspect(_get(request, dataset_id), min(int(sample), 20000))
 
 
+# How far a search will read before it stops looking. A search that scans a
+# two-million-row file holds the controller for a minute; one that scans the
+# first fifty thousand answers in a moment and says what it did.
+SEARCH_SCAN = 50_000
+
+
 @router.get("/{dataset_id}/rows")
 async def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
-                       limit: int = 25) -> dict:
+                       limit: int = 25, q: str = "", split: str = "") -> dict:
+    """A page of rows, rendered the way training will read them.
+
+    `q` filters to rows containing that text, matched against the rendered
+    form rather than the raw JSON -- searching for a word should find it
+    whether it lives in `text`, in a message, or three keys deep.
+    """
     d = _get(request, dataset_id)
     limit = min(max(int(limit), 1), 200)
-    rows = []
+    offset = max(int(offset), 0)
     fmt = formatting.resolve_format(d.get("format") or {})
-    for i, row in enumerate(ds.iter_rows(dataset_id, offset + limit)):
-        if i < offset:
+    needle = (q or "").strip().lower()
+    want = (split or "").strip() or None
+    in_split = (d.get("splits") or {}).get(want) if want else (d.get("rows") or 0)
+    rows = []
+
+    if not needle:
+        seen = 0
+        for i, row in ds.iter_indexed(dataset_id, want):
+            seen += 1
+            if seen <= offset:
+                continue
+            rows.append({"index": i, "row": row,
+                         "rendered": formatting.format_example(row, fmt) or ""})
+            if len(rows) >= limit:
+                break
+        return {"rows": rows, "offset": offset, "total": d.get("rows") or 0,
+                "matched": in_split or 0, "query": "", "split": want or "",
+                "columns": d.get("columns") or []}
+
+    matched = 0
+    scanned = 0
+    for i, row in ds.iter_indexed(dataset_id, want):
+        scanned += 1
+        if scanned > SEARCH_SCAN:
+            break
+        rendered = formatting.format_example(row, fmt) or ""
+        if needle not in rendered.lower() \
+                and needle not in json.dumps(row, ensure_ascii=False).lower():
             continue
-        rows.append({"index": i, "row": row,
-                     "rendered": formatting.format_example(row, fmt) or ""})
-    return {"rows": rows, "offset": offset, "total": d.get("rows") or 0}
+        matched += 1
+        if matched > offset and len(rows) < limit:
+            rows.append({"index": i, "row": row, "rendered": rendered})
+    return {"rows": rows, "offset": offset, "total": d.get("rows") or 0,
+            "matched": matched, "query": q, "split": want or "",
+            "columns": d.get("columns") or [],
+            "scanned": scanned, "capped": scanned >= SEARCH_SCAN}
 
 
 @router.get("/{dataset_id}/dataset-file")
@@ -98,26 +140,80 @@ async def download_dataset(request: Request, dataset_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/upload")
-async def upload_dataset(request: Request, file: UploadFile,
-                         name: str = Query(default="")) -> dict:
-    user = current_user(request)
-    blob = await file.read()
-    if len(blob) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413, "That file is larger than %d MB. Put a corpus this size on "
-                 "the Hub and import it by name instead."
-                 % (MAX_UPLOAD_BYTES // (1024 * 1024)))
-    try:
-        rows = list(ds.rows_from_upload(file.filename or "", blob))
-    except ValueError as e:
-        raise HTTPException(
-            400, "That file could not be read as JSONL, JSON, CSV or plain "
-                 "text (%s)." % e) from e
-    if not rows:
-        raise HTTPException(400, "That file contained no rows.")
+async def upload_dataset(request: Request,
+                         file: list[UploadFile] = File(...),
+                         name: str = Query(default=""),
+                         text_split: str = Query(default="auto"),
+                         chunk_chars: int = Query(default=ds.DEFAULT_CHUNK_CHARS),
+                         overlap: int = Query(default=ds.DEFAULT_OVERLAP),
+                         delimiter: str = Query(default=""),
+                         header: str = Query(default="auto"),
+                         split: str = Query(default=""),
+                         into: str = Query(default="")) -> dict:
+    """One or many files, in whatever format, as one dataset.
 
-    created = ds.register(user["id"], name or (file.filename or "Uploaded data"),
-                          "upload", iter(rows), origin=file.filename)
+    Many rather than one because data arrives as a folder at least as often as
+    it arrives as a file, and uploading eighty transcripts one at a time is
+    the point at which people give up and go back to a notebook. Each file's
+    rows are tagged with the file they came from when there is more than one.
+
+    `split` is the split these rows belong to -- train unless you say
+    otherwise -- and `into` adds them to a dataset that already exists rather
+    than making another one. `text_split` is a different thing entirely: how
+    a prose file is cut into rows.
+    """
+    user = current_user(request)
+    files = [f for f in file if (f.filename or "").strip() or f.size]
+    if not files:
+        raise HTTPException(400, "No file was uploaded.")
+    options = {"text_split": text_split, "chunk_chars": chunk_chars,
+               "overlap": overlap, "delimiter": delimiter, "header": header}
+    split = (split or "").strip() or ds.DEFAULT_SPLIT
+    target = _get(request, into, "edit") if into else None
+
+    rows: list[dict] = []
+    failures: list[str] = []
+    total = 0
+    for f in files:
+        blob = await f.read()
+        total += len(blob)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                413, "That is more than %d MB in one upload. Put a corpus "
+                     "this size on the Hub and import it by name instead."
+                     % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+        try:
+            rows += list(ds.rows_from_upload(
+                f.filename or "", blob, options,
+                source=f.filename if len(files) > 1 else None,
+                problems=failures))
+        except ValueError as e:
+            failures.append("%s: %s" % (f.filename or "that file", e))
+        except Exception as e:  # noqa: BLE001 - a malformed file is the user's
+            failures.append("%s: %s" % (f.filename or "that file", e))
+
+    if not rows:
+        raise HTTPException(
+            400, "Nothing could be read. " + (" ".join(failures[:3])
+                 or "The files contained no rows."))
+
+    if target:
+        # Added to a dataset that already exists, which is what "here is the
+        # test set for the data I uploaded yesterday" means.
+        created = ds.append_rows(target, rows, split)
+        created["skipped"] = failures
+        created["added"] = len(rows)
+        return created
+
+    label = name or (files[0].filename or "Uploaded data") if len(files) == 1 \
+        else (name or "%d uploaded files" % len(files))
+    origin = files[0].filename if len(files) == 1 \
+        else "%d files" % len(files)
+    created = ds.register(user["id"], label, "upload", iter(rows),
+                          split=split, origin=origin)
+    # Not an error and not silence: a folder where two files of ninety could
+    # not be read is a successful import with something worth knowing in it.
+    created["skipped"] = failures
     return created
 
 
@@ -127,10 +223,40 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
     hub_id = (payload.get("dataset") or "").strip()
     if not hub_id:
         raise HTTPException(400, "Which dataset on the Hub?")
+    # One split or several. "splits" is what the picker sends; "split" is kept
+    # so an older client, or a script somebody wrote against this endpoint,
+    # keeps working.
+    wanted = payload.get("splits") or payload.get("split") or ""
+    if isinstance(wanted, str):
+        wanted = [s.strip() for s in wanted.split(",") if s.strip()]
+    if not wanted:
+        # Nothing named means everything there is. Defaulting to "train" was a
+        # decision disguised as a default: it silently left the test split --
+        # the reason anybody can tell learning from memorising -- behind.
+        try:
+            found = await hub.dataset_configs(hub_id)
+        except Exception:  # noqa: BLE001 - a lookup failure is not fatal here
+            found = {}
+        config_name = payload.get("config")
+        for c in found.get("configs") or []:
+            if not config_name or c.get("name") == config_name:
+                wanted = list(c.get("splits") or [])
+                if not config_name:
+                    config_name = c.get("name")
+                break
+        payload = {**payload, "config": config_name}
+        wanted = wanted or ["train"]
+
+    # 0 means every row. The old default of 5,000 quietly truncated datasets
+    # to a demo-sized slice, which is fine for a first look and wrong for
+    # everything after it.
+    limit = payload.get("limit")
+    limit = ds.MAX_ROWS if limit in (None, "", 0, "0") else int(limit)
+    incomplete: dict = {}
     try:
         rows = await ds.rows_from_hub(
-            hub_id, payload.get("config"), payload.get("split") or "train",
-            int(payload.get("limit") or 5000), hfaccount.token_for(user))
+            hub_id, payload.get("config"), wanted,
+            limit, hfaccount.token_for(user), incomplete=incomplete)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     if not rows:
@@ -138,10 +264,20 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
 
     created = ds.register(
         user["id"], payload.get("name") or hub_id.split("/")[-1], "hub",
-        iter(rows), origin=hub_id,
-        notes="Imported %s rows from %s (%s / %s)."
-              % (f"{len(rows):,}", hub_id, payload.get("config") or "default",
-                 payload.get("split") or "train"))
+        iter(rows), origin=hub_id)
+    # The note describes what arrived, not what was asked for. Those are the
+    # same thing right up until Hugging Face stops serving rows halfway.
+    got = created.get("splits") or {}
+    note = "Imported %s rows from %s (%s): %s." % (
+        f"{created.get('rows', 0):,}", hub_id,
+        payload.get("config") or "default",
+        ", ".join("%s %s" % (f"{n:,}", name) for name, n in got.items()) or "none")
+    if incomplete:
+        note += (" Hugging Face stopped serving rows partway through %s, so "
+                 "that split is incomplete." % ", ".join(incomplete))
+    db.update_dataset(created["id"], notes=note)
+    created["notes"] = note
+    created["incomplete"] = incomplete
     return created
 
 
@@ -172,6 +308,75 @@ async def transform_dataset(request: Request, dataset_id: str,
     try:
         return ds.transform(d, payload.get("ops") or {}, user["id"],
                             payload.get("name"))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.post("/{dataset_id}/transform/preview")
+async def preview_transform(request: Request, dataset_id: str,
+                            payload: dict = Body(...)) -> dict:
+    """What a transform would do, without doing it."""
+    d = _get(request, dataset_id)
+    try:
+        return ds.preview_transform(d, payload.get("ops") or {},
+                                    int(payload.get("sample") or 2000))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.post("/{dataset_id}/rows/add")
+async def add_rows(request: Request, dataset_id: str,
+                   payload: dict = Body(...)) -> dict:
+    """Write new rows by hand, into a named split.
+
+    The smallest thing a data tool has to be able to do and the one most
+    often missing: you read the rows, you see the example that is missing,
+    you add it. Rows arrive as objects with the columns this dataset already
+    has, or as free text for a plain-text dataset.
+    """
+    d = _get(request, dataset_id, "edit")
+    rows = payload.get("rows")
+    if isinstance(rows, str):
+        # A textarea of JSONL, or of plain lines for a text dataset.
+        field = (d.get("format") or {}).get("text_field") or "text"
+        parsed = []
+        for line in rows.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                except ValueError as e:
+                    raise HTTPException(
+                        400, "That is not valid JSON: %s" % e) from e
+                if isinstance(obj, dict):
+                    parsed.append(obj)
+            else:
+                parsed.append({field: line})
+        rows = parsed
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(400, "No rows were given.")
+    if not all(isinstance(r, dict) for r in rows):
+        raise HTTPException(400, "Every row has to be an object.")
+    return ds.append_rows(d, rows, (payload.get("split") or "").strip()
+                          or ds.DEFAULT_SPLIT)
+
+
+@router.post("/{dataset_id}/rows/edit")
+async def edit_rows(request: Request, dataset_id: str,
+                    payload: dict = Body(...)) -> dict:
+    """Delete rows, move them to another split, or rewrite one.
+
+    Changes the dataset in place, which nothing else here does. Curating data
+    is the work, and requiring a derived copy to remove four bad rows is how a
+    library fills up with near-identical datasets nobody can tell apart.
+    """
+    d = _get(request, dataset_id, "edit")
+    try:
+        return ds.edit_rows(d, delete=payload.get("delete"),
+                            move=payload.get("move"),
+                            update=payload.get("update"))
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 

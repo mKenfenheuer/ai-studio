@@ -207,6 +207,120 @@ Three things it catches before a run starts rather than an hour in:
   on half the dataset, so empty and unreadable are counted separately and only
   one of them is an error.
 
+### Your own files, and turning them into training data
+
+The dataset library takes files as they actually arrive, not as a trainer
+wishes they had been written:
+
+| Comes in as | Becomes |
+| --- | --- |
+| `.jsonl`, `.json` | rows, including a JSON array, `{"rows": [...]}`, or a dict of columns |
+| `.csv`, `.tsv` | rows, with the delimiter sniffed and the header row detected rather than assumed |
+| `.txt`, `.md` | rows cut by line, by paragraph, by document, or into fixed-size chunks with overlap |
+| `.html` | the text, with scripts, styles and tags removed |
+| `.docx` | its paragraphs — read out of the zip with the standard library, so nothing extra is installed |
+| `.zip` | every readable file inside it, each row tagged with the file it came from |
+| several files at once | one dataset, with a `source` column |
+
+`.pdf` works only if `pypdf` happens to be installed on the controller;
+otherwise it says so rather than importing gibberish. `.parquet` and `.xlsx`
+are refused with the shorter route named — the Hub import for one, "save as
+CSV" for the other.
+
+How a text file is cut into rows is a choice, not a guess, because the same
+file is a corpus of one-line examples or a book depending on what you meant.
+The default reads the file and picks: paragraphs where there are blank lines
+between them, otherwise one row per line.
+
+Once a dataset is in, every operation writes a **new** dataset and records
+what it did, so nothing is destructive and the lineage is visible: drop empty
+rows, remove duplicates, filter by length or by regex, sample, shuffle, split
+off a validation slice, merge several, rewrite as chat turns — and rearrange
+the columns. That last one is what makes an arbitrary spreadsheet trainable:
+rename a column to a name the trainer knows, or build one out of the others
+with a template like `Q: {question}\nA: {answer}` and drop the rest.
+
+### The workbench
+
+Rows are shown as a **table**, because reading data as JSON is reading it
+through a keyhole: you cannot compare two rows, you cannot see that a column
+is empty in half of them, and the punctuation outweighs the content. Columns
+become columns; a value that is a conversation or a tool schema is summarised
+in place ("4 messages") and opens in full on a click. One toggle switches to
+what the trainer actually reads.
+
+From the same panel: search, page, filter by split, select rows and delete
+them or move them to another split, open one row and correct a field, and add
+new rows by hand. Those change the dataset in place — curating data is the
+work, and requiring a derived copy to fix four bad rows is how a library fills
+up with near-identical datasets nobody can tell apart. Every such edit is
+recorded in the dataset's own history.
+
+Everything else still writes a **new** dataset, and now shows you what it
+would do first: **Show me what it would do** runs the same code over a sample
+and reports how many rows would survive, which steps ran, and the first rows
+after — before anything is created.
+
+Columns can be **calculated**, one per line, `name = template`:
+
+```
+who  = {first|title} {last|title}
+text = Q: {question}
+A: {answer|trim}
+```
+
+Any `{column}` is replaced with that row's value, so this is how columns are
+concatenated and how a spreadsheet becomes trainable. Values pass through
+`|` filters — `upper`, `lower`, `title`, `trim`, `lines`, `first`, `last`,
+`len`, `words`, `json`, `slice:0:200` — a short list of verbs rather than an
+expression language, because a spreadsheet's worth of functions in a text box
+is a programming language nobody wrote documentation for. A column can also be
+**split** into several (`name -> first, last  on  ,`), and columns can be
+renamed or dropped, in that order: dropped after the calculations, so a column
+a template reads from can still be thrown away.
+
+### Splits
+
+A dataset holds all of its splits together, with each row naming the split it
+belongs to. Importing from the Hub brings in **every split, in full** unless
+you say otherwise — the old default of "the train split, first 5,000 rows" was
+a decision disguised as a default, and it silently left behind the test split
+that makes a held-out score mean anything. Tick fewer splits if you want
+fewer; they arrive as one dataset rather than three; uploading, say which split the file is, and
+add the test set to the dataset the training data is already in. Every screen
+that reads rows can be pointed at one split — the row browser, the training
+preview, and the trainer itself.
+
+One file with a `split` column rather than a file per split: a dataset here is
+JSONL that streams, appends and can be opened in an editor, and separate files
+would buy nothing a column does not while costing every reader a directory
+walk. The counts are taken when the file is written, so no page has to count
+two million rows to draw a badge.
+
+### Writing a dataset with a model somebody else hosts
+
+The generator can drive a **hosted** model instead of a local one: OpenAI,
+**Azure OpenAI**, Anthropic, or any service that speaks the OpenAI shape —
+Together, Groq, OpenRouter, Mistral, a vLLM or Ollama server on your own
+network, or another AI Studio. This is the one job where paying per token is
+obviously right: a large model writes the dataset, and your own small model is
+trained on what it wrote.
+
+Keys are per account, encrypted at rest, never returned to the browser, and
+attached to a run at the moment it is created — the same rule the Hugging Face
+token follows, and it means "whose key paid for this dataset" has an answer.
+Connect one on your account page; the Test button asks the model to say hello
+and reports exactly what came back, because finding out on row 1 of 5,000 is
+the failure mode worth designing against.
+
+Three request shapes cover it — OpenAI's, Azure's (deployment in the URL, key
+in `api-key`, version on the query string), and Anthropic's (`/v1/messages`, a
+system field of its own, content blocks in the reply) — and they live in one
+module that performs no I/O, so the controller's test button and the runner's
+generation loop cannot disagree about what a provider expects. Rate limits are
+waited out rather than fatal; a rejected key stops the run immediately rather
+than spending five thousand attempts discovering the same thing.
+
 ## Designing the model yourself
 
 The five sizes are a starting point, not a ceiling. "Design it yourself" opens

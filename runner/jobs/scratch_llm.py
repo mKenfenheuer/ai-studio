@@ -339,9 +339,16 @@ def _iter_texts(cfg: dict, ctx: Any) -> Iterator[str]:
                 "it in full instead." % type(e).__name__, "warn")
         ds = load_dataset(name, **kwargs)
 
+    # A studio dataset holds every split in one file, with the split named on
+    # each row. Rows from another split are skipped here rather than filtered
+    # up front, because the Hub path streams and cannot be filtered at all.
+    want = (cfg.get("dataset_split") or "").strip() if local else ""
+
     seen = 0
     unreadable = 0
     for row in ds:
+        if want and (row.get("split") or "train") != want:
+            continue
         seen += 1
         if not fmt:
             # No format recorded -- an older job, or one made through the API.

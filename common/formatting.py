@@ -31,6 +31,7 @@ _RESPONSE_FIELDS = ["output", "response", "answer", "completion"]
 _TEXT_FIELDS = ["text", "content", "document", "sentence", "raw", "body"]
 _MESSAGE_FIELDS = ["messages", "conversations", "conversation", "chat", "turns"]
 _TOOL_FIELDS = ["tools", "functions", "tool_schema"]
+_SYSTEM_FIELDS = ["system", "system_prompt"]
 _REASONING_FIELDS = ["reasoning", "reasoning_content", "thinking",
                      "thought", "analysis", "rationale"]
 
@@ -302,6 +303,42 @@ def find_messages(row: dict, field: str | None = None,
     return normalize_messages(row.get(key), selectors) if key else []
 
 
+def messages_from_pair(row: dict, fmt: dict | None = None) -> list[dict]:
+    """A conversation built out of instruction/response columns.
+
+    Half the instruction datasets on the Hub have no `messages` column at all
+    -- they are two or three flat columns, Alpaca-style. That is still a
+    conversation: one user turn and one assistant turn. Rendering it as such is
+    what lets a chat template be chosen for *any* dataset, rather than only for
+    the ones that happen to ship their turns pre-assembled.
+
+    Used only when a chat template is actually in play. Left to itself, an
+    instruction dataset still renders through the instruction template, which
+    is what a base model without a chat format wants.
+    """
+    fmt = fmt or {}
+    instr_f = fmt.get("instruction_field") or first_present(row, _INSTRUCTION_FIELDS)
+    resp_f = fmt.get("response_field") or first_present(row, _RESPONSE_FIELDS)
+    if not instr_f or not resp_f:
+        return []
+    instruction, response = row.get(instr_f), row.get(resp_f)
+    if not instruction or not response:
+        return []
+    # A separate "input" column is extra context for the instruction, not a
+    # second instruction -- the same rule the instruction template follows.
+    context = row.get("input") if instr_f != "input" else None
+    user = str(instruction) + (("\n\n" + str(context)) if context else "")
+    turns = []
+    system_f = fmt.get("system_field") or first_present(row, _SYSTEM_FIELDS)
+    if system_f and row.get(system_f):
+        turns.append({"role": "system", "content": str(row[system_f])})
+    turns.append({"role": "user", "content": user})
+    turns.append({"role": "assistant", "content": str(response)})
+    # Through the normaliser like any other conversation, so a reply with
+    # <think> tags in it is unpacked into reasoning here too.
+    return normalize_messages(turns)
+
+
 def find_tools(row: dict, field: str | None = None) -> list[dict]:
     key = field or first_present(row, _TOOL_FIELDS)
     return normalize_tools(row.get(key)) if key else []
@@ -411,6 +448,13 @@ def format_example(row: dict, fmt: dict) -> str | None:
     if mode in ("chat", "auto"):
         messages = find_messages(row, fmt.get("messages_field"),
                                  fmt.get("selectors"))
+        # An instruction dataset is a conversation that has not been assembled
+        # yet. Assemble it -- but only when a chat template was actually asked
+        # for, either by name or by the model's own. Without one, an
+        # instruction pair still belongs in the instruction template below,
+        # which is the shape a base model expects.
+        if not messages and (fmt.get("chat_template") or mode == "chat"):
+            messages = messages_from_pair(row, fmt)
         if messages:
             tools = find_tools(row, fmt.get("tools_field"))
             template = fmt.get("chat_template") or BUILTIN_CHAT_TEMPLATE
@@ -526,7 +570,9 @@ def system_prompts(rows: list[dict], fmt: dict | None = None,
     fmt = fmt or {}
     seen: list[str] = []
     for row in rows or []:
-        for m in find_messages(row, fmt.get("messages_field")):
+        turns = (find_messages(row, fmt.get("messages_field"))
+                 or messages_from_pair(row, fmt))
+        for m in turns:
             if m["role"] == "system" and m["content"].strip():
                 text = m["content"].strip()
                 if text not in seen:
@@ -662,7 +708,12 @@ def resolve_format(fmt: dict | None) -> dict:
     if spec["bos_token"]:
         specials.setdefault("bos_token", spec["bos_token"])
     fmt["specials"] = specials
-    if fmt.get("mode") in (None, "auto"):
+    # A named format implies a conversation -- unless the run also names the
+    # column its text lives in, which is how a from-scratch run says "the
+    # corpus is prose, but reserve this format's tokens in the vocabulary
+    # anyway". Forcing chat there would make every row of that corpus
+    # unreadable.
+    if fmt.get("mode") in (None, "auto") and not fmt.get("text_field"):
         fmt["mode"] = "chat"
     return fmt
 

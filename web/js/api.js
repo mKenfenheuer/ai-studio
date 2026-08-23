@@ -105,6 +105,19 @@ export const api = {
     req(`/api/jobs/${encodeURIComponent(id)}/publish`,
         { method: "POST", body: JSON.stringify(body) }),
 
+  // ---- hosted model providers -------------------------------------------
+  providers:      () => req("/api/providers"),
+  saveProvider:   (id, body) =>
+    req(`/api/providers/${encodeURIComponent(id)}`,
+        { method: "PUT", body: JSON.stringify(body) }),
+  deleteProvider: (id) =>
+    req(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  providerModels: (id) =>
+    req(`/api/providers/${encodeURIComponent(id)}/models`),
+  testProvider:   (id, model) =>
+    req(`/api/providers/${encodeURIComponent(id)}/test`,
+        { method: "POST", body: JSON.stringify({ model }) }),
+
   // ---- sharing ---------------------------------------------------------
   shares:      (kind, id) => req(`/api/${kind}s/${encodeURIComponent(id)}/shares`),
   addShare:    (kind, id, body) =>
@@ -122,14 +135,19 @@ export const api = {
   datasets:    () => req("/api/datasets"),
   dataset:     (id) => req(`/api/datasets/${encodeURIComponent(id)}`),
   datasetInspect: (id) => req(`/api/datasets/${encodeURIComponent(id)}/inspect`),
-  datasetRows: (id, offset = 0, limit = 25) =>
-    req(`/api/datasets/${encodeURIComponent(id)}/rows?offset=${offset}&limit=${limit}`),
+  datasetRows: (id, offset = 0, limit = 25, q = "", split = "") =>
+    req(`/api/datasets/${encodeURIComponent(id)}/rows?offset=${offset}`
+        + `&limit=${limit}&q=${encodeURIComponent(q)}`
+        + `&split=${encodeURIComponent(split)}`),
   importDataset: (body) =>
     req("/api/datasets/import", { method: "POST", body: JSON.stringify(body) }),
-  uploadDataset: (file, name) => {
+  // Several files at once, under one field name: the endpoint takes a list,
+  // so one file and eighty go the same way.
+  uploadDataset: (files, name, options = {}) => {
     const form = new FormData();
-    form.append("file", file);
-    return fetch(`/api/datasets/upload?name=${encodeURIComponent(name || "")}`,
+    [...files].forEach((f) => form.append("file", f));
+    const query = new URLSearchParams({ name: name || "", ...options });
+    return fetch(`/api/datasets/upload?${query}`,
                  { method: "POST", body: form, credentials: "same-origin" })
       .then(async (r) => {
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
@@ -138,6 +156,15 @@ export const api = {
   },
   renameDataset: (id, body) =>
     req(`/api/datasets/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  previewTransform: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/transform/preview`,
+        { method: "POST", body: JSON.stringify(body) }),
+  editRows: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/rows/edit`,
+        { method: "POST", body: JSON.stringify(body) }),
+  addRows: (id, body) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/rows/add`,
+        { method: "POST", body: JSON.stringify(body) }),
   transformDataset: (id, body) =>
     req(`/api/datasets/${encodeURIComponent(id)}/transform`,
         { method: "POST", body: JSON.stringify(body) }),

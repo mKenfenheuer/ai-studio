@@ -13,10 +13,12 @@ from fastapi import (Body, FastAPI, Header, HTTPException, Query, Request,
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from common import apimodels, formatting
+
 from . import architectures as arch
 from . import config, datasets as dsets, db, diagnose, hfaccount, hub, serving
-from .api import (accounts, data, evals, security, serving as serving_api,
-                  sharing, sso)
+from .api import (accounts, data, evals, providers, security,
+                  serving as serving_api, sharing, sso)
 from .scheduler import Fleet
 
 fleet = Fleet()
@@ -70,6 +72,7 @@ app.middleware("http")(security.authenticate)
 app.include_router(accounts.router)
 app.include_router(data.router)
 app.include_router(evals.router)
+app.include_router(providers.router)
 app.include_router(serving_api.router)
 app.include_router(sharing.router)
 app.include_router(sso.router)
@@ -292,6 +295,35 @@ def _check_generation_source(request: Request, cfg: dict) -> None:
         security.require_view(request, "job", src)
 
 
+def _attach_provider(user: dict | None, cfg: dict) -> None:
+    """Resolve a hosted-model choice into a usable connection.
+
+    The key is attached here, at creation, exactly as the Hugging Face token
+    is: the runner cannot ask for it later, and the run belongs to the person
+    whose key paid for it. It is stripped again from every response that hands
+    a job back to a browser -- see `_public_job`.
+    """
+    model = cfg.get("model") or {}
+    conn = providers.connection(user, model.get("provider"))
+    if not conn:
+        raise HTTPException(
+            400, "That provider is not connected to your account. Connect it "
+                 "on your account page first.")
+    if problem := apimodels.problems(conn):
+        raise HTTPException(400, problem)
+    name = apimodels.model_name(conn, model.get("model"))
+    if not name:
+        raise HTTPException(400, "Which model at %s should write it?"
+                            % apimodels.describe(conn))
+    model["model"] = name
+    model["connection"] = conn
+    model["label"] = "%s · %s" % (apimodels.describe(conn), name)
+    cfg["model"] = model
+    # It reaches the model over the network, so any machine will do -- a
+    # runner with no GPU at all is a perfectly good place to run it from.
+    cfg.setdefault("allow_cpu", True)
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request, payload: dict = Body(...)) -> dict:
     return {"id": await _create_job(request, payload)}
@@ -368,12 +400,16 @@ async def _create_job(request: Request, payload: dict) -> str:
         cfg.setdefault("format", src["config"].get("format"))
         cfg.setdefault("system_prompt", src["config"].get("system_prompt"))
     elif kind == "generate_dataset":
-        if not (cfg.get("model") or {}).get("job_id") \
-                and not (cfg.get("model") or {}).get("base_model"):
+        model = cfg.get("model") or {}
+        if not model.get("job_id") and not model.get("base_model") \
+                and not model.get("provider"):
             raise HTTPException(400, "Choose a model to write the data with.")
         if not int(cfg.get("count") or 0):
             raise HTTPException(400, "How many rows should it write?")
-        _check_generation_source(request, cfg)
+        if model.get("provider"):
+            _attach_provider(user, cfg)
+        else:
+            _check_generation_source(request, cfg)
     else:
         raise HTTPException(400, "Unknown kind of training run: %s" % kind)
 
@@ -570,8 +606,12 @@ async def get_job(request: Request, job_id: str) -> dict:
         job["queue_position"] = positions.get(job_id)
         job["queue_length"] = len(positions)
     job["resumable"] = _resumable(job)
-    # Never hand the runner's copy of the HF token back to the browser.
+    # Never hand a credential back to the browser: not the runner's copy of
+    # the Hugging Face token, and not the API key a hosted model was written
+    # with. Both went in at creation and only the runner needs them.
     job["config"].pop("hf_token", None)
+    if isinstance(job["config"].get("model"), dict):
+        job["config"]["model"].pop("connection", None)
     return job
 
 
@@ -937,17 +977,41 @@ async def hub_builtin_template() -> dict:
 
 
 @app.post("/api/hub/training-preview")
-async def hub_training_preview(payload: dict = Body(...)) -> dict:
+async def hub_training_preview(request: Request,
+                               payload: dict = Body(...)) -> dict:
     """The exact text the model will be trained on.
 
     Rendered by the same function the runner uses to build its batches, so
     what is shown here is what the model reads -- not an approximation of it.
+
+    A dataset from this studio's own library is read off the disk here rather
+    than fetched from the Hub, which is the difference between the wizard
+    showing your own rows and showing "no preview available" for every dataset
+    you brought in yourself.
     """
+    rows_source = None
+    if studio_id := payload.get("studio_dataset"):
+        d = db.get_dataset(studio_id)
+        if not d:
+            return {"available": False, "reason": "That dataset is gone."}
+        security.require_view(request, "dataset", d)
+        split = (payload.get("split") or "").strip() or None
+        rows = list(dsets.iter_rows(studio_id, 40, split))
+        rows_source = {
+            "available": bool(rows),
+            "reason": None if rows else "That split has no rows in it.",
+            "rows": rows,
+            "columns": d.get("columns") or sorted({k for r in rows for k in r}),
+            "split": split or "all",
+            "detected_format": d.get("format")
+            or formatting.detect_format(d.get("columns") or [], rows),
+        }
     try:
         return await hub.training_preview(
-            payload["dataset"], payload.get("config") or None,
+            payload.get("dataset") or "", payload.get("config") or None,
             payload.get("split") or "train", payload.get("format"),
-            payload.get("text_field"), payload.get("base_model"))
+            payload.get("text_field"), payload.get("base_model"),
+            rows_source)
     except Exception as e:  # noqa: BLE001
         return {"available": False, "reason": str(e)[:300],
                 "dataset": payload.get("dataset")}

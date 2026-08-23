@@ -246,8 +246,43 @@ input:focus, select:focus, textarea:focus {
 }
 .pick:hover { border-color: var(--accent); background: var(--surface); }
 .pick.selected { border-color: var(--accent); background: var(--accent-bg); }
+/* A recommendation, not an answer: dashed until it has actually been chosen,
+   so a step that must be answered never looks like one already was. */
+.pick.suggested { border-style: dashed; border-color: var(--accent); }
 .pick .t { font-weight: 650; display: flex; align-items: center; gap: 8px; }
 .pick .d { color: var(--text-2); font-size: 12.5px; line-height: 1.45; }
+
+/* ------------------------------------------------------- data table */
+/* Dense, scannable, and readable across a hundred columns: the header stays
+   put while the body scrolls, cells do not wrap into paragraphs, and a value
+   too big for a cell says what it is instead of being cut mid-word. */
+.grid-table { font-size: 12.5px; }
+.grid-table thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--surface);
+  border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.grid-table td {
+  max-width: 380px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: top;
+}
+.grid-table td.clickable { cursor: pointer; }
+.grid-table td.clickable:hover { background: var(--accent-bg); }
+.grid-table tr.picked td { background: var(--accent-bg); }
+
+/* A pair of buttons acting as one control. */
+.seg { display: inline-flex; border: 1px solid var(--border);
+       border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: var(--surface); }
+.seg button.on { background: var(--accent-bg); color: var(--text); font-weight: 600; }
+
+/* --------------------------------------------------------- drop zone */
+.dropzone {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 20px 14px; margin-top: 10px; text-align: center;
+  border: 1.5px dashed var(--border); border-radius: var(--radius);
+  background: var(--surface-2); transition: border-color .12s, background .12s;
+}
+.dropzone.over { border-color: var(--accent); background: var(--accent-bg); }
 
 /* ------------------------------------------------------------ steps */
 .steps { display: flex; gap: 6px; margin-bottom: 24px; flex-wrap: wrap; }

@@ -33,22 +33,45 @@ const MODES = [
 ];
 
 export async function generateView(mount) {
-  const [runners, playable] = await Promise.all([api.runners(), api.playground()]);
+  const [runners, playable, hosted] = await Promise.all([
+    api.runners(), api.playground(),
+    // A studio with no keys connected simply has no hosted options; it must
+    // not be a reason for this page to fail to open.
+    api.providers().catch(() => ({ providers: [], connected: [] })),
+  ]);
   const online = runners.filter((r) => r.status !== "offline");
+  const connected = hosted.connected || [];
+  const labelOf = Object.fromEntries(
+    (hosted.providers || []).map((p) => [p.id, p.label]));
 
   const state = {
     mode: "from_prompts",
     runnerId: online[0]?.id || null,
-    source: playable[0] ? `job:${playable[0].id}` : "",
+    source: connected.length
+      ? `api:${connected[0].provider}`
+      : (playable[0] ? `job:${playable[0].id}` : ""),
+    // Which model at the provider. Free text, because the list of models a
+    // provider offers changes weekly and a dropdown baked in here would be
+    // wrong by the time anyone read it.
+    apiModel: connected[0]?.model || "",
     count: 200,
   };
 
-  const draw = () => { mount.innerHTML = layout(state, online, playable); wire(); };
+  const draw = () => {
+    mount.innerHTML = layout(state, online, playable, connected, labelOf);
+    wire();
+  };
 
   function wire() {
     on(mount, "click", "[data-mode]", (_e, t) => { state.mode = t.dataset.mode; draw(); });
     on(mount, "change", "#genRunner", (_e, t) => { state.runnerId = t.value; });
-    on(mount, "change", "#genSource", (_e, t) => { state.source = t.value; });
+    on(mount, "change", "#genSource", (_e, t) => {
+      state.source = t.value;
+      // The model box only exists for a hosted provider, so the panel has to
+      // be redrawn rather than updated in place.
+      draw();
+    });
+    on(mount, "input", "#genApiModel", (_e, t) => { state.apiModel = t.value; });
 
     on(mount, "submit", "#genForm", async (e) => {
       e.preventDefault();
@@ -58,7 +81,13 @@ export async function generateView(mount) {
 
       const model = src.startsWith("job:")
         ? { job_id: src.slice(4), kind: kindOf(playable, src.slice(4)) }
+        : src.startsWith("api:")
+        ? { provider: src.slice(4), model: (state.apiModel || "").trim() }
         : { base_model: src, kind: "finetune_llm" };
+      if (model.provider && !model.model
+          && model.provider !== "azure") {
+        return toast("Which model at that provider should write it?", "err");
+      }
 
       const cfg = {
         mode: state.mode,
@@ -101,7 +130,7 @@ const kindOf = (playable, id) =>
 
 // ---------------------------------------------------------------------------
 
-function layout(state, online, playable) {
+function layout(state, online, playable, connected = [], labelOf = {}) {
   const mode = MODES.find((m) => m.id === state.mode);
   return html`
     <div class="page-head">
@@ -113,7 +142,8 @@ function layout(state, online, playable) {
 
     ${raw(!online.length ? html`
       <div class="callout callout-err"><strong>No machine is connected</strong>
-        Generating needs a GPU, the same as training does.</div>` : "")}
+        A generation runs as a job, so it needs a machine to run on — even a
+        hosted model is driven from one.</div>` : "")}
 
     <div class="callout callout-warn" style="margin-bottom:14px">
       <strong>Read this before you train on the result</strong>
@@ -163,20 +193,47 @@ function layout(state, online, playable) {
             <div class="field">
               <label for="genSource">Model</label>
               <select id="genSource" name="source">
-                ${raw(playable.map((p) => html`
-                  <option value="job:${p.id}"${
-                    state.source === `job:${p.id}` ? " selected" : ""}>
-                    ${p.name} — your own</option>`).join(""))}
-                <optgroup label="From Hugging Face">
+                ${raw(connected.length ? html`
+                  <optgroup label="Hosted — billed to your account">
+                    ${raw(connected.map((c) => html`
+                      <option value="api:${c.provider}"${
+                        state.source === `api:${c.provider}` ? " selected" : ""}>
+                        ${labelOf[c.provider] || c.provider}${
+                          c.deployment ? ` · ${c.deployment}` : ""}</option>`).join(""))}
+                  </optgroup>` : "")}
+                <optgroup label="On your own machine">
+                  ${raw(playable.map((p) => html`
+                    <option value="job:${p.id}"${
+                      state.source === `job:${p.id}` ? " selected" : ""}>
+                      ${p.name} — your own</option>`).join(""))}
                   ${raw(["Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-0.5B-Instruct",
                          "HuggingFaceTB/SmolLM2-1.7B-Instruct"].map((m) =>
-                    `<option value="${esc(m)}">${esc(m)}</option>`).join(""))}
+                    `<option value="${esc(m)}"${
+                      state.source === m ? " selected" : ""}>${esc(m)} — from Hugging Face</option>`).join(""))}
                 </optgroup>
               </select>
               <div class="hint">A bigger model writes better data and writes it
                 more slowly. This is the one place where paying for quality is
                 obviously worth it — the data outlives the run.</div>
             </div>
+
+            ${raw(state.source.startsWith("api:") ? html`
+              <div class="field">
+                <label for="genApiModel">Which model there</label>
+                <input id="genApiModel" class="mono" value="${state.apiModel}"
+                       placeholder="${state.source === "api:azure"
+                         ? "leave blank to use the deployment" : "model name"}">
+                <div class="hint">Exactly as the provider names it.
+                  <a href="#/account">Your account page</a> lists what this
+                  connection can reach.</div>
+              </div>
+              <div class="callout" style="margin:0">
+                <strong>This does not use the GPU</strong>
+                The rows are written over the network and billed to the account
+                you connected. A machine is still chosen below, because the run
+                is a job like any other — it just spends network rather than
+                VRAM.
+              </div>` : "")}
             <div class="field">
               <label for="genRunner">Machine</label>
               <select id="genRunner" name="runner">

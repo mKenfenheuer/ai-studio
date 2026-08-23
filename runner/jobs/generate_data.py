@@ -52,11 +52,17 @@ def run(cfg: dict, ctx: Any) -> dict:
     target = int(cfg.get("count") or 100)
     out_path = Path(ctx.workdir) / "generated.jsonl"
 
-    host = inference.ModelHost(ctx.controller_url, ctx.runner_token,
-                               ctx.capabilities)
     spec = dict(cfg.get("model") or {})
     spec.setdefault("hf_token", ctx.hf_token)
-    if not spec.get("job_id") and not spec.get("base_model"):
+    # Two kinds of writer, one interface. A hosted model is reached over the
+    # network and a local one is loaded onto the GPU, and the loop below cares
+    # about neither -- it asks for a reply and gets one.
+    if spec.get("connection"):
+        host: Any = _HostedModel(spec, ctx)
+    elif spec.get("job_id") or spec.get("base_model"):
+        host = inference.ModelHost(ctx.controller_url, ctx.runner_token,
+                                   ctx.capabilities)
+    else:
         raise ValueError("No model was chosen to generate the data with.")
 
     ctx.progress(0, target, stage="loading_model")
@@ -95,6 +101,11 @@ def run(cfg: dict, ctx: Any) -> dict:
             try:
                 result = host.generate(spec, messages, params, None,
                                        lambda _l: None)
+            except ProviderRefused:
+                # A rejected key or a model that does not exist is not a bad
+                # row: it is every row. Carrying on would spend five thousand
+                # attempts discovering the same thing.
+                raise
             except Exception as e:  # noqa: BLE001 - one bad row must not end the run
                 ctx.log("Row %d failed (%s); carrying on." % (i + 1, type(e).__name__),
                         "debug")
@@ -149,6 +160,119 @@ def run(cfg: dict, ctx: Any) -> dict:
         "stopped_early": stopped_early, "target": target,
         "duration_s": time.time() - t0, "mode": mode,
     })
+
+
+# ---------------------------------------------------------------------------
+# A model that is not on this machine
+# ---------------------------------------------------------------------------
+
+class ProviderRefused(RuntimeError):
+    """The provider said no in a way that will not change on the next row."""
+
+
+# Attempts per row before giving up on it, and the wait between them. Rate
+# limits are a fact of every hosted API, and a thousand-row generation that
+# fails the moment one arrives is not a feature.
+_ATTEMPTS = 4
+_BACKOFF = (2, 8, 20)
+
+
+class _HostedModel:
+    """A model behind an API, wearing the two methods ModelHost has.
+
+    The generation loop asks for a reply and gets one; whether that took a
+    GPU or a POST is not its business. Everything about *which* API and what
+    its request looks like lives in common/apimodels.py, so the preview in the
+    browser and the run on the machine cannot disagree about it.
+    """
+
+    def __init__(self, spec: dict, ctx: Any) -> None:
+        import httpx
+        from common import apimodels
+
+        self.api = apimodels
+        self.conn = dict(spec.get("connection") or {})
+        self.model = apimodels.model_name(self.conn, spec.get("model"))
+        self.ctx = ctx
+        self.warned_limit = False
+        if problem := apimodels.problems(self.conn):
+            raise ValueError(problem)
+        if not self.model:
+            raise ValueError("No model was named at %s."
+                             % apimodels.describe(self.conn))
+        # One client for the whole run: a new TLS handshake per row is most of
+        # the time a small row takes.
+        self.client = httpx.Client(timeout=120.0)
+
+    def ensure_loaded(self, _spec: dict, log) -> None:
+        log("Writing with %s, over the network. This machine's GPU is not "
+            "used -- the rows are billed to the account you connected."
+            % self.api.describe(self.conn))
+
+    def generate(self, _spec: dict, messages: list[dict], params: dict,
+                 _stop, _log) -> dict:
+        import httpx
+
+        req = self.api.chat_request(self.conn, self.model, messages, params)
+        body = req["json"]
+        started = time.time()
+        last = ""
+        for attempt in range(_ATTEMPTS):
+            try:
+                r = self.client.post(req["url"], headers=req["headers"],
+                                     json=body)
+            except httpx.HTTPError as e:
+                last = str(e)
+                self._wait(attempt, None, "the network")
+                continue
+
+            if r.status_code < 400:
+                data = r.json()
+                usage = self.api.chat_usage(self.conn, data)
+                elapsed = max(time.time() - started, 1e-6)
+                return {
+                    "text": self.api.chat_text(self.conn, data),
+                    "tokens_per_sec": round(usage["output_tokens"] / elapsed, 2),
+                    "usage": usage,
+                }
+
+            last = self.api.error_message(self.conn, r.status_code, _json(r))
+            # A parameter this model spells differently. Fix it once and the
+            # rest of the run uses the corrected body.
+            if fixed := self.api.retry_body(self.conn, body, r.text):
+                self.ctx.log("Adjusting the request for this model: %s"
+                             % ", ".join(sorted(set(fixed) - set(body))
+                                         or ["dropped an unsupported setting"]))
+                body = fixed
+                continue
+            if r.status_code in (401, 403, 404):
+                raise ProviderRefused(last)
+            if r.status_code == 429 or r.status_code >= 500:
+                self._wait(attempt, r.headers.get("retry-after"), "the provider")
+                continue
+            raise ProviderRefused(last)
+        raise RuntimeError(last or "no reply")
+
+    def _wait(self, attempt: int, retry_after: str | None, who: str) -> None:
+        delay = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+        if retry_after:
+            try:
+                delay = max(delay, min(float(retry_after), 60))
+            except ValueError:
+                pass
+        if not self.warned_limit:
+            self.warned_limit = True
+            self.ctx.log("%s asked this run to slow down. Waiting %ds and "
+                         "carrying on -- this is their rate limit, not the "
+                         "studio's." % (who.capitalize(), delay), "warn")
+        time.sleep(delay)
+
+
+def _json(r: Any):
+    try:
+        return r.json()
+    except ValueError:
+        return r.text
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +426,7 @@ def _clip(text: str, n: int = 110) -> str:
 # ---------------------------------------------------------------------------
 
 def _preamble(ctx: Any, cfg: dict, mode: str, target: int, spec: dict) -> None:
-    who = spec.get("base_model") or "the model you trained"
+    who = spec.get("label") or spec.get("base_model") or "the model you trained"
     ctx.log("Writing %s rows with %s." % (f"{target:,}", who))
     ctx.log("Generated data is not free data. Three things go wrong with it, "
             "and none of them look like failure while it runs:")

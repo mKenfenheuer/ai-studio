@@ -1,5 +1,6 @@
 /** Your account: your name, your password, how you are told a run ended,
- *  and your Hugging Face connection. */
+ *  your Hugging Face connection, and the hosted models you can write data
+ *  with. */
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo,
          askForNotifications } from "../util.js";
@@ -8,13 +9,17 @@ export async function accountView(mount) {
   let me = await api.me();
   let alerts = await api.notifyState();
   let keys = await api.apiKeys();
+  let hosted = await api.providers();
   // The one time a key is visible. Held in memory only, and dropped as soon
   // as the page is left -- there is nowhere it could be stored that would not
   // be a worse place than the user's own password manager.
   let freshKey = null;
+  // Which provider's form is open. Only one at a time: they are forms with a
+  // secret in them, not a list to browse.
+  let opening = null;
 
   const draw = () => {
-    mount.innerHTML = layout(me, alerts, keys, freshKey);
+    mount.innerHTML = layout(me, alerts, keys, freshKey, hosted, opening);
     wire();
   };
 
@@ -137,6 +142,73 @@ export async function accountView(mount) {
       } catch (ex) { toast(ex.message, "err"); }
     });
 
+    on(mount, "click", "[data-open-provider]", (_e, t) => {
+      opening = opening === t.dataset.openProvider ? null : t.dataset.openProvider;
+      draw();
+    });
+
+    on(mount, "submit", "[data-provider-form]", async (e) => {
+      e.preventDefault();
+      const id = e.target.dataset.providerForm;
+      const body = Object.fromEntries(new FormData(e.target).entries());
+      try {
+        await api.saveProvider(id, body);
+        hosted = await api.providers();
+        opening = null;
+        toast("Saved. Nothing was sent anywhere yet — use Test to check it.", "ok");
+        draw();
+      } catch (ex) { toast(ex.message, "err"); }
+    });
+
+    on(mount, "click", "[data-test-provider]", async (_e, t) => {
+      const id = t.dataset.testProvider;
+      const box = $(`[data-provider-result="${id}"]`, mount);
+      const model = $(`[data-provider-model="${id}"]`, mount)?.value || "";
+      box.innerHTML = `<span class="muted tiny">Asking ${esc(id)} to say hello…</span>`;
+      try {
+        const r = await api.testProvider(id, model);
+        box.innerHTML = `<div class="callout callout-ok" style="margin-top:8px">
+          <strong>${esc(r.model)} answered</strong>
+          "${esc(r.reply || "(nothing)")}" —
+          ${r.usage.input_tokens + r.usage.output_tokens} tokens.</div>`;
+        hosted = await api.providers();
+      } catch (ex) {
+        box.innerHTML = `<div class="callout callout-err" style="margin-top:8px">${
+          esc(ex.message)}</div>`;
+      }
+    });
+
+    on(mount, "click", "[data-list-models]", async (_e, t) => {
+      const id = t.dataset.listModels;
+      const box = $(`[data-provider-result="${id}"]`, mount);
+      box.innerHTML = `<span class="muted tiny">Asking what it can reach…</span>`;
+      try {
+        const r = await api.providerModels(id);
+        box.innerHTML = `<div class="callout" style="margin-top:8px">
+          <strong>${r.models.length} model(s)</strong>
+          ${raw(r.note ? esc(r.note) : "")}
+          <div class="mono tiny" style="max-height:140px;overflow:auto;margin-top:6px">${
+            r.models.map((m) => esc(m)).join("<br>")}</div></div>`;
+      } catch (ex) {
+        box.innerHTML = `<div class="callout callout-err" style="margin-top:8px">${
+          esc(ex.message)}</div>`;
+      }
+    });
+
+    on(mount, "click", "[data-forget-provider]", async (_e, t) => {
+      const id = t.dataset.forgetProvider;
+      if (!confirm(`Disconnect ${id}?
+
+The key is deleted from this studio. `
+                   + "Runs already queued keep going.")) return;
+      try {
+        const r = await api.deleteProvider(id);
+        hosted = await api.providers();
+        toast(r.note || "Disconnected.", "ok");
+        draw();
+      } catch (ex) { toast(ex.message, "err"); }
+    });
+
     on(mount, "submit", "#hfForm", async (e) => {
       e.preventDefault();
       const token = $("#hfToken", mount).value.trim();
@@ -203,7 +275,7 @@ export async function accountView(mount) {
 
 // ---------------------------------------------------------------------------
 
-function layout(me, alerts, keys, freshKey) {
+function layout(me, alerts, keys, freshKey, hosted, opening) {
   const hf = me.hf || {};
   return html`
     <div class="page-head">
@@ -265,6 +337,7 @@ function layout(me, alerts, keys, freshKey) {
         ${raw(keysCard(keys, freshKey))}
         ${raw(alertCard(alerts))}
         ${raw(hfCard(hf))}
+        ${raw(hostedCard(hosted, opening))}
       </div>
     </div>`;
 }
@@ -504,4 +577,85 @@ function shortAgent(ua) {
     : /Linux/.test(ua) ? "Linux" : "";
   const browser = m ? m[0].split("/")[0].replace("Edg", "Edge") : "browser";
   return os ? `${browser} on ${os}` : browser;
+}
+
+/** Hosted models: OpenAI, Azure OpenAI, Anthropic, anything OpenAI-shaped.
+ *
+ *  Here rather than in Settings because a key is yours and is billed to you.
+ *  What it unlocks is one thing — writing a dataset with a model far larger
+ *  than anything this hardware could run — so the card says that rather than
+ *  presenting itself as a general integration surface. */
+function hostedCard(hosted, opening) {
+  const catalogue = hosted?.providers || [];
+  const connected = new Map((hosted?.connected || []).map((c) => [c.provider, c]));
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3>Hosted models</h3>
+      <p class="muted tiny">Connect an account and this studio can write
+        datasets with a model far larger than this hardware could run — then
+        train your own small one on what it wrote. Keys are encrypted, are
+        never shown again, and are only ever sent to the provider you gave
+        them for. Every row is billed to you.</p>
+
+      ${raw(catalogue.map((p) => {
+        const c = connected.get(p.id);
+        const open = opening === p.id;
+        return html`
+          <div style="border-top:1px solid var(--border);padding:10px 0">
+            <div class="row-between" style="gap:8px;flex-wrap:wrap">
+              <div style="min-width:0">
+                <strong class="tiny">${p.label}</strong>
+                ${raw(c ? `<span class="badge badge-ok">connected</span>` : "")}
+                ${raw(c?.key_hint ? `<span class="badge">key ${esc(c.key_hint)}</span>` : "")}
+                <p class="muted tiny" style="margin:2px 0 0">${p.blurb}</p>
+              </div>
+              <div class="row" style="gap:6px">
+                ${raw(c ? `<button class="btn-sm" data-test-provider="${p.id}">Test</button>` : "")}
+                ${raw(c && p.lists_models
+                  ? `<button class="btn-sm" data-list-models="${p.id}">Models</button>` : "")}
+                <button class="btn-sm" data-open-provider="${p.id}">${
+                  open ? "Close" : c ? "Edit" : "Connect"}</button>
+              </div>
+            </div>
+
+            ${raw(c ? html`
+              <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap">
+                <input class="mono" data-provider-model="${p.id}"
+                       style="max-width:280px" placeholder="${
+                         p.id === "azure" ? c.deployment : "model to test"}"
+                       value="${c.model || (p.id === "azure" ? c.deployment : "")}">
+                <button class="btn-sm btn-danger" data-forget-provider="${p.id}">Disconnect</button>
+              </div>` : "")}
+
+            <div data-provider-result="${p.id}"></div>
+
+            ${raw(!open ? "" : html`
+              <form data-provider-form="${p.id}" style="margin-top:10px">
+                ${raw(p.fields.map((f) => html`
+                  <div class="field">
+                    <label for="pf_${p.id}_${f.name}">${f.label}${
+                      raw(f.required ? "" : ` <span class="muted tiny">(optional)</span>`)}</label>
+                    <input id="pf_${p.id}_${f.name}" name="${f.name}" class="mono"
+                           type="${f.secret ? "password" : "text"}"
+                           autocomplete="off"
+                           placeholder="${f.name === "base_url" ? p.base_url : ""}"
+                           value="${f.secret ? "" : (c?.[f.name] || "")}"
+                           ${f.required && !(f.secret && c) ? "required" : ""}>
+                    <div class="hint">${f.hint}</div>
+                  </div>`).join(""))}
+                <div class="field">
+                  <label for="pf_${p.id}_model">Default model</label>
+                  <input id="pf_${p.id}_model" name="model" class="mono"
+                         value="${c?.model || ""}"
+                         placeholder="${p.id === "azure"
+                           ? "the deployment name" : "e.g. the model you use most"}">
+                  <div class="hint">Offered first when writing a dataset. You
+                    can change it there.</div>
+                </div>
+                <button class="btn-sm btn-primary" type="submit">${
+                  c ? "Save changes" : "Connect"}</button>
+              </form>`)}
+          </div>`;
+      }).join(""))}
+    </div>`;
 }
