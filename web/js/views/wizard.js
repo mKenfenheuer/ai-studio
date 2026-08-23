@@ -1,4 +1,4 @@
-import { api } from "../api.js";
+import { api, events } from "../api.js";
 import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast } from "../util.js";
 
 // Two fundamentally different jobs behind one wizard. They share a machine
@@ -140,7 +140,14 @@ function ensure(res, key, fetcher, draw) {
   return res;
 }
 
-const loading = (what) => html`<div class="card muted tiny">${what}</div>`;
+// The words say what is being waited for -- they are different every time and
+// worth reading -- and the bar under them holds the space the answer will
+// need, so the panel does not grow when it arrives.
+const loading = (what) => html`<div class="card muted tiny" aria-busy="true">
+  ${what}
+  <div class="sk-line shimmer" style="margin-top:10px;width:70%"></div>
+  <div class="sk-line shimmer" style="margin-top:6px;width:45%"></div>
+</div>`;
 const failed = (msg) => html`<div class="callout callout-err">${msg}</div>`;
 
 // ===========================================================================
@@ -192,29 +199,94 @@ export async function wizardView(mount) {
     }
   } catch { /* nothing was handed over */ }
 
-  const runners = (await api.runners()).filter((r) => r.status !== "offline");
-  const starters = await api.starters();
+  // In parallel: neither needs the other, and doing them in turn doubled the
+  // wait before anything at all appeared.
+  const [allRunners, starters] = await Promise.all([
+    api.runners(), api.starters(),
+  ]);
+  let known = allRunners;
+  let runners = allRunners.filter((r) => r.status !== "offline");
   state.runnerId = runners[0]?.id ?? null;
   state.vocab = starters.default_vocab || 8192;
 
-  const ctx = { state, runners, starters, draw: () => draw() };
+  const ctx = { state, runners, known, starters, draw: () => draw() };
+  // `draw` reads ctx.runners, so the subscription below can refresh the list
+  // without rebuilding the context.
 
   function draw() {
     // Clamp rather than trust: a step index that runs past the end used to
     // throw "steps[state.step] is not a function" and blank the page.
     const names = STEP_NAMES[state.mode] || STEP_NAMES.finetune;
     state.step = Math.max(0, Math.min(state.step | 0, names.length - 1));
-    mount.innerHTML = shell(state, runners, names);
+    mount.innerHTML = shell(state, ctx.runners, names, ctx.known);
     const body = $("#stepBody", mount);
     if (body) STEPS[state.mode][state.step](body, ctx);
     wireNav(mount, ctx);
   }
 
   draw();
-  return () => {};
+
+  // A runner that is reconnecting is offline for a second or two -- after a
+  // controller restart, every one of them is. Opening the wizard in that
+  // window used to give "No machines are connected" and leave it there
+  // forever, because the list was read exactly once. It is not a state to
+  // report; it is a state to wait a moment for.
+  const recheck = async () => {
+    const fresh = await api.runners().catch(() => null);
+    if (!fresh) return;
+    const live = fresh.filter((r) => r.status !== "offline");
+    const changed = live.length !== runners.length
+      || live.some((r, i) => r.id !== runners[i]?.id);
+    known = fresh;
+    ctx.known = fresh;
+    if (!changed) return;
+    runners = live;
+    ctx.runners = live;
+    if (!state.runnerId || !live.some((r) => r.id === state.runnerId)) {
+      state.runnerId = live[0]?.id ?? null;
+    }
+    // Only when the screen would actually be wrong. Redrawing under somebody
+    // halfway through a form is worse than a slightly stale machine list.
+    if (state.step === 0 || !live.length) draw();
+  };
+
+  const stop = events.subscribe((msg) => {
+    if (msg.type === "runners_changed" || msg.type === "_connected") recheck();
+  });
+  // Belt as well as braces, and only while there is nothing to work with: the
+  // socket event is the fast path, but a page opened during a restart may
+  // have connected before the runner did and would then wait for an event
+  // that already happened.
+  const timer = setInterval(() => { if (!runners.length) recheck(); }, 3000);
+  return () => { stop(); clearInterval(timer); };
 }
 
-function shell(state, runners, names) {
+function shell(state, runners, names, known = []) {
+  if (!runners.length && known.length) {
+    // A machine this studio knows about, currently not answering. After a
+    // controller restart that is every machine, for as long as it takes them
+    // to dial back in -- and telling somebody to go and connect a machine
+    // they already own, while it is in the middle of reconnecting, is the
+    // wrong instruction as well as the wrong diagnosis.
+    return html`
+      <div class="page-head"><h1>New training run</h1></div>
+      <div class="card">
+        <div class="row" style="gap:12px;align-items:flex-start">
+          <div class="sk-value shimmer" style="min-width:34px;height:34px;
+               border-radius:50%;flex:none"></div>
+          <div>
+            <h3 style="margin:0 0 2px">Waiting for
+              ${known.length === 1 ? known[0].name : "your machines"}</h3>
+            <p class="muted tiny" style="margin:0">Connected before, not
+              answering right now — usually a few seconds after the studio
+              itself restarts. This page carries on by itself the moment it
+              is back.</p>
+            <p class="tiny" style="margin:8px 0 0">
+              <a href="#/runners">See what the machines are doing</a></p>
+          </div>
+        </div>
+      </div>`;
+  }
   if (!runners.length) {
     return html`
       <div class="page-head"><h1>New training run</h1></div>
@@ -1341,11 +1413,15 @@ function stepDesign(body, ctx) {
       // Seed the designer from whichever preset was highlighted, so it starts
       // from something that works rather than from an empty form.
       const from = sizes.find((s) => s.recommended) || sizes[0];
+      // Heads and feed-forward width start as null, meaning "work it out
+      // from the width". They are shown as whatever the plan resolved them
+      // to, and they follow the width until somebody moves them by hand.
       state.custom = {
         num_hidden_layers: from.layers, hidden_size: from.dim,
-        num_attention_heads: from.heads, max_position_embeddings: from.seq,
-        intermediate_size: null,
+        max_position_embeddings: from.seq,
+        num_attention_heads: null, intermediate_size: null,
       };
+      state.touched = {};
     }
     draw();
   });
@@ -1453,43 +1529,179 @@ function sizeCard(s, state) {
     </button>`;
 }
 
+// Fallback stops, used for the first paint only. The real ones come back with
+// every plan, because what counts as a sensible head count depends on the
+// width and what fits depends on the whole shape.
+const FALLBACK_STOPS = {
+  num_hidden_layers: [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64],
+  hidden_size: [128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1152,
+                1280, 1536, 1792, 2048, 2560, 3072, 4096],
+  num_attention_heads: [1, 2, 4, 6, 8, 12, 16, 24, 32],
+  max_position_embeddings: [128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096,
+                            6144, 8192],
+  intermediate_size: [512, 1024, 1536, 2048, 2752, 3072, 4096, 5504, 8192],
+};
+
+const nearestIndex = (stops, value) => {
+  let best = 0;
+  stops.forEach((v, i) => {
+    if (Math.abs(v - value) < Math.abs(stops[best] - value)) best = i;
+  });
+  return best;
+};
+
+/** The scales this designer is currently drawing against.
+ *  The plan carries them; until the first plan lands, the fallbacks do. */
+function scalesFor(state) {
+  const fromPlan = state.plan?.data?.scales;
+  const out = {};
+  for (const [k, stops] of Object.entries(FALLBACK_STOPS)) {
+    const live = fromPlan?.[k];
+    out[k] = { stops: live?.stops?.length ? live.stops : stops,
+               fits_up_to: live?.fits_up_to ?? null };
+  }
+  return out;
+}
+
 function designer(state) {
-  const c = state.custom || {};
+  // What the server actually built, with anything explicitly set on top. A
+  // field left alone is DERIVED -- feed-forward width from model width, for
+  // instance -- and showing a made-up default for it meant the box read 2752
+  // while the model being planned had 704. The number on the screen has to be
+  // the number that gets trained.
+  const planned = state.plan?.data?.settings?.arch || {};
+  const c = { ...planned };
+  for (const [k, v] of Object.entries(state.custom || {})) {
+    if (v != null) c[k] = v;
+  }
+  const scales = scalesFor(state);
   return html`
     <div class="card" style="margin-top:14px">
       <h3 style="margin:0 0 4px">Design your model</h3>
-      <p class="muted tiny">Change anything. The numbers on the right update as
-        you type, and problems are explained underneath rather than hidden.</p>
+      <p class="muted tiny">Drag for sensible values, or type an exact one. The
+        sliders click through shapes that actually work — head counts that
+        divide the width, context lengths that tile evenly — and the marked
+        point on each track is where this machine runs out of memory.</p>
       <div class="grid grid-2" style="margin-top:12px;align-items:start">
         <div>
-          ${raw(ARCH_FIELDS.map(([k, label, hint]) => html`
-            <div class="field">
-              <label for="a_${k}">${label}</label>
-              <input id="a_${k}" data-arch="${k}" type="number" min="1"
-                     value="${c[k] ?? ""}"
-                     placeholder="${k === "intermediate_size" ? "auto" : ""}">
-              <div class="hint">${hint}</div>
-            </div>`).join(""))}
+          ${raw(ARCH_FIELDS.map(([k, label, hint]) =>
+            sliderRow(k, label, hint, c[k], scales[k])).join(""))}
         </div>
         <div id="designPreview"></div>
       </div>
     </div>`;
 }
 
+function sliderRow(key, label, hint, value, scale) {
+  const stops = scale.stops;
+  // Only reached before the first plan comes back, when there is nothing
+  // authoritative to show yet.
+  const current = value ?? stops[Math.floor(stops.length / 2)];
+  const index = nearestIndex(stops, current);
+  const limit = scale.fits_up_to;
+  // Where along the track the machine gives out, as a percentage, so the part
+  // beyond it can be shaded rather than explained in a sentence nobody reads.
+  // `null` means there is no machine to check against; `0` means nothing on
+  // this track fits, which is the opposite thing and must not shade green.
+  // The thumb sits at index/(N-1) of the track, so the boundary between the
+  // last stop that fits and the first that does not is halfway between them.
+  // Dividing by N instead of N-1 left a sliver of red on a track where
+  // everything fits, which reads as a limit that is not there.
+  const fitPct = limit == null ? 100
+    : limit === 0 ? 0
+    : limit >= stops[stops.length - 1] ? 100
+    : Math.min(100, Math.round(100 * (nearestIndex(stops, limit) + 0.5)
+                               / Math.max(stops.length - 1, 1)));
+  const over = limit != null && limit !== null && current > limit;
+  return html`
+    <div class="field slider-field">
+      <label for="a_${key}">${label}
+        <span class="slider-value ${over ? "over" : ""}">${current}</span></label>
+      <div class="slider-line">
+        <input type="range" id="a_${key}" data-arch-range="${key}"
+               min="0" max="${stops.length - 1}" step="1" value="${index}"
+               style="--fit:${fitPct}%"
+               aria-valuetext="${current}">
+        <input type="number" class="slider-num" data-arch="${key}"
+               min="1" value="${current}" inputmode="numeric">
+      </div>
+      <div class="hint">${hint}${raw(!over ? "" : limit === 0
+        ? ` <strong class="warn-text">Nothing on this scale fits while the
+            rest of the model is this big. Bring the width, the depth or the
+            context down first.</strong>`
+        : ` <strong class="warn-text">Past ${limit} this will not fit on this
+            machine unless something else comes down.</strong>`)}</div>
+    </div>`;
+}
+
 function wireDesigner(body, ctx) {
   const { state } = ctx;
-  const refresh = () => refreshPlan(ctx, "#designPreview", designSummary);
+  const refresh = () => refreshPlan(ctx, "#designPreview", designSummary, () => {
+    // A new plan may have re-derived the fields nobody has touched, and may
+    // have moved the memory marks on every track. Redrawn only when nothing
+    // is being dragged, so the panel never changes under a finger.
+    if (document.activeElement?.closest?.("#designer")) return;
+    const host = $("#designer", body);
+    if (!host) return;
+    host.innerHTML = designer(state);
+    // `designer()` rebuilds the summary panel along with the sliders, so the
+    // answer that just arrived has to be put back into it -- otherwise the
+    // redraw blanks the very thing that triggered it.
+    const preview = $("#designPreview", host);
+    if (preview) preview.innerHTML = designSummary(state, state.plan.data);
+  });
   refresh();
 
   let timer = null;
-  // Rendered into its own panel rather than through draw(), so that typing in
-  // a field does not destroy the field being typed into.
-  on(body, "input", "[data-arch]", (_e, t) => {
-    const k = t.dataset.arch;
-    state.custom = { ...state.custom, [k]: t.value === "" ? null : +t.value };
+  const settle = () => {
     state.plan = resource();
     clearTimeout(timer);
     timer = setTimeout(refresh, 350);
+  };
+
+  // Redrawn in place rather than through draw(), so that dragging a slider
+  // does not destroy the slider being dragged. Only the readout and the
+  // partner field move while the finger is down.
+  // Which dimensions the person has actually set. Everything else is derived
+  // and keeps following what it is derived from -- widen the model and the
+  // head count and feed-forward width move with it, which is what makes the
+  // sliders feel like they know about each other.
+  const DERIVED_FROM_WIDTH = ["num_attention_heads", "intermediate_size"];
+  state.touched = state.touched || {};
+
+  const setValue = (key, value, from) => {
+    state.touched[key] = true;
+    state.custom = { ...state.custom, [key]: value };
+    if (key === "hidden_size") {
+      for (const dep of DERIVED_FROM_WIDTH) {
+        if (!state.touched[dep]) state.custom[dep] = null;
+      }
+    }
+    const field = $(`#a_${key}`, body)?.closest(".slider-field");
+    if (field) {
+      const readout = $(".slider-value", field);
+      if (readout) readout.textContent = value;
+      if (from !== "range") {
+        const scale = scalesFor(state)[key];
+        $(`#a_${key}`, field).value = nearestIndex(scale.stops, value);
+      }
+      if (from !== "number") $(".slider-num", field).value = value;
+    }
+    settle();
+  };
+
+  on(body, "input", "[data-arch-range]", (_e, t) => {
+    const key = t.dataset.archRange;
+    const stops = scalesFor(state)[key].stops;
+    setValue(key, stops[Math.min(+t.value, stops.length - 1)], "range");
+  });
+
+  // `change`, not `input`, for the box: a half-typed "1" on the way to "16"
+  // is a different model, and re-snapping the slider under a moving cursor
+  // makes the field impossible to type in.
+  on(body, "change", "[data-arch]", (_e, t) => {
+    const value = t.value === "" ? null : Math.max(1, +t.value);
+    setValue(t.dataset.arch, value, "number");
   });
 }
 
@@ -1845,7 +2057,7 @@ function wireOverrides(body, ctx) {
 }
 
 /** Fetch a scratch plan and paint one panel with it, without a full redraw. */
-function refreshPlan(ctx, selector, render) {
+function refreshPlan(ctx, selector, render, onReady) {
   const { state } = ctx;
   const box = $(selector);
   if (box) box.innerHTML = loading("Checking…");
@@ -1858,6 +2070,7 @@ function refreshPlan(ctx, selector, render) {
     target.innerHTML = render(state, state.plan.data);
     gateNext(state.plan.data.blocked,
              "Fix the problems above before starting.");
+    onReady?.();
   });
   if (state.plan.status === "ready" && box) {
     box.innerHTML = render(state, state.plan.data);

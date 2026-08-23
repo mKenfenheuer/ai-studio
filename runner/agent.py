@@ -29,7 +29,13 @@ from .jobs import evaluate, generate_data, lora_llm, merge, scratch_llm
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
 RECONNECT_MIN_S = 2
-RECONNECT_MAX_S = 30
+# Ten, not thirty. The backoff exists so a runner does not hammer a
+# controller that is gone; it is not a reason to stay dark for half a minute
+# after one that came back. A controller restart takes a few seconds, and the
+# old ceiling meant the studio showed "no machines are connected" for up to
+# thirty of them afterwards -- one connection attempt every ten seconds to a
+# machine on the same network costs nothing to weigh against that.
+RECONNECT_MAX_S = 10
 
 JOB_HANDLERS = {
     "finetune_llm": lora_llm.run,

@@ -102,6 +102,13 @@ p { margin: 0 0 .8em; }
   background: var(--surface-2); border-radius: 8px; font-size: 12px;
   color: var(--text-2);
 }
+/* "connecting..." becomes "2 machines - 1 training" a second later, and the
+   width changes with it. In the sidebar nothing moves; in the top bar it
+   shoves the help button sideways just as it is being tapped. Reserving the
+   room costs nothing and stops the shove. */
+.fleet-pill [data-fleet-text] {
+  display: inline-block; min-width: 11ch; white-space: nowrap;
+}
 .link-btn {
   background: none; border: none; color: var(--accent); cursor: pointer;
   font: inherit; font-size: 12.5px; text-align: left; padding: 4px 10px;
@@ -117,6 +124,62 @@ p { margin: 0 0 .8em; }
 /* ------------------------------------------------------------- main */
 .main { padding: 28px 34px 60px; max-width: 1180px; }
 .loading { color: var(--text-3); padding: 40px; }
+
+/* --- things that have not arrived yet ------------------------------------
+   A page that renders as one line of "Loading…" and then expands to nine
+   cards moves everything under it, and on a phone that means the thing you
+   were about to tap is somewhere else by the time your thumb lands. So a
+   placeholder takes up roughly the room the real thing will, and shimmers
+   rather than sitting blank -- which also answers "is this broken or is it
+   still coming", the only question a spinner ever gets asked. */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-2);
+  border-radius: 6px;
+  color: transparent !important;
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg,
+    transparent, rgba(255,255,255,.45), transparent);
+  animation: shimmer 1.4s infinite;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .shimmer::after {
+    background: linear-gradient(90deg,
+      transparent, rgba(255,255,255,.09), transparent);
+  }
+}
+@keyframes shimmer { 100% { transform: translateX(100%); } }
+
+/* A block of them, shaped like the page that is coming. */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+.skeleton { display: flex; flex-direction: column; gap: 14px; }
+.sk-line { height: 13px; }
+.sk-title { height: 26px; width: 46%; max-width: 320px; }
+.sk-sub { height: 13px; width: 66%; max-width: 460px; }
+.sk-card {
+  height: 118px; border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.sk-row { display: grid; gap: 14px; grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 700px) { .sk-row { grid-template-columns: 1fr; } }
+
+/* A value that is coming: keeps its own height so the card does not resize
+   underneath it, which is the jump people actually notice. */
+.sk-value { display: inline-block; min-width: 3.5em; height: 1em;
+  vertical-align: -0.12em; }
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer::after { animation: none; }
+}
 .page-head { margin-bottom: 22px; }
 .page-head .sub { color: var(--text-2); margin: 0; }
 
@@ -398,7 +461,16 @@ details.reasoning .txt {
    already are. A top bar carries brand, fleet status and help.
    ===================================================================== */
 @media (max-width: 760px) {
-  #app { grid-template-columns: 1fr; }
+  /* One column, and TWO ROWS -- the second of which takes the slack.
+     `#app` is a grid with `min-height: 100vh`, the sidebar is taken out of
+     flow to become the bottom tab bar, and that leaves the top bar and the
+     page as two auto-sized rows. Auto rows stretch to fill leftover space by
+     default, so on any page whose content is shorter than the screen the top
+     bar grew to swallow half of what was left -- a third of an iPhone screen,
+     with the brand floating in the middle of it. Naming the rows is the whole
+     fix: the bar is its own height, the page gets the rest. */
+  #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .main { min-height: 0; }
 
   .topbar {
     display: flex; align-items: center; gap: 9px;
@@ -408,6 +480,11 @@ details.reasoning .txt {
   }
   .topbar .brand-name { font-size: 14px; }
   .topbar .fleet-pill { padding: 5px 9px; font-size: 11px; }
+  .topbar .fleet-pill [data-fleet-text] { min-width: 9ch; }
+  /* Fixed height whatever is in it, so nothing below it moves when the text
+     inside changes -- and a ceiling as well as a floor, because a floor alone
+     is what let the grid stretch it. */
+  .topbar { min-height: 52px; max-height: 52px; }
 
   .sidebar {
     position: fixed; left: 0; right: 0; bottom: 0; top: auto;
@@ -806,3 +883,71 @@ details.card[open] > summary::before { content: "▾ "; }
 }
 .kind-option:hover { border-color: var(--accent); background: var(--accent-bg); }
 .kind-option strong { font-size: 14px; }
+
+/* --- the designer's sliders ---------------------------------------------
+   A range input that clicks between allowed shapes, with a box beside it for
+   typing an exact number. The track is shaded past the point where this
+   machine runs out of memory: the answer to "how far can I go" belongs on
+   the control, not in a paragraph under it. */
+.slider-field { margin-bottom: 16px; }
+.slider-field label {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px;
+}
+.slider-value {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+  color: var(--accent); background: var(--accent-bg);
+  padding: 1px 7px; border-radius: 999px;
+}
+.slider-value.over { color: var(--err); background: var(--err-bg); }
+.slider-line { display: flex; align-items: center; gap: 10px; }
+/* `.slider-line` in front of it on purpose. The base rule is
+   `input[type=number] { width: 100% }`, and an attribute selector outranks a
+   bare class -- so `.slider-num { width: 92px }` lost, the box took the whole
+   row, and the slider beside it collapsed to nothing. */
+.slider-line .slider-num {
+  width: 92px; flex: none; font-family: var(--mono); font-size: 13px;
+  text-align: right;
+}
+.slider-line input[type="range"] { flex: 1 1 auto; min-width: 60px; }
+
+input[type="range"] {
+  flex: 1; min-width: 0; appearance: none; -webkit-appearance: none;
+  background: none; height: 26px; margin: 0; padding: 0; cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg,
+    var(--border-2) 0, var(--border-2) var(--fit, 100%),
+    var(--err-bg) var(--fit, 100%), var(--err-bg) 100%);
+}
+input[type="range"]::-moz-range-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg,
+    var(--border-2) 0, var(--border-2) var(--fit, 100%),
+    var(--err-bg) var(--fit, 100%), var(--err-bg) 100%);
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 20px; height: 20px; border-radius: 50%; margin-top: -7px;
+  background: var(--accent); border: 2px solid var(--surface);
+  box-shadow: 0 1px 3px rgba(16,24,40,.3);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--surface);
+  background: var(--accent); box-shadow: 0 1px 3px rgba(16,24,40,.3);
+}
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.warn-text { color: var(--err); font-weight: 550; }
+
+@media (max-width: 760px) {
+  /* Thumbs big enough to hit, and the number box does not need to be wide
+     when the value is also printed above the track. */
+  input[type="range"] { height: 34px; }
+  input[type="range"]::-webkit-slider-thumb { width: 26px; height: 26px;
+    margin-top: -10px; }
+  input[type="range"]::-moz-range-thumb { width: 26px; height: 26px; }
+  .slider-num { width: 78px; }
+}

@@ -29,48 +29,33 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Sizes
 # ---------------------------------------------------------------------------
-# Deliberately stops at ~200M. Anything larger cannot be trained to a useful
-# standard on one consumer GPU, and offering it would be a trap rather than a
-# feature. The ceiling is compute, not memory -- see time_for_tokens().
+# Shapes with proportions that are known to work, from a toy to something that
+# needs a serious card. Width, layers, heads, context.
+#
+# The five sizes offered are a WINDOW onto this ladder rather than a fixed
+# list, positioned by how much memory the machine has. A fixed list meant that
+# on a small card the top two could never be trained, and on a large one the
+# offer stopped well short of what the card could do. In both directions the
+# studio was describing some other computer.
+SHAPE_LADDER = [
+    (256, 4, 4, 256),
+    (384, 6, 6, 512),
+    (512, 8, 8, 512),
+    (640, 10, 10, 1024),
+    (768, 12, 12, 1024),
+    (1024, 16, 16, 1024),
+    (1280, 20, 20, 2048),
+    (1536, 24, 24, 2048),
+    (2048, 24, 32, 2048),
+]
 
-SIZE_PRESETS = [
-    {
-        "id": "nano", "label": "Nano", "layers": 4, "dim": 256, "heads": 4,
-        "seq": 256,
-        "blurb": "Learns spelling, punctuation and short sentence shapes. "
-                 "Finishes in minutes, so it is the right way to check your "
-                 "data and settings before committing to a long run.",
-        "expect": "Real words, wobbly grammar.",
-    },
-    {
-        "id": "tiny", "label": "Tiny", "layers": 6, "dim": 384, "heads": 6,
-        "seq": 512,
-        "blurb": "The smallest size that writes genuinely coherent English "
-                 "when trained on simple text. A satisfying first real model.",
-        "expect": "Short readable passages that stay on topic.",
-    },
-    {
-        "id": "small", "label": "Small", "layers": 8, "dim": 512, "heads": 8,
-        "seq": 512,
-        "blurb": "Noticeably better sentence structure and longer memory. "
-                 "Wants several hours of training to earn its size.",
-        "expect": "Fluent paragraphs, simple reasoning.",
-    },
-    {
-        "id": "base", "label": "Base", "layers": 12, "dim": 768, "heads": 12,
-        "seq": 1024,
-        "blurb": "GPT-2 small's shape. A serious model that needs serious "
-                 "compute -- expect days, not hours, on one consumer card.",
-        "expect": "Good text, but only if you train it properly.",
-    },
-    {
-        "id": "large", "label": "Large", "layers": 16, "dim": 1024, "heads": 16,
-        "seq": 1024,
-        "blurb": "Included for completeness. On a single GPU you will run out "
-                 "of patience long before this model runs out of things to "
-                 "learn from.",
-        "expect": "Only worth it with a week of GPU time.",
-    },
+# Five names, smallest to largest. They are relative to the machine: "Large"
+# means the largest this card can train at all, not a fixed parameter count.
+# Which is why every option also carries its parameter count, and why what is
+# said about each comes from that count rather than from the name.
+SIZE_TIERS = [
+    ("nano", "Nano"), ("tiny", "Tiny"), ("small", "Small"),
+    ("base", "Base"), ("large", "Large"),
 ]
 
 # Vocabulary size for a freshly trained tokenizer.
@@ -191,18 +176,102 @@ def _intermediate(dim: int) -> int:
     return int(round(8 * dim / 3 / 64)) * 64
 
 
-def preset(size_id: str) -> dict | None:
-    return next((p for p in SIZE_PRESETS if p["id"] == size_id), None)
+def _arch_from_shape(shape: tuple, vocab_size: int) -> dict:
+    dim, layers, heads, seq = shape
+    return {
+        "model_type": "llama", "vocab_size": int(vocab_size),
+        "hidden_size": dim, "intermediate_size": _intermediate(dim),
+        "num_hidden_layers": layers, "num_attention_heads": heads,
+        "num_key_value_heads": heads, "max_position_embeddings": seq,
+        "tie_word_embeddings": True, "rms_norm_eps": 1e-5,
+    }
+
+
+def _describe(params: int) -> tuple[str, str]:
+    """What a model of this size is for, and what to expect from it.
+
+    Keyed on the parameter count and never on the tier, because the tiers
+    slide with the machine: "Nano" on a 24 GB card can be bigger than "Small"
+    on an 8 GB one, and a description tied to the name would be wrong on both.
+    """
+    if params < 15e6:
+        return ("Learns spelling, punctuation and short sentence shapes. "
+                "Finishes in minutes, so it is the right way to check your "
+                "data and settings before committing to a long run.",
+                "Real words, wobbly grammar.")
+    if params < 60e6:
+        return ("The smallest size that writes genuinely coherent English "
+                "when trained on simple text. A satisfying first real model.",
+                "Short readable passages that stay on topic.")
+    if params < 200e6:
+        return ("Noticeably better sentence structure and longer memory. "
+                "Wants several hours of training to earn its size.",
+                "Fluent paragraphs, simple reasoning.")
+    if params < 600e6:
+        return ("A serious model that needs serious compute -- expect a day "
+                "or more on one consumer card.",
+                "Good text, but only if you train it properly.")
+    return ("At the edge of what one card can train at all. It will not reach "
+            "a full budget of text; what you get is a glimpse of a larger "
+            "model rather than a finished one.",
+            "Capable in places, and visibly undertrained.")
+
+
+def _shape_fits(shape: tuple, vocab_size: int, caps: dict) -> bool:
+    """Whether this machine can train this shape at all -- one sequence at a
+    time with activation recomputation, which is the most frugal it gets."""
+    vram = caps.get("vram_gb")
+    if not vram:
+        return True
+    mem = training_memory_gb(
+        _arch_from_shape(shape, vocab_size), 1,
+        optim_8bit=bool((caps.get("quantization") or {}).get("optim_8bit")),
+        checkpointing=True,
+        flash=bool((caps.get("attention") or {}).get("flash")))
+    return mem["total_gb"] <= usable_vram_gb(vram)
+
+
+def size_presets(caps: dict | None = None,
+                 vocab_size: int = 8192) -> list[dict]:
+    """The five sizes worth offering on this machine, smallest first."""
+    top = len(SHAPE_LADDER) - 1
+    if caps:
+        while top > 0 and not _shape_fits(SHAPE_LADDER[top], vocab_size, caps):
+            top -= 1
+    # Spread across the ladder from the bottom rung to whatever this card can
+    # reach, rather than sliding a fixed-width window up it. The smallest
+    # option has a job -- finish in minutes so you can check your data before
+    # committing to a long run -- and a sliding window destroyed it: on a
+    # 16 GB card "Nano" became a 55M model, which is not a sanity check.
+    # So the bottom is pinned and only the top moves.
+    n = min(len(SIZE_TIERS), top + 1)
+    picks = sorted({round(i * top / max(n - 1, 1)) for i in range(n)})
+    window = [SHAPE_LADDER[i] for i in picks]
+    tiers = SIZE_TIERS[-len(window):]
+    out = []
+    for (size_id, label), shape in zip(tiers, window):
+        params = count_params(_arch_from_shape(shape, vocab_size))["total"]
+        blurb, expect = _describe(params)
+        dim, layers, heads, seq = shape
+        out.append({"id": size_id, "label": label, "layers": layers,
+                    "dim": dim, "heads": heads, "seq": seq,
+                    "blurb": blurb, "expect": expect})
+    return out
+
+
+def preset(size_id: str, caps: dict | None = None) -> dict | None:
+    return next((p for p in size_presets(caps) if p["id"] == size_id), None)
 
 
 def build_arch(size_id: str, vocab_size: int = DEFAULT_VOCAB,
-               seq_len: int | None = None, moe: dict | None = None) -> dict | None:
+               seq_len: int | None = None, moe: dict | None = None,
+               caps: dict | None = None) -> dict | None:
     """Concrete architecture the runner can hand straight to transformers.
 
     Resolved here rather than on the runner so that the parameter count shown
     in the UI and the model that actually gets built can never disagree.
     """
-    p = preset(size_id)
+    p = preset(size_id, caps)
     if not p:
         return None
     seq = int(seq_len or p["seq"])
@@ -680,8 +749,8 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
     optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
 
     out = []
-    for p in SIZE_PRESETS:
-        arch = build_arch(p["id"], vocab_size, moe=moe)
+    for p in size_presets(caps, vocab_size):
+        arch = build_arch(p["id"], vocab_size, moe=moe, caps=caps)
         counts = count_params(arch)
         fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
                               checkpointing=False, flash=flash)
@@ -779,9 +848,119 @@ LIMITS = {
 # runs, and runs slower.
 GOOD_HEAD_DIMS = (32, 48, 64, 80, 96, 128)
 
+# The stops a slider clicks through. Free-typing any number is still allowed --
+# there is a box beside each one -- but dragging should never land on a value
+# that is merely legal. A width of 517 divides by no sensible head count; a
+# context of 1500 wastes the last block of every tile.
+WIDTH_STOPS = (128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024,
+               1152, 1280, 1536, 1792, 2048, 2560, 3072, 4096)
+DEPTH_STOPS = (1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64)
+CONTEXT_STOPS = (128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+
 # Width divided by depth. Real language models cluster tightly in this range;
 # the GPT and Llama families all sit between roughly 60 and 130.
 ASPECT_HEALTHY = (32, 320)
+
+
+def _head_stops(dim: int) -> list[int]:
+    """Head counts that divide this width into a size the kernels like.
+
+    This is the "based on the rest" part: change the width and the heads
+    slider changes under it, because the two are not independent. A head
+    dimension that is not one of the tuned sizes runs -- and runs slower --
+    and one that does not divide the width at all does not run.
+    """
+    good = [dim // hd for hd in GOOD_HEAD_DIMS
+            if dim % hd == 0 and 1 <= dim // hd <= LIMITS["num_attention_heads"]["max"]]
+    if good:
+        return sorted(set(good))
+    # An awkward width still gets something to drag along: every divisor.
+    return sorted({h for h in range(1, LIMITS["num_attention_heads"]["max"] + 1)
+                   if dim % h == 0}) or [1]
+
+
+def _ffn_stops(dim: int) -> list[int]:
+    """Feed-forward widths from about 1.5x to 5x the model width.
+
+    The canonical value is always in the list, so the slider can land exactly
+    on what the studio would have chosen for you.
+    """
+    step = 128 if dim >= 512 else 64
+    lo, hi = int(dim * 1.5), int(dim * 5)
+    stops = {int(round(v / step) * step) for v in
+             (lo + (hi - lo) * i / 12 for i in range(13))}
+    stops.add(_intermediate(dim))
+    return sorted(v for v in stops
+                  if LIMITS["intermediate_size"]["min"] <= v
+                  <= LIMITS["intermediate_size"]["max"])
+
+
+def slider_scales(arch: dict, caps: dict | None = None) -> dict:
+    """For each dimension of a custom model: where the slider clicks, and how
+    far along it this machine can still hold the result.
+
+    The stops depend on the rest of the architecture, which is the whole
+    point -- heads follow width, feed-forward width follows width -- so this
+    is recomputed with every plan rather than fixed once.
+    """
+    dim = arch["hidden_size"]
+    scales = {
+        "hidden_size": list(WIDTH_STOPS),
+        "num_hidden_layers": [v for v in DEPTH_STOPS
+                              if v <= LIMITS["num_hidden_layers"]["max"]],
+        "num_attention_heads": _head_stops(dim),
+        "max_position_embeddings": [
+            v for v in CONTEXT_STOPS
+            if v <= LIMITS["max_position_embeddings"]["max"]],
+        "intermediate_size": _ffn_stops(dim),
+    }
+
+    out = {}
+    for field, stops in scales.items():
+        out[field] = {
+            "stops": stops,
+            "label": LIMITS.get(field, {}).get("label", field),
+            "fits_up_to": _largest_that_fits(arch, field, stops, caps),
+        }
+    return out
+
+
+def _largest_that_fits(arch: dict, field: str, stops: list[int],
+                       caps: dict | None) -> int | None:
+    """The last stop this card can still train, everything else held still.
+
+    Not a limit -- turning one thing down makes room for another, and the
+    slider will happily go past it. It is a mark on the track saying where
+    the machine gives out, which is the question people are actually asking
+    when they drag one of these.
+    """
+    if not caps or not caps.get("vram_gb"):
+        return None          # no machine in hand: no mark to draw
+    budget = usable_vram_gb(caps["vram_gb"])
+    optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
+    flash = bool((caps.get("attention") or {}).get("flash"))
+    best = None
+    for value in stops:
+        candidate = dict(arch)
+        candidate[field] = value
+        if field == "hidden_size":
+            # Width drags the parts derived from it along, or the answer is
+            # about a model nobody would build.
+            candidate["intermediate_size"] = _intermediate(value)
+            heads = _head_stops(value)
+            candidate["num_attention_heads"] = heads[len(heads) // 2]
+            candidate["num_key_value_heads"] = candidate["num_attention_heads"]
+        mem = training_memory_gb(candidate, 1, optim_8bit=optim_8bit,
+                                 checkpointing=True, flash=flash)
+        if mem["total_gb"] <= budget:
+            best = value
+        else:
+            break
+    # Zero, not None, when even the smallest stop is too big. The two mean
+    # opposite things -- "no machine to check against" and "none of this fits
+    # on the one you have" -- and collapsing them into None made the screen
+    # draw a full, unmarked track for a model that could not be built at all.
+    return best if best is not None else 0
 
 
 def recommended_lr(dim: int) -> float:
@@ -1168,3 +1347,8 @@ def _hours(minutes: float) -> str:
     if minutes < 2880:
         return "%.1f hours" % (minutes / 60)
     return "%.1f days" % (minutes / 1440)
+
+
+# What a caller with no machine in hand sees. Defined at the end because it
+# needs everything above it.
+SIZE_PRESETS = size_presets(None)

@@ -173,3 +173,30 @@ export function takeSsoError() {
     location.pathname + (rest ? "?" + rest : "") + location.hash);
   return message;
 }
+
+/** A placeholder shaped like the thing that is coming.
+ *
+ *  Not decoration. A page that renders as one line of "Loading…" and then
+ *  expands into nine cards moves everything below it, and on a phone that
+ *  means the control you were reaching for is somewhere else by the time your
+ *  thumb arrives. Taking up roughly the right room from the start is the
+ *  whole point; the shimmer is just what makes it read as "coming" rather
+ *  than as "broken".
+ */
+export function skeleton({ title = true, cards = 3, rows = 0 } = {}) {
+  const card = `<div class="sk-card shimmer"></div>`;
+  return `
+    <div class="skeleton" aria-busy="true" aria-live="polite">
+      <span class="visually-hidden">Loading</span>
+      ${title ? `<div class="sk-title shimmer"></div>
+                 <div class="sk-sub shimmer"></div>` : ""}
+      ${cards ? `<div class="sk-row">${card.repeat(cards)}</div>` : ""}
+      ${Array.from({ length: rows },
+                   () => `<div class="sk-line shimmer"></div>`).join("")}
+    </div>`;
+}
+
+/** A single value that has not arrived: keeps its own width and height so the
+ *  card around it does not resize when it does. */
+export const skeletonValue = (width = "3.5em") =>
+  raw(`<span class="sk-value shimmer" style="min-width:${width}"></span>`);

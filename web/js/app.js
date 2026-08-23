@@ -1,5 +1,5 @@
 import { api, events, handleUnauthorized, NotSignedIn } from "./api.js";
-import { $, $$, toast, takeSsoError } from "./util.js";
+import { $, $$, toast, takeSsoError, skeleton } from "./util.js";
 import { initGate, showGate, hideGate } from "./views/gate.js";
 
 import { dashboardView } from "./views/dashboard.js";
@@ -46,7 +46,17 @@ export const session = { user: null };
 
 let teardown = null;
 
+// Which render is the current one. Views are async -- most fetch something
+// before they draw -- so two can be in flight at once when a route changes
+// while the first is still loading. Unguarded, whichever finishes LAST wins,
+// which is often the one you navigated away from, and its teardown is never
+// called so its event subscription keeps redrawing the page you did navigate
+// to. Both were real: the wizard would intermittently come up as the previous
+// page, more often the slower the machine.
+let renderSeq = 0;
+
 async function render() {
+  const mine = ++renderSeq;
   const path = (location.hash.slice(1) || "/").split("?")[0];
   const main = $("#main");
 
@@ -58,10 +68,20 @@ async function render() {
     if (!m) continue;
     $$(".nav a").forEach((a) =>
       a.classList.toggle("active", a.dataset.nav === nav));
-    main.innerHTML = `<div class="loading">Loading…</div>`;
+    // Shaped like the page that is coming rather than a word in the corner,
+    // so the layout settles once instead of twice.
+    main.innerHTML = skeleton({ cards: 3, rows: 2 });
     try {
-      teardown = await view(main, m.slice(1));
+      const stop = await view(main, m.slice(1));
+      if (mine !== renderSeq) {
+        // Somebody navigated while this was loading. Whatever it built is
+        // already off screen; unsubscribe it rather than leaving it running.
+        if (typeof stop === "function") { try { stop(); } catch { /* gone */ } }
+        return;
+      }
+      teardown = stop;
     } catch (err) {
+      if (mine !== renderSeq) return;
       // A session that expired mid-render is not an error to display; the
       // gate is already going up in front of it.
       if (err instanceof NotSignedIn) return;
@@ -88,7 +108,12 @@ function setFleet(dotClass, text) {
 async function refreshFleet() {
   try {
     const s = await api.status();
-    if (s.runners_online === 0) {
+    if (s.runners_online === 0 && s.runners_total > 0) {
+      // Known machines, none answering. Almost always a restart in progress,
+      // and "no machines connected" reads as "you have not set one up" --
+      // which sends people off to fix something that is not broken.
+      setFleet("dot-idle", "Reconnecting\u2026");
+    } else if (s.runners_online === 0) {
       setFleet("dot-err", "No machines connected");
     } else {
       setFleet(s.jobs_running ? "dot-busy" : "dot-ok",

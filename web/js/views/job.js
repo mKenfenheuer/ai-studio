@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast } from "../util.js";
+import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast, skeletonValue } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 
@@ -717,9 +717,14 @@ function paintStats(mount, job, m, scratch, stage = "training",
     ["Time left", m.eta_s != null && job.status === "running"
       ? fmtDuration(m.eta_s) : "—", "estimate"],
   ];
+  // A dash means "there is no such number"; a shimmer means "it is on its
+  // way". Those are different states and the page used to show both as "—",
+  // so a run that had just started looked broken for its first few seconds.
+  const coming = ["queued", "assigned", "running"].includes(job.status);
   $("#statCards", mount).innerHTML = cards.map(([k, v, sub]) => html`
     <div class="card stat">
-      <span class="k">${k}</span><span class="v">${v}</span>
+      <span class="k">${k}</span>
+      <span class="v">${v === "—" && coming ? skeletonValue("4em") : v}</span>
       <span class="tiny muted">${sub}</span>
     </div>`).join("");
 }

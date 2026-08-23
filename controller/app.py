@@ -1086,7 +1086,7 @@ async def scratch_sizes(runner_id: str = Query(...), minutes: float = 60,
         "moe_limits": arch.MOE_LIMITS,
         "moe_defaults": {"num_local_experts": arch.MOE_DEFAULT_EXPERTS,
                          "num_experts_per_tok": arch.MOE_DEFAULT_ACTIVE},
-        "presets": arch.SIZE_PRESETS,
+        "presets": arch.size_presets(caps, vocab_size),
     }
 
 
@@ -1103,7 +1103,12 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         architecture = arch.build_custom_arch(payload.get("custom") or {},
                                               vocab_size, moe)
     else:
-        architecture = arch.build_arch(size_id, vocab_size, moe=moe)
+        # `caps` is not optional here. The five sizes are a window onto a
+        # ladder positioned by the machine's memory, so building one without
+        # the machine gives a different model from the one the picker just
+        # offered -- on a 16 GB card the two happened to coincide, which is
+        # exactly the kind of luck that hides a bug until somebody else runs it.
+        architecture = arch.build_arch(size_id, vocab_size, moe=moe, caps=caps)
     if not architecture:
         raise HTTPException(400, "Unknown model size: %s" % size_id)
 
@@ -1236,6 +1241,8 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "blocked": any(i["level"] == "error" for i in issues),
         "recommended_lr": arch.recommended_lr(architecture["hidden_size"]),
         "limits": arch.LIMITS,
+        # Where each slider clicks, given everything else as it stands now.
+        "scales": arch.slider_scales(architecture, caps),
         "memory_gb": fit["memory"]["total_gb"],
         "tokens_per_step": fit["tokens_per_step"],
         "estimated_minutes": round(planned_minutes, 1),
