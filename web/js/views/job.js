@@ -75,10 +75,19 @@ export async function jobView(mount, [jobId]) {
   // machine restarted right now" -- is only interesting while it is running.
   let checkpointStep = job.checkpoint_step || 0;
   let latest = metrics[metrics.length - 1] || {};
+  // Held-out loss is measured every `eval_every` steps, not every step, so
+  // the newest metric row almost never carries one -- 96 rows in 97 on a
+  // typical run. Reading it off `latest` therefore showed a dash almost
+  // always, and once dashes started shimmering it pulsed forever, promising
+  // a number that was hours away. It is a fact that stays true until the next
+  // evaluation replaces it, so it is kept rather than re-read.
+  let lastEval = [...metrics].reverse().find((m) => m.val_loss != null) || null;
   // The stage the runner last reported. paintStats runs on every metric and
   // must not claim "training" while the tokenizer is still being built.
   let stage = job.status === "running" ? "" : "training";
-  paintStats(mount, job, latest, scratch, stage, checkpointStep);
+  const stats = () =>
+    paintStats(mount, job, latest, scratch, stage, checkpointStep, lastEval);
+  stats();
 
   const unsub = events.subscribe(async (msg) => {
     if (msg.job_id && msg.job_id !== jobId) return;
@@ -87,12 +96,15 @@ export async function jobView(mount, [jobId]) {
       if (msg.data.sample_text) return;   // samples arrive as job_sample
       latest = { step: msg.step, ...msg.data };
       if (msg.data.loss != null) lossChart.pushSeries("train", { x: msg.step, y: msg.data.loss });
-      if (msg.data.val_loss != null) lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
+      if (msg.data.val_loss != null) {
+        lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
+        lastEval = { step: msg.step, val_loss: msg.data.val_loss };
+      }
       if (msg.data.learning_rate != null)
         lrChart.push({ x: msg.step, y: msg.data.learning_rate });
       if (msg.data.expert_balance != null)
         expertChart?.push({ x: msg.step, y: msg.data.expert_balance });
-      paintStats(mount, job, latest, scratch, stage, checkpointStep);
+      stats();
     } else if (msg.type === "job_sample") {
       samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
       paintSamples(mount, samples);
@@ -110,7 +122,7 @@ export async function jobView(mount, [jobId]) {
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
       paintHeader(mount, job);
-      paintStats(mount, job, latest, scratch, stage, checkpointStep);
+      stats();
       // A run that just finished has a model to build on, and one that just
       // failed has a checkpoint to carry on from. Both change this panel.
       paintFurther();
@@ -164,7 +176,7 @@ export async function jobView(mount, [jobId]) {
       const r = await api.resumeJob(jobId);
       toast(`Carrying on from step ${r.from_step}.`, "ok");
       job = await api.job(jobId);
-      paintStats(mount, job, latest, scratch, stage, checkpointStep);
+      stats();
     } catch (e) { toast(e.message, "err"); t.disabled = false; }
   });
 
@@ -692,7 +704,7 @@ function resumeCard(job) {
 }
 
 function paintStats(mount, job, m, scratch, stage = "training",
-                   checkpointStep = 0) {
+                   checkpointStep = 0, lastEval = null) {
   paintHeader(mount, job);
   paintProgress(mount, job, stage, null, null,
                 checkpointStep || job.checkpoint_step || 0);
@@ -700,9 +712,10 @@ function paintStats(mount, job, m, scratch, stage = "training",
   if (q) q.innerHTML = queueCard(job);
   const rc = $("#resumeCard", mount);
   if (rc) rc.innerHTML = resumeCard(job);
+  const held = heldOutCard(job, m, lastEval);
   const cards = scratch ? [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
-    ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—", "on unseen text"],
+    held,
     ["Text read", m.tokens_seen != null ? fmtNum(m.tokens_seen) : "—", "tokens so far"],
     ["Speed", m.tokens_per_sec != null ? fmtNum(m.tokens_per_sec) + "/s" : "—", "tokens per second"],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
@@ -710,8 +723,7 @@ function paintStats(mount, job, m, scratch, stage = "training",
       ? fmtDuration(m.eta_s) : "—", "estimate"],
   ] : [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
-    ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—",
-     "on unseen examples"],
+    held,
     ["Speed", m.steps_per_sec != null ? m.steps_per_sec.toFixed(2) + "/s" : "—", "steps per second"],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
     ["Time left", m.eta_s != null && job.status === "running"
@@ -720,13 +732,40 @@ function paintStats(mount, job, m, scratch, stage = "training",
   // A dash means "there is no such number"; a shimmer means "it is on its
   // way". Those are different states and the page used to show both as "—",
   // so a run that had just started looked broken for its first few seconds.
+  // Only for numbers that arrive with the very first step. Anything on a
+  // slower schedule says when it is due instead -- a placeholder that pulses
+  // for an hour is a lie about how long you are waiting.
+  const NEVER_SHIMMER = new Set(["Held-out loss"]);
   const coming = ["queued", "assigned", "running"].includes(job.status);
   $("#statCards", mount).innerHTML = cards.map(([k, v, sub]) => html`
     <div class="card stat">
       <span class="k">${k}</span>
-      <span class="v">${v === "—" && coming ? skeletonValue("4em") : v}</span>
+      <span class="v">${v === "—" && coming && !NEVER_SHIMMER.has(k)
+        ? skeletonValue("4em") : v}</span>
       <span class="tiny muted">${sub}</span>
     </div>`).join("");
+}
+
+/** Held-out loss, which happens on its own schedule.
+ *
+ *  It is checked every `eval_every` steps, so between checks there is no new
+ *  number -- but the last one is still the truth, and saying when the next is
+ *  due is more use than a placeholder that pulses in the meantime.
+ */
+function heldOutCard(job, m, lastEval) {
+  const sub = job.kind === "pretrain_llm" ? "on unseen text" : "on unseen examples";
+  const value = m.val_loss ?? lastEval?.val_loss;
+  const at = m.val_loss != null ? m.step : lastEval?.step;
+  if (value != null) {
+    return ["Held-out loss", value.toFixed(4),
+            at ? `${sub} · step ${fmtNum(at)}` : sub];
+  }
+  const every = job.config?.eval_every;
+  const live = ["queued", "assigned", "running"].includes(job.status);
+  if (live && every) {
+    return ["Held-out loss", "—", `${sub} · first check at step ${fmtNum(every)}`];
+  }
+  return ["Held-out loss", "—", live ? sub : `${sub} · never measured`];
 }
 
 function paintSamples(mount, samples) {
