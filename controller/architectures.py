@@ -381,6 +381,25 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     }
 
 
+# 72% of the card, not 100%. The estimate is good to about 10%, the
+# allocator's fragmentation is real memory that no formula sees, and the
+# desktop compositor is often on the same card. An over-optimistic batch does
+# not degrade gracefully -- it dies at step one, an hour into a download,
+# which is the single worst outcome this app can produce.
+VRAM_USABLE_FRACTION = 0.72
+
+
+def usable_vram_gb(vram_gb: float | None) -> float:
+    """How much of a card can actually be planned against.
+
+    Named, and used by both the decision and the sentence that explains it.
+    They were the same number written twice, and a message that says "will not
+    fit in 16.0 GB" about a model needing 15.1 GB is what that costs: true,
+    and unreadable, because the 16.0 is not the number being compared.
+    """
+    return (vram_gb or 8.0) * VRAM_USABLE_FRACTION
+
+
 def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = False,
                     checkpointing: bool = False, flash: bool = False,
                     target_tokens_per_step: int = 65536) -> dict:
@@ -392,11 +411,7 @@ def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = Fal
     mathematically equivalent and costs only wall-clock time.
     """
     seq = arch["max_position_embeddings"]
-    # 72% of the card, not 100%. The estimate above is good to about 10%, and
-    # the allocator's fragmentation is real memory that no formula sees. An
-    # over-optimistic batch does not degrade -- it dies at step one, an hour
-    # into a download, which is the single worst outcome this app can produce.
-    budget = (vram_gb or 8.0) * 0.72
+    budget = usable_vram_gb(vram_gb)
 
     batch = 1
     for candidate in (64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1):
@@ -836,8 +851,12 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
                 at_one = training_memory_gb(arch, 1, optim_8bit=optim_8bit,
                                             checkpointing=True, flash=flash)
                 out.append(_issue("error", "hidden_size",
-                    "This will not fit in %.1f GB. Even a single sequence at a "
-                    "time needs about %.1f GB." % (vram, at_one["total_gb"]),
+                    "This will not fit. One sequence at a time needs about "
+                    "%.1f GB, and only about %.1f GB of this %.1f GB card can "
+                    "be planned against -- the rest goes to memory "
+                    "fragmentation, to the display, and to the margin of error "
+                    "in the estimate itself."
+                    % (at_one["total_gb"], usable_vram_gb(vram), vram),
                     "Reduce the width, the depth, or the context length."))
 
     # ---- will it learn anything -----------------------------------------
@@ -845,13 +864,22 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
         budget = tokens_in_time(arch, caps, minutes)
         verdict = training_verdict(arch, budget)
         if verdict["verdict"] in ("not_viable", "weak"):
-            out.append(_issue(
-                "error" if verdict["verdict"] == "not_viable" else "warn",
-                "budget",
+            # A warning, never an error, however bad the number is. Not fitting
+            # in memory is a fact -- the run dies at step one. This is a
+            # prediction about how good the result will be, and somebody
+            # deliberately training a tiny model to watch the loss move, or
+            # stopping early on purpose, is entitled to overrule it. Refusing
+            # to start was the studio mistaking its own opinion for a limit.
+            out.append(_issue("warn", "budget",
                 "In %s this model would see %.1f tokens per parameter. %s"
                 % (_hours(minutes), verdict.get("ratio") or 0, verdict["message"]),
-                "Choose a smaller model, or allow more time."))
-        elif verdict.get("ratio", 0) > TOKENS_PER_PARAM_TARGET * 3:
+                "A smaller model, or more time, would give a better result -- "
+                "but this will run if you want to see it."))
+        # `or 0`, not a default: the key is always present, and it is None
+        # whenever the machine's speed could not be estimated -- so a plain
+        # `.get("ratio", 0)` returns None and the comparison raises. That is
+        # every unprobed runner, and it took the whole planner down with it.
+        elif (verdict.get("ratio") or 0) > TOKENS_PER_PARAM_TARGET * 3:
             out.append(_issue("info", "budget",
                 "This model finishes learning well inside your time budget "
                 "(%.0f tokens per parameter against a target of %d). A larger "

@@ -1097,23 +1097,62 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                    optim_8bit=optim_8bit, checkpointing=True,
                                    flash=flash)
-    budget = arch.tokens_in_time(architecture, caps, minutes) or 0
-
-    # A corpus can be smaller than the time budget wants to consume. Reading
-    # the same text more than about four times teaches the model to recite it
-    # rather than to write, so the budget is trimmed and the reason is stated.
+    # How much text the clock allows. This is a ceiling, not a plan: three
+    # separate things can make the right answer smaller, and each says so.
+    clock_budget = arch.tokens_in_time(architecture, caps, minutes) or 0
+    budget = clock_budget
     notes: list[str] = []
+
+    # A model of a given size stops learning much at a knowable point, and
+    # spending the rest of the evening past it buys almost nothing. This used
+    # to fill whatever time it was given: a 29M model was handed 1.9 billion
+    # tokens -- 65 per parameter, more than three times what it can use -- and
+    # ran for ten and a half hours to reach, in its last seven, a loss it had
+    # essentially arrived at in the first three.
+    #
+    # The compute-optimal move with time left over is a BIGGER model, not more
+    # tokens for a small one, which is exactly what the note below says. Real
+    # small models are trained well past this point and do improve, so the cap
+    # is a default and not a limit -- every setting on this screen can still be
+    # overridden by hand.
+    enough = int(counts["effective"] * arch.TOKENS_PER_PARAM_TARGET)
+    if budget > enough > 0:
+        saved = arch.time_for_tokens(architecture, caps, budget - enough)
+        notes.append(
+            "Your machine could read %s in the time you allowed, but a model "
+            "this size has learned what it can from about %s -- %d tokens for "
+            "every parameter it has. Training is planned to stop there, which "
+            "gives you about %s back. To use the whole slot, choose a larger "
+            "model: with time to spare, size is what buys quality, not more "
+            "passes over the same text."
+            % (_human(budget), _human(enough), arch.TOKENS_PER_PARAM_TARGET,
+               _hours_words(saved)))
+        budget = enough
+
+    # A corpus can be smaller than the budget wants to consume. Reading the
+    # same text more than about four times teaches the model to recite it
+    # rather than to write, so the budget is trimmed and the reason is stated.
     corpus_tokens = payload.get("corpus_tokens")
     if corpus_tokens and budget > corpus_tokens * 4:
+        # Phrased against the plan rather than against the clock, because the
+        # cap above may already have shortened it -- "this machine could get
+        # through X in the time you have" was true only when this was the
+        # first thing to trim, and read as nonsense once it was the second.
         notes.append(
-            "This machine could get through %s tokens in the time you have, but "
-            "the text you chose only holds about %s. Training stops after four "
-            "passes over it, because past that the model starts memorising the "
-            "text instead of learning from it."
-            % (_human(budget), _human(corpus_tokens)))
+            "The plan wants %s tokens and the text you chose holds only about "
+            "%s. Training stops after four passes over it, at %s, because past "
+            "that the model starts memorising the text instead of learning "
+            "from it."
+            % (_human(budget), _human(corpus_tokens),
+               _human(corpus_tokens * 4)))
         budget = int(corpus_tokens * 4)
 
     steps = int(max(20, budget // max(fit["tokens_per_step"], 1)))
+    # What the run will actually take, which is not what was asked for the
+    # moment anything above trimmed the budget. The review screen showed the
+    # requested time and was therefore wrong by hours whenever a cap applied.
+    planned_minutes = arch.time_for_tokens(
+        architecture, caps, steps * fit["tokens_per_step"]) or minutes
     lr = arch.recommended_lr(architecture["hidden_size"])
     verdict = arch.training_verdict(architecture, budget)
 
@@ -1165,11 +1204,20 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "limits": arch.LIMITS,
         "memory_gb": fit["memory"]["total_gb"],
         "tokens_per_step": fit["tokens_per_step"],
-        "estimated_minutes": round(minutes, 1),
+        "estimated_minutes": round(planned_minutes, 1),
+        "requested_minutes": round(minutes, 1),
         "minutes_for_full": arch.time_for_tokens(
             architecture, caps, counts["effective"] * arch.TOKENS_PER_PARAM_TARGET),
         "explanations": _explain_scratch(settings, counts, verdict, fit),
     }
+
+
+def _hours_words(minutes: float | None) -> str:
+    if not minutes:
+        return "no time"
+    if minutes < 90:
+        return "%d minutes" % round(minutes)
+    return "%.1f hours" % (minutes / 60)
 
 
 def _human(n: float) -> str:

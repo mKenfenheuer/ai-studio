@@ -1680,7 +1680,13 @@ function scratchReview(state, runner, caps) {
         <dt>Learning from</dt><dd class="mono">${state.dataset}${
           state.config ? " · " + state.config : ""} · ${state.split}</dd>
         <dt>Running on</dt><dd>${runner?.name} — ${caps.device_name || ""}</dd>
-        <dt>Training time</dt><dd>about ${fmtDuration(state.minutes * 60)}</dd>
+        <dt>Training time</dt><dd>about ${fmtDuration(
+          (plan.estimated_minutes ?? state.minutes) * 60)}${
+          plan.estimated_minutes && plan.requested_minutes
+            && plan.estimated_minutes < plan.requested_minutes * 0.9
+          ? ` — less than the ${fmtDuration(plan.requested_minutes * 60)} you `
+            + `allowed, for the reason below`
+          : ""}</dd>
         <dt>Text it will read</dt><dd>${fmtNum(s.token_budget)} tokens over
           ${fmtNum(s.max_steps)} steps</dd>
         <dt>Memory needed</dt><dd>about ${plan.memory_gb} GB of
