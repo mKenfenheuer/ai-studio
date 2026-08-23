@@ -95,3 +95,81 @@ export async function askForNotifications() {
   try { return await Notification.requestPermission(); }
   catch { return "denied"; }
 }
+
+/** A modal dialog, built on the element the platform already provides.
+ *
+ *  `<dialog>` is used rather than a div with a z-index because it brings the
+ *  three things a hand-rolled modal always gets wrong for free: focus is
+ *  trapped inside it, Escape closes it, and everything behind it is inert to
+ *  both the mouse and the screen reader. */
+export function modal({ title, body = "", width = 580, onClose } = {}) {
+  const dlg = document.createElement("dialog");
+  dlg.className = "modal";
+  dlg.style.setProperty("--modal-w", `${width}px`);
+  dlg.innerHTML = `
+    <div class="modal-head">
+      <h2>${esc(title || "")}</h2>
+      <button class="icon-btn" data-modal-close aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">${body}</div>`;
+  document.body.appendChild(dlg);
+  dlg.addEventListener("close", () => { dlg.remove(); onClose?.(); });
+  on(dlg, "click", "[data-modal-close]", () => dlg.close());
+  // A click on the backdrop is reported as a click on the dialog itself --
+  // the box has its own padding-free geometry -- so comparing the target to
+  // the element is what tells "outside" from "inside".
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
+  dlg.showModal();
+  return dlg;
+}
+
+/** Run `fn` only once the typing stops. Used by every search-as-you-type box:
+ *  without it each keystroke is a request, and the answers come back out of
+ *  order so the list flickers between two different searches. */
+export function debounce(fn, ms = 180) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+/** One or two letters standing in for a face. */
+export function initials(name) {
+  const parts = String(name || "?").trim().split(/[\s._-]+/).filter(Boolean);
+  if (!parts.length) return "?";
+  return (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : ""))
+    .toUpperCase();
+}
+
+/** A person, as a small avatar.
+ *
+ *  The initials are always rendered; the picture, when the directory gave us
+ *  one, is laid over them. So a photo that 404s or is blocked reveals the
+ *  initials underneath rather than a broken-image icon, with no error
+ *  handler to get wrong. */
+export function avatar(person, size = 30) {
+  const px = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px`;
+  const pic = person?.avatar_url
+    ? `<img src="${esc(person.avatar_url)}" alt="" loading="lazy">` : "";
+  return raw(`<span class="who-avatar" style="${px}">${
+    esc(initials(person?.display_name || person?.username))}${pic}</span>`);
+}
+
+/** The message a failed sign-in sent back, read once and then scrubbed.
+ *
+ *  It arrives as a query parameter because the browser was at the identity
+ *  provider when it went wrong and there was nowhere else to put it. Read
+ *  once: leaving it in the address bar means a reload redisplays an error
+ *  about something that already happened, and a bookmark carries it forever.
+ */
+export function takeSsoError() {
+  const params = new URLSearchParams(location.search);
+  const message = params.get("sso_error");
+  if (!message) return null;
+  params.delete("sso_error");
+  const rest = params.toString();
+  history.replaceState(null, "",
+    location.pathname + (rest ? "?" + rest : "") + location.hash);
+  return message;
+}

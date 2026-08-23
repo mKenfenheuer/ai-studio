@@ -13,7 +13,7 @@
  * question, and magnitude is what the table's bars are for.
  */
 import { api } from "../api.js";
-import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
+import { html, raw, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { LineChart } from "../chart.js";
 
 export async function compareView(mount) {

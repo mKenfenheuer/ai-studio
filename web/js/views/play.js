@@ -100,7 +100,7 @@ function runCard(r) {
           ? `<span class="badge badge-warn" title="This run was stopped before
                it finished, so the model had less practice than planned."
              >stopped early</span>` : "")}
-        <span class="badge">${esc(fmtAgo(r.finished_at))}</span>
+        <span class="badge">${fmtAgo(r.finished_at)}</span>
       </span>
     </a>`;
 }

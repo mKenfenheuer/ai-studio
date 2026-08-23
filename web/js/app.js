@@ -1,5 +1,5 @@
 import { api, events, handleUnauthorized, NotSignedIn } from "./api.js";
-import { $, $$, toast } from "./util.js";
+import { $, $$, toast, takeSsoError } from "./util.js";
 import { initGate, showGate, hideGate } from "./views/gate.js";
 
 import { dashboardView } from "./views/dashboard.js";
@@ -11,6 +11,7 @@ import { runnersView } from "./views/runners.js";
 import { settingsView } from "./views/settings.js";
 import { accountView } from "./views/account.js";
 import { usersView } from "./views/users.js";
+import { ssoView } from "./views/sso.js";
 import { dataView } from "./views/data.js";
 import { datasetView } from "./views/dataset.js";
 import { generateView } from "./views/generate.js";
@@ -30,6 +31,7 @@ const routes = [
   [/^\/settings$/,     settingsView,  "settings"],
   [/^\/account$/,      accountView,   ""],
   [/^\/users$/,        usersView,     "settings"],
+  [/^\/sso$/,          ssoView,       "settings"],
   [/^\/data$/,         dataView,      "data"],
   [/^\/data\/(.+)$/,   datasetView,   "data"],
   [/^\/generate$/,     generateView,  "data"],
@@ -191,6 +193,12 @@ async function start() {
     return;
   }
   hideGate();
+  // A sign-in that failed while a session was already open has no login
+  // screen to be shown on, and used to vanish silently -- the browser landed
+  // on the dashboard as if nothing had been attempted. It is the same message
+  // either way; only where it goes differs.
+  const ssoError = takeSsoError();
+  if (ssoError) toast(ssoError, "err");
   session.user = state.user;
   paintWho(state.user);
   events.start?.();

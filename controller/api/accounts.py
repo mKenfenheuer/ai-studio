@@ -25,6 +25,25 @@ def _set_cookie(response: Response, request: Request, raw: str) -> None:
         path="/")
 
 
+def _email_or_none(value, exclude_id: str | None = None) -> str | None:
+    """A usable address, or a refusal saying why.
+
+    Checked for uniqueness rather than merely stored. An address is what a
+    single sign-on provider matches an existing account by, so two accounts
+    sharing one is not an untidiness -- it is an ambiguity in the middle of
+    deciding who somebody is.
+    """
+    email = (value or "").strip().lower()
+    if not email:
+        return None
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(400, "That does not look like an email address.")
+    clash = db.get_user_by_email(email)
+    if clash and clash["id"] != exclude_id:
+        raise HTTPException(409, "Another account here already uses %s." % email)
+    return email[:200]
+
+
 @router.get("/auth/state")
 async def auth_state(request: Request) -> dict:
     """What the login screen needs to know before anyone types anything."""
@@ -88,6 +107,15 @@ async def login(request: Request, response: Response,
     stored = user["password_hash"] if user else auth.hash_password("x" * 24)
     ok = auth.verify_password(password, stored)
 
+    if user and not user["password_hash"] and user.get("provider"):
+        # No hash and a provider means this account signs in elsewhere. Telling
+        # them so is not a leak worth worrying about -- the sign-in button is
+        # on the same screen, in front of them.
+        idp = db.get_idp(user["provider"])
+        raise HTTPException(
+            400, "This account signs in with %s. Use the button above."
+                 % ((idp or {}).get("name") or "single sign-on"))
+
     if not user or not ok or not user["active"]:
         auth.note_failure(key)
         if user and ok and not user["active"]:
@@ -124,10 +152,24 @@ async def me(request: Request) -> dict:
 @router.patch("/me")
 async def update_me(request: Request, payload: dict = Body(...)) -> dict:
     user = current_user(request)
-    name = (payload.get("display_name") or "").strip()
-    if not name:
-        raise HTTPException(400, "A display name cannot be empty.")
-    db.update_user(user["id"], display_name=name[:80])
+    fields: dict = {}
+    if "display_name" in payload:
+        name = (payload.get("display_name") or "").strip()
+        if not name:
+            raise HTTPException(400, "A display name cannot be empty.")
+        fields["display_name"] = name[:80]
+    if "email" in payload:
+        # Not for signing in -- for being found. A colleague looking for you
+        # in the share box is far more likely to type your address than your
+        # username, and an account with neither is one nobody can share with.
+        if user.get("provider"):
+            raise HTTPException(
+                400, "Your address comes from the account you sign in with, "
+                     "and changing it here would only make the two disagree.")
+        fields["email"] = _email_or_none(payload["email"], exclude_id=user["id"])
+    if not fields:
+        raise HTTPException(400, "Nothing to change.")
+    db.update_user(user["id"], **fields)
     return db.public_user(db.get_user(user["id"]))
 
 
@@ -137,6 +179,12 @@ async def change_password(request: Request, response: Response,
     user = current_user(request)
     current = payload.get("current_password") or ""
     new = payload.get("new_password") or ""
+    if user.get("provider") and not user["password_hash"]:
+        idp = db.get_idp(user["provider"])
+        raise HTTPException(
+            400, "This account signs in with %s, so there is no password here "
+                 "to change. Change it where that account lives."
+                 % ((idp or {}).get("name") or "single sign-on"))
 
     # Skipped only for an account an administrator has just reset, which by
     # definition has no password its owner knows.
@@ -283,22 +331,58 @@ async def hf_delete_repo(request: Request, repo_id: str, kind: str = "models") -
 # ---------------------------------------------------------------------------
 
 @router.get("/users")
-async def list_users(request: Request) -> list[dict]:
-    """Everyone with an account.
+async def list_users(request: Request, q: str = "", limit: int = 200,
+                     pending: bool = False) -> dict:
+    """Accounts on this studio, filtered and capped.
 
     Not admin-only: sharing a run with a colleague requires knowing that the
     colleague exists. Members see names and roles; nothing else about an
     account is exposed, and the Hugging Face block is stripped below.
+
+    Capped, and paged by search rather than by page number, because a studio
+    connected to a company directory has thousands of accounts and an
+    administration screen that tries to draw all of them is one that never
+    finishes. People imported from a directory who have never signed in are
+    left out unless asked for.
     """
     user = current_user(request)
+    rows, total = db.list_users_page(q, max(1, min(limit, 500)), pending)
     out = []
-    for u in db.list_users():
+    for u in rows:
         pub = db.public_user(u)
         if user["role"] != "admin":
             pub = {k: pub[k] for k in ("id", "username", "display_name", "role",
-                                       "active")}
+                                       "active", "pending")}
         out.append(pub)
-    return out
+    return {"users": out, "total": total, "shown": len(out),
+            "pending_total": db.count_pending()}
+
+
+@router.get("/users/search")
+async def find_users(request: Request, q: str = "", limit: int = 12,
+                     exclude: str = "") -> list[dict]:
+    """People matching what has been typed, for the share box.
+
+    Separate from `/api/users` rather than a parameter on it, because the two
+    answer different questions. That one lists everybody, which is what an
+    administrator wants and what a directory of four thousand people makes
+    useless. This one is a lookup, capped, ranked, and safe to call on every
+    keystroke.
+
+    What comes back is deliberately thin -- a name, a handle, an address and
+    whether they have ever been here. Sharing needs exactly that and a search
+    box should not be a way to read the staff list.
+    """
+    current_user(request)
+    rows = db.search_users(q, limit=max(1, min(limit, 50)),
+                           exclude=[x for x in exclude.split(",") if x])
+    return [{"id": u["id"], "username": u["username"],
+             "display_name": u["display_name"], "email": u.get("email"),
+             "avatar_url": u.get("avatar_url"),
+             "job_title": u.get("job_title"),
+             "department": u.get("department"),
+             "role": u["role"], "pending": bool(u.get("pending"))}
+            for u in rows]
 
 
 @router.post("/users")
@@ -316,10 +400,13 @@ async def create_user(request: Request, payload: dict = Body(...)) -> dict:
     if problem := auth.password_problem(password):
         raise HTTPException(400, problem)
 
+    email = _email_or_none(payload.get("email"))
     uid = db.create_user(username,
                          (payload.get("display_name") or "").strip() or username,
                          auth.hash_password(password), role,
                          must_change=bool(payload.get("must_change", True)))
+    if email:
+        db.update_user(uid, email=email)
     return db.public_user(db.get_user(uid))
 
 
@@ -341,6 +428,8 @@ async def modify_user(request: Request, user_id: str,
         fields["role"] = payload["role"]
     if "active" in payload:
         fields["active"] = 1 if payload["active"] else 0
+    if "email" in payload:
+        fields["email"] = _email_or_none(payload["email"], exclude_id=user_id)
 
     # The two ways to lock everybody out of their own studio, refused rather
     # than explained afterwards.

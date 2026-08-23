@@ -672,3 +672,137 @@ details.card[open] > summary::before { content: "▾ "; }
         border-radius: 8px; padding: 10px 12px; margin: 8px 0 0;
         font-family: var(--mono); line-height: 1.6; overflow-x: auto;
         white-space: pre; color: var(--text); }
+
+
+/* --- modals -------------------------------------------------------------
+   A real <dialog>, so focus trapping, Escape and inertness behind it come
+   from the platform rather than from three event listeners that each have a
+   case they get wrong. */
+.modal {
+  width: min(var(--modal-w, 580px), calc(100vw - 24px));
+  max-height: min(86vh, 900px);
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 12px 40px rgba(16,24,40,.22);
+  overflow: visible;
+}
+.modal::backdrop { background: rgba(12,16,22,.45); backdrop-filter: blur(2px); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .modal::backdrop { background: rgba(0,0,0,.62); }
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 14px 16px 10px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--surface);
+  border-radius: var(--radius) var(--radius) 0 0; z-index: 2;
+}
+.modal-head h2 { margin: 0; font-size: 1.05rem; }
+.modal-body { padding: 16px; overflow-y: auto; max-height: calc(86vh - 58px); }
+
+/* --- the person picker --------------------------------------------------- */
+.pick { position: relative; }
+.pick-field {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 5px 6px; min-height: 40px;
+  border: 1px solid var(--border-2); border-radius: 8px;
+  background: var(--surface);
+}
+.pick-field:focus-within { border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg); }
+.pick-field input {
+  flex: 1 1 160px; min-width: 140px; border: none; outline: none;
+  background: none; padding: 4px 2px; color: var(--text); font-size: 14px;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 4px 2px 2px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  font-size: 12.5px; max-width: 100%;
+}
+.chip .who-avatar { font-size: 9px; }
+.chip-x {
+  border: none; background: none; cursor: pointer; color: var(--text-3);
+  font-size: 11px; padding: 0 4px; line-height: 1;
+}
+.chip-x:hover { color: var(--err); }
+
+.pick-list {
+  position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+  margin: 0; padding: 4px; list-style: none; z-index: 5;
+  max-height: 268px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow);
+}
+.pick-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer;
+}
+.pick-item.on, .pick-item:hover { background: var(--accent-bg); }
+.pick-text { display: flex; flex-direction: column; min-width: 0; }
+.pick-name { font-weight: 550; display: flex; align-items: center; gap: 6px; }
+.pick-sub, .access-sub {
+  font-size: 11.5px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pick-empty { padding: 10px; color: var(--text-3); font-size: 12.5px; }
+
+/* --- who has access ------------------------------------------------------ */
+.access-list { display: flex; flex-direction: column; }
+.access-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 0; border-top: 1px solid var(--border);
+}
+.access-row:first-child { border-top: none; }
+.access-who { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.access-name { font-weight: 550; display: flex; align-items: center;
+  gap: 6px; flex-wrap: wrap; }
+.access-level { max-width: 148px; flex: none; }
+
+/* The Share action reads as "something is already shared" without being
+   opened, so a run that is out of your hands looks different at a glance from
+   one that is not -- in the row of actions, next to Stop. */
+.btn-shared {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* The picture sits over the initials rather than replacing them, so a photo
+   that fails to load reveals the letters instead of a broken-image icon. */
+.who-avatar { position: relative; overflow: hidden; }
+.who-avatar img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: inherit;
+}
+
+.badge-soft {
+  background: var(--surface-2); color: var(--text-3);
+  border: 1px solid var(--border); font-weight: 500;
+}
+
+/* --- sign-in with someone else ------------------------------------------- */
+.gate-sso { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+.btn-sso {
+  display: flex; align-items: center; justify-content: center; gap: 9px;
+  width: 100%; padding: 9px 12px; font-weight: 550;
+}
+.sso-mark { display: inline-flex; }
+.or {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text-3); font-size: 11.5px; margin: 4px 0 -4px;
+}
+.or::before, .or::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+
+.kind-option {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; text-align: left; padding: 10px 12px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); color: var(--text);
+}
+.kind-option:hover { border-color: var(--accent); background: var(--accent-bg); }
+.kind-option strong { font-size: 14px; }

@@ -154,7 +154,7 @@ function layout(items, filter) {
       <div class="row-between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
         <h3 style="margin:0">Your library</h3>
         <input type="search" id="dsFilter" placeholder="Filter…"
-               value="${esc(filter)}" style="max-width:220px">
+               value="${filter}" style="max-width:220px">
       </div>
       <div id="mergeBar" class="callout" hidden style="margin-bottom:10px">
         <strong><span id="mergeCount">0</span> selected</strong>
@@ -188,17 +188,17 @@ function listing(items, filter) {
         const [cls, label] = SOURCE[d.source] || ["badge", d.source];
         return html`
           <tr>
-            <td><input type="checkbox" data-pick="${esc(d.id)}"></td>
+            <td><input type="checkbox" data-pick="${d.id}"></td>
             <td>
-              <a href="#/data/${esc(d.id)}"><strong>${esc(d.name)}</strong></a>
+              <a href="#/data/${d.id}"><strong>${d.name}</strong></a>
               ${raw(d.mine ? "" : `<span class="badge badge-accent">shared with you</span>`)}
               ${raw(d.mine && d.is_shared ? `<span class="badge">shared</span>` : "")}
             </td>
             <td>${fmtNum(d.rows)}</td>
             <td class="hide-sm"><span class="${cls}">${label}</span>
               ${raw(d.origin ? `<div class="muted tiny mono">${esc(d.origin)}</div>` : "")}</td>
-            <td class="tiny muted hide-sm">${esc(d.owner_name || "—")}</td>
-            <td class="tiny muted hide-sm">${esc(fmtAgo(d.updated_at))}</td>
+            <td class="tiny muted hide-sm">${d.owner_name || "—"}</td>
+            <td class="tiny muted hide-sm">${fmtAgo(d.updated_at)}</td>
           </tr>`;
       }).join(""))}
     </tbody></table>`;

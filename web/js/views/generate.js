@@ -135,13 +135,13 @@ function layout(state, online, playable) {
     <form id="genForm">
       <div class="grid grid-2" style="align-items:start">
         <div class="card">
-          <h3>${esc(mode.title)}</h3>
+          <h3>${mode.title}</h3>
           <div class="field">
-            <label for="genBody">${esc(bodyLabel(state.mode))}</label>
+            <label for="genBody">${bodyLabel(state.mode)}</label>
             <textarea id="genBody" name="body" rows="10" class="mono"
-                      placeholder="${esc(bodyPlaceholder(state.mode))}"
+                      placeholder="${bodyPlaceholder(state.mode)}"
                       required></textarea>
-            <div class="hint">${esc(bodyHint(state.mode))}</div>
+            <div class="hint">${bodyHint(state.mode)}</div>
           </div>
           ${raw(state.mode !== "from_prompts" ? html`
             <details class="adv">
@@ -149,7 +149,7 @@ function layout(state, online, playable) {
               <div class="field" style="margin-top:8px">
                 <label for="genInstr">Instruction template</label>
                 <textarea id="genInstr" name="instruction" rows="3" class="mono"
-                          placeholder="${esc(templateHint(state.mode))}"></textarea>
+                          placeholder="${templateHint(state.mode)}"></textarea>
                 <div class="hint">${state.mode === "from_topics"
                   ? "Use {topic} where the topic should go."
                   : "Use {examples} where the seed examples should go."}</div>
@@ -164,9 +164,9 @@ function layout(state, online, playable) {
               <label for="genSource">Model</label>
               <select id="genSource" name="source">
                 ${raw(playable.map((p) => html`
-                  <option value="job:${esc(p.id)}"${
+                  <option value="job:${p.id}"${
                     state.source === `job:${p.id}` ? " selected" : ""}>
-                    ${esc(p.name)} — your own</option>`).join(""))}
+                    ${p.name} — your own</option>`).join(""))}
                 <optgroup label="From Hugging Face">
                   ${raw(["Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-0.5B-Instruct",
                          "HuggingFaceTB/SmolLM2-1.7B-Instruct"].map((m) =>
@@ -181,7 +181,7 @@ function layout(state, online, playable) {
               <label for="genRunner">Machine</label>
               <select id="genRunner" name="runner">
                 ${raw(online.map((r) => html`
-                  <option value="${esc(r.id)}">${esc(r.name)}</option>`).join(""))}
+                  <option value="${r.id}">${r.name}</option>`).join(""))}
               </select>
             </div>
           </div>

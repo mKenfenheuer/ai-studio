@@ -37,6 +37,13 @@ def join_token() -> str:
     return tok
 
 
+# The address people actually type. Only needed behind a reverse proxy or a
+# tunnel, and only by single sign-on -- a provider matches the redirect URI it
+# was given character for character, and behind a proxy the URL the
+# application sees is the internal one, which matches nothing anybody
+# registered. Left unset, the forwarded headers are used, then the request.
+PUBLIC_URL: str | None = (os.environ.get("AI_STUDIO_PUBLIC_URL") or "").strip() or None
+
 # Optional Hugging Face token, forwarded to runners so they can pull gated
 # models (Llama, Gemma) and get better rate limits.
 HF_TOKEN: str | None = os.environ.get("HF_TOKEN") or None

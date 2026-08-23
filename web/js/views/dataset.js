@@ -7,7 +7,7 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtNum, fmtAgo } from "../util.js";
-import { shareBox, wireShareBox } from "./share.js";
+import { shareButton, wireShareBox } from "./share.js";
 
 export async function datasetView(mount, [id]) {
   let d = await api.dataset(id);
@@ -134,16 +134,17 @@ function layout(d, stats, rows) {
     <div class="page-head">
       <a href="#/data" class="tiny">← All datasets</a>
       <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${esc(d.name)}</h1>
+        <h1 style="margin:0">${d.name}</h1>
         <div class="row" style="gap:6px;flex-wrap:wrap">
           <button class="btn-sm btn-primary" id="useForTraining">Train on this</button>
-          <a class="btn btn-sm" href="/api/datasets/${esc(d.id)}/dataset-file">↓ JSONL</a>
+          ${raw(shareButton("dataset", d))}
+          <a class="btn btn-sm" href="/api/datasets/${d.id}/dataset-file">↓ JSONL</a>
           ${raw(d.mine ? `<button class="btn-sm btn-danger" id="deleteDs">Delete</button>` : "")}
         </div>
       </div>
       <p class="sub tiny">
         ${fmtNum(d.rows)} rows · ${(d.bytes / 1048576).toFixed(1)} MB ·
-        ${esc(d.owner_name || "unowned")} · updated ${esc(fmtAgo(d.updated_at))}
+        ${d.owner_name || "unowned"} · updated ${fmtAgo(d.updated_at)}
         ${raw(d.access === "view"
           ? ` · <span class="badge">shared with you — read only</span>` : "")}
       </p>
@@ -154,7 +155,7 @@ function layout(d, stats, rows) {
         <strong>How this was made</strong>
         ${raw(d.parent_name
           ? `From <a href="#/data/${esc(d.parent_id)}">${esc(d.parent_name)}</a>: ` : "")}
-        ${esc(d.recipe.steps.join(" · "))}
+        ${d.recipe.steps.join(" · ")}
       </div>` : "")}
     ${raw(d.notes ? `<div class="callout" style="margin-bottom:14px">${esc(d.notes)}</div>` : "")}
 
@@ -179,13 +180,12 @@ function layout(d, stats, rows) {
           ${raw(rows ? rowTable(rows) : html`
             <div class="mono tiny" style="white-space:pre-wrap;max-height:220px;
                  overflow:auto;background:var(--surface-2);padding:10px;border-radius:6px">
-              ${esc(JSON.stringify(d.preview?.[0] || {}, null, 2))}</div>`)}
+              ${JSON.stringify(d.preview?.[0] || {}, null, 2)}</div>`)}
         </div>
       </div>
 
       <div>
         ${raw(canEdit ? toolsCard(d) : "")}
-        ${raw(shareBox("dataset", d))}
         ${raw(publishCard(d))}
         ${raw(canEdit ? metaCard(d) : "")}
       </div>
@@ -201,7 +201,7 @@ function statsPanel(s) {
         <div class="callout ${p.level === "error" ? "callout-err"
           : p.level === "warn" ? "callout-warn"
           : p.level === "ok" ? "callout-ok" : ""}" style="margin-bottom:8px">
-          ${esc(p.message)}
+          ${p.message}
           ${raw(p.fix ? `<button class="btn-sm btn-primary" data-fix="${esc(p.fix)}"
                   style="margin-top:6px">Fix it — makes a new dataset</button>` : "")}
         </div>`).join(""))}
@@ -227,7 +227,7 @@ function statsPanel(s) {
       <summary>Columns</summary>
       <table class="table" style="margin-top:8px"><tbody>
         ${raw(s.columns.map((c) => html`
-          <tr><td class="mono tiny">${esc(c.name)}</td>
+          <tr><td class="mono tiny">${c.name}</td>
             <td class="tiny muted">${Math.round(c.fill_rate * 100)}% filled</td></tr>`).join(""))}
       </tbody></table>
     </details>
@@ -236,7 +236,7 @@ function statsPanel(s) {
       <summary>How the trainer will read these rows</summary>
       <div class="mono tiny" style="white-space:pre-wrap;max-height:240px;overflow:auto;
            background:var(--surface-2);padding:10px;border-radius:6px;margin-top:8px">
-        ${esc((s.preview || []).slice(0, 3).join("\n\n───\n\n"))}</div>
+        ${(s.preview || []).slice(0, 3).join("\n\n───\n\n")}</div>
     </details>`;
 }
 
@@ -255,7 +255,7 @@ function rowTable(data) {
       ${raw(data.rows.map((r) => html`
         <div style="border-bottom:1px solid var(--border);padding:8px 0">
           <div class="muted tiny mono">row ${r.index}</div>
-          <div class="mono tiny" style="white-space:pre-wrap">${esc(r.rendered || "(reads as nothing)")}</div>
+          <div class="mono tiny" style="white-space:pre-wrap">${r.rendered || "(reads as nothing)"}</div>
         </div>`).join(""))}
     </div>
     <p class="muted tiny" style="margin-top:8px">Showing ${data.rows.length} of
@@ -274,7 +274,7 @@ function toolsCard(d) {
         <div class="field">
           <label for="tName">Call the result</label>
           <input id="tName" name="name" type="text"
-                 placeholder="${esc(d.name)} (cleaned)">
+                 placeholder="${d.name} (cleaned)">
         </div>
         <label class="check"><input type="checkbox" name="drop_empty" checked>
           Drop rows that render as nothing</label>
@@ -346,7 +346,7 @@ function publishCard(d) {
         <div class="field">
           <label for="pubRepo">Repository</label>
           <input id="pubRepo" name="repo_id" type="text" class="mono" required
-                 placeholder="your-name/${esc(slug(d.name))}">
+                 placeholder="your-name/${slug(d.name)}">
         </div>
         <div class="field">
           <label for="pubVis">Visibility</label>
@@ -368,12 +368,12 @@ function metaCard(d) {
       <form id="renameForm" style="margin-top:10px">
         <div class="field">
           <label for="mName">Name</label>
-          <input id="mName" name="name" type="text" value="${esc(d.name)}" maxlength="120">
+          <input id="mName" name="name" type="text" value="${d.name}" maxlength="120">
         </div>
         <div class="field">
           <label for="mNotes">Notes</label>
           <textarea id="mNotes" name="notes" rows="3"
-                    placeholder="What is this, and what is it for?">${esc(d.notes || "")}</textarea>
+                    placeholder="What is this, and what is it for?">${d.notes || ""}</textarea>
         </div>
         <button class="btn-sm" type="submit">Save</button>
       </form>

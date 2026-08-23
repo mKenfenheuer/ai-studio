@@ -1,7 +1,7 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast } from "../util.js";
 import { LineChart } from "../chart.js";
-import { shareBox, wireShareBox } from "./share.js";
+import { shareButton, wireShareBox } from "./share.js";
 
 const STAGES = {
   evaluating: "Putting the prompts to each model…",
@@ -122,9 +122,10 @@ export async function jobView(mount, [jobId]) {
     const box = $("#ownerRow", mount);
     if (!box) return;
     const hasModel = job.artifacts?.length;
-    box.innerHTML = shareBox("job", job) + (hasModel ? publishCard(job) : "");
+    box.innerHTML = hasModel ? publishCard(job) : "";
     wireShareBox(mount, "job", job, async () => {
       job = await api.job(jobId);
+      paintHeader(mount, job);
       paintOwnerRow();
     });
   };
@@ -279,7 +280,7 @@ function layout(job, scratch, experts = 0) {
       <p class="sub mono tiny" style="margin-top:4px">${subtitle}</p>
       ${raw(job.config.sweep_id ? html`
         <p class="tiny" style="margin:4px 0 0">One of several variants —
-          <a href="#/sweeps/${esc(job.config.sweep_id)}">see them side by
+          <a href="#/sweeps/${job.config.sweep_id}">see them side by
           side</a>.</p>` : "")}
     </div>
 
@@ -414,15 +415,15 @@ function furtherCard(job, datasets) {
         : html`
           This keeps the adapter this run produced and carries on training it
           on new data. Everything it already learned stays; the new examples
-          are added on top. Its base model, <code>${esc(cfg.base_model || "—")}</code>,
+          are added on top. Its base model, <code>${cfg.base_model || "—"}</code>,
           stays the same.`)}</p>
 
       <form id="furtherForm" style="margin-top:12px">
         <div class="field">
           <label for="furtherData">Text to learn from</label>
           <select id="furtherData" name="studio_dataset">
-            <option value="">Keep the same source (${esc(
-              cfg.dataset_label || String(cfg.dataset || "").split("/").pop() || "—")})</option>
+            <option value="">Keep the same source (${
+              cfg.dataset_label || String(cfg.dataset || "").split("/").pop() || "—"})</option>
             ${raw(datasets.map((d) => html`
               <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
           </select>
@@ -443,7 +444,7 @@ function furtherCard(job, datasets) {
         <div class="field">
           <label for="furtherName">Name</label>
           <input id="furtherName" name="name" type="text"
-                 value="${esc(job.name)} (continued)">
+                 value="${job.name} (continued)">
         </div>
         <button class="btn-primary btn-sm" type="submit" id="furtherGo">
           Start the follow-on run</button>
@@ -497,7 +498,7 @@ function mergeCard(job) {
       </summary>
       <p class="muted tiny" style="margin:10px 0 0">
         This run produced an <em>adapter</em>: a few megabytes that mean
-        nothing without <code>${esc(job.config.base_model || "its base model")}</code>.
+        nothing without <code>${job.config.base_model || "its base model"}</code>.
         Merging folds it in and writes a complete model that loads on its own —
         which is what you need to run it in Ollama, llama.cpp, or anywhere
         outside this studio.</p>
@@ -538,7 +539,7 @@ function publishCard(job) {
         <div class="field">
           <label for="pubRepo">Repository</label>
           <input id="pubRepo" name="repo_id" type="text" class="mono" required
-                 placeholder="your-name/${esc(slug)}">
+                 placeholder="your-name/${slug}">
         </div>
         <div class="field">
           <label for="pubVis">Visibility</label>
@@ -609,6 +610,7 @@ function paintHeader(mount, job) {
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download</a>` : "")}
+    ${raw(shareButton("job", job))}
     ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>`
                 : `<button class="btn-danger btn-sm" id="deleteBtn">Delete</button>`)}`;
 
@@ -683,7 +685,7 @@ function resumeCard(job) {
         ? html`<button class="btn-primary btn-sm" id="resumeBtn">
                  Carry on from step ${fmtNum(r.step)}</button>`
         : html`<p class="muted tiny" style="margin:0">
-            <strong>${esc(r.runner || "That machine")}</strong> is not
+            <strong>${r.runner || "That machine"}</strong> is not
             connected, and the checkpoint is on its disk. Bring it back and
             this button appears.</p>`)}
     </div>`;

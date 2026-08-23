@@ -13,7 +13,7 @@
  */
 import { api, events } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtDuration } from "../util.js";
-import { shareBox, wireShareBox } from "./share.js";
+import { shareButton, wireShareBox } from "./share.js";
 
 export async function evalView(mount, [evalId]) {
   let ev = await api.eval(evalId);
@@ -92,6 +92,7 @@ function layout(ev, candidates, openScore) {
         <div class="row" style="gap:6px">
           <span class="badge">${(ev.items || []).length} prompts</span>
           <button class="btn-sm" id="copyEval" title="Make an editable copy">Copy</button>
+          ${raw(shareButton("eval", ev))}
         </div>
       </div>
       ${raw(ev.notes ? `<p class="sub">${esc(ev.notes)}</p>` : "")}
@@ -165,8 +166,7 @@ function layout(ev, candidates, openScore) {
         </div>
       </div>
     </div>
-
-    <div id="shareRow">${raw(shareBox("eval", ev))}</div>`;
+`;
 }
 
 // Below this, a difference between two models is a difference between a
@@ -246,8 +246,8 @@ function scoreTable(scores, answered, total) {
                   ${raw(m.seconds ? `<div>${esc(fmtDuration(m.seconds))}</div>` : "")}</td>
                 <td class="tiny muted">${fmtAgo(s.created_at)}</td>
                 <td><div class="row" style="gap:4px">
-                  <button class="btn-sm" data-open-score="${esc(s.id)}">Answers</button>
-                  <button class="btn-sm btn-danger" data-del-score="${esc(s.id)}"
+                  <button class="btn-sm" data-open-score="${s.id}">Answers</button>
+                  <button class="btn-sm btn-danger" data-del-score="${s.id}"
                           title="Remove from the comparison">✕</button>
                 </div></td>
               </tr>`;

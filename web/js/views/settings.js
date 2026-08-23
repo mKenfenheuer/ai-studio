@@ -1,5 +1,5 @@
 import { api } from "../api.js";
-import { html, raw, esc, $, on, toast } from "../util.js";
+import { html, raw, $, on, toast } from "../util.js";
 import { session } from "../app.js";
 
 export async function settingsView(mount) {
@@ -32,6 +32,19 @@ export async function settingsView(mount) {
 
     ${raw(!admin ? "" : html`
     <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="gap:10px;flex-wrap:wrap;align-items:flex-start">
+        <div style="min-width:0">
+          <h3 style="margin-bottom:2px">Single sign-on</h3>
+          <p class="muted tiny" style="margin:0">Let people in with the account
+            they already have — Entra ID, Google, Okta, Keycloak — and find
+            colleagues by name when sharing, without keeping a second list of
+            who works here.</p>
+        </div>
+        <a class="btn btn-sm" href="#/sso">Set up</a>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
       <h3>Join token</h3>
       <p class="muted tiny">Machines present this to join the studio. Anyone with
         it can attach a machine and read job data, so share it carefully.</p>
@@ -50,7 +63,7 @@ export async function settingsView(mount) {
         <dt>Version</dt><dd>${status.version}</dd>
         <dt>Machines</dt><dd>${status.runners_online} online / ${status.runners_total} known</dd>
         <dt>Controller</dt><dd class="mono">${location.origin}</dd>
-        <dt>Signed in as</dt><dd>${esc(session.user?.display_name || "?")}
+        <dt>Signed in as</dt><dd>${session.user?.display_name || "?"}
           ${raw(admin ? `<span class="badge badge-accent">administrator</span>` : "")}</dd>
       </dl>
       ${raw(admin ? `<a class="btn btn-sm" href="#/users"

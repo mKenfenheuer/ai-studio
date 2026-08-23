@@ -30,7 +30,15 @@ PUBLIC_PATHS = {
     "/api/auth/state",
     "/api/auth/login",
     "/api/auth/setup",
+    # Which "sign in with..." buttons to draw. A name and a button, nothing
+    # more -- see the note at the top of api/sso.py.
+    "/api/auth/providers",
 }
+
+# The single sign-on round trip. These cannot require a session, because they
+# are how a session is obtained. Their ids vary, so they are matched by prefix
+# rather than listed -- and the prefix is deliberately narrow.
+PUBLIC_PREFIXES = ("/api/auth/sso/",)
 
 # Runners call these with the join token instead of a cookie, because a runner
 # has no session and no user.
@@ -87,7 +95,7 @@ async def authenticate(request: Request, call_next):
         # publicly is what lets the login screen exist at all.
         return await call_next(request)
 
-    if path in PUBLIC_PATHS:
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
         return await call_next(request)
 
     token = request.headers.get("X-Runner-Token")

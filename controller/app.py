@@ -10,12 +10,13 @@ from typing import Any
 
 from fastapi import (Body, FastAPI, Header, HTTPException, Query, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import architectures as arch
 from . import config, datasets as dsets, db, diagnose, hfaccount, hub, serving
-from .api import accounts, data, evals, security, serving as serving_api, sharing
+from .api import (accounts, data, evals, security, serving as serving_api,
+                  sharing, sso)
 from .scheduler import Fleet
 
 fleet = Fleet()
@@ -30,10 +31,33 @@ async def lifespan(app: FastAPI):
     for r in db.q("SELECT id FROM runners WHERE status != 'offline'"):
         db.mark_runner_offline(r["id"])
     task = asyncio.create_task(fleet.scheduler_loop())
+    sync = asyncio.create_task(_directory_loop())
     yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    for t in (task, sync):
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+
+async def _directory_loop() -> None:
+    """Keep the list of people in step with whatever directory owns it.
+
+    Hourly, and only for providers that asked. Deliberately not on startup
+    with everything else: a directory that is slow or unreachable must not be
+    able to hold up a controller that has training to schedule, so the first
+    pass waits a minute and every failure is recorded rather than raised.
+    """
+    from . import directory
+    await asyncio.sleep(60)
+    while True:
+        try:
+            for result in await directory.sync_all():
+                print("[directory] %s" % result.get("note", result))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- a timer must not die
+            print("[directory] sync failed: %s" % e)
+        await asyncio.sleep(3600)
 
 
 app = FastAPI(title="AI Studio", version="0.1.0", lifespan=lifespan)
@@ -48,6 +72,7 @@ app.include_router(data.router)
 app.include_router(evals.router)
 app.include_router(serving_api.router)
 app.include_router(sharing.router)
+app.include_router(sso.router)
 
 # The evaluation routes queue jobs, which means they need the live fleet. Set
 # here rather than imported the other way round, because the fleet is created

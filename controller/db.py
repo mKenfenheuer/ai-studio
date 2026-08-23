@@ -7,6 +7,7 @@ that an ORM would cost more than it saves.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -165,6 +166,53 @@ CREATE INDEX IF NOT EXISTS idx_eval_scores ON eval_scores(eval_id, created_at);
 -- this table must not hand anybody a working credential. `prefix` is the
 -- handful of visible characters that let a person tell two of their own keys
 -- apart without either of them being recoverable.
+-- An external identity provider: Entra ID, Google, Okta, Keycloak, anything
+-- that speaks OpenID Connect. Rows here are configuration, not credentials of
+-- this studio's own -- except `client_secret_enc`, which is encrypted at rest
+-- for the same reason the Hugging Face token is: whoever holds it can ask the
+-- provider for tokens as this application.
+CREATE TABLE IF NOT EXISTS idp (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    kind           TEXT NOT NULL,          -- entra | google | okta | oidc ...
+    issuer         TEXT NOT NULL,
+    client_id      TEXT NOT NULL,
+    client_secret_enc TEXT,
+    tenant         TEXT,                   -- Entra tenant id, Google domain
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    auto_create    INTEGER NOT NULL DEFAULT 1,
+    link_by_email  INTEGER NOT NULL DEFAULT 1,
+    allowed_domains TEXT,                  -- comma separated; empty = any
+    admin_groups   TEXT,                   -- comma separated group names/ids
+    scopes         TEXT,
+    -- The discovery document, cached. Kept so a provider that is briefly
+    -- unreachable does not take the login button down with it.
+    discovery      TEXT,
+    discovered_at  REAL,
+    sync_enabled   INTEGER NOT NULL DEFAULT 0,
+    sync_group     TEXT,                   -- only import members of this group
+    sync_subject   TEXT,                   -- Google: the admin to read as
+    sync_secret_enc TEXT,                  -- Graph app secret / Google SA key
+    last_sync_at   REAL,
+    last_sync_note TEXT,
+    created_at     REAL NOT NULL,
+    created_by     TEXT
+);
+
+-- One in-flight sign-in. Holds the state, the nonce and the PKCE verifier
+-- server-side rather than in a cookie, so none of the three can be read or
+-- replayed from the browser, and so a callback that arrives without a
+-- matching row is refused instead of trusted.
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state        TEXT PRIMARY KEY,
+    idp_id       TEXT NOT NULL,
+    nonce        TEXT NOT NULL,
+    verifier     TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    next_url     TEXT,
+    created_at   REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL,
@@ -198,6 +246,27 @@ _ADDED_COLUMNS = [
     # and no endpoint returns it in full.
     ("users", "notify_url_enc", "TEXT"),
     ("users", "notify_events", "TEXT"),
+    # Where this account comes from. NULL means a password on this studio;
+    # anything else is the id of a row in `idp`, and the account signs in
+    # through that provider instead.
+    ("users", "provider", "TEXT"),
+    ("users", "external_id", "TEXT"),
+    ("users", "email", "TEXT"),
+    ("users", "avatar_url", "TEXT"),
+    ("users", "job_title", "TEXT"),
+    ("users", "department", "TEXT"),
+    ("users", "groups", "TEXT"),
+    ("users", "synced_at", "REAL"),
+    # Imported from a directory and has never signed in. Such an account can
+    # be found, shared with and mentioned -- it simply has nothing of its own
+    # yet. The flag clears on first sign-in.
+    ("users", "pending", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+_ADDED_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_users_external"
+    " ON users(provider, external_id)",
+    "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)",
 ]
 
 _conn: sqlite3.Connection | None = None
@@ -220,6 +289,10 @@ def connect() -> sqlite3.Connection:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+        # Indexes last. An index over a column that only exists because of
+        # the migration above cannot be created before that migration has run.
+        for stmt in _ADDED_INDEXES:
+            _conn.execute(stmt)
         _conn.commit()
     return _conn
 
@@ -544,7 +617,8 @@ def list_artifacts(job_id: str) -> list[dict]:
 # otherwise.
 
 _PUBLIC_USER_FIELDS = ("id", "username", "display_name", "role", "active",
-                       "created_at", "last_login", "must_change")
+                       "created_at", "last_login", "must_change", "email",
+                       "avatar_url", "job_title", "department", "provider")
 
 
 def public_user(user: dict | None) -> dict | None:
@@ -553,6 +627,12 @@ def public_user(user: dict | None) -> dict | None:
     out = {k: user.get(k) for k in _PUBLIC_USER_FIELDS}
     out["active"] = bool(out.get("active"))
     out["must_change"] = bool(out.get("must_change"))
+    # "Pending" is the honest word for somebody the directory knows about who
+    # has never been here. They can be found and shared with; they simply own
+    # nothing yet, and the flag clears the first time they sign in.
+    out["pending"] = bool(user.get("pending"))
+    out["groups"] = json.loads(user.get("groups") or "[]")
+    out["sso"] = bool(user.get("provider"))
     out["hf"] = {
         "connected": bool(user.get("hf_token_enc")),
         "username": user.get("hf_username"),
@@ -604,7 +684,9 @@ def update_user(user_id: str, **fields: Any) -> None:
     allowed = {"display_name", "role", "active", "password_hash", "last_login",
                "must_change", "hf_token_enc", "hf_username", "hf_fullname",
                "hf_avatar", "hf_orgs", "hf_can_write", "hf_checked_at",
-               "notify_url_enc", "notify_events"}
+               "notify_url_enc", "notify_events", "provider", "external_id",
+               "email", "avatar_url", "job_title", "department", "groups",
+               "synced_at", "pending", "username"}
     sets, args = [], []
     for k, v in fields.items():
         if k not in allowed:
@@ -644,6 +726,228 @@ def adopt_ownerless(user_id: str) -> int:
     c.execute("UPDATE datasets SET owner_id=? WHERE owner_id IS NULL", (user_id,))
     c.commit()
     return n
+
+
+
+def get_user_by_external(provider: str, external_id: str) -> dict | None:
+    return q1("SELECT * FROM users WHERE provider=? AND external_id=?",
+              (provider, external_id))
+
+
+def get_user_by_email(email: str) -> dict | None:
+    """Case-insensitive, because an address is not case sensitive and every
+    directory in existence disagrees with itself about the capitals."""
+    if not email:
+        return None
+    return q1("SELECT * FROM users WHERE lower(email)=lower(?)"
+              " ORDER BY pending, created_at LIMIT 1", (email.strip(),))
+
+
+def search_users(term: str, limit: int = 20,
+                 exclude: Iterable[str] = ()) -> list[dict]:
+    """People matching what has been typed so far, best match first.
+
+    Ranked rather than merely filtered, because the answer to "ma" should be
+    Maria before Norman Hallmark, and a plain LIKE cannot tell those apart.
+    The order is: an exact username or address, then anything *starting* with
+    the term, then anything containing it. Within each band, people who have
+    signed in come before people who are only in the directory -- a colleague
+    you work with is a likelier target than a name from the org chart.
+    """
+    term = (term or "").strip().lower()
+    skip = {x for x in exclude if x}
+    if not term:
+        rows = q("SELECT * FROM users WHERE active=1 ORDER BY pending,"
+                 " last_login IS NULL, last_login DESC, display_name"
+                 " LIMIT ?", (limit + len(skip),))
+    else:
+        like = "%" + term.replace("%", "").replace("_", "") + "%"
+        rows = q(
+            "SELECT *, ("
+            "  CASE WHEN lower(username)=? OR lower(IFNULL(email,''))=? THEN 0"
+            "       WHEN lower(username) LIKE ? OR lower(display_name) LIKE ?"
+            "         OR lower(IFNULL(email,'')) LIKE ? THEN 1"
+            "       ELSE 2 END) AS rank"
+            " FROM users WHERE active=1 AND ("
+            "  lower(username) LIKE ? OR lower(display_name) LIKE ?"
+            "  OR lower(IFNULL(email,'')) LIKE ?)"
+            " ORDER BY rank, pending, display_name LIMIT ?",
+            (term, term, term + "%", term + "%", term + "%",
+             like, like, like, limit + len(skip)))
+    return [r for r in rows if r["id"] not in skip][:limit]
+
+
+def unique_username(base: str) -> str:
+    """A username nobody else has, derived from what the directory offered."""
+    stem = re.sub(r"[^a-z0-9._-]", "", (base or "").strip().lower())
+    stem = re.sub(r"^[^a-z0-9]+", "", stem)[:28] or "person"
+    if len(stem) < 2:
+        stem += "0"
+    if not get_user_by_name(stem):
+        return stem
+    for n in range(2, 500):
+        candidate = "%s%d" % (stem[:28], n)
+        if not get_user_by_name(candidate):
+            return candidate
+    return new_id("usr")
+
+
+def list_users_page(term: str = "", limit: int = 200,
+                    include_pending: bool = False) -> tuple[list[dict], int]:
+    """A page of accounts for the administration screen, and the total.
+
+    Separate from `search_users` because the two want different things: that
+    one is a lookup and only ever offers people who can actually be shared
+    with, while this one has to show disabled accounts -- being able to see
+    them is the point of the screen.
+
+    Directory imports are hidden by default. A tenant of four thousand people
+    would otherwise bury the handful who actually use the studio, which is the
+    list an administrator came here to read.
+    """
+    where, args = [], []
+    if not include_pending:
+        where.append("pending=0")
+    if term := (term or "").strip().lower():
+        like = "%" + term.replace("%", "").replace("_", "") + "%"
+        where.append("(lower(username) LIKE ? OR lower(display_name) LIKE ?"
+                     " OR lower(IFNULL(email,'')) LIKE ?)")
+        args += [like, like, like]
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    total = q1("SELECT COUNT(*) AS n FROM users" + clause, args)
+    rows = q("SELECT * FROM users" + clause
+             + " ORDER BY pending, role, username LIMIT ?", args + [limit])
+    return rows, int(total["n"]) if total else 0
+
+
+def upsert_directory_user(idp_id: str, external_id: str, username: str,
+                          display_name: str, email: str | None = None,
+                          **extra: Any) -> tuple[str, bool]:
+    """Record somebody the directory told us about. Returns (id, created).
+
+    Deliberately conservative about what it overwrites. A directory owns the
+    name, the address and the job title; it does not own the role somebody has
+    in this studio, their password, or the fact that an administrator disabled
+    them -- so those are left exactly as they are.
+    """
+    fields = {k: v for k, v in extra.items() if v is not None}
+    existing = get_user_by_external(idp_id, external_id)
+    if not existing and email:
+        candidate = get_user_by_email(email)
+        # Only adopt an account that is not already tied to a *different*
+        # provider. Two directories claiming the same address is a conflict to
+        # leave alone, not one to resolve by guessing.
+        if candidate and candidate.get("provider") in (None, "", idp_id):
+            existing = candidate
+    if existing:
+        update_user(existing["id"], provider=idp_id, external_id=external_id,
+                    display_name=display_name or existing["display_name"],
+                    email=email, synced_at=now(), **fields)
+        return existing["id"], False
+
+    uid = new_id("usr")
+    ex("INSERT INTO users (id,username,display_name,password_hash,role,active,"
+       "created_at,must_change,provider,external_id,email,pending,synced_at)"
+       " VALUES (?,?,?,'','member',1,?,0,?,?,?,1,?)",
+       (uid, unique_username(username), display_name or username,
+        now(), idp_id, external_id, email, now()))
+    if fields:
+        update_user(uid, **fields)
+    return uid, True
+
+
+def directory_users(idp_id: str) -> list[dict]:
+    return q("SELECT * FROM users WHERE provider=?", (idp_id,))
+
+
+def count_pending(idp_id: str | None = None) -> int:
+    sql = "SELECT COUNT(*) AS n FROM users WHERE pending=1"
+    args: tuple = ()
+    if idp_id:
+        sql += " AND provider=?"
+        args = (idp_id,)
+    row = q1(sql, args)
+    return int(row["n"]) if row else 0
+
+
+# --------------------------------------------------------- identity providers
+
+def create_idp(idp_id: str | None = None, **fields: Any) -> str:
+    iid = idp_id or new_id("idp")
+    cols = ["id", "created_at"]
+    vals: list[Any] = [iid, now()]
+    for k, v in fields.items():
+        cols.append(k)
+        vals.append(v)
+    ex("INSERT INTO idp (%s) VALUES (%s)"
+       % (",".join(cols), ",".join("?" * len(cols))), vals)
+    return iid
+
+
+_IDP_FIELDS = {"name", "kind", "issuer", "client_id", "client_secret_enc",
+               "tenant", "enabled", "auto_create", "link_by_email",
+               "allowed_domains", "admin_groups", "scopes", "discovery",
+               "discovered_at", "sync_enabled", "sync_group",
+               "sync_subject", "sync_secret_enc", "last_sync_at", "last_sync_note"}
+
+
+def update_idp(idp_id: str, **fields: Any) -> None:
+    sets, args = [], []
+    for k, v in fields.items():
+        if k not in _IDP_FIELDS:
+            raise ValueError("refusing to update unknown idp column %r" % k)
+        sets.append("%s=?" % k)
+        args.append(v)
+    if not sets:
+        return
+    args.append(idp_id)
+    ex("UPDATE idp SET %s WHERE id=?" % ",".join(sets), args)
+
+
+def get_idp(idp_id: str) -> dict | None:
+    return q1("SELECT * FROM idp WHERE id=?", (idp_id,))
+
+
+def list_idps(enabled_only: bool = False) -> list[dict]:
+    sql = "SELECT * FROM idp"
+    if enabled_only:
+        sql += " WHERE enabled=1"
+    return q(sql + " ORDER BY created_at")
+
+
+def delete_idp(idp_id: str) -> int:
+    """Remove a provider, and detach -- never delete -- the people it brought.
+
+    Deleting those accounts would take their runs' owner with them. An account
+    that can no longer sign in is a problem an administrator can fix in a
+    minute; a week of somebody GPU time gone unowned is not.
+    """
+    c = connect()
+    n = c.execute("UPDATE users SET provider=NULL, external_id=NULL"
+                  " WHERE provider=?", (idp_id,)).rowcount
+    c.execute("DELETE FROM oauth_states WHERE idp_id=?", (idp_id,))
+    c.execute("DELETE FROM idp WHERE id=?", (idp_id,))
+    c.commit()
+    return n
+
+
+# ------------------------------------------------------------- sign-in state
+
+def put_oauth_state(state: str, idp_id: str, nonce: str, verifier: str,
+                    redirect_uri: str, next_url: str | None) -> None:
+    ex("INSERT INTO oauth_states (state,idp_id,nonce,verifier,redirect_uri,"
+       "next_url,created_at) VALUES (?,?,?,?,?,?,?)",
+       (state, idp_id, nonce, verifier, redirect_uri, next_url, now()))
+
+
+def take_oauth_state(state: str, max_age_s: float = 600.0) -> dict | None:
+    """Read a pending sign-in and destroy it. Single use, by construction."""
+    row = q1("SELECT * FROM oauth_states WHERE state=?", (state,))
+    ex("DELETE FROM oauth_states WHERE state=? OR created_at < ?",
+       (state, now() - max_age_s))
+    if not row or now() - row["created_at"] > max_age_s:
+        return None
+    return row
 
 
 # ---------------------------------------------------------------- api keys

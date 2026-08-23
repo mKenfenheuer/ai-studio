@@ -219,7 +219,7 @@ function layout(me, alerts, keys, freshKey) {
           <p class="muted tiny">Shown next to your runs and when somebody
             shares something with you.</p>
           <form id="nameForm" class="row row-top" style="margin-top:10px">
-            <input type="text" id="displayName" value="${esc(me.display_name)}"
+            <input type="text" id="displayName" value="${me.display_name}"
                    maxlength="80">
             <button class="btn-sm btn-primary" type="submit">Save</button>
           </form>
@@ -254,8 +254,8 @@ function layout(me, alerts, keys, freshKey) {
             me.sessions.length === 1 ? "" : "s"}.</p>
           <ul class="muted tiny" style="margin:8px 0;padding-left:18px;line-height:1.7">
             ${raw(me.sessions.slice(0, 6).map((s) => html`
-              <li>${esc(shortAgent(s.user_agent))} — last used ${
-                esc(fmtAgo(s.last_used))}</li>`).join(""))}
+              <li>${shortAgent(s.user_agent)} — last used ${
+                fmtAgo(s.last_used)}</li>`).join(""))}
           </ul>
           <button class="btn-sm btn-danger" id="revoke">Sign out everywhere else</button>
         </div>
@@ -282,9 +282,9 @@ function keysCard(keys, fresh) {
 
       <div class="field" style="margin-top:10px">
         <label>Base URL</label>
-        <input type="text" class="mono" readonly value="${esc(origin)}/v1">
+        <input type="text" class="mono" readonly value="${origin}/v1">
         <div class="hint">Model names come from
-          <code>GET ${esc(origin)}/v1/models</code> — each finished run is one,
+          <code>GET ${origin}/v1/models</code> — each finished run is one,
           by its id or its name.</div>
       </div>
 
@@ -295,7 +295,7 @@ function keysCard(keys, fresh) {
           delete it and make another.
           <div class="row" style="gap:6px;margin-top:8px">
             <input type="text" class="mono" readonly id="freshKey"
-                   value="${esc(fresh.key)}" style="flex:1">
+                   value="${fresh.key}" style="flex:1">
             <button class="btn-sm" id="copyKey">Copy</button>
           </div>
         </div>` : "")}
@@ -314,14 +314,14 @@ function keysCard(keys, fresh) {
                 <div class="muted tiny mono">${k.prefix}…</div></td>
               <td class="tiny muted">${k.last_used
                 ? `used ${fmtAgo(k.last_used)}` : "never used"}</td>
-              <td><button class="btn-sm btn-danger" data-del-key="${esc(k.id)}"
+              <td><button class="btn-sm btn-danger" data-del-key="${k.id}"
                           title="Delete this key">✕</button></td>
             </tr>`).join(""))}
         </tbody></table>` : "")}
 
       <details class="adv" style="margin-top:10px">
         <summary>How to point something at it</summary>
-        <pre class="code tiny">curl ${esc(origin)}/v1/chat/completions \
+        <pre class="code tiny">curl ${origin}/v1/chat/completions \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model": "your-run-name",
@@ -347,7 +347,7 @@ function alertCard(a) {
         <div class="field">
           <label for="hookUrl">Webhook address</label>
           <input id="hookUrl" name="url" type="url" class="mono"
-                 placeholder="${a.configured ? esc(a.url_hint)
+                 placeholder="${a.configured ? a.url_hint
                                 : "https://ntfy.sh/your-topic"}">
           <div class="hint">One JSON POST per event. Works with ntfy, Slack,
             Discord, Gotify, Home Assistant, or your own script — it carries
@@ -443,8 +443,8 @@ function hfCard(hf) {
                   style="border-radius:50%">`
           : `<span class="who-avatar">${esc((hf.username || "?")[0].toUpperCase())}</span>`)}
         <div>
-          <div><strong>${esc(hf.fullname || hf.username)}</strong></div>
-          <div class="muted tiny mono">@${esc(hf.username)}</div>
+          <div><strong>${hf.fullname || hf.username}</strong></div>
+          <div class="muted tiny mono">@${hf.username}</div>
         </div>
       </div>
       <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:12px">
@@ -484,13 +484,13 @@ function repoList(repos, kind) {
       <tr>
         <td>
           <a href="https://huggingface.co/${kind === "datasets" ? "datasets/" : ""}${
-            esc(r.id)}" target="_blank" rel="noopener" class="mono tiny">${esc(r.id)}</a>
+            r.id}" target="_blank" rel="noopener" class="mono tiny">${r.id}</a>
           ${raw(r.private ? `<span class="badge">private</span>` : "")}
           ${raw(r.gated ? `<span class="badge badge-warn">gated</span>` : "")}
         </td>
         <td class="tiny muted hide-sm">${r.downloads} downloads</td>
-        <td class="tiny muted hide-sm">${esc(fmtAgo(Date.parse(r.updated) / 1000))}</td>
-        <td><button class="btn-sm btn-danger" data-delrepo="${esc(r.id)}"
+        <td class="tiny muted hide-sm">${fmtAgo(Date.parse(r.updated) / 1000)}</td>
+        <td><button class="btn-sm btn-danger" data-delrepo="${r.id}"
                     data-kind="${kind}" title="Delete on Hugging Face">✕</button></td>
       </tr>`).join(""))}
   </tbody></table>`;

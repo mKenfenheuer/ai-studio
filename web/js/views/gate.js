@@ -7,7 +7,8 @@
  * drawn until there is a session.
  */
 import { api } from "../api.js";
-import { html, raw, $, on, toast } from "../util.js";
+import { html, raw, esc, $, on, toast,
+         takeSsoError } from "../util.js";
 
 let onSignedIn = null;
 
@@ -21,8 +22,62 @@ export function showGate(state) {
   gate.innerHTML = state.setup_required ? setupForm()
     : state.must_change ? changeForm() : loginForm();
   wire(gate, state);
+  showReturnedError(gate);
   setTimeout(() => $("#gateFirst", gate)?.focus(), 30);
+
+  // The buttons arrive a moment after the form rather than delaying it. A
+  // studio with no provider configured is the common case and must not pay a
+  // request for the possibility, and a provider list that fails to load has to
+  // leave a working password form behind, not an empty screen.
+  if (!state.setup_required && !state.must_change) {
+    api.authProviders()
+      .then(({ providers }) => paintProviders(gate, providers || []))
+      .catch(() => { /* password sign-in still works */ });
+  }
 }
+
+function showReturnedError(gate) {
+  const message = takeSsoError();
+  if (!message) return;
+  $("#gateError", gate).innerHTML =
+    `<div class="callout callout-err">${esc(message)}</div>`;
+}
+
+function paintProviders(gate, providers) {
+  const slot = $("#gateSso", gate);
+  if (!slot || !providers.length) return;
+  // Where they were heading before the session ran out, so that signing in
+  // returns them to the page they asked for rather than to the dashboard.
+  const next = location.hash.startsWith("#/") ? location.hash : "";
+  slot.innerHTML = html`
+    ${raw(providers.map((p) => html`
+      <a class="btn btn-sso" href="/api/auth/sso/${p.id}/start${
+          next ? "?next=" + encodeURIComponent(next) : ""}">
+        <span class="sso-mark" aria-hidden="true">${raw(MARKS[p.kind] || MARKS.oidc)}</span>
+        Continue with ${p.name}
+      </a>`).join(""))}
+    <div class="or"><span>or use a password</span></div>`;
+  slot.hidden = false;
+}
+
+// Small inline marks rather than fetched logos: a strict page that loads
+// nothing from another origin cannot fetch a brand asset, and a studio on a
+// private network often has no route to one anyway.
+const MARKS = {
+  entra: `<svg viewBox="0 0 16 16" width="15" height="15">
+    <rect x="0" y="0" width="7" height="7" fill="#f25022"/>
+    <rect x="9" y="0" width="7" height="7" fill="#7fba00"/>
+    <rect x="0" y="9" width="7" height="7" fill="#00a4ef"/>
+    <rect x="9" y="9" width="7" height="7" fill="#ffb900"/></svg>`,
+  google: `<svg viewBox="0 0 18 18" width="15" height="15">
+    <path fill="#4285f4" d="M17.6 9.2c0-.6-.1-1.3-.2-1.9H9v3.5h4.8a4.1 4.1 0 0 1-1.8 2.7v2.2h2.9c1.7-1.6 2.7-3.9 2.7-6.5z"/>
+    <path fill="#34a853" d="M9 18c2.4 0 4.5-.8 6-2.2l-2.9-2.3a5.4 5.4 0 0 1-8.1-2.8H1v2.3A9 9 0 0 0 9 18z"/>
+    <path fill="#fbbc05" d="M4 10.7a5.4 5.4 0 0 1 0-3.4V5H1a9 9 0 0 0 0 8l3-2.3z"/>
+    <path fill="#ea4335" d="M9 3.6c1.3 0 2.5.5 3.4 1.3L15 2.3A9 9 0 0 0 1 5l3 2.3A5.4 5.4 0 0 1 9 3.6z"/></svg>`,
+  oidc: `<svg viewBox="0 0 16 16" width="15" height="15" fill="none"
+    stroke="currentColor" stroke-width="1.6">
+    <path d="M11 7V5a3 3 0 1 0-6 0v2"/><rect x="3" y="7" width="10" height="7" rx="1.5"/></svg>`,
+};
 
 export function hideGate() {
   $("#gate").hidden = true;
@@ -37,6 +92,7 @@ const frame = (title, sub, body, foot = "") => html`
     <div class="gate-brand"><span class="brand-mark">◆</span> AI Studio</div>
     <h1>${title}</h1>
     <p class="muted tiny">${sub}</p>
+    <div id="gateSso" class="gate-sso" hidden></div>
     <form id="gateForm" autocomplete="on">${raw(body)}</form>
     <div id="gateError"></div>
     ${raw(foot)}

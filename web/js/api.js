@@ -45,7 +45,16 @@ export const api = {
     req("/api/me/password", { method: "POST", body: JSON.stringify(body) }),
   revokeSessions: () => req("/api/me/sessions/revoke", { method: "POST" }),
 
-  users:       () => req("/api/users"),
+  authProviders: () => req("/api/auth/providers"),
+
+  users:       (q = "", opts = {}) =>
+    req(`/api/users?q=${encodeURIComponent(q)}`
+        + `&limit=${opts.limit || 200}&pending=${!!opts.pending}`),
+  // Called on every keystroke of the share box, so it is a lookup rather than
+  // a filter: the server ranks and caps, and the browser never holds the list.
+  searchUsers: (q, exclude = []) =>
+    req(`/api/users/search?q=${encodeURIComponent(q || "")}`
+        + (exclude.length ? `&exclude=${encodeURIComponent(exclude.join(","))}` : "")),
   createUser:  (body) => req("/api/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser:  (id, body) =>
     req(`/api/users/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -53,6 +62,20 @@ export const api = {
     req(`/api/users/${encodeURIComponent(id)}/password`,
         { method: "POST", body: JSON.stringify({ password }) }),
   deleteUser:  (id) => req(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // ---- single sign-on --------------------------------------------------
+  idps:        () => req("/api/idp"),
+  idpPresets:  () => req("/api/idp/presets"),
+  createIdp:   (body) => req("/api/idp", { method: "POST", body: JSON.stringify(body) }),
+  updateIdp:   (id, body) =>
+    req(`/api/idp/${encodeURIComponent(id)}`,
+        { method: "PATCH", body: JSON.stringify(body) }),
+  deleteIdp:   (id) => req(`/api/idp/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  rediscoverIdp: (id) =>
+    req(`/api/idp/${encodeURIComponent(id)}/rediscover`, { method: "POST" }),
+  syncIdp:     (id, dryRun = false) =>
+    req(`/api/idp/${encodeURIComponent(id)}/sync?dry_run=${dryRun}`,
+        { method: "POST" }),
 
   // ---- api keys --------------------------------------------------------
   apiKeys:     () => req("/api/me/api-keys"),

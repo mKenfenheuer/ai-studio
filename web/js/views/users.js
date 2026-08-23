@@ -1,6 +1,7 @@
 /** Administering accounts. Visible only to administrators. */
 import { api } from "../api.js";
-import { html, raw, esc, $, on, toast, fmtAgo } from "../util.js";
+import { html, raw, esc, $, on, toast, fmtAgo, debounce,
+         avatar } from "../util.js";
 import { session } from "../app.js";
 
 export async function usersView(mount) {
@@ -11,16 +12,42 @@ export async function usersView(mount) {
     return;
   }
 
-  let users = await api.users();
+  // What is being looked at, rather than the whole studio: a directory of
+  // several thousand people cannot be drawn, and mostly should not be -- the
+  // list an administrator came here for is the handful who actually use this.
+  const view = { q: "", pending: false };
+  let page = await api.users("", view);
 
   const draw = () => {
-    mount.innerHTML = layout(users);
+    mount.innerHTML = layout(page, view);
     wire();
+    const box = $("#userSearch", mount);
+    if (box) {
+      box.value = view.q;
+      // Focus is restored after every repaint, at the end of what was typed,
+      // or searching stops after the first letter.
+      if (view.focus) { box.focus(); box.setSelectionRange(box.value.length,
+                                                           box.value.length); }
+    }
   };
 
-  const refresh = async () => { users = await api.users(); draw(); };
+  const refresh = async () => { page = await api.users(view.q, view); draw(); };
+
+  const search = debounce(async () => { await refresh(); }, 200);
 
   function wire() {
+    on(mount, "input", "#userSearch", (_e, t) => {
+      view.q = t.value;
+      view.focus = true;
+      search();
+    });
+
+    on(mount, "change", "#showPending", async (_e, t) => {
+      view.pending = t.checked;
+      view.focus = false;
+      await refresh();
+    });
+
     on(mount, "submit", "#newUser", async (e) => {
       e.preventDefault();
       const f = Object.fromEntries(new FormData(e.target).entries());
@@ -82,13 +109,31 @@ export async function usersView(mount) {
   draw();
 }
 
-function layout(users) {
+function layout(page, view) {
+  const users = page.users || [];
   const admins = users.filter((u) => u.role === "admin" && u.active).length;
   return html`
     <div class="page-head">
       <h1>People</h1>
-      <p class="sub">${users.length} account${users.length === 1 ? "" : "s"} ·
-        ${admins} administrator${admins === 1 ? "" : "s"}</p>
+      <p class="sub">${page.total} account${page.total === 1 ? "" : "s"} ·
+        ${admins} administrator${admins === 1 ? "" : "s"}${
+        page.pending_total ? ` · ${page.pending_total} imported from a `
+          + `directory who have never signed in` : ""}</p>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="row row-top" style="gap:10px;flex-wrap:wrap">
+        <input id="userSearch" type="search" style="flex:1;min-width:200px"
+               placeholder="Search by name, username or email"
+               autocomplete="off" spellcheck="false">
+        ${raw(page.pending_total ? html`
+          <label class="check" style="margin:0">
+            <input type="checkbox" id="showPending" ${view.pending ? "checked" : ""}>
+            Include directory entries</label>` : "")}
+      </div>
+      ${raw(page.shown < page.total ? html`
+        <p class="muted tiny" style="margin:8px 0 0">Showing ${page.shown}
+          of ${page.total}. Type to narrow it down.</p>` : "")}
     </div>
 
     <div class="card" style="margin-bottom:14px">
@@ -127,7 +172,8 @@ function layout(users) {
     <div class="card">
       <table class="table">
         <thead><tr>
-          <th>Person</th><th>Role</th><th class="hide-sm">Last signed in</th>
+          <th>Person</th><th>Role</th><th class="hide-sm">Signs in with</th>
+          <th class="hide-sm">Last signed in</th>
           <th class="hide-sm">Hugging Face</th><th></th>
         </tr></thead>
         <tbody>
@@ -146,31 +192,45 @@ function row(u) {
   return html`
     <tr style="${u.active ? "" : "opacity:.55"}">
       <td>
-        <strong>${esc(u.display_name)}</strong>
-        ${raw(me ? `<span class="badge badge-accent">you</span>` : "")}
-        ${raw(u.active ? "" : `<span class="badge">disabled</span>`)}
-        <div class="muted tiny mono">${esc(u.username)}</div>
+        <div class="row" style="gap:9px;align-items:center">
+          ${avatar(u, 30)}
+          <div style="min-width:0">
+            <strong>${u.display_name}</strong>
+            ${raw(me ? `<span class="badge badge-accent">you</span>` : "")}
+            ${raw(u.active ? "" : `<span class="badge">disabled</span>`)}
+            ${raw(u.pending
+              ? `<span class="badge badge-soft">never signed in</span>` : "")}
+            <div class="muted tiny mono">${u.email || u.username}</div>
+          </div>
+        </div>
       </td>
       <td>
-        <select data-role="${esc(u.id)}" ${me ? "disabled" : ""}
+        <select data-role="${u.id}" ${me ? "disabled" : ""}
                 title="${me ? "You cannot change your own role." : ""}">
           <option value="member"${u.role === "member" ? " selected" : ""}>Member</option>
           <option value="admin"${u.role === "admin" ? " selected" : ""}>Administrator</option>
         </select>
       </td>
-      <td class="tiny muted hide-sm">${u.last_login ? esc(fmtAgo(u.last_login)) : "never"}</td>
+      <td class="tiny muted hide-sm">${raw(u.sso
+        ? `<span class="badge badge-soft">${esc(u.provider)}</span>`
+        : "a password")}</td>
+      <td class="tiny muted hide-sm">${u.last_login ? fmtAgo(u.last_login) : "never"}</td>
       <td class="tiny muted hide-sm">${raw(u.hf?.connected
         ? `<span class="badge badge-ok">@${esc(u.hf.username)}</span>`
         : `<span class="muted">not connected</span>`)}</td>
       <td>
         <div class="row" style="gap:5px;flex-wrap:wrap">
-          <button class="btn-sm" data-reset="${esc(u.id)}">Reset password</button>
+          <button class="btn-sm" data-reset="${u.id}"
+                  title="${u.sso ? "This account signs in with " + u.provider
+                    + ". Setting a password gives it a second way in."
+                    : "Set a temporary password they must replace."}">
+            ${u.sso ? "Give a password" : "Reset password"}</button>
           ${raw(me ? "" : html`
-            <button class="btn-sm" data-toggle="${esc(u.id)}"
+            <button class="btn-sm" data-toggle="${u.id}"
                     data-active="${u.active ? 1 : 0}">
               ${u.active ? "Disable" : "Enable"}</button>
-            <button class="btn-sm btn-danger" data-del="${esc(u.id)}"
-                    data-name="${esc(u.display_name)}">✕</button>`)}
+            <button class="btn-sm btn-danger" data-del="${u.id}"
+                    data-name="${u.display_name}">✕</button>`)}
         </div>
       </td>
     </tr>`;

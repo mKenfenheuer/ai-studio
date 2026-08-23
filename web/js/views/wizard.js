@@ -467,7 +467,7 @@ function ownModelPanel(state) {
             </p>
             ${raw(src.kind !== "pretrain_llm" ? html`
               <p class="muted tiny" style="margin:4px 0 0">Its base model,
-                <code>${esc(src.base_model || "—")}</code>, stays the same.</p>` : "")}
+                <code>${src.base_model || "—"}</code>, stays the same.</p>` : "")}
             ${raw(tmpl.status === "ready" && !tmpl.data.available ? html`
               <p class="muted tiny" style="margin:4px 0 0">It carries no chat
                 template of its own, so the plain readable format is used.</p>` : "")}
@@ -831,7 +831,7 @@ function templatePanel(state, scratch) {
             ? `<span class="badge badge-accent">tool calls</span>` : "")}
         </p>` : html`
         <p class="muted tiny" style="margin:0 0 10px">
-          Rows are read as ${esc(det.mode || "…")}. Change the template below if
+          Rows are read as ${det.mode || "…"}. Change the template below if
           that is not the shape you want the model to learn.</p>`)}
 
       ${raw(scratch && isChat
@@ -1155,7 +1155,7 @@ function previewControls(state, scratch) {
           `<option value="${v}"${v === (state.formatMode || "") ? " selected" : ""}>${
             esc(l)}</option>`).join(""))}
       </select>
-      <div class="hint">Detected: ${esc(mode)}.</div>
+      <div class="hint">Detected: ${mode}.</div>
     </div>`;
 }
 
@@ -1404,9 +1404,9 @@ function moePanel(state) {
           </div>
           ${raw(chosen ? html`
             <div class="callout" style="margin-top:4px">
-              <strong>${esc(chosen.label)} as a mixture of experts</strong>
-              holds ${esc(chosen.params_label)} parameters and uses
-              ${esc(chosen.active_params_label)} of them on any given token.
+              <strong>${chosen.label} as a mixture of experts</strong>
+              holds ${chosen.params_label} parameters and uses
+              ${chosen.active_params_label} of them on any given token.
               Memory and the amount of text it needs follow the first number;
               speed follows the second.
               <em class="muted">Its weights and optimiser state alone take
@@ -1939,10 +1939,10 @@ function sweepPanel(state) {
       <div class="field">
         <label for="sweepValues">Values to try</label>
         <input type="text" id="sweepValues" class="mono"
-               value="${esc(state.sweepValues || "")}"
-               placeholder="${esc(((options.find(
+               value="${state.sweepValues || ""}"
+               placeholder="${((options.find(
                  (o) => o[0] === state.sweepKey) || [])[2] || [])
-                 .join(", "))}">
+                 .join(", ")}">
         <div class="hint">Separated by commas. Up to eight in total.</div>
       </div>
     </details>`;
