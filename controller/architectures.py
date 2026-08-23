@@ -305,6 +305,24 @@ def effective_params(total: int, active: int) -> int:
 # Memory
 # ---------------------------------------------------------------------------
 
+# Everything the terms below do not name: cuBLAS workspaces, the quantisation
+# buffers the 8-bit optimiser allocates during its step, and the slack inside
+# blocks the allocator has already handed out. Not derived -- measured, and
+# the same factor fits both runs there is data for, which is the only reason
+# it is a single number rather than a term:
+#
+#   29M,  d=512,  8 layers, 512 tokens,  batch 48, no checkpointing
+#         10.97 GB predicted raw   vs   11.89 GB measured   (+8.4%)
+#   207M, d=1024, 15 layers, 4096 tokens, batch 1, checkpointing
+#          4.10 GB predicted raw   vs    4.56 GB measured   (+11.2%)
+#
+# Both are `max_memory_allocated`, which is what a run reports. What the
+# allocator RESERVES is higher again, and that is what the separate headroom
+# in `usable_vram_gb` is for -- these are two different overheads and folding
+# them into one number is how an estimate ends up unable to explain itself.
+UNNAMED_OVERHEAD = 1.10
+
+
 def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
                        checkpointing: bool = False, flash: bool = False) -> dict:
     """VRAM needed to train every parameter of this model.
@@ -348,16 +366,33 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     if checkpointing:
         # Only layer inputs survive the forward pass; the rest is recomputed.
         acts = tokens * d * L * 2 + tokens * d * per_layer_bytes
+        # ...and that is exactly why only ONE layer's attention scores are
+        # ever live. See the note on `live_layers` below.
+        live_layers = 1
     else:
         acts = tokens * d * L * per_layer_bytes
+        live_layers = L
 
     attn = 0
     if not flash:
         # Without a fused kernel the scores matrix is materialised per layer
         # AND its softmax is kept for the backward pass -- two tensors, not
         # one, which is why this is doubled. Quadratic in sequence length, so
-        # it is negligible at 256 tokens and the largest single term at 1024.
-        attn = 2 * batch * h * s * s * 2 * L
+        # it is negligible at 256 tokens and dominant at 4096.
+        #
+        # Multiplied by the number of layers whose scores are alive AT ONCE,
+        # which is not the same as the number of layers. Without checkpointing
+        # every layer keeps its own for the backward pass, so it is all of
+        # them. With checkpointing nothing is kept: each layer's scores are
+        # rebuilt during its own recomputation and freed again, so the peak
+        # holds one.
+        #
+        # This was charged against every layer in both cases, and it is the
+        # largest term in the whole estimate at a long context. On a 207M
+        # model at 4096 tokens it predicted 7.50 GB of attention scores where
+        # 0.50 GB was live, and turned a 4.6 GB run into an 11.1 GB one --
+        # which then forced batch 1 to "fit", on a card with 11 GB spare.
+        attn = 2 * batch * h * s * s * 2 * live_layers
 
     # The output logits, and the single most surprising term here.
     #
@@ -372,7 +407,7 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
     # direction that picks a batch size and then runs out of memory.
     logits = tokens * arch["vocab_size"] * 16
 
-    total = (state + acts + attn + logits) / 1024 ** 3
+    total = (state + acts + attn + logits) * UNNAMED_OVERHEAD / 1024 ** 3
     return {
         "optimizer_gb": round(state / 1024 ** 3, 2),
         "activations_gb": round((acts + attn) / 1024 ** 3, 2),
@@ -433,36 +468,59 @@ def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = Fal
 # Compute
 # ---------------------------------------------------------------------------
 
+# How much slower the attention matmuls are than the rest of the model when
+# there is no fused kernel. They are memory-bound, not arithmetic-bound: the
+# scores matrix is written out and read back rather than staying in registers,
+# so the card spends its time moving s x s numbers instead of multiplying.
+#
+# 0.40, from the three runs below -- and it is the term that makes the
+# difference at a long context. Attention is 9% of the arithmetic at 256
+# tokens and 38% of it at 4096, which is why an estimate calibrated on short
+# runs was 2.8x optimistic on a 4096-token one.
+ATTENTION_EFFICIENCY = 0.40
+
+# What gradient checkpointing costs. The forward pass is thrown away and done
+# again during the backward pass: 2N + 4N becomes 2N + 2N + 4N, so 4/3.
+CHECKPOINT_COST = 4.0 / 3.0
+
+
 def _efficiency(dim: int, flash: bool = False) -> float:
     """Fraction of the GPU's measured peak a model of this width can reach.
 
     The capability probe multiplies 2048x2048 matrices, which saturates the
-    card. A transformer does not reach that, and how far short it falls is the
-    difference between a 30-minute estimate and a six-hour run.
+    card. A transformer does not, and how far short it falls is the difference
+    between a three-hour estimate and an eleven-hour run.
 
-    These numbers are MEASURED, on an RX 6900 XT training TinyStories:
+    MEASURED, on an RX 6900 XT (gfx1030, fp16, 31.6 TFLOPS by the probe):
 
-        nano   d=256, seq=256, batch 64   222k tokens/s  ->  0.223 of peak
-        small  d=512, seq=512, batch 48    50k tokens/s  ->  0.279 of peak
+        nano   d=256,  4 layers, 256 tokens,  batch 64   222,000 tok/s
+        small  d=512,  8 layers, 512 tokens,  batch 48    49,809 tok/s
+        custom d=1024, 15 layers, 4096 tokens, batch 1     2,752 tok/s
+                                              (checkpointing on)
 
-    The direction was right and the magnitude was not: efficiency does climb
-    with width, but the first guess here (0.06 at 256 wide, rising to 0.22)
-    was nearly four times too pessimistic at the small end. That error would
-    have reported the smallest size as unable to finish when in fact it
-    reaches a full Chinchilla budget in eight minutes.
+    Solved against the FLOP model in `tokens_per_second` -- which now counts
+    attention and recomputation, both of which this function used to absorb --
+    those three imply efficiencies of 0.279, 0.374 and 0.363. So it rises
+    steeply from 256 to 512 and then flattens, which is what "small matmuls
+    are what a GPU is bad at" predicts.
 
-    One measurement was itself misleading and worth recording. The same Small
-    model first measured 0.203, not 0.279 -- because that run was at batch 64,
-    which sat against the memory ceiling and stalled on the allocator. A model
-    squeezed into barely enough memory does not fail; it just runs a third
-    slower, which is a good reason for the batch planner to leave headroom.
+    The previous version of this table absorbed attention into the width
+    number, which worked at 512 tokens and failed badly at 4096: the same
+    32-fold growth in the attention term had nowhere to go. That is the error
+    the third measurement here caught.
 
-    Sizes above 512 wide are extrapolated, and so is every flash-attention
-    figure: no card in this fleet has the kernels.
+    One measurement was itself misleading and worth recording. The 512-wide
+    model first measured 0.203 of peak, not 0.374 -- because that run was at
+    batch 64, which sat against the memory ceiling and stalled on the
+    allocator. A model squeezed into barely enough memory does not fail; it
+    runs a third slower, which is a good reason for the batch planner to leave
+    headroom.
+
+    Widths above 1024 are extrapolated flat rather than upward. Guessing high
+    on speed means promising an overnight run that takes two nights.
     """
-    if flash:
-        return 0.26 if dim <= 256 else 0.30 if dim <= 384 else 0.34
-    return 0.22 if dim <= 256 else 0.25 if dim <= 384 else 0.28 if dim <= 512 else 0.30
+    del flash  # a fused kernel changes the attention term, not this one
+    return 0.28 if dim <= 256 else 0.33 if dim <= 384 else 0.37
 
 
 def moe_time_multiplier(experts: int, active: int) -> float:
@@ -505,36 +563,71 @@ def moe_time_multiplier(experts: int, active: int) -> float:
     return 0.77 + 0.24 * experts + 0.26 * (max(active, 1) - 1)
 
 
-def tokens_per_second(arch: dict, caps: dict) -> float | None:
+def tokens_per_second(arch: dict, caps: dict,
+                      checkpointing: bool = False) -> float | None:
+    """Training throughput, from the card's measured peak and this shape.
+
+    Three terms, because the studio got each of them wrong in turn:
+
+    * **the model itself**, 6 FLOPs per parameter per token, forward and
+      backward. This was the only term for a long time.
+    * **attention**, 12 * layers * context * width per token, which does not
+      scale with parameter count at all. It is a rounding error at 256 tokens
+      and more than a third of the work at 4096, and leaving it out is why a
+      4096-token run was predicted at 7,650 tokens per second and delivered
+      2,752.
+    * **recomputation**, when gradient checkpointing is on. The forward pass
+      is simply done twice. The planner has been turning checkpointing on to
+      make things fit and then quoting a time that assumed it was off.
+    """
     tflops = (caps.get("dtypes") or {}).get(caps.get("recommended_dtype", "float16"))
     if not tflops:
         return None
     counts = count_params(arch)
     flash = bool((caps.get("attention") or {}).get("flash"))
-    eff = _efficiency(arch["hidden_size"], flash)
+    eff = _efficiency(arch["hidden_size"])
+    peak = tflops * 1e12 * eff
+    if peak <= 0:
+        return None
+
+    layers = arch["num_hidden_layers"]
+    seq = arch["max_position_embeddings"]
+    width = arch["hidden_size"]
 
     if counts["experts"] > 1:
         # Measured against the same shape with one feed-forward network per
         # block, not against the active parameter count. That was the first
         # attempt and the data rejected it: routing overhead scales with how
         # many experts exist, and the active count does not know how many
-        # exist. 6 FLOPs per parameter per token covers forward and backward.
+        # exist.
         dense = count_params({k: v for k, v in arch.items()
-                              if k != "num_local_experts"})
-        base = (tflops * 1e12 * eff) / (6 * dense["total"])
-        return base / moe_time_multiplier(counts["experts"],
-                                          counts["experts_per_token"])
-    return (tflops * 1e12 * eff) / (6 * counts["total"])
+                              if k != "num_local_experts"})["total"]
+        weights_s = (6 * dense / peak) * moe_time_multiplier(
+            counts["experts"], counts["experts_per_token"])
+    else:
+        weights_s = 6 * counts["total"] / peak
+
+    # Attention is untouched by a mixture of experts -- only the feed-forward
+    # half is routed -- so it sits outside the multiplier above.
+    attention_flops = 12 * layers * seq * width
+    attention_s = attention_flops / (peak * (1.0 if flash else ATTENTION_EFFICIENCY))
+
+    seconds_per_token = weights_s + attention_s
+    if checkpointing:
+        seconds_per_token *= CHECKPOINT_COST
+    return 1.0 / seconds_per_token if seconds_per_token > 0 else None
 
 
-def tokens_in_time(arch: dict, caps: dict, minutes: float) -> int | None:
-    tps = tokens_per_second(arch, caps)
+def tokens_in_time(arch: dict, caps: dict, minutes: float,
+                   checkpointing: bool = False) -> int | None:
+    tps = tokens_per_second(arch, caps, checkpointing)
     return int(tps * minutes * 60) if tps else None
 
 
-def time_for_tokens(arch: dict, caps: dict, tokens: float) -> float | None:
+def time_for_tokens(arch: dict, caps: dict, tokens: float,
+                    checkpointing: bool = False) -> float | None:
     """Minutes needed to train on this many tokens."""
-    tps = tokens_per_second(arch, caps)
+    tps = tokens_per_second(arch, caps, checkpointing)
     return round(tokens / tps / 60, 1) if tps else None
 
 
@@ -596,7 +689,8 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
             fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
                                   checkpointing=True, flash=flash)
             fit["checkpointing"] = True
-        achievable = tokens_in_time(arch, caps, minutes)
+        achievable = tokens_in_time(arch, caps, minutes,
+                                    fit.get("checkpointing", False))
         recommended = int(counts["effective"] * TOKENS_PER_PARAM_TARGET)
         out.append({
             **{k: p[k] for k in ("id", "label", "blurb", "expect")},
@@ -622,7 +716,8 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
             "tokens_achievable": achievable,
             "tokens_recommended": recommended,
             "coverage": round(achievable / max(recommended, 1), 3) if achievable else None,
-            "minutes_for_full": time_for_tokens(arch, caps, recommended),
+            "minutes_for_full": time_for_tokens(
+                arch, caps, recommended, fit.get("checkpointing", False)),
             **training_verdict(arch, achievable),
         })
 
@@ -836,6 +931,7 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
 
     # ---- can it actually run --------------------------------------------
     vram = caps.get("vram_gb")
+    recomputing = False
     if vram:
         optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
         fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
@@ -843,10 +939,13 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
         if not fit["fits"]:
             fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
                                   checkpointing=True, flash=flash)
+            recomputing = fit["fits"]
             if fit["fits"]:
                 out.append(_issue("info", "hidden_size",
-                    "This only fits with activation recomputation turned on, "
-                    "which costs about 30%% of the speed."))
+                    "This only fits by recomputing activations instead of "
+                    "storing them, which does the forward pass twice and "
+                    "makes the run about a quarter slower. The time shown "
+                    "already accounts for it."))
             else:
                 at_one = training_memory_gb(arch, 1, optim_8bit=optim_8bit,
                                             checkpointing=True, flash=flash)
@@ -861,7 +960,7 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
 
     # ---- will it learn anything -----------------------------------------
     if minutes:
-        budget = tokens_in_time(arch, caps, minutes)
+        budget = tokens_in_time(arch, caps, minutes, recomputing)
         verdict = training_verdict(arch, budget)
         if verdict["verdict"] in ("not_viable", "weak"):
             # A warning, never an error, however bad the number is. Not fitting

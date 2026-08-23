@@ -1116,15 +1116,22 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
                                flash=flash)
     checkpointing = False
     if not fit["fits"]:
-        # Recomputing activations instead of storing them costs about 30% of
-        # the speed, and can be the difference between running and not.
+        # Recomputing activations instead of storing them does the forward
+        # pass twice -- about a quarter slower -- and can be the difference
+        # between running and not. `tokens_per_second` is told, so the time
+        # this plan quotes is the time with recomputation on.
         checkpointing = True
         fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                    optim_8bit=optim_8bit, checkpointing=True,
                                    flash=flash)
     # How much text the clock allows. This is a ceiling, not a plan: three
     # separate things can make the right answer smaller, and each says so.
-    clock_budget = arch.tokens_in_time(architecture, caps, minutes) or 0
+    # `checkpointing` matters here and was ignored. The planner turns it on to
+    # make a shape fit and then used to quote a speed that assumed it was off,
+    # so the budget it derived was a third too large before anything else went
+    # wrong.
+    clock_budget = arch.tokens_in_time(
+        architecture, caps, minutes, checkpointing) or 0
     budget = clock_budget
     notes: list[str] = []
 
@@ -1142,7 +1149,8 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
     # overridden by hand.
     enough = int(counts["effective"] * arch.TOKENS_PER_PARAM_TARGET)
     if budget > enough > 0:
-        saved = arch.time_for_tokens(architecture, caps, budget - enough)
+        saved = arch.time_for_tokens(architecture, caps, budget - enough,
+                                     checkpointing)
         notes.append(
             "Your machine could read %s in the time you allowed, but a model "
             "this size has learned what it can from about %s -- %d tokens for "
@@ -1177,7 +1185,8 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
     # moment anything above trimmed the budget. The review screen showed the
     # requested time and was therefore wrong by hours whenever a cap applied.
     planned_minutes = arch.time_for_tokens(
-        architecture, caps, steps * fit["tokens_per_step"]) or minutes
+        architecture, caps, steps * fit["tokens_per_step"], checkpointing) \
+        or minutes
     lr = arch.recommended_lr(architecture["hidden_size"])
     verdict = arch.training_verdict(architecture, budget)
 
@@ -1232,7 +1241,8 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         "estimated_minutes": round(planned_minutes, 1),
         "requested_minutes": round(minutes, 1),
         "minutes_for_full": arch.time_for_tokens(
-            architecture, caps, counts["effective"] * arch.TOKENS_PER_PARAM_TARGET),
+            architecture, caps, counts["effective"] * arch.TOKENS_PER_PARAM_TARGET,
+            checkpointing),
         "explanations": _explain_scratch(settings, counts, verdict, fit),
     }
 
@@ -1296,7 +1306,8 @@ def _explain_scratch(s: dict, counts: dict, verdict: dict, fit: dict) -> list[di
         out.append({"setting": "Memory saving", "value": "on",
                     "why": "This size does not fit otherwise, so activations "
                            "are recomputed during the backward pass rather than "
-                           "stored. Costs about 30% of the speed."})
+                           "stored. Does the forward pass twice, so about "
+                           "a quarter slower."})
     if s["optim_8bit"]:
         out.append({"setting": "8-bit optimiser", "value": "on",
                     "why": "Adam normally keeps two 32-bit numbers per "
