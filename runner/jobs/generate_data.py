@@ -569,6 +569,32 @@ def _extend_one(conv: dict, host: Any, spec: dict, params: dict, turns: int,
     msgs = conv[C.MESSAGES_KEY]
     added = invented = 0
 
+    # A conversation that ends on a call nobody answered cannot be carried
+    # further, and a great many of them do: the best-known tool-calling
+    # datasets are question-then-call and stop there, with no result and no
+    # reply. That is also not a conversation any provider will accept as
+    # input -- the Responses API refuses outright, "no tool output found for
+    # function call" -- so the loop is closed before anything is added to it.
+    if invent_results:
+        for call in _unanswered(msgs):
+            msgs.append({"role": "tool", "tool_call_id": call.get("id"),
+                         "name": call["function"]["name"],
+                         "content": _invent_result(host, spec, params, call, tools)})
+            invented += 1
+            added += 1
+        if added:
+            # The assistant never got to say what the result meant. Without
+            # this the row still ends mid-exchange, one step further along.
+            reply = host.generate(spec, _for_provider(conv),
+                                  {**params, "tools": tools or None},
+                                  None, lambda _l: None)
+            if text := (reply.get("text") or "").strip():
+                turn: dict[str, Any] = {"role": "assistant", "content": text}
+                if thinking := (reply.get("reasoning") or "").strip():
+                    turn["reasoning"] = thinking
+                msgs.append(turn)
+                added += 1
+
     for _ in range(turns):
         # 1. The person's next message, written in their character.
         history = _as_plain(msgs)
@@ -652,11 +678,39 @@ def _invent_result(host: Any, spec: dict, params: dict, call: dict,
         return json.dumps({"result": text[:2000]}, ensure_ascii=False)
 
 
+def _unanswered(msgs: list[dict]) -> list[dict]:
+    """Tool calls in this conversation that no result ever answered."""
+    answered = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+    return [c for m in msgs if m.get("role") == "assistant"
+            for c in (m.get("tool_calls") or [])
+            if c.get("id") not in answered]
+
+
 def _for_provider(conv: dict) -> list[dict]:
-    """The conversation as a provider's chat API wants it."""
+    """The conversation as a provider's chat API wants it.
+
+    Two things are stripped. `reasoning` is ours and not a field any of them
+    accept. And a tool call with no result is dropped rather than sent: the
+    Responses API rejects the whole request over one, and there is no useful
+    version of "carry on from here" that includes a question the model asked
+    and nothing answered.
+    """
     from common import conversation as C
-    return [{k: v for k, v in m.items() if k != "reasoning"}
-            for m in conv[C.MESSAGES_KEY]]
+    msgs = conv[C.MESSAGES_KEY]
+    orphans = {c.get("id") for c in _unanswered(msgs)}
+    out = []
+    for m in msgs:
+        item = {k: v for k, v in m.items() if k != "reasoning"}
+        if calls := item.get("tool_calls"):
+            kept = [c for c in calls if c.get("id") not in orphans]
+            if kept:
+                item["tool_calls"] = kept
+            else:
+                item.pop("tool_calls", None)
+                if not (item.get("content") or "").strip():
+                    continue
+        out.append(item)
+    return out
 
 
 def _as_plain(messages: list[dict]) -> str:
