@@ -522,8 +522,27 @@ def requeue_jobs_for_runner(runner_id: str,
     return requeued, rescued
 
 
+# Facts about a run that the controller establishes and the runner cannot
+# know. A runner reports what it did; which dataset row its output became is
+# decided here, after the artifact is unpacked -- and that happens *before* the
+# runner's own "finished" message arrives. Replacing the summary wholesale
+# therefore threw the link away every time, and a finished generation had no
+# way back to the rows it had just written.
+_CONTROLLER_OWNED = ("dataset_id", "dataset_name")
+
+
 def set_job_summary(job_id: str, summary: dict) -> None:
-    ex("UPDATE jobs SET summary=? WHERE id=?", (json.dumps(summary), job_id))
+    """Record what a run produced, keeping what only the controller knows."""
+    keep = {}
+    if row := q1("SELECT summary FROM jobs WHERE id=?", (job_id,)):
+        try:
+            existing = json.loads(row["summary"] or "{}")
+        except ValueError:
+            existing = {}
+        keep = {k: existing[k] for k in _CONTROLLER_OWNED
+                if k in existing and k not in summary}
+    ex("UPDATE jobs SET summary=? WHERE id=?",
+       (json.dumps({**summary, **keep}), job_id))
 
 
 def set_checkpoint(job_id: str, step: int, runner_id: str | None) -> None:
