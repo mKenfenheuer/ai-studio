@@ -778,6 +778,17 @@ def parse_reply(text: str, fmt: dict | None = None,
     if not calls:
         take(_BARE_CALL)
 
+    if calls:
+        # Once the calls are structure, any call syntax still in the body is
+        # residue -- not prose. Stripped here rather than in each branch above,
+        # because which branch matched depends on what the model emitted and
+        # the leftovers do not: a truncated second copy, the brackets of
+        # `[TOOL_CALLS] [ {...} ]`, a comma between two calls. Returning any of
+        # it as `content` puts a line of raw JSON above the reply in every
+        # client that renders content and tool_calls together.
+        for pattern in (_CHATML_CALL, _INST_CALL, _BARE_CALL, _PLAIN_CALL):
+            body = pattern.sub("", body)
+
     # Whatever marker the format ends a message with, left over because
     # generation stopped on it rather than before it.
     for token in ("<|call|>", "<|end|>", "<|return|>", "<|eom_id|>",
@@ -786,10 +797,7 @@ def parse_reply(text: str, fmt: dict | None = None,
         body = body.replace(token, "")
     body = body.strip()
 
-    # Punctuation left behind by lifting a call out of the syntax that wrapped
-    # it -- the brackets of `[TOOL_CALLS] [ {...} ]`, a trailing comma between
-    # two calls. It is not content, and returning it as content puts a stray
-    # "[]" in front of the reply in every client that renders both.
+    # What is left after all that is punctuation or nothing.
     if calls and not re.search(r"\w", body):
         body = ""
 
