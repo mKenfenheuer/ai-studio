@@ -411,6 +411,10 @@ def repair(conv: dict) -> tuple[dict, list[str]]:
     inference made silently is one nobody can check.
     """
     notes: list[str] = []
+    if unbaked := _unbake_tools(conv):
+        notes.append("took the tool schema out of %d system prompt%s, where it "
+                     "was written in one format's syntax"
+                     % (unbaked, "" if unbaked == 1 else "s"))
     # Calls still waiting for a result, oldest first. A conversation with two
     # parallel calls and two results pairs them in order, which is the only
     # ordering any of the datasets that do this actually use.
@@ -468,6 +472,47 @@ def repair(conv: dict) -> tuple[dict, list[str]]:
         notes.append("linked %d tool result%s to the call it answers"
                      % (linked, "" if linked == 1 else "s"))
     return conv, notes
+
+
+# A tool schema written into the system prompt, in the syntax of whichever
+# format the dataset was built for. The payload is required: the same prompts
+# also *mention* the tags in prose -- "function signatures within <tools>
+# </tools> XML tags" -- and matching that leaves the sentence saying "within
+# XML tags" with a hole in the middle of it. That is the dataset's own
+# instruction to the model and none of our business; only the schema goes.
+_BAKED_TOOLS = re.compile(r"<tools>\s*[\[{].*?</tools>", re.DOTALL | re.IGNORECASE)
+
+
+def _unbake_tools(conv: dict) -> int:
+    """Remove a tool schema that a dataset wrote into its own system prompt.
+
+    Several of the widely used function-calling sets ship the declaration
+    inline -- `<tools>[...]</tools>` inside the system message -- because they
+    were built for one particular format. Once the schema has been read into
+    `tools`, leaving the inline copy means the model is shown the same
+    functions twice, and shown them in a syntax that may not be the one this
+    run is training in: a conversation rendered in Harmony would carry a
+    ChatML-style block *and* a namespace block, disagreeing about nothing but
+    costing a thousand tokens of context to say so.
+
+    Only ever removed when the schema was actually captured. A system prompt
+    that mentions tools nobody parsed keeps every word of it.
+    """
+    if not conv.get(TOOLS_KEY):
+        return 0
+    changed = 0
+    for m in conv.get(MESSAGES_KEY) or []:
+        if m.get("role") not in ("system", "developer"):
+            continue
+        content = m.get("content") or ""
+        if not _BAKED_TOOLS.search(content):
+            continue
+        stripped = _BAKED_TOOLS.sub("", content)
+        # The sentence that introduced the block is left alone -- it is
+        # instruction, not schema -- but the hole it leaves is closed up.
+        m["content"] = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+        changed += 1
+    return changed
 
 
 def _name_in_payload(content: Any) -> str | None:
