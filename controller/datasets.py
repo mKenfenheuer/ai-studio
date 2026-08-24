@@ -37,7 +37,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 import httpx
 
-from common import formatting
+from common import conversation, formatting
 
 from . import config, db
 
@@ -1027,7 +1027,7 @@ def _problems(stats: dict, dataset: dict) -> list[dict]:
 
 def transform(dataset: dict, ops: dict, owner_id: str | None,
               name: str | None = None) -> dict:
-    rows, steps, out_fmt, before = apply_ops(dataset, ops)
+    rows, steps, out_fmt, before, report = apply_ops(dataset, ops)
     if not rows:
         raise ValueError(
             "Those settings would leave the dataset empty. Loosen them and "
@@ -1040,8 +1040,10 @@ def transform(dataset: dict, ops: dict, owner_id: str | None,
         columns=sorted({k for r in rows[:200] for k in r}),
         format=out_fmt,
         recipe={"from": dataset["id"], "from_name": dataset["name"],
-                "steps": steps, "rows_before": before, "rows_after": len(rows)},
+                "steps": steps, "rows_before": before, "rows_after": len(rows),
+                "report": report or None},
         notes=ops.get("notes"))
+    created["report"] = report
     return created
 
 
@@ -1058,7 +1060,7 @@ def preview_transform(dataset: dict, ops: dict, sample: int = 2000) -> dict:
     Dedupe and sampling behave differently on a slice, which is exactly why
     the answer is labelled rather than presented as a count.
     """
-    rows, steps, out_fmt, before = apply_ops(dataset, ops, sample)
+    rows, steps, out_fmt, before, report = apply_ops(dataset, ops, sample)
     fmt = formatting.resolve_format(out_fmt or {})
     shown = rows[:5]
     return {
@@ -1072,6 +1074,9 @@ def preview_transform(dataset: dict, ops: dict, sample: int = 2000) -> dict:
         "rows": shown,
         "rendered": [formatting.format_example(r, fmt) or "" for r in shown],
         "splits": _count_splits(rows),
+        # What the conversion had to infer and what it could not make sense
+        # of. Empty for every transform that is not a conversion.
+        "report": report,
     }
 
 
@@ -1083,8 +1088,8 @@ def _count_splits(rows: list[dict]) -> dict:
     return out
 
 
-def apply_ops(dataset: dict, ops: dict,
-              sample: int | None = None) -> tuple[list[dict], list[str], dict, int]:
+def apply_ops(dataset: dict, ops: dict, sample: int | None = None
+              ) -> tuple[list[dict], list[str], dict, int, dict]:
     """Run a set of operations over the rows. Reads; never writes.
 
     Shared by the real transform and by the preview of one, so that what the
@@ -1244,12 +1249,28 @@ def apply_ops(dataset: dict, ops: dict,
             rows = rows[:sample]
             steps.append("Sampled %s rows" % f"{sample:,}")
 
-    if ops.get("to_chat"):
-        rows, converted = _to_chat(rows, fmt, ops)
-        steps.append("Rewrote %d rows as system/user/assistant turns" % converted)
+    # `to_chat` is what the first version of this called it, kept working
+    # because it is in saved recipes and in whatever anybody scripted against
+    # the endpoint. It means the same thing it always did, which is now this.
+    report: dict = {}
+    if ops.get("to_conversations") or ops.get("to_chat"):
+        rows, report = _to_conversations(rows, fmt, ops)
+        steps.append("Converted %d rows to the standard conversation format"
+                     % report["converted"])
+        if report.get("dropped"):
+            steps.append("Dropped %d rows with nothing conversational in them"
+                         % report["dropped"])
+        for fixed in report.get("repairs") or []:
+            steps.append("Repaired what the data left implicit: %s (%d rows)"
+                         % (fixed["what"], fixed["rows"]))
+        if ops.get("train_on") == "last":
+            steps.append("Marked every assistant turn but the last one "
+                         "weight 0, so they are context and not lessons")
 
-    if ops.get("to_chat"):
+    if ops.get("to_conversations") or ops.get("to_chat"):
         out_fmt = {"mode": "chat"}
+        if train_on := (ops.get("train_on") or "").strip():
+            out_fmt["train_on"] = "assistant" if train_on == "last" else train_on
     elif built:
         # Recorded, not re-detected. A dataset that still carries its original
         # columns would otherwise be read by those instead of by the column
@@ -1257,7 +1278,7 @@ def apply_ops(dataset: dict, ops: dict,
         out_fmt = {"mode": "text", "text_field": built[-1][0]}
     else:
         out_fmt = dataset.get("format")
-    return rows, steps, out_fmt or {}, before
+    return rows, steps, out_fmt or {}, before, report
 
 
 # `{column}`, `{column|filter}`, `{column|slice:0:80}`, `{a|trim|lower}`.
@@ -1343,48 +1364,74 @@ def _fill_template(template: str, row: dict) -> str:
     return _PLACEHOLDER.sub(one, template)
 
 
-def _to_chat(rows: list[dict], fmt: dict, ops: dict) -> tuple[list[dict], int]:
-    """Rewrite rows into a single `messages` column.
+def _to_conversations(rows: list[dict], fmt: dict,
+                      ops: dict) -> tuple[list[dict], dict]:
+    """Rewrite rows into the canonical conversation format.
 
-    Uses exactly the normalisation the trainer and the preview already use, so
-    a dataset converted here reads identically to one that arrived in that
-    shape. A system prompt can be prepended, which is the usual reason for
-    doing this at all.
+    This is the step the whole workbench exists to reach. Whatever the data
+    was -- ShareGPT turns, three Alpaca columns, a CSV of questions and
+    answers, a tool-calling set with the schema in a sibling column -- it comes
+    out of here as one shape: `messages`, `tools`, `meta`. Everything after
+    this point, the trainer and the playground included, reads that one shape
+    and nothing else.
+
+    Done as an explicit transform rather than silently at training time
+    because the conversion is exactly where data goes wrong, and a conversion
+    you cannot see is a conversion you cannot fix. What comes out is a new
+    dataset, inspectable row by row, with a report of everything that had to be
+    inferred to produce it.
     """
     system = (ops.get("system_prompt") or "").strip()
     selectors = ops.get("selectors") or fmt.get("selectors")
+    # Which turns the eventual run should learn from, recorded per row rather
+    # than only on the job: a dataset that means "learn the final answer only"
+    # means it wherever it is trained.
+    train_on = (ops.get("train_on") or "").strip()
+    read_as = dict(fmt)
+    if selectors:
+        read_as["selectors"] = selectors
+
     out: list[dict] = []
-    converted = 0
+    convs: list[dict] = []
+    repairs: dict[str, int] = {}
+    dropped = 0
+
     for r in rows:
-        msgs = formatting.find_messages(r, fmt.get("messages_field"), selectors)
-        if not msgs:
-            prompt = formatting.first_present(r, ["instruction", "prompt",
-                                                  "question", "input"])
-            answer = formatting.first_present(r, ["output", "response",
-                                                  "answer", "completion"])
-            if prompt and answer:
-                msgs = [{"role": "user", "content": str(r.get(prompt) or "")},
-                        {"role": "assistant", "content": str(r.get(answer) or "")}]
-            else:
-                text = formatting.format_example(r, fmt) or ""
-                if not text.strip():
-                    continue
-                msgs = [{"role": "assistant", "content": text}]
-        clean = [{k: v for k, v in m.items()
-                  if k in ("role", "content", "name", "reasoning", "tool_calls") and v}
-                 for m in msgs]
-        if system and not any(m.get("role") == "system" for m in clean):
-            clean.insert(0, {"role": "system", "content": system})
-        row = {"messages": clean}
-        if tools := r.get("tools"):
-            row["tools"] = tools
-        # Which split this row is in survives being rewritten. Losing it here
-        # would quietly merge somebody's held-out rows back into training.
-        if value := r.get(SPLIT_FIELD):
-            row[SPLIT_FIELD] = value
-        out.append(row)
-        converted += 1
-    return out, converted
+        conv = conversation.from_row(r, read_as, selectors)
+        if not conv[conversation.MESSAGES_KEY]:
+            dropped += 1
+            continue
+        conv, notes = conversation.repair(conv)
+        for note in notes:
+            # Counted by what was done, not by row: "linked 4,180 tool results
+            # to the call they answer" is a fact somebody can act on, and four
+            # thousand copies of one sentence is not.
+            kind = re.sub(r"\d+", "N", note)
+            repairs[kind] = repairs.get(kind, 0) + 1
+
+        msgs = conv[conversation.MESSAGES_KEY]
+        if system and not any(m["role"] == "system" for m in msgs):
+            msgs.insert(0, {"role": "system", "content": system})
+        if train_on == "last":
+            # Everything but the final assistant turn is rendered as context
+            # and not learned from. The usual reason: a long conversation whose
+            # earlier replies came from somewhere you do not want imitated.
+            last = max((i for i, m in enumerate(msgs)
+                        if m["role"] == "assistant"), default=None)
+            for i, m in enumerate(msgs):
+                if m["role"] == "assistant" and i != last:
+                    m["weight"] = 0
+
+        convs.append(conv)
+        # The split survives being rewritten. Losing it here would quietly
+        # merge somebody's held-out rows back into training.
+        out.append(conversation.to_row(conv, split=r.get(SPLIT_FIELD)))
+
+    report = conversation.validate_many(convs)
+    report["converted"] = len(out)
+    report["dropped"] = dropped
+    report["repairs"] = [{"what": k, "rows": v} for k, v in repairs.items()]
+    return out, report
 
 
 def split(dataset: dict, fraction: float, owner_id: str | None,

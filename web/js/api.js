@@ -139,6 +139,14 @@ export const api = {
     req(`/api/datasets/${encodeURIComponent(id)}/rows?offset=${offset}`
         + `&limit=${limit}&q=${encodeURIComponent(q)}`
         + `&split=${encodeURIComponent(split)}`),
+  // Rows as conversations, each already cut where a model would take over.
+  // What the playground loads to try a held-out example against the model
+  // that was trained on the rest of the file.
+  datasetConversations: (id, offset = 0, limit = 20, split = "") =>
+    req(`/api/datasets/${encodeURIComponent(id)}/conversations?offset=${offset}`
+        + `&limit=${limit}&split=${encodeURIComponent(split)}`),
+  conversationReport: (id) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/conversation-report`),
   importDataset: (body) =>
     req("/api/datasets/import", { method: "POST", body: JSON.stringify(body) }),
   // Several files at once, under one field name: the endpoint takes a list,

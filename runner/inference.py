@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from common import formatting
+from common import conversation, formatting
 
 from . import artifacts, capabilities
 
@@ -327,17 +327,23 @@ class ModelHost:
 
             self.last_used = time.time()
             elapsed = time.time() - t0
-            # The prompt already opened the reasoning block, so the model's
-            # output continues inside it -- put the opener back before
-            # splitting, or the first half of its own reply looks like prose.
-            whole = emitted
-            if want_reasoning and not whole.lstrip().startswith("<"):
-                whole = "<think>\n" + whole if "<|channel|>" not in text \
-                    else "<|channel|>analysis<|message|>" + whole
-            reasoning, answer = formatting.split_reasoning(whole, fmt)
+            # Read back through the same module that wrote it. Putting the
+            # opener of the reasoning block back, separating the working from
+            # the answer, and recognising a tool call are all one job and all
+            # format-specific, so they live with the formats rather than here.
+            reply = conversation.parse_reply(emitted, fmt,
+                                             reasoning_on=want_reasoning)
             return {
-                "text": answer if want_reasoning and reasoning else emitted,
-                "reasoning": reasoning,
+                "text": reply["content"] or (emitted if not reply["tool_calls"]
+                                             else ""),
+                "reasoning": reply["reasoning"],
+                # Calls the model actually made, as structure rather than as
+                # syntax. This is what lets the playground show "it called
+                # get_order(order_id=12345)" and then hand back a result so the
+                # conversation can carry on past the call -- which was
+                # impossible while a call arrived as an undifferentiated
+                # string of angle brackets.
+                "tool_calls": reply["tool_calls"],
                 "tokens": len(produced),
                 "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
                 "prompt_tokens": prompt_len,

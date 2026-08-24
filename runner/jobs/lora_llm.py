@@ -13,7 +13,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common.formatting import detect_format, format_example
+from common import conversation
+from common.formatting import (conversation_style, detect_format,
+                               format_example)
 from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import expert_kernel
 
@@ -411,25 +413,119 @@ def run(cfg: dict, ctx: Any) -> dict:
                    "resolved_format": {k: v for k, v in fmt.items()
                                        if k not in ("chat_template", "specials")}})
 
+    # ---- what the loss is computed over -------------------------------
+    #
+    # A conversation is not uniformly worth learning from. The user's questions
+    # and the tool's answers are *context*: the model is never asked to produce
+    # them, and training on them teaches it to write the next question itself,
+    # which is why a model trained that way answers and then carries on holding
+    # both sides of the conversation.
+    #
+    # So for conversational data the loss covers the assistant's turns and
+    # nothing else, unless the run says otherwise. The boundaries come from
+    # `conversation.segments`, which measures them by rendering prefixes rather
+    # than by matching on turn markers -- see that function for what happens
+    # when a template makes that impossible.
+    is_chat = conversation_style(fmt) == "chat"
+    train_on = (cfg.get("train_on")
+                or (conversation.DEFAULT_TRAIN_ON if is_chat else "all"))
+    # Offsets need a fast tokenizer. Nearly every model on the Hub ships one;
+    # the few that do not fall back to learning from the whole conversation,
+    # which is what this did for everything until now.
+    can_mask = train_on != "all" and getattr(tok, "is_fast", False)
+    if train_on != "all" and not can_mask:
+        ctx.log("This tokenizer cannot report character offsets, so the loss "
+                "has to cover the whole conversation rather than only the "
+                "assistant's turns.", "warn")
+    if can_mask:
+        ctx.log("The loss covers the assistant's replies only. The questions "
+                "and tool results are still rendered -- the model reads them "
+                "-- but it is not asked to learn to write them.")
+    inexact = 0
+
     def tokenize(batch_rows: dict) -> dict:
+        nonlocal inexact
         keys = list(batch_rows.keys())
         n = len(batch_rows[keys[0]])
-        texts = []
+        texts: list[str] = []
+        keep: list[list[tuple[int, int]]] = []
         for i in range(n):
             row = {k: batch_rows[k][i] for k in keys}
-            t = format_example(row, fmt)
+            spans: list[tuple[int, int]] = []
+            if can_mask:
+                conv, _ = conversation.repair(conversation.from_row(row, fmt))
+                t, spans, exact = conversation.trainable_spans(conv, fmt, train_on)
+                if not exact:
+                    inexact += 1
+            else:
+                t = format_example(row, fmt)
             # Every example ends with the end-of-text token. Without it the
             # model learns what a response looks like but never learns that one
             # has *finished*, so at generation time it answers correctly and
             # then keeps going, inventing a follow-up conversation.
-            texts.append((t + tok.eos_token) if t else "")
+            #
+            # Unless the format already ended it, which every chat format does
+            # -- ChatML closes the last turn with <|im_end|>. Appending
+            # unconditionally, as this did, put two terminators on every
+            # conversational example and taught the model to emit the stop
+            # token twice.
+            if t:
+                if not t.rstrip().endswith(tok.eos_token):
+                    # The terminator is part of the last thing the model has to
+                    # produce, so it belongs *inside* the final trained span.
+                    # Leaving it outside is the same failure in a subtler form:
+                    # the model would read an ending it is never scored on.
+                    if spans and spans[-1][1] == len(t):
+                        spans[-1] = (spans[-1][0], len(t) + len(tok.eos_token))
+                    t += tok.eos_token
+                texts.append(t)
+            else:
+                texts.append("")
+            keep.append(spans)
+
         enc = tok(texts, truncation=True, max_length=max_seq,
-                  padding="max_length", return_tensors=None)
-        enc["labels"] = [list(ids) for ids in enc["input_ids"]]
+                  padding="max_length", return_tensors=None,
+                  return_offsets_mapping=can_mask)
+        offsets = enc.pop("offset_mapping", None)
+
+        labels = []
+        for i, ids in enumerate(enc["input_ids"]):
+            mask = enc["attention_mask"][i]
+            spans = keep[i]
+            row_labels = []
+            for j, token_id in enumerate(ids):
+                # Padding is not data. Scoring it taught the model that the
+                # most likely thing after an answer is another end-of-text,
+                # forty times over -- and on a batch padded to the full context
+                # it was most of the loss.
+                if not mask[j]:
+                    row_labels.append(-100)
+                    continue
+                if not spans:
+                    row_labels.append(token_id)
+                    continue
+                start, end = offsets[i][j]
+                # A zero-width offset is a special token the tokenizer added
+                # itself. It belongs to whichever span contains it, and a
+                # bare `start < end` test would drop the very tokens that mark
+                # the end of an assistant turn.
+                inside = any(s <= start and (end or start + 1) <= e
+                             for s, e in spans)
+                row_labels.append(token_id if inside else -100)
+            labels.append(row_labels)
+        enc["labels"] = labels
         return enc
 
     ds = ds.map(tokenize, batched=True, batch_size=64,
                 remove_columns=ds.column_names, desc="Tokenizing")
+    if inexact:
+        # Not a failure, but not something to pass over either: those rows
+        # trained on every token including the questions, which is a different
+        # thing from what the rest of the run did.
+        ctx.log("%d row(s) had turn boundaries this chat template does not "
+                "allow to be measured -- some templates rewrite earlier turns "
+                "when a later one arrives. Those rows learned from the whole "
+                "conversation." % inexact, "warn")
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     val_ds = None

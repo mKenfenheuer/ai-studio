@@ -16,9 +16,32 @@ with them, and where generation must stop. The template is written onto the
 finished tokenizer as its `chat_template`, so the resulting model is
 self-describing: the playground reads it back exactly as it reads Qwen's.
 
-The templates follow each format's published layout for roles and message
-boundaries, which is what a small model can actually learn. They do not
-attempt the full tool-calling encodings the larger formats also define.
+## Tool calling
+
+Every format here renders tool calls and tool results, each in the encoding
+its own family published:
+
+    plain     readable words, no reserved tokens
+    chatml    <tool_call>/<tool_response> JSON blocks, the Hermes and Qwen
+              layout that most ChatML-speaking models are trained on
+    llama3    a bare JSON object ended by <|eom_id|>, with the result coming
+              back from the `ipython` role -- Llama 3.1's own convention
+    harmony   a `commentary` channel addressed with `to=functions.name`,
+              ended by <|call|>
+    inst      Mistral's [TOOL_CALLS] / [TOOL_RESULTS] tokens
+
+This used to be Harmony only, and the omission was not visible from anywhere:
+the other four rendered an assistant turn that *had* a tool call as an
+assistant turn with nothing in it. A tool-calling dataset trained in ChatML
+taught the model to think about calling a tool and then fall silent, and the
+only symptom was a model that did not work.
+
+The rule when a format's published encoding is elaborate -- Qwen's system
+preamble runs to a hundred and fifty tokens of instructions -- is to keep the
+*tokens and the structure* and drop the prose. A 20M-parameter model trained
+from scratch here cannot spare a sixth of its context on an explanation it will
+never generalise from, and a fine-tune renders through its base model's own
+template anyway.
 
 WHY EVERY TEMPLATE IS ONE LONG LINE: Jinja's trim_blocks removes the newline
 after a `{% %}` tag but never after a `{{ }}` expression. A template laid out
@@ -26,6 +49,17 @@ across source lines therefore emits the source's own newlines on top of the
 ones it means -- a blank line between every turn, and a stray one after the
 generation prompt. Chat templates in the wild are written this way for the
 same reason.
+
+WHAT THE TEMPLATES ARE GIVEN: `common.conversation.for_template` builds the
+message list, so every message reliably has `content`, `reasoning`,
+`tool_calls` (each with a flat `name` and `arguments`, and a nested
+`function.*`), `name` and `tool_call_id` -- present and empty rather than
+missing. `tools_text` is the tool declaration already written in this format's
+own idiom by `formatting.tool_declaration`. `more_turns` is true when what is
+being rendered is a prefix of a longer conversation, which is how the trainer
+finds the boundary of each turn in order to mask the ones it must not learn
+from; only Harmony needs it, because only Harmony ends its final message with
+a different token.
 """
 from __future__ import annotations
 
@@ -41,9 +75,30 @@ CHAT_FORMATS = [
         "eos_token": "<|endoftext|>",
         "bos_token": None,
         "stop": ["\nuser:", "\nsystem:", "\ntool:", "<|endoftext|>"],
-        "template": "{% for m in messages %}{% if m.reasoning %}{{ m.role + ' thinks: ' + m.reasoning + '\\n' }}{% endif %}{{ m.role + ': ' + m.content + '\\n' }}{% endfor %}{% if add_generation_prompt %}{% if reasoning %}{{ 'assistant thinks: ' }}{% else %}{{ 'assistant: ' }}{% endif %}{% endif %}",
+        "template": (
+            "{% if tools_text %}{{ tools_text + '\\n\\n' }}{% endif %}"
+            "{% for m in messages %}"
+            "{% if m.reasoning %}{{ m.role + ' thinks: ' + m.reasoning + '\\n' }}{% endif %}"
+            "{% if m.role == 'tool' %}"
+            "{{ 'tool ' + (m.name or 'result') + ': ' + m.content + '\\n' }}"
+            "{% else %}"
+            "{% if m.content %}{{ m.role + ': ' + m.content + '\\n' }}{% endif %}"
+            "{% for c in m.tool_calls %}"
+            "{{ m.role + ' calls ' + c.name + '(' + c.arguments + ')\\n' }}"
+            "{% endfor %}"
+            "{% if not m.content and not m.tool_calls and not m.reasoning %}"
+            "{{ m.role + ': \\n' }}{% endif %}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{% if reasoning %}{{ 'assistant thinks: ' }}"
+            "{% else %}{{ 'assistant: ' }}{% endif %}"
+            "{% endif %}"),
         "reasoning_specials": [],
         "reasoning_note": 'Written as an extra line. No reserved token, so the model has to learn the phrase like any other words.',
+        "tool_note": "Written out as words: `assistant calls get_order({...})`. "
+                     "Nothing is reserved, so the model has to learn the shape "
+                     "of a call the way it learns any other sentence.",
         "sample_prompt": "user: hello\nassistant: ",
     },
     {
@@ -57,9 +112,53 @@ CHAT_FORMATS = [
         "eos_token": "<|im_end|>",
         "bos_token": None,
         "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-        "template": "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' }}{% if m.reasoning %}{{ '<think>\\n' + m.reasoning + '\\n</think>\\n\\n' }}{% endif %}{{ m.content + '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% if reasoning %}{{ '<think>\\n' }}{% endif %}{% endif %}",
+        # Tools are declared in their own leading system turn rather than
+        # folded into the user's system prompt. Qwen folds them; keeping them
+        # separate means a run whose data has no system prompt does not
+        # suddenly acquire one, and the model sees the declaration in the same
+        # place every time.
+        #
+        # <tool_call> and <tool_response> are ordinary text, not reserved
+        # tokens -- which is what Hermes and Qwen do, so a model fine-tuned
+        # from one of those already knows them. `c.arguments` is spliced in as
+        # raw JSON text rather than quoted, so the result is a JSON *object*:
+        # {"name": "get_order", "arguments": {"order_id": "12345"}}.
+        "template": (
+            "{% if tools_text %}"
+            "{{ '<|im_start|>system\\n' + tools_text + '<|im_end|>\\n' }}"
+            "{% endif %}"
+            "{% for m in messages %}"
+            "{% if m.role == 'tool' %}"
+            "{{ '<|im_start|>tool\\n<tool_response>\\n' }}"
+            "{% if m.name %}{{ '{\"name\": \"' + m.name + '\", \"content\": ' }}"
+            "{{ m.content + '}' }}{% else %}{{ m.content }}{% endif %}"
+            "{{ '\\n</tool_response><|im_end|>\\n' }}"
+            "{% else %}"
+            "{{ '<|im_start|>' + m.role + '\\n' }}"
+            "{% if m.reasoning %}{{ '<think>\\n' + m.reasoning + '\\n</think>\\n\\n' }}{% endif %}"
+            "{{ m.content }}"
+            "{% for c in m.tool_calls %}"
+            # The separating newline belongs before a call only when something
+            # was already written on that line. After a </think> block, which
+            # already ends in a blank line, one more would train the model on a
+            # stray empty line before every tool call it ever makes.
+            "{{ ('\\n' if m.content or not loop.first else '')"
+            " + '<tool_call>\\n{\"name\": \"' + c.name + '\", \"arguments\": '"
+            " + c.arguments + '}\\n</tool_call>' }}"
+            "{% endfor %}"
+            "{{ '<|im_end|>\\n' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{{ '<|im_start|>assistant\\n' }}"
+            "{% if reasoning %}{{ '<think>\\n' }}{% endif %}"
+            "{% endif %}"),
         "reasoning_specials": ['<think>', '</think>'],
         "reasoning_note": "A reserved <think> block inside the assistant's turn — the layout DeepSeek-R1 and the Qwen reasoning models use.",
+        "tool_note": "A <tool_call> block holding {\"name\", \"arguments\"} "
+                     "JSON, answered by a <tool_response> block in a turn of "
+                     "its own. The Hermes and Qwen layout, so a fine-tune from "
+                     "either already speaks it.",
         "sample_prompt": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n",
     },
     {
@@ -69,14 +168,55 @@ CHAT_FORMATS = [
                  "turn ends with an end-of-turn token distinct from "
                  "end-of-text. Verbose, and unusually unambiguous about where "
                  "a turn stops.",
+        # <|eom_id|> -- "end of message" rather than "end of turn" -- is what
+        # Llama 3.1 added for exactly this: an assistant message that is a tool
+        # call is not the end of the assistant's turn, because a result is
+        # coming back and the assistant will speak again.
         "specials": ["<|begin_of_text|>", "<|end_of_text|>",
-                     "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+                     "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+                     "<|eom_id|>"],
         "eos_token": "<|eot_id|>",
         "bos_token": "<|begin_of_text|>",
-        "stop": ["<|eot_id|>", "<|start_header_id|>", "<|end_of_text|>"],
-        "template": "{{ '<|begin_of_text|>' }}{% for m in messages %}{{ '<|start_header_id|>' + m.role + '<|end_header_id|>\\n\\n' }}{% if m.reasoning %}{{ '<think>\\n' + m.reasoning + '\\n</think>\\n\\n' }}{% endif %}{{ m.content + '<|eot_id|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{% if reasoning %}{{ '<think>\\n' }}{% endif %}{% endif %}",
+        "stop": ["<|eot_id|>", "<|eom_id|>", "<|start_header_id|>",
+                 "<|end_of_text|>"],
+        # A tool result comes back from the `ipython` role, which is the name
+        # Llama 3 gives the tool-executing environment. Calls are a bare JSON
+        # object with `parameters` -- not `arguments` -- which is the spelling
+        # Llama's own tool encoding uses and differs from every other format
+        # here on purpose.
+        "template": (
+            "{{ '<|begin_of_text|>' }}"
+            "{% if tools_text %}"
+            "{{ '<|start_header_id|>system<|end_header_id|>\\n\\n'"
+            " + tools_text + '<|eot_id|>' }}"
+            "{% endif %}"
+            "{% for m in messages %}"
+            "{% if m.role == 'tool' %}"
+            "{{ '<|start_header_id|>ipython<|end_header_id|>\\n\\n'"
+            " + m.content + '<|eot_id|>' }}"
+            "{% else %}"
+            "{{ '<|start_header_id|>' + m.role + '<|end_header_id|>\\n\\n' }}"
+            "{% if m.reasoning %}{{ '<think>\\n' + m.reasoning + '\\n</think>\\n\\n' }}{% endif %}"
+            "{{ m.content }}"
+            "{% if m.tool_calls %}"
+            "{% for c in m.tool_calls %}"
+            "{{ '{\"name\": \"' + c.name + '\", \"parameters\": '"
+            " + c.arguments + '}' }}"
+            "{% endfor %}"
+            "{{ '<|eom_id|>' }}"
+            "{% else %}{{ '<|eot_id|>' }}{% endif %}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
+            "{% if reasoning %}{{ '<think>\\n' }}{% endif %}"
+            "{% endif %}"),
         "reasoning_specials": ['<think>', '</think>'],
         "reasoning_note": "A reserved <think> block inside the assistant's turn.",
+        "tool_note": "A bare JSON object with \"name\" and \"parameters\", "
+                     "closed by <|eom_id|> rather than <|eot_id|> because the "
+                     "turn is not over — the result comes back from the "
+                     "`ipython` role. Llama 3.1's own convention.",
         "sample_prompt": ("<|begin_of_text|><|start_header_id|>user"
                           "<|end_header_id|>\n\nhello<|eot_id|>"
                           "<|start_header_id|>assistant<|end_header_id|>\n\n"),
@@ -147,9 +287,17 @@ CHAT_FORMATS = [
             "{% endfor %}"
             "{% elif m.content %}"
             "{{ '<|start|>assistant<|channel|>final<|message|>' + m.content }}"
-            "{{ '<|return|>' if loop.last else '<|end|>' }}"
+            # `more_turns` says this render is a *prefix* of a longer
+            # conversation, which is how the trainer measures where each turn
+            # begins in order to mask the ones it must not learn from. Without
+            # it every prefix would claim to be the end and close with
+            # <|return|>, so no prefix would be a prefix of the next and the
+            # measurement would silently give up. Undefined -- which is what it
+            # is everywhere except that measurement -- is falsy, so this reads
+            # exactly as `loop.last` did for every other caller.
+            "{{ '<|return|>' if loop.last and not more_turns else '<|end|>' }}"
             "{% endif %}"
-            "{% elif m.role in ['tool', 'function'] %}"
+            "{% elif m.role == 'tool' %}"
             "{{ '<|start|>functions.' + (m.name or 'tool')"
             " + '<|message|>' + m.content + '<|end|>' }}"
             "{% else %}"
@@ -168,6 +316,11 @@ CHAT_FORMATS = [
         ),
         "reasoning_specials": [],
         "reasoning_note": 'Its own analysis channel — the mechanism the format was designed around. Nothing extra to reserve; the channel tokens are already there.',
+        "tool_note": "A commentary-channel message addressed to the tool by "
+                     "name and closed with <|call|>; the answer comes back "
+                     "authored by `functions.{name}`. The most explicit of the "
+                     "five, and the only one where a call is structurally "
+                     "distinct from an answer.",
         "sample_prompt": ("<|start|>user<|message|>hello<|end|>"
                           "<|start|>assistant"),
     },
@@ -179,13 +332,51 @@ CHAT_FORMATS = [
                  "token. Compact, and it reuses tokens the model needs anyway. "
                  "A system prompt is folded into the first user turn, which is "
                  "how the format defines it.",
-        "specials": ["<s>", "</s>"],
+        # [TOOL_CALLS], [AVAILABLE_TOOLS] and [TOOL_RESULTS] are real tokens in
+        # Mistral's v3 tokenizer, reserved here for the same reason [INST] is.
+        "specials": ["<s>", "</s>", "[AVAILABLE_TOOLS]", "[/AVAILABLE_TOOLS]",
+                     "[TOOL_CALLS]", "[TOOL_RESULTS]", "[/TOOL_RESULTS]"],
         "eos_token": "</s>",
         "bos_token": "<s>",
         "stop": ["</s>", "[INST]"],
-        "template": "{% set sys = messages | selectattr('role', 'equalto', 'system') | map(attribute='content') | join('\\n') %}{{ '<s>' }}{% for m in messages if m.role != 'system' %}{% if m.role == 'user' %}{{ '[INST] ' + (sys + '\\n\\n' if loop.first and sys else '') + m.content + ' [/INST]' }}{% else %}{% if m.reasoning %}{{ ' <think>\\n' + m.reasoning + '\\n</think>\\n\\n' + m.content + '</s>' }}{% else %}{{ ' ' + m.content + '</s>' }}{% endif %}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ ' <think>\\n' if reasoning else ' ' }}{% endif %}",
+        # Written across several source lines because it is now too long to
+        # read on one; the concatenation still produces a single line, which is
+        # what matters (see the note at the top of this file).
+        "template": (
+            "{% set sys = messages | selectattr('role', 'equalto', 'system')"
+            " | map(attribute='content') | join('\\n') %}"
+            "{{ '<s>' }}"
+            "{% if tools_text %}"
+            "{{ '[AVAILABLE_TOOLS] ' + tools_text + '[/AVAILABLE_TOOLS]' }}"
+            "{% endif %}"
+            "{% for m in messages if m.role != 'system' %}"
+            "{% if m.role == 'user' %}"
+            "{{ '[INST] ' + (sys + '\\n\\n' if loop.first and sys else '')"
+            " + m.content + ' [/INST]' }}"
+            "{% elif m.role == 'tool' %}"
+            "{{ '[TOOL_RESULTS] ' + m.content + '[/TOOL_RESULTS]' }}"
+            "{% else %}"
+            "{% if m.reasoning %}{{ ' <think>\\n' + m.reasoning + '\\n</think>\\n\\n' }}"
+            "{% elif m.content or not m.tool_calls %}{{ ' ' }}{% endif %}"
+            "{{ m.content }}"
+            "{% if m.tool_calls %}"
+            "{{ '[TOOL_CALLS] [' }}"
+            "{% for c in m.tool_calls %}"
+            "{{ '{\"name\": \"' + c.name + '\", \"arguments\": '"
+            " + c.arguments + '}' + (', ' if not loop.last else '') }}"
+            "{% endfor %}"
+            "{{ ']</s>' }}"
+            "{% else %}{{ '</s>' }}{% endif %}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{{ ' <think>\\n' if reasoning else ' ' }}"
+            "{% endif %}"),
         "reasoning_specials": ['<think>', '</think>'],
         "reasoning_note": 'A reserved <think> block before the reply.',
+        "tool_note": "Mistral's own [TOOL_CALLS] and [TOOL_RESULTS] tokens, "
+                     "with the tool list declared once inside "
+                     "[AVAILABLE_TOOLS].",
         "sample_prompt": "<s>[INST] hello [/INST]",
     },
 ]
@@ -201,7 +392,8 @@ def format_or_default(format_id: str | None) -> dict:
     return chat_format(format_id) or chat_format(DEFAULT_FORMAT)
 
 
-def special_tokens(format_id: str | None, reasoning: bool = False) -> list[str]:
+def special_tokens(format_id: str | None, reasoning: bool = False,
+                   tools: bool = False) -> list[str]:
     """Tokens the tokenizer must reserve, in order, before it is trained.
 
     Reserved before, never added after. A token added to an already-trained
@@ -209,7 +401,11 @@ def special_tokens(format_id: str | None, reasoning: bool = False) -> list[str]:
     the embedding table stops matching.
 
     Teaching the model to reason adds a few more, unless the format already
-    carries the machinery -- Harmony reasons in a channel it already has.
+    carries the machinery -- Harmony reasons in a channel it already has. The
+    same is true of tools: `tools` is accepted so a caller can be explicit,
+    but the tool tokens are part of `specials` in every format that has them,
+    because a vocabulary is sized once and a run that discovers tools in its
+    data on the second epoch cannot go back and reserve them.
     """
     spec = format_or_default(format_id)
     out = list(spec["specials"])
@@ -230,4 +426,5 @@ def public_formats() -> list[dict]:
         "token_count": len(f["specials"]),
         "reasoning_specials": f.get("reasoning_specials", []),
         "reasoning_note": f.get("reasoning_note", ""),
+        "tool_note": f.get("tool_note", ""),
     } for f in CHAT_FORMATS]

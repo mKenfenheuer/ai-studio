@@ -14,14 +14,32 @@ would be worse, because nothing would be pointed at it.
 ## What is and is not implemented
 
 Implemented: `/v1/models`, `/v1/chat/completions` with and without streaming,
-`temperature`, `top_p`, `max_tokens`, `stop`, and multi-turn messages. Errors
-are returned in OpenAI's error shape, because a client library handed a bare
-`{"detail": ...}` turns a clear refusal into a parse error about missing keys.
+`temperature`, `top_p`, `max_tokens`, `stop`, multi-turn messages, `tools`,
+reasoning, and tool calls in both directions. Errors are returned in OpenAI's
+error shape, because a client library handed a bare `{"detail": ...}` turns a
+clear refusal into a parse error about missing keys.
 
-Not implemented, and not faked: `n` above 1, `logprobs`, function calling as a
-protocol feature, embeddings. A field that is accepted and ignored is worse
-than one that is refused -- it produces a client that believes it asked for
-something.
+**Tool calling** works the way a client expects it to. `tools` on the request
+are declared to the model in the idiom of the format it was trained in; a call
+the model makes comes back as `message.tool_calls` with `finish_reason:
+"tool_calls"`; and a `role: "tool"` message with its `tool_call_id` can be sent
+straight back to continue the exchange. That last one is the half that is
+usually missing: without it the model is handed a conversation in which it
+never made the call it is being given a result for.
+
+What it cannot promise is that a call *will* be made. Nothing here constrains
+decoding, so `tool_choice` accepts `"auto"` and `"none"` and refuses the rest
+rather than pretending. Whether a model calls tools well at all is a property
+of what it was trained on -- declare tools to a model whose data had none and
+it will ignore them.
+
+**Reasoning** is returned as `reasoning_content` (what vLLM, SGLang and the
+DeepSeek API emit, and what most clients read) and as `reasoning`, kept apart
+from `content` rather than left inline for the client to strip.
+
+Not implemented, and not faked: `n` above 1, `logprobs`, embeddings. A field
+that is accepted and ignored is worse than one that is refused -- it produces a
+client that believes it asked for something.
 
 Token counts are real counts from the runner, not estimates. `prompt_tokens`
 is what the model was actually given after the run's own chat template was
@@ -37,6 +55,8 @@ import time
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from common import conversation
 
 from .. import config, db, serving as spec_for
 from .security import current_user
@@ -128,24 +148,44 @@ async def list_models(request: Request) -> dict:
 
 
 def _messages(payload: dict) -> list[dict]:
+    """The request's conversation, canonical.
+
+    Everything the format carries is kept, not just the text: an assistant turn
+    that made a tool call, the result that answered it, and the id linking the
+    two. Flattening those to `{role, content}` -- as this did -- meant a client
+    could send a tool result back and the model would be given a conversation
+    in which it had never made the call, so the second turn of every
+    tool-calling exchange was nonsense.
+    """
     raw = payload.get("messages")
     if not isinstance(raw, list) or not raw:
         raise HTTPException(400, "`messages` must be a non-empty list.")
-    out = []
     for m in raw:
         if not isinstance(m, dict) or "role" not in m:
             raise HTTPException(400, "Each message needs a `role` and `content`.")
-        content = m.get("content")
-        if isinstance(content, list):
-            # The multi-part content form. Only the text parts mean anything
-            # to a text model, and silently dropping an image would be worse
-            # than joining what is there.
-            content = "".join(p.get("text", "") for p in content
-                              if isinstance(p, dict))
-        out.append({"role": str(m["role"]), "content": str(content or "")})
-    if not any(m["content"].strip() for m in out if m["role"] != "system"):
+
+    conv = conversation.from_messages(raw, payload.get("tools"))
+    conv, _ = conversation.repair(conv)
+    out = conv[conversation.MESSAGES_KEY]
+    if not out:
+        raise HTTPException(400, "There is nothing to answer.")
+    # A conversation is answerable if anything but the system prompt is in it.
+    # A bare tool result counts: "here is what the function returned, carry on"
+    # is a legitimate request and refusing it would break the very loop tool
+    # calling exists for.
+    if not any(m.get("content", "").strip() or m.get("tool_calls")
+               for m in out if m["role"] not in ("system", "developer")):
         raise HTTPException(400, "There is nothing to answer.")
     return out
+
+
+def _tools(payload: dict) -> list[dict]:
+    """Tool definitions from the request, flattened the way the runner wants."""
+    raw = payload.get("tools")
+    if not isinstance(raw, list):
+        return []
+    conv = conversation.from_messages([], raw)
+    return conversation.flat_tools(conv)
 
 
 async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
@@ -156,6 +196,12 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
     spec = spec_for.chat_spec(job)
     if config.HF_TOKEN:
         spec["hf_token"] = config.HF_TOKEN
+    # Tools travel on the spec because that is where the runner reads them
+    # when it renders the prompt -- the same field the playground fills, so a
+    # tool declared over this API is declared to the model in exactly the same
+    # words as one declared in the browser.
+    if tools := _tools(payload):
+        spec["tools"] = tools
     stops = payload.get("stop")
     if isinstance(stops, str):
         stops = [stops]
@@ -190,12 +236,27 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
     user = current_user(request)
     for unsupported, why in (
             ("n", "Only one reply per request is produced."),
-            ("logprobs", "Token probabilities are not available."),
-            ("tools", "Tool calling is a property of how a model was trained "
-                      "here, not a request option. Train with tools in the "
-                      "data and the model will emit them.")):
+            ("logprobs", "Token probabilities are not available.")):
         if payload.get(unsupported) not in (None, False, 1):
             return _error(400, "`%s` is not supported. %s" % (unsupported, why))
+
+    # `tool_choice` is honoured only where it can be. Nothing here constrains
+    # decoding, so "you must call a tool" cannot be promised -- and a request
+    # option that is accepted and quietly ignored produces a client that
+    # believes it asked for something.
+    choice = payload.get("tool_choice")
+    if isinstance(choice, dict) or choice not in (None, "auto", "none", "required"):
+        return _error(400, "`tool_choice` may be \"auto\" or \"none\". Naming a "
+                           "tool, or requiring one, would need constrained "
+                           "decoding, which this server does not do.")
+    if choice == "required":
+        return _error(400, "`tool_choice: \"required\"` cannot be honoured: "
+                           "nothing here constrains what the model emits, so a "
+                           "tool call cannot be guaranteed.")
+    if choice == "none":
+        # Not an error -- the plain meaning is "answer without tools", and the
+        # way to do that is not to declare any.
+        payload = {**payload, "tools": []}
 
     wanted = str(payload.get("model") or "")
     try:
@@ -219,7 +280,16 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
     created = int(time.time())
     if payload.get("stream"):
         return StreamingResponse(
-            _stream(rid, queue, job, created),
+            # A reply that may contain a tool call cannot be streamed as it
+            # arrives. The call is recognised by syntax spanning many tokens --
+            # `<tool_call>{...}</tool_call>` and its equivalents -- so
+            # streaming the text through would deliver that syntax to the
+            # client as the assistant's *content*, and then deliver the same
+            # call again, parsed, at the end. Where tools are declared the
+            # reply is therefore held until it is whole. Where they are not,
+            # nothing can appear that needs parsing, and it streams token by
+            # token as before.
+            _stream(rid, queue, job, created, buffer=bool(payload.get("tools"))),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     return await _collect(rid, queue, job, created)
@@ -228,6 +298,24 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
 def _shell(job: dict, created: int, rid: str) -> dict:
     return {"id": "chatcmpl-" + rid, "object": "chat.completion",
             "created": created, "model": job["id"]}
+
+
+def _tool_calls(msg: dict) -> list[dict]:
+    """The runner's parsed calls, in the exact shape OpenAI clients unpack.
+
+    The runner reports whether each call's arguments parse. A malformed call is
+    still returned rather than dropped -- a client that gets nothing back
+    cannot tell a model that made no call from one whose call was thrown away,
+    and the second is the one worth knowing about.
+    """
+    out = []
+    for i, call in enumerate(msg.get("tool_calls") or []):
+        fn = call.get("function") or {}
+        out.append({"id": call.get("id") or "call_%d" % (i + 1),
+                    "type": "function",
+                    "function": {"name": fn.get("name") or "",
+                                 "arguments": fn.get("arguments") or ""}})
+    return out
 
 
 async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
@@ -243,15 +331,30 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
                 return _error(502, msg.get("error") or "Generation failed.",
                               "upstream_error")
             elif kind == "generate_done":
-                whole = msg.get("text") or "".join(text)
+                calls = _tool_calls(msg)
+                message = {"role": "assistant",
+                           "content": (msg.get("text") or "".join(text)) or None}
+                if reasoning := msg.get("reasoning"):
+                    # Both spellings. `reasoning_content` is what vLLM, SGLang
+                    # and the DeepSeek API emit and what most clients read;
+                    # `reasoning` is what the Responses API calls it. Sending
+                    # both costs a few bytes and saves every client a
+                    # translation.
+                    message["reasoning_content"] = reasoning
+                    message["reasoning"] = reasoning
+                if calls:
+                    message["tool_calls"] = calls
                 return {
                     **_shell(job, created, rid),
                     "choices": [{
                         "index": 0,
-                        "message": {"role": "assistant", "content": whole,
-                                    **({"reasoning": msg["reasoning"]}
-                                       if msg.get("reasoning") else {})},
-                        "finish_reason": "stop",
+                        "message": message,
+                        # A reply that ends in a tool call has not finished
+                        # answering -- it is waiting for a result. A client
+                        # driving a tool loop branches on exactly this, so
+                        # reporting "stop" would stall the loop at the first
+                        # call.
+                        "finish_reason": "tool_calls" if calls else "stop",
                     }],
                     "usage": {
                         "prompt_tokens": msg.get("prompt_tokens") or 0,
@@ -267,7 +370,8 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
         FLEET.waiters.pop(rid, None)
 
 
-async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int):
+async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
+                  buffer: bool = False):
     """Server-sent events, in the exact chunk shape OpenAI clients parse."""
     def chunk(delta: dict, finish=None) -> str:
         body = {**_shell(job, created, rid), "object": "chat.completion.chunk",
@@ -281,7 +385,8 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int):
             msg = await asyncio.wait_for(queue.get(), GENERATE_TIMEOUT_S)
             kind = msg.get("type")
             if kind == "generate_delta":
-                yield chunk({"content": msg.get("delta") or ""})
+                if not buffer:
+                    yield chunk({"content": msg.get("delta") or ""})
             elif kind == "generate_error":
                 # There is no error frame in this protocol once the stream has
                 # started, so the failure is delivered as the reply -- silence
@@ -292,7 +397,21 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int):
                 yield "data: [DONE]\n\n"
                 return
             elif kind == "generate_done":
-                yield chunk({}, "stop")
+                # Reasoning and tool calls are only known once the reply is
+                # whole -- both are recognised by syntax that spans many
+                # tokens, so neither can honestly be streamed as it arrives.
+                # They are delivered in a final delta before the stop, which is
+                # a shape every client already handles.
+                if buffer and (whole := msg.get("text")):
+                    yield chunk({"content": whole})
+                if reasoning := msg.get("reasoning"):
+                    yield chunk({"reasoning_content": reasoning,
+                                 "reasoning": reasoning})
+                calls = _tool_calls(msg)
+                if calls:
+                    yield chunk({"tool_calls": [
+                        {**c, "index": i} for i, c in enumerate(calls)]})
+                yield chunk({}, "tool_calls" if calls else "stop")
                 yield "data: [DONE]\n\n"
                 return
     except asyncio.TimeoutError:

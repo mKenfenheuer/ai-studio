@@ -290,7 +290,8 @@ function opsFrom(f) {
     drop_empty: !!f.drop_empty, dedupe: !!f.dedupe, shuffle: !!f.shuffle,
     min_chars: +f.min_chars || 0, max_chars: +f.max_chars || 0,
     sample: +f.sample || 0, contains: f.contains, excludes: f.excludes,
-    to_chat: !!f.to_chat, system_prompt: f.system_prompt,
+    to_conversations: !!f.to_conversations, system_prompt: f.system_prompt,
+    train_on: f.train_on || "",
     columns: parseCalc(f.calc),
     split_columns: parseSplitColumn(f.split_column),
     drop_columns: splitList(f.drop_columns), rename: parsePairs(f.rename),
@@ -344,6 +345,7 @@ function dryRunPanel(r) {
       ${raw(r.steps.length ? `<ul class="tiny" style="margin:8px 0 0;padding-left:18px">${
         r.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : "")}
     </div>
+    ${raw(conversionReport(r.report))}
     ${raw(r.rows.length ? html`
       <details class="adv" open style="margin-top:8px">
         <summary>The first rows, after</summary>
@@ -367,6 +369,57 @@ function dryRunPanel(r) {
            padding:10px;border-radius:8px;max-height:200px;overflow:auto">${
           (r.rendered || [])[0] || "(reads as nothing)"}</p>
       </details>` : "")}`;
+}
+
+/** What the conversion found, and what it had to work out for itself.
+ *
+ *  The conversion is where data goes wrong, and it goes wrong quietly: a tool
+ *  result that answers a call which never happened still renders, still
+ *  trains, and still produces a model that has learned something false. This
+ *  is the panel that makes that visible while there is still a form on screen
+ *  to change.
+ */
+function conversionReport(rep) {
+  if (!rep || !rep.problems) return "";
+  const bad = (rep.problems || []).filter((p) => p.level === "error");
+  const warn = (rep.problems || []).filter((p) => p.level === "warn");
+  if (!rep.converted && !bad.length && !warn.length) return "";
+
+  const line = (p) => `<li><strong>${esc(String(p.count))} row${
+    p.count === 1 ? "" : "s"}</strong> — ${esc(p.message)}${
+    p.rows?.length ? ` <span class="muted">(e.g. row ${
+      p.rows.slice(0, 3).join(", ")})</span>` : ""}</li>`;
+
+  return html`
+    <div class="callout ${bad.length ? "callout-err" : warn.length ? "callout-warn" : "callout-ok"}"
+         style="margin-top:10px">
+      <strong>${fmtNum(rep.converted || 0)} rows converted${
+        rep.rows_with_errors ? ` — ${fmtNum(rep.rows_with_errors)} with problems` : ""}</strong>
+      ${raw(bad.length || warn.length
+        ? ""
+        : "Every row reads as a well-formed conversation: no tool result "
+          + "answering a call that never happened, no assistant turn with "
+          + "nothing in it, no tool called that was never declared.")}
+      ${raw(bad.length ? `<div class="tiny" style="margin-top:6px">
+        <strong>These would teach the model something false:</strong>
+        <ul style="margin:4px 0 0;padding-left:18px">${
+          bad.map(line).join("")}</ul></div>` : "")}
+      ${raw(warn.length ? `<div class="tiny" style="margin-top:6px">
+        <strong>Worth a look:</strong>
+        <ul style="margin:4px 0 0;padding-left:18px">${
+          warn.map(line).join("")}</ul></div>` : "")}
+      ${raw((rep.repairs || []).length ? `<div class="tiny" style="margin-top:6px">
+        <strong>Worked out rather than read:</strong>
+        <ul style="margin:4px 0 0;padding-left:18px">${
+          rep.repairs.map((f) => `<li>${esc(f.what)} — ${fmtNum(f.rows)} rows</li>`)
+            .join("")}</ul>
+        <span class="muted">Real data leaves the link between a tool call and
+        its result implicit. It is reconstructed here and written down, so
+        nothing downstream has to guess again.</span></div>` : "")}
+      ${raw(rep.dropped ? `<div class="tiny" style="margin-top:6px">${
+        fmtNum(rep.dropped)} row(s) had nothing conversational in them and were
+        left out.</div>` : "")}
+    </div>`;
 }
 
 /** "a, b, c" as a list; blank entries ignored. */
@@ -671,12 +724,37 @@ function toolsCard(d) {
           Remove exact duplicates</label>
         <label class="check"><input type="checkbox" name="shuffle">
           Shuffle</label>
-        <label class="check"><input type="checkbox" name="to_chat">
-          Rewrite as system/user/assistant turns</label>
+        <div class="callout" style="margin:12px 0">
+          <strong>🧩 Convert to the standard conversation format</strong>
+          Whatever this data is now — ShareGPT turns, two flat columns, a
+          tool-calling set with the schema in a sibling column — this rewrites
+          every row into the one shape the trainer, the playground and the API
+          all read: <code>messages</code>, <code>tools</code>,
+          <code>meta</code>. It is the same format OpenAI's fine-tuning files
+          use, which is what every published chat template already knows how to
+          render.
+        </div>
+        <label class="check"><input type="checkbox" name="to_conversations">
+          Convert to conversations</label>
         <div class="field">
-          <label for="tSys">System prompt to add (when rewriting)</label>
+          <label for="tSys">System prompt to add (when converting)</label>
           <input id="tSys" name="system_prompt" type="text"
                  placeholder="You are a helpful assistant.">
+          <div class="hint">Added only to rows that do not already have one.
+            A model fine-tuned with a system prompt behaves noticeably
+            differently without it, so it is worth setting deliberately.</div>
+        </div>
+        <div class="field">
+          <label for="tTrainOn">What a run should learn from these rows</label>
+          <select id="tTrainOn" name="train_on">
+            <option value="">Every assistant turn (the usual choice)</option>
+            <option value="last">Only the final answer in each conversation</option>
+            <option value="all">Every token, questions included</option>
+          </select>
+          <div class="hint">The questions and the tool results are always
+            rendered — the model reads them. This is about which tokens it is
+            scored on. Training on the questions teaches it to write the next
+            question itself.</div>
         </div>
         <div class="grid grid-3">
           <div class="field">

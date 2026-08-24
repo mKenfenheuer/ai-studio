@@ -1472,6 +1472,19 @@ async def playground(request: Request) -> list[dict]:
             "reasoning": spec["reasoning"],
             "stopped_early": job["status"] == "cancelled",
         }
+        # Which dataset this run learned from, so the playground can offer its
+        # held-out rows to try. The held-out split is the one that matters --
+        # a row the model trained on proves nothing, because reciting it is
+        # exactly what it was rewarded for.
+        if studio_id := cfg.get("studio_dataset"):
+            if d := db.get_dataset(studio_id):
+                splits = d.get("splits") or {}
+                entry["dataset_id"] = studio_id
+                entry["dataset_name"] = d["name"]
+                entry["splits"] = splits
+                entry["held_out_split"] = next(
+                    (s for s in ("validation", "test", "eval", "holdout")
+                     if splits.get(s)), None)
         if job["kind"] == "pretrain_llm":
             a = cfg.get("arch") or {}
             entry["size"] = (arch.preset(a.get("size_id", "")) or {}).get("label")
@@ -1531,8 +1544,13 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
         if not prompt:
             raise HTTPException(400, "Type something first.")
         messages = [{"role": "user", "content": prompt}]
-    if not any((m.get("content") or "").strip() for m in messages
-               if m.get("role") != "system"):
+    # A turn counts as something to answer if it has words OR a tool call OR is
+    # a tool result. The last two matter: continuing a conversation past a tool
+    # call means sending back a result and nothing else, and requiring text
+    # there made the second half of every tool exchange impossible.
+    if not any((m.get("content") or "").strip() or m.get("tool_calls")
+               or m.get("role") in ("tool", "function")
+               for m in messages if m.get("role") != "system"):
         raise HTTPException(400, "Type something first.")
 
     system = (payload.get("system") or "").strip()
@@ -1544,6 +1562,17 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
     spec = chat_spec(job)
     if config.HF_TOKEN:
         spec["hf_token"] = config.HF_TOKEN
+    # Tools the caller wants declared for this exchange. They travel per
+    # request rather than being fixed on the run, because trying a model
+    # against a held-out row means declaring *that row's* tools -- which are
+    # rarely the same from one row to the next.
+    if tools := payload.get("tools"):
+        spec["tools"] = [
+            {"name": (t.get("function") or t).get("name"),
+             "description": (t.get("function") or t).get("description") or "",
+             "parameters": (t.get("function") or t).get("parameters") or {}}
+            for t in tools if isinstance(t, dict)
+            and (t.get("function") or t).get("name")]
     request_id = db.new_id("gen")
     sent = await fleet.send_to_runner(runner_id, {
         "type": "generate", "request_id": request_id, "spec": spec,

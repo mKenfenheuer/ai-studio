@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtAgo, toast } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtAgo, toast } from "../util.js";
 
 // Talking to what you trained.
 //
@@ -15,6 +15,25 @@ import { html, raw, esc, $, on, fmtAgo, toast } from "../util.js";
 //   chat      roles, a system prompt, and turns that accumulate
 //   instruct  one question at a time, wrapped in its training template
 //   continue  a base model, which continues text and has never seen a question
+//
+// ## Trying it on data it has never seen
+//
+// Typing a question and reading the answer tells you whether a model produces
+// *something*. It does not tell you whether it produces the right thing, and
+// for a tool-calling model it barely tells you anything at all -- you have to
+// know the tools, guess a question they apply to, and then judge a call
+// against a schema you are holding in your head.
+//
+// So a conversation can be loaded from a held-out row instead: the questions
+// the model was never trained on, with the reply the data says is correct
+// shown beside whatever the model produces, and the row's tool definitions
+// declared automatically. The prefill is editable, because the useful thing to
+// do with a held-out example is nearly always to change one word of it and see
+// whether the answer survives.
+//
+// And when the model calls a tool, the result the dataset recorded can be
+// handed straight back, so a multi-step exchange runs to the end instead of
+// stopping at the first call.
 const STYLE_UI = {
   chat: {
     icon: "💬",
@@ -96,6 +115,8 @@ function runCard(r) {
           ${r.kind === "pretrain_llm" ? "your own model" : "fine-tune"}</span>
         <span class="badge">${ui.title.toLowerCase()}</span>
         ${raw(r.system_prompt ? `<span class="badge badge-accent">has a system prompt</span>` : "")}
+        ${raw(r.held_out_split
+          ? `<span class="badge badge-ok">held-out rows to try</span>` : "")}
         ${raw(r.stopped_early
           ? `<span class="badge badge-warn" title="This run was stopped before
                it finished, so the model had less practice than planned."
@@ -105,17 +126,44 @@ function runCard(r) {
     </a>`;
 }
 
-// ------------------------------------------------------------------ chat
+// --------------------------------------------------------------- helpers
+const roleLabel = { user: "you", assistant: "model", tool: "tool",
+                    system: "system", developer: "developer" };
+
+/** Pretty-print JSON when it is JSON, leave it alone when it is not.
+ *  A tool's arguments are the thing you most want to read at a glance and the
+ *  thing most often written as one unbroken line. */
+function pretty(text) {
+  const s = String(text ?? "").trim();
+  if (!s.startsWith("{") && !s.startsWith("[")) return s;
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+/** One canonical message as readable text, for an editor box. */
+const bodyOf = (m) => m.role === "assistant" && !m.content && m.tool_calls?.length
+  ? "" : (m.content || "");
+
+// --------------------------------------------------------------- the view
 function chatView(mount, run, runs) {
   const ui = styleOf(run);
-  // The conversation, in the same shape the model was trained on.
+  // The conversation, in canonical form: the same message objects the trainer
+  // and the API use. Keeping the playground's own shape here is how the two
+  // drift apart, so there is only the one.
   let turns = [];
+  let tools = [];            // declared for this exchange
   let requestId = null;
-  let pending = null;      // the bubble currently being written into
-  let early = [];          // events that beat their own POST response
-  // Only offered for a run that was actually taught to reason; a model that
-  // never saw a reasoning block just writes prose inside one.
+  let pending = null;        // the bubble currently being written into
+  let early = [];            // events that beat their own POST response
   let think = !!run.reasoning;
+
+  // The held-out example currently loaded, if any.
+  let sample = null;         // {index, messages, tools, prompt, expected, ...}
+  let samples = [];          // the page of rows fetched
+  let at = 0;                // which of them is loaded
+  let sourceId = run.dataset_id || "";
+  let sourceSplit = run.held_out_split || "";
+  let datasets = [];
+  let autoTools = true;      // hand back recorded results without being asked
 
   mount.innerHTML = html`
     <div class="page-head">
@@ -136,8 +184,10 @@ function chatView(mount, run, runs) {
       ${ui.note}
     </div>
 
+    <div class="card" id="trialCard" style="margin-bottom:14px"></div>
+
     ${raw(ui.system ? html`
-      <details class="adv" id="sysBox" ${run.system_prompt ? "" : ""}>
+      <details class="adv" id="sysBox">
         <summary>System prompt${raw(run.system_prompt
           ? ` <span class="badge badge-accent">from your training data</span>` : "")}</summary>
         <div class="card" style="margin-top:10px">
@@ -226,54 +276,213 @@ function chatView(mount, run, runs) {
   const stopBtn = $("#stopBtn", mount);
   const statusEl = $("#chatStatus", mount);
   const systemBox = $("#systemBox", mount);
+  const trial = $("#trialCard", mount);
 
   const scroll = () => { log.scrollTop = log.scrollHeight; };
 
-  const bubble = (cls, text, role) => {
-    $("#chatEmpty", mount)?.remove();
-    const d = document.createElement("div");
-    d.className = `bubble ${cls}`;
-    if (role) d.dataset.role = role;
-    d.textContent = text;
-    log.appendChild(d);
-    scroll();
-    return d;
-  };
+  // ------------------------------------------------------- trying a row
+  //
+  // The dataset picker, the row navigation, and the expected reply. Drawn on
+  // its own so that loading a row, editing one, and moving to the next all go
+  // through one place.
+  function drawTrial() {
+    if (!ui.multiturn && !ui.system) {
+      // A base model continues text; there is no held-out "reply" to compare
+      // against, so the whole panel would be a category error.
+      trial.hidden = true;
+      return;
+    }
+    const options = datasets.length ? datasets : (run.dataset_id
+      ? [{ id: run.dataset_id, name: run.dataset_name || "the training data" }] : []);
+    const chosen = options.find((d) => d.id === sourceId);
+    const splits = chosen?.splits || run.splits || {};
+    const splitNames = Object.keys(splits);
 
-  const paintTurns = () => {
+    trial.innerHTML = html`
+      <div class="row-between" style="flex-wrap:wrap;gap:8px">
+        <h3 style="margin:0">🎯 Try it on data it has never seen</h3>
+        ${raw(sample ? html`
+          <span class="tiny muted">row ${sample.index} of
+            ${chosen?.name || "the dataset"}</span>` : "")}
+      </div>
+      <p class="muted tiny" style="margin:6px 0 10px">A held-out row is one the
+        model never trained on, so what it does with it is the only honest
+        answer to “did this work”. Load one, edit it if you like, and the
+        reply the data says is correct is shown beside the model’s.</p>
+
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
+        <div class="field" style="margin:0;min-width:200px">
+          <label for="dsPick">Dataset</label>
+          <select id="dsPick">
+            ${raw(options.map((d) => `<option value="${esc(d.id)}"
+              ${d.id === sourceId ? "selected" : ""}>${esc(d.name)}${
+                d.id === run.dataset_id ? " — what it trained on" : ""}</option>`).join(""))}
+            ${raw(options.length ? "" : `<option value="">(no datasets)</option>`)}
+          </select>
+        </div>
+        <div class="field" style="margin:0;min-width:150px">
+          <label for="splitPick">Split</label>
+          <select id="splitPick">
+            <option value="" ${!sourceSplit ? "selected" : ""}>Every row</option>
+            ${raw(splitNames.map((s) => `<option value="${esc(s)}"
+              ${s === sourceSplit ? "selected" : ""}>${esc(s)} (${splits[s]})${
+                s === run.held_out_split ? " — held out" : ""}</option>`).join(""))}
+          </select>
+        </div>
+        <button class="btn btn-primary btn-sm" id="loadRow">
+          ${sample ? "Load another" : "Load a row"}</button>
+        ${raw(sample ? html`
+          <button class="btn btn-sm" id="prevRow" ${at <= 0 ? "disabled" : ""}>‹ Previous</button>
+          <button class="btn btn-sm" id="nextRow">Next ›</button>` : "")}
+      </div>
+
+      ${raw(sample ? trialDetail(sample) : "")}`;
+  }
+
+  function trialDetail(s) {
+    const problems = (s.problems || []).filter((p) => p.level !== "ok");
+    return html`
+      <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px">
+        ${raw(s.tools?.length ? html`
+          <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">
+            <span class="tiny muted">Tools declared to the model:</span>
+            ${raw(s.tools.map((t) => `<span class="badge badge-accent">${
+              esc(t.function?.name || "?")}</span>`).join(""))}
+          </div>` : "")}
+        ${raw(problems.length ? html`
+          <div class="callout callout-warn" style="margin-bottom:8px">
+            <strong>This row has problems</strong>
+            ${raw(problems.map((p) => `<div class="tiny">${esc(p.message)}</div>`).join(""))}
+          </div>` : "")}
+        ${raw(s.repaired?.length ? html`
+          <p class="tiny muted" style="margin:0 0 8px">The data left some of
+            this implicit; it was worked out on load: ${s.repaired.join("; ")}.</p>` : "")}
+
+        <details class="adv" ${s.expected?.length ? "open" : ""}>
+          <summary>What the data says should happen next
+            (${(s.expected || []).length} message${
+              (s.expected || []).length === 1 ? "" : "s"})</summary>
+          <div style="margin-top:8px">
+            ${raw((s.expected || []).map((m) => expectedBlock(m)).join("")
+                  || `<p class="muted tiny">Nothing — this row ends with the
+                      question.</p>`)}
+          </div>
+        </details>
+
+        <label class="check" style="margin-top:8px">
+          <input type="checkbox" id="autoTools" ${autoTools ? "checked" : ""}>
+          <span>When the model calls a tool, hand back the result this row
+            recorded so the conversation can carry on</span>
+        </label>
+      </div>`;
+  }
+
+  function expectedBlock(m) {
+    if (m.role === "tool") {
+      return html`<div class="tiny mono" style="opacity:.75;margin:4px 0">
+        <span class="badge">${m.name || "tool"} returned</span>
+        <pre style="white-space:pre-wrap;margin:4px 0 0">${pretty(m.content)}</pre>
+      </div>`;
+    }
+    const calls = (m.tool_calls || []).map((c) => html`
+      <div class="tiny mono" style="margin:4px 0">⚙ ${c.function.name}(<pre
+        style="white-space:pre-wrap;display:inline">${c.function.arguments}</pre>)</div>`).join("");
+    return html`
+      <div style="margin:6px 0">
+        ${raw(m.reasoning ? `<div class="tiny muted" style="font-style:italic">${
+          esc(m.reasoning)}</div>` : "")}
+        ${raw(m.content ? `<div class="txt">${esc(m.content)}</div>` : "")}
+        ${raw(calls)}
+      </div>`;
+  }
+
+  // ------------------------------------------------------------ painting
+  //
+  // The log is redrawn from `turns` rather than appended to, because a turn
+  // can now be edited and a tool result can be inserted in the middle. Two
+  // ways of getting a message on screen is two ways for the screen to stop
+  // matching what will actually be sent.
+  function paint() {
+    const parts = turns.map((m, i) => bubble(m, i));
+    log.innerHTML = parts.join("") || html`
+      <div class="chat-empty">Nothing said yet. ${ui.title}.</div>`;
+    if (pendingText !== null) {
+      log.insertAdjacentHTML("beforeend", html`
+        <div class="bubble it ${pendingText ? "" : "pending"}"
+             data-role="assistant" id="pendingBubble">${pendingText}</div>`);
+    }
+    pending = $("#pendingBubble", mount);
     const el = $("#turnCount", mount);
     if (el) el.textContent = turns.length
       ? `${turns.length} message${turns.length > 1 ? "s" : ""} in context` : "";
-  };
+    scroll();
+  }
 
+  let pendingText = null;
+
+  function bubble(m, i) {
+    const mine = m.role === "user";
+    if (m.role === "tool") {
+      return html`
+        <div class="bubble it" data-role="${m.name || "tool"} returned"
+             style="font-family:var(--mono,monospace);font-size:12px">
+          <pre style="white-space:pre-wrap;margin:0"
+               data-edit="${i}">${pretty(m.content)}</pre>
+          <div class="row" style="gap:6px;margin-top:6px">
+            <button class="btn-sm" data-editrow="${i}">Edit</button>
+            <button class="btn-sm" data-delrow="${i}">Remove</button>
+          </div>
+        </div>`;
+    }
+    const calls = (m.tool_calls || []).map((c) => html`
+      <div style="margin-top:6px;padding:6px 8px;border-radius:8px;
+                  background:var(--surface-3,rgba(0,0,0,.08))">
+        <div class="tiny"><strong>⚙ ${c.function.name}</strong>
+          ${raw(c.valid === false
+            ? `<span class="badge badge-err">arguments are not valid JSON</span>` : "")}</div>
+        <pre class="mono tiny" style="white-space:pre-wrap;margin:4px 0 0">${
+          pretty(c.function.arguments)}</pre>
+        ${raw(m.role === "assistant" && i === turns.length - 1
+          ? `<button class="btn-sm" data-answer="${esc(c.id)}"
+                     style="margin-top:6px">Return a result…</button>` : "")}
+      </div>`).join("");
+    return html`
+      <div class="bubble ${mine ? "me" : "it"}" data-role="${roleLabel[m.role] || m.role}">
+        ${raw(m.reasoning ? `<details class="reasoning"><summary>Its reasoning (${
+          m.reasoning.length} characters)</summary><p class="txt">${
+          esc(m.reasoning)}</p></details>` : "")}
+        <span data-edit="${i}">${bodyOf(m)}</span>
+        ${raw(calls)}
+        <div class="row" style="gap:6px;margin-top:6px;opacity:.6">
+          <button class="btn-sm" data-editrow="${i}">Edit</button>
+          <button class="btn-sm" data-delrow="${i}">Remove</button>
+        </div>
+      </div>`;
+  }
+
+  // ---------------------------------------------------------- generating
   const finish = () => {
     requestId = null;
     early = [];
-    pending?.classList.remove("pending");
+    pendingText = null;
     pending = null;
     sendBtn.disabled = false;
     stopBtn.hidden = true;
-    box.focus();
+    paint();
   };
 
-  const send = async () => {
-    const text = box.value.trim();
-    if (!text || requestId) return;
-
-    // A model that never learned to follow a conversation is not given one:
-    // each instruction stands alone, exactly as it did in training.
-    if (!ui.multiturn) turns = [];
-    turns.push({ role: "user", content: text });
-
-    bubble("me", text, "user");
-    box.value = "";
-    sendBtn.disabled = true;
-    pending = bubble("it pending", "", "assistant");
+  /** Send whatever is in `turns` and let the model write the next turn. */
+  async function ask() {
+    if (requestId) return;
+    pendingText = "";
+    paint();
     statusEl.textContent = "Waking the model up…";
     early = [];
+    sendBtn.disabled = true;
     try {
       const r = await api.chat(run.id, {
         messages: turns,
+        tools,
         system: systemBox ? systemBox.value : "",
         temperature: parseFloat($("#temp", mount).value) || 0.8,
         max_new_tokens: parseInt($("#maxTok", mount).value, 10) || 200,
@@ -286,16 +495,85 @@ function chatView(mount, run, runs) {
       early = [];
       buffered.forEach(handle);
     } catch (e) {
-      turns.pop();
-      pending.classList.remove("pending");
-      pending.textContent = e.message;
-      pending.classList.add("muted");
-      finish();
+      pendingText = null;
+      paint();
       statusEl.textContent = "";
+      sendBtn.disabled = false;
+      toast(e.message, "err");
     }
-    paintTurns();
+  }
+
+  const send = async () => {
+    const text = box.value.trim();
+    if (!text || requestId) return;
+    // A model that never learned to follow a conversation is not given one:
+    // each instruction stands alone, exactly as it did in training.
+    if (!ui.multiturn) turns = [];
+    turns.push({ role: "user", content: text });
+    box.value = "";
+    await ask();
   };
 
+  /** The result this row recorded for a call the model just made, if any. */
+  function recordedResult(call) {
+    for (const m of (sample?.expected || [])) {
+      if (m.role !== "tool") continue;
+      if (m.name && m.name === call.function.name) return m.content;
+    }
+    return null;
+  }
+
+  /** Hand a tool result back and let the model carry on. */
+  async function returnResult(call, content) {
+    turns.push({ role: "tool", tool_call_id: call.id,
+                 name: call.function.name, content });
+    paint();
+    await ask();
+  }
+
+  // ------------------------------------------------------------- loading
+  async function loadRow(index) {
+    const id = sourceId;
+    if (!id) { toast("Pick a dataset to try rows from.", "err"); return; }
+    try {
+      if (!samples.length || index === undefined) {
+        const r = await api.datasetConversations(id, 0, 25, sourceSplit);
+        samples = r.rows || [];
+        at = 0;
+        if (!samples.length) {
+          toast("That split has no rows that read as conversations.", "err");
+          return;
+        }
+      } else {
+        at = Math.max(0, Math.min(index, samples.length - 1));
+      }
+      applyRow(samples[at]);
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  }
+
+  /** Put a held-out row into the conversation, ready to be sent or edited. */
+  function applyRow(s) {
+    sample = s;
+    // Everything up to and including the last user turn. The reply is
+    // deliberately NOT loaded: producing it is the model's job, and having it
+    // already on screen is how you talk yourself into believing a wrong answer
+    // was right.
+    turns = JSON.parse(JSON.stringify(s.prompt || []));
+    tools = s.tools || [];
+    const sys = turns.find((m) => m.role === "system");
+    if (sys && systemBox) systemBox.value = sys.content || "";
+    // The system turn lives in the box, not in the log, so it is edited in one
+    // place rather than two.
+    turns = turns.filter((m) => m.role !== "system");
+    pendingText = null;
+    statusEl.textContent = "";
+    drawTrial();
+    paint();
+  }
+
+  // -------------------------------------------------------------- wiring
   sendBtn.addEventListener("click", send);
   box.addEventListener("keydown", (e) => {
     // Enter sends, Shift+Enter makes a new line — the convention every chat
@@ -313,10 +591,12 @@ function chatView(mount, run, runs) {
   });
   on(mount, "click", "#resetChat", () => {
     turns = [];
-    log.innerHTML = `<div class="chat-empty" id="chatEmpty">Nothing said yet. ${
-      esc(ui.title)}.</div>`;
+    tools = [];
+    sample = null;
+    pendingText = null;
     statusEl.textContent = "";
-    paintTurns();
+    drawTrial();
+    paint();
     box.focus();
   });
   on(mount, "click", "#resetSystem", () => {
@@ -325,11 +605,92 @@ function chatView(mount, run, runs) {
   });
   on(mount, "click", "#clearSystem", () => { if (systemBox) systemBox.value = ""; });
 
+  on(mount, "change", "#dsPick", (_e, t) => {
+    sourceId = t.value;
+    samples = [];
+    sample = null;
+    const d = datasets.find((x) => x.id === sourceId);
+    sourceSplit = d?.splits?.validation ? "validation"
+      : (d?.splits?.test ? "test" : "");
+    drawTrial();
+  });
+  on(mount, "change", "#splitPick", (_e, t) => {
+    sourceSplit = t.value;
+    samples = [];
+    drawTrial();
+  });
+  on(mount, "change", "#autoTools", (_e, t) => { autoTools = t.checked; });
+  on(mount, "click", "#loadRow", () => loadRow());
+  on(mount, "click", "#prevRow", () => loadRow(at - 1));
+  on(mount, "click", "#nextRow", async () => {
+    if (at + 1 >= samples.length) {
+      // Past the end of the page: fetch the next one rather than stopping.
+      const r = await api.datasetConversations(
+        sourceId, (sample?.index ?? 0) + 1, 25, sourceSplit).catch(() => null);
+      if (r?.rows?.length) { samples = r.rows; at = 0; applyRow(samples[0]); return; }
+      toast("That is the last row in this split.", "");
+      return;
+    }
+    loadRow(at + 1);
+  });
+
+  // Editing a turn in place. The point of loading a held-out row is usually to
+  // change one word of it, so every message is editable -- including the
+  // model's own replies and the tool results, which is how you ask "what would
+  // it have said if the tool had returned something else".
+  on(mount, "click", "[data-editrow]", (_e, t) => {
+    const i = +t.dataset.editrow;
+    const m = turns[i];
+    if (!m) return;
+    const target = $(`[data-edit="${i}"]`, mount);
+    if (!target || target.dataset.editing) return;
+    const area = document.createElement("textarea");
+    area.className = "mono";
+    area.rows = Math.min(12, String(bodyOf(m) || m.content || "").split("\n").length + 1);
+    area.style.width = "100%";
+    area.value = m.role === "tool" ? pretty(m.content) : bodyOf(m);
+    const save = document.createElement("button");
+    save.className = "btn-sm btn-primary";
+    save.textContent = "Save";
+    save.addEventListener("click", () => {
+      m.content = area.value;
+      paint();
+    });
+    target.dataset.editing = "1";
+    target.replaceWith(area);
+    area.after(save);
+    area.focus();
+  });
+  on(mount, "click", "[data-delrow]", (_e, t) => {
+    turns.splice(+t.dataset.delrow, 1);
+    paint();
+  });
+
+  // Answering a call by hand, when the row recorded no result for it or you
+  // want to see what a different result would do.
+  on(mount, "click", "[data-answer]", (_e, t) => {
+    const last = turns[turns.length - 1];
+    const call = (last?.tool_calls || []).find((c) => c.id === t.dataset.answer);
+    if (!call) return;
+    const box2 = document.createElement("div");
+    box2.innerHTML = html`
+      <div class="field" style="margin-top:6px">
+        <label>What ${call.function.name} returns</label>
+        <textarea class="mono" rows="4" id="handResult">${
+          recordedResult(call) || "{}"}</textarea>
+      </div>
+      <button class="btn-sm btn-primary" id="sendResult">Send it back</button>`;
+    t.replaceWith(box2);
+    $("#sendResult", box2).addEventListener("click", () => {
+      returnResult(call, $("#handResult", box2).value);
+    });
+  });
+
   const unsub = events.subscribe((msg) => {
     if (!String(msg.type || "").startsWith("generate_")) return;
     if (!requestId) {
       // Our own POST has not returned yet; hold it until we can tell.
-      if (pending) early.push(msg);
+      if (pendingText !== null) early.push(msg);
       return;
     }
     if (msg.request_id !== requestId) return;
@@ -340,58 +701,64 @@ function chatView(mount, run, runs) {
     if (msg.type === "generate_status") {
       statusEl.textContent = msg.status;
     } else if (msg.type === "generate_delta") {
-      if (!pending) return;
-      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-      pending.textContent += msg.delta;
+      if (pendingText === null) return;
+      pendingText += msg.delta;
       statusEl.textContent = "";
-      if (atBottom) scroll();
+      if (pending) {
+        pending.textContent = pendingText;
+        pending.classList.remove("pending");
+        scroll();
+      }
     } else if (msg.type === "generate_done") {
-      // The runner's final text is authoritative. Normally it matches what the
-      // deltas built, but if a stop sequence trimmed the tail this is where the
-      // bubble catches up.
-      if (pending && typeof msg.text === "string"
-          && msg.text !== pending.textContent) {
-        pending.textContent = msg.text;
-      }
-      // Its working, kept apart from its answer and folded away by default:
-      // the reasoning is usually longer than the reply and rarely the thing
-      // you are reading for.
-      if (pending && msg.reasoning) {
-        const box = document.createElement("details");
-        box.className = "reasoning";
-        box.innerHTML = `<summary>Its reasoning (${
-          msg.reasoning.length} characters)</summary>`;
-        const body = document.createElement("p");
-        body.className = "txt";
-        body.textContent = msg.reasoning;
-        box.appendChild(body);
-        pending.parentNode.insertBefore(box, pending);
-      }
-      const reply = pending ? pending.textContent : "";
-      if (pending && !reply) {
-        pending.textContent = "(it produced nothing — try a different opening, "
-          + "or a longer length limit)";
-        pending.classList.add("muted");
+      const calls = msg.tool_calls || [];
+      const reply = {
+        role: "assistant",
+        content: typeof msg.text === "string" ? msg.text : (pendingText || ""),
+        reasoning: msg.reasoning || "",
+        tool_calls: calls,
+      };
+      const empty = !reply.content && !calls.length && !reply.reasoning;
+      requestId = null;
+      pendingText = null;
+      sendBtn.disabled = false;
+      stopBtn.hidden = true;
+      if (empty) {
+        toast("It produced nothing — try a different opening, or a longer "
+              + "length limit.", "");
       } else {
-        turns.push({ role: "assistant", content: reply });
+        turns.push(reply);
       }
       const peek = $("#promptPeek", mount);
       if (peek && msg.prompt_preview) peek.textContent = msg.prompt_preview;
-      const stats = msg.tokens
+      statusEl.textContent = msg.tokens
         ? `${msg.tokens} tokens · ${msg.tokens_per_sec}/s` : "";
-      finish();
-      statusEl.textContent = stats;
-      paintTurns();
-    } else if (msg.type === "generate_error") {
-      turns.pop();                       // the user turn never got a reply
-      if (pending) {
-        pending.textContent = msg.error;
-        pending.classList.add("muted");
+      paint();
+
+      // The model asked for a tool. If this row recorded what that tool
+      // returned, hand it back and let the exchange run on -- otherwise the
+      // conversation stops at the first call and a multi-step model can never
+      // be seen doing the thing it was trained to do.
+      if (calls.length && autoTools && sample) {
+        const answered = calls.map(recordedResult);
+        if (answered.every((a) => a !== null)) {
+          calls.forEach((c, i) => turns.push({
+            role: "tool", tool_call_id: c.id, name: c.function.name,
+            content: answered[i] }));
+          paint();
+          ask();
+        } else {
+          statusEl.textContent = "It called a tool this row has no recorded "
+            + "result for. Type one in to carry on.";
+        }
       }
+    } else if (msg.type === "generate_error") {
+      pendingText = null;
+      requestId = null;
+      sendBtn.disabled = false;
+      stopBtn.hidden = true;
       toast(msg.error, "err");
-      finish();
       statusEl.textContent = "";
-      paintTurns();
+      paint();
     }
   }
 
@@ -412,6 +779,17 @@ function chatView(mount, run, runs) {
     }).catch(() => {});
   }
 
+  // Every dataset this account can see, so a row can be tried from somewhere
+  // other than what the model trained on -- which is the honest test when the
+  // training data and the thing you actually want it to do are not the same.
+  api.datasets().then((rows) => {
+    datasets = rows.map((d) => ({ id: d.id, name: d.name, splits: d.splits || {} }));
+    if (!sourceId && datasets.length) sourceId = datasets[0].id;
+    drawTrial();
+  }).catch(() => {});
+
+  drawTrial();
+  paint();
   box.focus();
   return () => { unsub(); if (requestId) api.chatCancel(requestId).catch(() => {}); };
 }

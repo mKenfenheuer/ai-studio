@@ -8,7 +8,7 @@ from fastapi import (APIRouter, Body, File, HTTPException, Query, Request,
                      Response, UploadFile)
 from fastapi.responses import FileResponse
 
-from common import formatting
+from common import conversation, formatting
 
 from .. import datasets as ds
 from .. import db, hfaccount, hub
@@ -115,6 +115,90 @@ async def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
             "matched": matched, "query": q, "split": want or "",
             "columns": d.get("columns") or [],
             "scanned": scanned, "capped": scanned >= SEARCH_SCAN}
+
+
+@router.get("/{dataset_id}/conversations")
+async def dataset_conversations(request: Request, dataset_id: str,
+                                offset: int = 0, limit: int = 20,
+                                split: str = "") -> dict:
+    """Rows as conversations, each cut where a model would have to take over.
+
+    What the playground loads when you ask to try a held-out example. Every row
+    comes back three ways at once, because all three are needed and computing
+    them separately is how they end up disagreeing:
+
+      `messages`  the whole conversation, canonical
+      `prompt`    everything up to and including the last user turn
+      `expected`  what the data says comes next -- which for a tool-calling row
+                  is a call, a result and a reply, not a single message
+
+    The tool results in `expected` are what lets a conversation be *replayed*:
+    when the model asks for `get_order`, the answer the dataset recorded can be
+    handed back and the conversation carried on, instead of stopping at the
+    first call.
+    """
+    d = _get(request, dataset_id)
+    limit = min(max(int(limit), 1), 100)
+    offset = max(int(offset), 0)
+    fmt = formatting.resolve_format(d.get("format") or {})
+    want = (split or "").strip() or None
+
+    out = []
+    seen = 0
+    for i, row in ds.iter_indexed(dataset_id, want):
+        seen += 1
+        if seen <= offset:
+            continue
+        conv, notes = conversation.repair(conversation.from_row(row, fmt))
+        if not conv[conversation.MESSAGES_KEY]:
+            continue
+        prompt, expected = conversation.split_for_trial(conv)
+        out.append({
+            "index": i,
+            "split": row.get(ds.SPLIT_FIELD) or ds.DEFAULT_SPLIT,
+            "messages": conv[conversation.MESSAGES_KEY],
+            "tools": conv[conversation.TOOLS_KEY],
+            "meta": conv[conversation.META_KEY],
+            "prompt": prompt,
+            "expected": expected,
+            "repaired": notes,
+            "problems": conversation.validate(conv),
+        })
+        if len(out) >= limit:
+            break
+
+    counts = d.get("splits") or {}
+    return {"rows": out, "offset": offset, "split": want or "",
+            "matched": counts.get(want) if want else (d.get("rows") or 0),
+            "splits": counts, "dataset": {"id": d["id"], "name": d["name"]}}
+
+
+@router.get("/{dataset_id}/conversation-report")
+async def conversation_report(request: Request, dataset_id: str,
+                              sample: int = 2000) -> dict:
+    """Whether this dataset is usable as conversations, and what is wrong.
+
+    The same validation the conversion runs, offered on a dataset that has
+    already been converted -- because a dataset can be edited afterwards, and
+    "it was clean when it was made" is not the question anybody is asking.
+    """
+    d = _get(request, dataset_id)
+    fmt = formatting.resolve_format(d.get("format") or {})
+    convs = []
+    for row in ds.iter_rows(dataset_id, min(int(sample), 20000)):
+        conv, _ = conversation.repair(conversation.from_row(row, fmt))
+        if conv[conversation.MESSAGES_KEY]:
+            convs.append(conv)
+    if not convs:
+        return {"rows": 0, "ok": False, "problems": [
+            {"level": "error", "code": "empty",
+             "message": "Nothing in this dataset reads as a conversation."}]}
+    report = conversation.validate_many(convs)
+    report["canonical"] = sum(
+        1 for row in ds.iter_rows(dataset_id, 200)
+        if conversation.is_canonical(row))
+    report["sampled"] = len(convs)
+    return report
 
 
 @router.get("/{dataset_id}/dataset-file")

@@ -218,6 +218,15 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
             "content": content,
             "reasoning": reasoning,
             "tool_calls": calls,
+            # Which call this result answers. Carried through rather than
+            # dropped: it is the only thing that pairs a result with its call
+            # when two ran in parallel, and rebuilding it afterwards by
+            # position gets that case wrong exactly when it matters.
+            "tool_call_id": m.get("tool_call_id") or m.get("tool_use_id"),
+            # A dataset that marks the weight of a turn keeps it. OpenAI's
+            # fine-tuning format spells this `weight`; `train_on_turn` and
+            # `train` are what the datasets that predate it use.
+            **({"weight": m["weight"]} if "weight" in m else {}),
             # Some datasets mark which turns are worth learning from. Carried
             # through so a template can act on it, even though the trainer
             # currently learns from the whole conversation.
@@ -228,37 +237,23 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
 
 
 def _name_tool_results(messages: list[dict]) -> list[dict]:
-    """Give every tool result the name of the tool that produced it.
+    """Move a selector-chosen name onto the message, and nothing else.
 
-    Harmony addresses a tool result by its author -- `functions.HassTurnOff to=
-    assistant` -- so an unnamed result cannot be rendered at all. Datasets
-    rarely put the name on the message: it is either inside the JSON payload or
-    only knowable from the call that preceded it. Both are recovered here, once,
-    rather than in each template.
+    Naming an unnamed tool result -- from its own payload, or from the call it
+    answers -- used to happen here. It now happens in
+    `conversation.repair`, for two reasons. It belongs with the linking of
+    `tool_call_id`, because both are the same inference from the same evidence
+    and doing them apart got parallel calls wrong. And doing it here was
+    silent: every unnamed result was named `tool` and nobody was told, so a
+    dataset whose tool names never survived import looked like a dataset that
+    never had any.
+
+    What is left is the one thing that is not a guess: a name the person
+    pointed at with a selector.
     """
-    pending: list[str] = []
     for m in messages:
         if m.get("_selected_name"):
             m["name"] = m.pop("_selected_name")
-        if m["role"] == "assistant" and m["tool_calls"]:
-            pending = [c["name"] for c in m["tool_calls"]]
-            continue
-        if m["role"] not in ("tool", "function") or m["name"]:
-            continue
-        found = None
-        # Many datasets name the tool inside the result payload.
-        try:
-            payload = json.loads(m["content"])
-            if isinstance(payload, dict):
-                for key in ("tool_name", "name", "function", "tool"):
-                    if isinstance(payload.get(key), str):
-                        found = payload[key]
-                        break
-        except (ValueError, TypeError):
-            pass
-        if not found and pending:
-            found = pending.pop(0)
-        m["name"] = found or "tool"
     return messages
 
 
@@ -299,7 +294,15 @@ def _prune(value: Any) -> Any:
 
 def find_messages(row: dict, field: str | None = None,
                   selectors: dict | None = None) -> list[dict]:
-    key = field or first_present(row, _MESSAGE_FIELDS)
+    """The conversation in this row, wherever it lives.
+
+    A named field wins, but only if this row actually has it. A dataset's
+    format is detected from the union of every column across a sample, so a
+    file that carries `messages` on most rows and `conversations` on the rest
+    gets `messages_field: "messages"` -- and the rest then read as empty and
+    were dropped without a word. Falling back keeps them.
+    """
+    key = field if (field and field in row) else first_present(row, _MESSAGE_FIELDS)
     return normalize_messages(row.get(key), selectors) if key else []
 
 
@@ -389,11 +392,18 @@ def render_template(template: str, *, row: dict | None = None,
                     specials: dict | None = None,
                     add_generation_prompt: bool = False,
                     reasoning: bool = False,
-                    tools_text: str = "") -> str:
+                    tools_text: str = "",
+                    extra: dict | None = None) -> str:
     """Render one example with a Jinja template.
 
     The same call renders the preview in the browser and the training batch on
     the runner, which is the only way the two can be guaranteed to agree.
+
+    `extra` carries variables only some templates read -- `more_turns` for a
+    format that ends its final message differently, `reasoning_effort` for one
+    that writes it into the system message. A template that has never heard of
+    them simply does not mention them, which is why they can be passed
+    unconditionally.
     """
     env = _environment()
     try:
@@ -412,6 +422,7 @@ def render_template(template: str, *, row: dict | None = None,
         # template decides what that looks like in its own idiom.
         "reasoning": reasoning,
     })
+    ctx.update(extra or {})
     ctx.update(specials or {})
     try:
         return compiled.render(**ctx)
@@ -456,18 +467,27 @@ def format_example(row: dict, fmt: dict) -> str | None:
         if not messages and (fmt.get("chat_template") or mode == "chat"):
             messages = messages_from_pair(row, fmt)
         if messages:
-            tools = find_tools(row, fmt.get("tools_field"))
-            template = fmt.get("chat_template") or BUILTIN_CHAT_TEMPLATE
-            text = render_template(template, row=row, messages=messages,
-                                   tools=tools, specials=fmt.get("specials"),
-                                   tools_text=tool_declaration(
-                                       tools, fmt.get("chat_format")))
+            # Through the canonical form rather than straight to the template.
+            # That is what puts a tool call in front of the template in the
+            # shape it reads, gives reasoning all three of its names, and
+            # declares the tools in this format's own idiom. Rendering the
+            # normalised messages directly -- as this did -- worked for plain
+            # conversations and silently dropped every tool call in four of the
+            # five formats.
+            #
+            # Imported here rather than at the top because `conversation` is
+            # built on this module. The layering is deliberate: normalising is
+            # the lower layer, the canonical record is the upper one, and only
+            # this one function needs to reach upwards.
+            from . import conversation
+            conv, _ = conversation.repair(conversation.from_row(row, fmt))
             # Returned exactly as the template produced it, trailing newline
             # and all. Stripping would leave our training text one token
             # different from what transformers' own apply_chat_template emits
             # for the very template we save onto the tokenizer -- so anyone who
             # downloaded the model would prompt it slightly differently from
             # how it was taught.
+            text = conversation.render(conv, fmt)
             return text if text.strip() else None
 
     if mode in ("instruction", "auto"):
@@ -612,18 +632,21 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
     template = fmt.get("chat_template") or (
         fmt.get("template") if fmt.get("mode") == "jinja" else None)
 
-    if style == "chat" and template:
-        # A model's own template understands add_generation_prompt and emits
-        # the opening of the assistant turn itself.
-        return render_template(template, messages=messages, tools=tools,
-                               specials=specials, add_generation_prompt=True,
-                               reasoning=reasoning,
-                               tools_text=tool_declaration(
-                                   tools, fmt.get("chat_format")))
-
     if style == "chat":
-        body = render_template(BUILTIN_CHAT_TEMPLATE, messages=messages,
-                               tools=tools, specials=specials)
+        # The same canonical record training builds, so the prompt the model is
+        # given at generation time is the prompt it was taught on -- including
+        # the tools, which the playground now sends along so a tool-calling
+        # model can actually be asked to call one.
+        from . import conversation
+        conv, _ = conversation.repair(
+            conversation.from_messages(messages, tools))
+        if template:
+            # A model's own template understands add_generation_prompt and
+            # emits the opening of the assistant turn itself.
+            return conversation.render(conv, fmt, add_generation_prompt=True,
+                                       reasoning=reasoning)
+        body = conversation.render(conv, {**fmt, "chat_template":
+                                          BUILTIN_CHAT_TEMPLATE})
         # The built-in format writes one "role: content" line per turn, so the
         # cue for the next turn is the assistant's label with no newline after
         # it -- the model continues on the same line, exactly as it was taught.
@@ -760,17 +783,59 @@ def split_reasoning(text: str, fmt: dict | None = None) -> tuple[str, str]:
 def tool_declaration(tools: list[dict] | None, format_id: str | None = None) -> str:
     """How this format tells the model which tools exist.
 
-    Harmony declares them as a TypeScript-ish namespace inside a developer
-    message, which is what gpt-oss is trained to read. Everything else gets a
-    plain list, which is all a small model can use.
+    Each family declares them differently, and the difference is not cosmetic:
+    a model only learns to call a tool it was shown, in the shape it was shown
+    it. Getting this wrong is how a fine-tune ends up inventing plausible
+    function names that do not exist.
+
+        harmony   a TypeScript-ish namespace in a developer message
+        chatml    JSON schemas inside a <tools> block, the Hermes/Qwen layout
+        llama3    a JSON array, which is what Llama 3.1 is shown
+        inst      a JSON array, for Mistral's [AVAILABLE_TOOLS]
+        plain     a readable list, because that format reserves nothing
+
+    A schema is what the model needs -- the parameter names and types are the
+    part it has to reproduce. The earlier version of this listed only names and
+    descriptions for every format except Harmony, so a model in ChatML was
+    asked to call `get_order` having never been told it takes an `order_id`.
     """
     tools = tools or []
     if not tools:
         return ""
     if format_id == "harmony":
         return _harmony_namespace(tools)
+    if format_id == "chatml":
+        return ("# Tools\n\nYou may call one or more of these functions. Their "
+                "signatures are given inside <tools></tools>:\n<tools>\n"
+                + "\n".join(json.dumps(_schema(t), ensure_ascii=False)
+                            for t in tools)
+                + "\n</tools>\n\nTo call one, write a <tool_call> block "
+                  "holding {\"name\": ..., \"arguments\": ...}.")
+    if format_id in ("llama3", "inst"):
+        return json.dumps([_schema(t) for t in tools], ensure_ascii=False)
     return "Available tools:\n" + "\n".join(
-        "- %s: %s" % (t["name"], t["description"]) for t in tools)
+        "- %s%s: %s" % (t["name"], _signature(t), t["description"])
+        for t in tools)
+
+
+def _schema(tool: dict) -> dict:
+    """One tool in the nested shape every published tool encoding writes."""
+    return {"type": "function",
+            "function": {"name": tool["name"],
+                         "description": tool.get("description") or "",
+                         "parameters": tool.get("parameters")
+                         or {"type": "object", "properties": {}}}}
+
+
+def _signature(tool: dict) -> str:
+    """`(order_id, limit?)` -- the parameter names, for the readable list."""
+    params = tool.get("parameters") or {}
+    props = params.get("properties") if isinstance(params, dict) else None
+    if not isinstance(props, dict) or not props:
+        return "()"
+    required = set(params.get("required") or [])
+    return "(%s)" % ", ".join(
+        "%s%s" % (name, "" if name in required else "?") for name in props)
 
 
 def _ts_type(schema: Any) -> str:

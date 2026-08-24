@@ -422,6 +422,14 @@ def _tokenize_corpus(cfg: dict, ctx: Any, tok, token_budget: int, np):
             take = min(len(ids), room - 1)
             buf[filled:filled + take] = ids[:take]
             filled += take
+            # The separator, unless the document already ended with one. Every
+            # chat format closes its last turn with the end token, so adding
+            # another unconditionally put two in a row after every conversation
+            # and taught the model that a finished reply is followed by a
+            # second "finished" -- which is exactly the signal generation stops
+            # on, so it learned to stop one token late.
+            if take and int(buf[filled - 1]) == eos_id:
+                continue
             buf[filled] = eos_id
             filled += 1
         pending = []
