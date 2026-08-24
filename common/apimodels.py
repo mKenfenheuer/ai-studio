@@ -52,6 +52,20 @@ FIELD = {
                            "model id."},
     "api_version": {"label": "API version",
                     "hint": "Leave blank for %s." % AZURE_API_VERSION},
+    "model": {"label": "Model",
+              "hint": "The model name, as the service spells it — "
+                      "gpt-5.4, gpt-oss-120b."},
+    "api_style": {"label": "Which API",
+                  "choices": [
+                      {"value": "chat", "label": "Chat Completions",
+                       "hint": "/chat/completions — what almost everything "
+                               "speaks."},
+                      {"value": "responses", "label": "Responses",
+                       "hint": "/responses — OpenAI's newer surface. Needed "
+                               "for the models served only there, and the only "
+                               "one that returns reasoning as its own item."}],
+                  "hint": "Chat Completions unless the model is only served "
+                          "on /responses."},
 }
 
 PROVIDERS = [
@@ -75,6 +89,19 @@ PROVIDERS = [
         "blurb": "The same models inside your Azure subscription, with your "
                  "own region, quota and data handling. The model is whatever "
                  "you named the deployment.",
+    },
+    {
+        "id": "azure_v1",
+        "label": "Azure OpenAI (v1 API)",
+        "flavour": "azure_v1",
+        "required": ["endpoint", "api_key", "model"],
+        "optional": ["api_style"],
+        "lists_models": True,
+        "blurb": "Azure's newer unified surface: one endpoint, the model named "
+                 "in the request like everywhere else, and no deployment in "
+                 "the URL or version on the query string. This is the one to "
+                 "use for an AI Foundry resource — the older entry above is "
+                 "for a classic per-deployment Azure OpenAI resource.",
     },
     {
         "id": "anthropic",
@@ -142,16 +169,64 @@ def problems(conn: dict) -> str | None:
 
 def _base(conn: dict) -> str:
     spec = provider(conn["provider"]) or {}
+    if spec.get("flavour") == "azure_v1":
+        # One endpoint for everything. The resource may be given with or
+        # without the /openai/v1 suffix, because both are what people copy out
+        # of the portal, and appending it twice is the failure that produces a
+        # 404 with nothing in it to explain why.
+        endpoint = (conn.get("endpoint") or "").strip().rstrip("/")
+        if endpoint.endswith("/openai/v1"):
+            return endpoint
+        if endpoint.endswith("/openai"):
+            return endpoint + "/v1"
+        return endpoint + "/openai/v1"
     base = (conn.get("base_url") or spec.get("base_url") or "").strip()
     return base.rstrip("/")
+
+
+def api_style(conn: dict) -> str:
+    """Which of the two OpenAI request shapes this connection speaks."""
+    return "responses" if (conn.get("api_style") or "").strip() == "responses" \
+        else "chat"
+
+
+def flavour(conn: dict) -> str:
+    """How to build a request for this connection.
+
+    The provider decides the envelope -- where the key goes, what the URL looks
+    like -- and `api_style` decides the body, because OpenAI and Azure both
+    serve two different APIs from the same host and credential.
+    """
+    spec = provider(conn.get("provider")) or {}
+    base = spec.get("flavour") or ""
+    if base in ("openai", "azure_v1") and api_style(conn) == "responses":
+        return "responses"
+    return base
+
+
+def _auth(conn: dict) -> dict:
+    """Headers that authenticate this connection.
+
+    Azure's v1 surface accepts a bearer token, which is what every other
+    OpenAI-shaped service uses; the older per-deployment surface accepts only
+    `api-key`. Sending both would be harmless and is not done, because a
+    request that works for the wrong reason is a request nobody can debug.
+    """
+    key = (conn.get("api_key") or "").strip()
+    if not key:
+        return {"content-type": "application/json"}
+    if (provider(conn.get("provider")) or {}).get("flavour") == "azure":
+        return {"api-key": key, "content-type": "application/json"}
+    return {"authorization": "Bearer %s" % key,
+            "content-type": "application/json"}
 
 
 def model_name(conn: dict, model: str | None) -> str:
     """What to call the model in the request.
 
-    Azure has no model field worth sending -- the deployment in the URL *is*
-    the model -- so the deployment doubles as its name everywhere the UI
-    needs one.
+    Classic Azure has no model field worth sending -- the deployment in the URL
+    *is* the model -- so the deployment doubles as its name everywhere the UI
+    needs one. The v1 surface named the model again, like everyone else.
     """
     spec = provider(conn["provider"]) or {}
     if spec.get("flavour") == "azure":
@@ -164,11 +239,17 @@ def model_name(conn: dict, model: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 def chat_request(conn: dict, model: str, messages: list[dict],
-                 params: dict | None = None) -> dict:
+                 params: dict | None = None,
+                 tools: list[dict] | None = None) -> dict:
     """The HTTP request that asks this provider for one reply.
 
     Returns a dict of url/headers/json rather than performing the call, so the
     async controller and the sync runner can both send it.
+
+    `tools` are declared in whichever shape this API wants. The two OpenAI
+    surfaces disagree about it: Chat Completions nests the definition under
+    `function`, Responses puts the name and parameters at the top level of each
+    tool. Sending one to the other is a 400 that names no field.
     """
     spec = provider(conn["provider"])
     if not spec:
@@ -177,9 +258,13 @@ def chat_request(conn: dict, model: str, messages: list[dict],
     max_tokens = int(params.get("max_new_tokens") or params.get("max_tokens") or 512)
     temperature = params.get("temperature")
     top_p = params.get("top_p")
-    flavour = spec["flavour"]
+    shape = flavour(conn)
 
-    if flavour == "anthropic":
+    if shape == "responses":
+        return _responses_request(conn, model, messages, params, tools,
+                                  max_tokens, temperature, top_p)
+
+    if shape == "anthropic":
         # The system prompt is a field of its own here, not a message with a
         # role. Sending it as a message is accepted by nothing.
         system = "\n\n".join(m["content"] for m in messages
@@ -191,6 +276,14 @@ def chat_request(conn: dict, model: str, messages: list[dict],
         }
         if system:
             body["system"] = system
+        if tools:
+            # A third spelling: flat like Responses, but the schema is called
+            # `input_schema` rather than `parameters`.
+            body["tools"] = [{"name": t.get("name") or "",
+                              "description": t.get("description") or "",
+                              "input_schema": t.get("parameters")
+                              or {"type": "object", "properties": {}}}
+                             for t in tools]
         if temperature is not None:
             body["temperature"] = float(temperature)
         if top_p is not None:
@@ -203,13 +296,23 @@ def chat_request(conn: dict, model: str, messages: list[dict],
             "json": body,
         }
 
-    body = {"messages": messages, "max_tokens": max_tokens}
+    body = {"messages": _chat_messages(messages), "max_tokens": max_tokens}
+    if tools:
+        # Nested under `function`, which is the one shape the Responses API
+        # does *not* accept. Same tools, three encodings, and no provider
+        # tolerates another's.
+        body["tools"] = [{"type": "function",
+                          "function": {"name": t.get("name") or "",
+                                       "description": t.get("description") or "",
+                                       "parameters": t.get("parameters")
+                                       or {"type": "object", "properties": {}}}}
+                         for t in tools]
     if temperature is not None:
         body["temperature"] = float(temperature)
     if top_p is not None:
         body["top_p"] = float(top_p)
 
-    if flavour == "azure":
+    if shape == "azure":
         version = (conn.get("api_version") or "").strip() or AZURE_API_VERSION
         endpoint = (conn.get("endpoint") or "").strip().rstrip("/")
         url = "%s/openai/deployments/%s/chat/completions?api-version=%s" % (
@@ -230,6 +333,184 @@ def chat_request(conn: dict, model: str, messages: list[dict],
             "json": body}
 
 
+def _chat_messages(messages: list[dict]) -> list[dict]:
+    """Canonical messages as Chat Completions wants them.
+
+    Mostly a pass-through, and mostly about what to leave out: `reasoning` is
+    ours and not a field this API accepts, an assistant turn that only calls a
+    tool must send `content: null` rather than an empty string, and a tool
+    result needs its `tool_call_id` beside it or the provider rejects the
+    whole conversation.
+    """
+    out = []
+    for m in messages:
+        role = m.get("role") or "user"
+        item: dict[str, Any] = {"role": role}
+        content = m.get("content") or ""
+        if role == "tool":
+            item["content"] = content
+            if call_id := m.get("tool_call_id"):
+                item["tool_call_id"] = call_id
+            out.append(item)
+            continue
+        if calls := m.get("tool_calls"):
+            item["content"] = content or None
+            item["tool_calls"] = [
+                {"id": c.get("id") or "", "type": "function",
+                 "function": {"name": (c.get("function") or {}).get("name") or "",
+                              "arguments": (c.get("function") or {}).get("arguments") or "{}"}}
+                for c in calls]
+        else:
+            item["content"] = content
+        out.append(item)
+    return out
+
+
+def _responses_request(conn: dict, model: str, messages: list[dict],
+                       params: dict, tools: list[dict] | None,
+                       max_tokens: int, temperature, top_p) -> dict:
+    """A request to the Responses API.
+
+    Not a variant of the chat body -- a different one. The conversation is
+    `input` rather than `messages`, the limit is `max_output_tokens`, a tool
+    call and its result are *items in the input list* rather than fields on a
+    message, and a tool is declared flat rather than nested under `function`.
+
+    Reasoning models are the reason this exists at all: several are served here
+    and nowhere else, and this is the only surface that returns the model's
+    working as its own item instead of leaving it to be dug out of the text.
+    """
+    body: dict[str, Any] = {"model": model, "max_output_tokens": max_tokens}
+
+    # The system prompt is `instructions`, its own top-level field. It may also
+    # be passed as a message, but the field is unambiguous and every model
+    # served here honours it.
+    system = "\n\n".join(m.get("content") or "" for m in messages
+                         if m.get("role") in ("system", "developer")
+                         and m.get("content"))
+    if system:
+        body["instructions"] = system
+
+    items: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("system", "developer"):
+            continue
+        if role == "tool":
+            # A result is an item of its own, addressed by the call's id.
+            items.append({"type": "function_call_output",
+                          "call_id": m.get("tool_call_id") or "",
+                          "output": m.get("content") or ""})
+            continue
+        if content := (m.get("content") or ""):
+            items.append({"role": role, "content": content})
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") or call
+            items.append({"type": "function_call",
+                          "call_id": call.get("id") or "",
+                          "name": fn.get("name") or "",
+                          "arguments": fn.get("arguments") or "{}"})
+    body["input"] = items
+
+    if tools:
+        # Flat, not nested. Chat Completions wants
+        # {"type":"function","function":{...}}; this wants the name and
+        # parameters at the top level of the tool. Sending the wrong one is a
+        # 400 that names no field.
+        body["tools"] = [{"type": "function",
+                          "name": t.get("name") or "",
+                          "description": t.get("description") or "",
+                          "parameters": t.get("parameters")
+                          or {"type": "object", "properties": {}}}
+                         for t in tools]
+    if effort := (params.get("reasoning_effort") or "").strip():
+        body["reasoning"] = {"effort": effort}
+    if temperature is not None:
+        body["temperature"] = float(temperature)
+    if top_p is not None:
+        body["top_p"] = float(top_p)
+    return {"url": "%s/responses" % _base(conn), "headers": _auth(conn),
+            "json": body}
+
+
+def reply(conn: dict, data: dict) -> dict:
+    """A provider's answer as {content, reasoning, tool_calls}.
+
+    The same three things every caller wants, out of four different response
+    shapes. Tool calls come back in the canonical nested form regardless of
+    which surface produced them, so a generated conversation can be written
+    straight into a dataset without another translation.
+    """
+    shape = flavour(conn)
+    if shape == "responses":
+        text, thinking, calls = [], [], []
+        for item in data.get("output") or []:
+            kind = item.get("type")
+            if kind == "message":
+                for part in item.get("content") or []:
+                    if part.get("type") in ("output_text", "text"):
+                        text.append(part.get("text") or "")
+            elif kind == "reasoning":
+                # Only a summary is returned for the hosted reasoning models;
+                # the raw chain is not exposed. What comes back is what there
+                # is, and an empty summary is not an error.
+                for part in item.get("summary") or []:
+                    thinking.append(part.get("text") or ""
+                                    if isinstance(part, dict) else str(part))
+            elif kind == "function_call":
+                calls.append({
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {"name": item.get("name") or "",
+                                 "arguments": item.get("arguments") or ""}})
+        return {"content": "".join(text).strip(),
+                "reasoning": "\n\n".join(t for t in thinking if t).strip(),
+                "tool_calls": calls}
+
+    if shape == "anthropic":
+        text, thinking, calls = [], [], []
+        for block in data.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text.append(block.get("text") or "")
+            elif block.get("type") == "thinking":
+                thinking.append(block.get("thinking") or "")
+            elif block.get("type") == "tool_use":
+                import json as _json
+                calls.append({
+                    "id": block.get("id"), "type": "function",
+                    "function": {"name": block.get("name") or "",
+                                 "arguments": _json.dumps(
+                                     block.get("input") or {},
+                                     ensure_ascii=False)}})
+        return {"content": "".join(text).strip(),
+                "reasoning": "\n\n".join(thinking).strip(),
+                "tool_calls": calls}
+
+    choices = data.get("choices") or []
+    if not choices:
+        return {"content": "", "reasoning": "", "tool_calls": []}
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(p.get("text") or "" for p in content
+                          if isinstance(p, dict))
+    # `reasoning_content` is what vLLM, SGLang, DeepSeek and Azure's own
+    # gpt-oss deployments emit. Without reading it, a reasoning model that
+    # spends its whole budget thinking looks like a model that returned
+    # nothing at all.
+    thinking = message.get("reasoning_content") or message.get("reasoning") or ""
+    calls = []
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        calls.append({"id": call.get("id"), "type": "function",
+                      "function": {"name": fn.get("name") or "",
+                                   "arguments": fn.get("arguments") or ""}})
+    return {"content": (content or "").strip(),
+            "reasoning": (thinking or "").strip(), "tool_calls": calls}
+
+
 def retry_body(conn: dict, body: dict, error_text: str) -> dict | None:
     """A second attempt at a request the provider rejected on a technicality.
 
@@ -238,14 +519,17 @@ def retry_body(conn: dict, body: dict, error_text: str) -> dict | None:
     400 naming the parameter, which is enough to fix the request and try once
     more rather than failing a thousand-row generation on its first row.
     """
-    spec = provider(conn.get("provider")) or {}
-    if spec.get("flavour") not in ("openai", "azure"):
+    shape = flavour(conn)
+    if shape not in ("openai", "azure", "azure_v1", "responses"):
         return None
     text = (error_text or "").lower()
     fixed = dict(body)
     changed = False
     if "max_completion_tokens" in text and "max_tokens" in fixed:
         fixed["max_completion_tokens"] = fixed.pop("max_tokens")
+        changed = True
+    if "max_output_tokens" in text and "max_tokens" in fixed:
+        fixed["max_output_tokens"] = fixed.pop("max_tokens")
         changed = True
     if "temperature" in text and "temperature" in fixed:
         fixed.pop("temperature")
@@ -257,33 +541,29 @@ def retry_body(conn: dict, body: dict, error_text: str) -> dict | None:
 
 
 def chat_text(conn: dict, data: dict) -> str:
-    """The reply itself, whichever shape it arrived in."""
-    spec = provider(conn.get("provider")) or {}
-    if spec.get("flavour") == "anthropic":
-        # A reply is a list of blocks; only the text ones are the answer, and
-        # a thinking block at the front is not part of it.
-        parts = [b.get("text") or "" for b in (data.get("content") or [])
-                 if isinstance(b, dict) and b.get("type") == "text"]
-        return "".join(parts).strip()
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, list):
-        # Some compatible servers return blocks rather than a string.
-        return "".join(p.get("text") or "" for p in content
-                       if isinstance(p, dict)).strip()
-    return (content or "").strip()
+    """Just the answer. Kept because most callers only want that.
+
+    A reply with nothing but a tool call in it has no text, and that is the
+    correct answer rather than a failure -- callers that care about calls use
+    `reply` instead.
+    """
+    return reply(conn, data)["content"]
 
 
 def chat_usage(conn: dict, data: dict) -> dict:
     """Tokens in and out, under one set of names."""
-    spec = provider(conn.get("provider")) or {}
     usage = data.get("usage") or {}
-    if spec.get("flavour") == "anthropic":
-        return {"input_tokens": usage.get("input_tokens") or 0,
-                "output_tokens": usage.get("output_tokens") or 0}
+    shape = flavour(conn)
+    if shape in ("anthropic", "responses"):
+        # Both already call them this. The Responses API also reports how many
+        # of the output tokens went on reasoning, which is the number that
+        # explains a bill nobody expected.
+        out = {"input_tokens": usage.get("input_tokens") or 0,
+               "output_tokens": usage.get("output_tokens") or 0}
+        details = usage.get("output_tokens_details") or {}
+        if details.get("reasoning_tokens"):
+            out["reasoning_tokens"] = details["reasoning_tokens"]
+        return out
     return {"input_tokens": usage.get("prompt_tokens") or 0,
             "output_tokens": usage.get("completion_tokens") or 0}
 

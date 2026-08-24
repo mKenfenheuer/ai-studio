@@ -1,11 +1,25 @@
 """Connections to hosted models: OpenAI, Azure OpenAI, Anthropic, and the many
 services that copied the OpenAI shape.
 
-Per account, not per studio. An API key is a billable credential belonging to
-one person, and "whose key paid for this dataset" should have an answer -- the
-same rule the Hugging Face token already follows here. Stored encrypted, never
-returned, and injected into a job's config only at the moment the job is
-created, the way `hf_token` is.
+Two scopes, and the difference matters.
+
+**Account.** An API key is usually a billable credential belonging to one
+person, and "whose key paid for this dataset" should have an answer -- the same
+rule the Hugging Face token already follows here.
+
+**Studio.** But often it is not personal at all: one Azure resource, set up
+once, that everybody is meant to use. Requiring each person to paste the same
+key is how half a team ends up unable to generate data, and how that key ends
+up in a chat message. A studio connection is configured by an admin and usable
+by everyone, and it is honest about what that means -- anyone who can start a
+job can spend it.
+
+A personal connection wins over a studio one for the same provider, so
+somebody who wants their own quota simply connects their own.
+
+Either way the key is stored encrypted, never returned to the browser, and
+injected into a job's config only at the moment the job is created, the way
+`hf_token` is.
 """
 from __future__ import annotations
 
@@ -26,11 +40,14 @@ router = APIRouter(prefix="/api/providers")
 TIMEOUT = 30.0
 
 
-def connections(user: dict | None) -> dict[str, dict]:
-    """Every connection this user has, decrypted. Never leaves the server."""
-    if not user or not user.get("model_providers_enc"):
+# Where the studio-wide connections live in the settings table.
+STUDIO_KEY = "model_providers"
+
+
+def _decode(blob: str | None) -> dict[str, dict]:
+    if not blob:
         return {}
-    raw = auth.decrypt_secret(user["model_providers_enc"])
+    raw = auth.decrypt_secret(blob)
     if not raw:
         return {}
     try:
@@ -38,6 +55,31 @@ def connections(user: dict | None) -> dict[str, dict]:
     except ValueError:
         return {}
     return {k: v for k, v in stored.items() if isinstance(v, dict)}
+
+
+def studio_connections() -> dict[str, dict]:
+    """Connections configured for the whole studio."""
+    return _decode(db.get_setting(STUDIO_KEY))
+
+
+def account_connections(user: dict | None) -> dict[str, dict]:
+    """Connections belonging to one person."""
+    return _decode((user or {}).get("model_providers_enc"))
+
+
+def connections(user: dict | None) -> dict[str, dict]:
+    """Everything this user can reach, decrypted. Never leaves the server.
+
+    Studio first, then the account on top: somebody who connects their own key
+    for a provider the studio also has gets their own, which is the only
+    sensible way round -- the personal one is the deliberate act.
+    """
+    merged: dict[str, dict] = {}
+    for pid, conn in studio_connections().items():
+        merged[pid] = {**conn, "scope": "studio"}
+    for pid, conn in account_connections(user).items():
+        merged[pid] = {**conn, "scope": "account"}
+    return merged
 
 
 def connection(user: dict | None, provider_id: str) -> dict | None:
@@ -51,6 +93,27 @@ def connection(user: dict | None, provider_id: str) -> dict | None:
 def _save(user: dict, all_conns: dict) -> None:
     db.update_user(user["id"],
                    model_providers_enc=auth.encrypt_secret(json.dumps(all_conns)))
+
+
+def _save_studio(user: dict, all_conns: dict) -> None:
+    db.set_setting(STUDIO_KEY, auth.encrypt_secret(json.dumps(all_conns)),
+                   user.get("id"))
+
+
+def _require_admin(user: dict) -> None:
+    if (user or {}).get("role") != "admin":
+        raise HTTPException(
+            403, "A connection for the whole studio is an administrator's to "
+                 "set up. You can connect your own key for this provider "
+                 "instead.")
+
+
+def _scope_of(payload: dict, request: Request) -> str:
+    wanted = (payload.get("scope")
+              or request.query_params.get("scope") or "account").strip()
+    if wanted not in ("account", "studio"):
+        raise HTTPException(400, "Scope is either account or studio.")
+    return wanted
 
 
 def _public(provider_id: str, conn: dict) -> dict:
@@ -68,6 +131,11 @@ def _public(provider_id: str, conn: dict) -> dict:
         "key_hint": ("…" + conn["api_key"][-4:]) if conn.get("api_key") else "",
         "checked_at": conn.get("checked_at"),
         "note": conn.get("note") or "",
+        "api_style": conn.get("api_style") or "",
+        # Whose credential this is. The UI says so plainly, because "shared
+        # with everyone in this studio" is not a detail somebody should have
+        # to infer from a key working that they never pasted.
+        "scope": conn.get("scope") or "account",
     }
 
 
@@ -79,6 +147,8 @@ async def list_providers(request: Request) -> dict:
     return {
         "providers": apimodels.public_providers(),
         "connected": [_public(pid, conn) for pid, conn in sorted(mine.items())],
+        # Whether this account may connect something on everyone's behalf.
+        "can_manage_studio": (user or {}).get("role") == "admin",
     }
 
 
@@ -90,9 +160,14 @@ async def save_provider(request: Request, provider_id: str,
     if not spec:
         raise HTTPException(404, "No such provider.")
 
-    mine = connections(user)
+    scope = _scope_of(payload, request)
+    if scope == "studio":
+        _require_admin(user)
+        mine = studio_connections()
+    else:
+        mine = account_connections(user)
     conn = dict(mine.get(provider_id) or {})
-    for field in spec["required"] + spec["optional"] + ["model"]:
+    for field in spec["required"] + spec["optional"] + ["model", "api_style"]:
         if field not in payload:
             continue
         value = (payload.get(field) or "").strip()
@@ -106,14 +181,27 @@ async def save_provider(request: Request, provider_id: str,
     if problem := apimodels.problems({**conn, "provider": provider_id}):
         raise HTTPException(400, problem)
     mine[provider_id] = conn
-    _save(user, mine)
-    return _public(provider_id, conn)
+    if scope == "studio":
+        _save_studio(user, mine)
+    else:
+        _save(user, mine)
+    return _public(provider_id, {**conn, "scope": scope})
 
 
 @router.delete("/{provider_id}")
 async def delete_provider(request: Request, provider_id: str) -> dict:
     user = current_user(request)
-    mine = connections(user)
+    scope = _scope_of({}, request)
+    if scope == "studio":
+        _require_admin(user)
+        mine = studio_connections()
+        if mine.pop(provider_id, None) is None:
+            raise HTTPException(404, "That provider is not connected for the "
+                                     "studio.")
+        _save_studio(user, mine)
+        return {"ok": True, "note": "Disconnected for everyone. Runs already "
+                                    "queued keep going."}
+    mine = account_connections(user)
     if mine.pop(provider_id, None) is None:
         raise HTTPException(404, "That provider is not connected.")
     _save(user, mine)
@@ -189,14 +277,23 @@ async def test_provider(request: Request, provider_id: str,
             conn, r.status_code, _body(r)))
 
     data = r.json()
-    mine = connections(user)
-    if provider_id in mine:
-        mine[provider_id]["checked_at"] = __import__("time").time()
-        if model and not mine[provider_id].get("model"):
-            mine[provider_id]["model"] = model
-        _save(user, mine)
-    return {"ok": True, "model": model,
-            "reply": apimodels.chat_text(conn, data)[:200],
+    # Stamped on whichever record was actually used, not on a merged copy that
+    # belongs to nobody -- writing the studio's connection into the caller's
+    # account would silently give them a private copy of a shared key.
+    scope = conn.get("scope") or "account"
+    store = studio_connections() if scope == "studio"         else account_connections(user)
+    if provider_id in store:
+        store[provider_id]["checked_at"] = __import__("time").time()
+        if model and not store[provider_id].get("model"):
+            store[provider_id]["model"] = model
+        if scope == "studio":
+            if user.get("role") == "admin":
+                _save_studio(user, store)
+        else:
+            _save(user, store)
+    answer = apimodels.reply(conn, data)
+    return {"ok": True, "model": model, "scope": scope,
+            "reply": (answer["content"] or answer["reasoning"])[:200],
             "usage": apimodels.chat_usage(conn, data)}
 
 

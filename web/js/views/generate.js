@@ -6,7 +6,7 @@
  * plentiful, and it can be uniformly wrong.
  */
 import { api } from "../api.js";
-import { html, raw, esc, $, $$, on, toast } from "../util.js";
+import { html, raw, esc, $, $$, on, toast, fmtNum } from "../util.js";
 
 const MODES = [
   {
@@ -30,14 +30,24 @@ const MODES = [
          + "Everything it produces will resemble your seeds — that is the "
          + "point, and it is also the ceiling.",
   },
+  {
+    id: "extend_conversations",
+    title: "Carry these conversations further",
+    blurb: "You supply a dataset; the model adds more turns to every "
+         + "conversation in it. The mode most tool-calling datasets need — "
+         + "they are almost all single exchanges, and a model trained only on "
+         + "those never learns the fourth turn.",
+    dataset: true,
+  },
 ];
 
 export async function generateView(mount) {
-  const [runners, playable, hosted] = await Promise.all([
+  const [runners, playable, hosted, datasets] = await Promise.all([
     api.runners(), api.playground(),
     // A studio with no keys connected simply has no hosted options; it must
     // not be a reason for this page to fail to open.
     api.providers().catch(() => ({ providers: [], connected: [] })),
+    api.datasets().catch(() => []),
   ]);
   const online = runners.filter((r) => r.status !== "offline");
   const connected = hosted.connected || [];
@@ -58,7 +68,8 @@ export async function generateView(mount) {
   };
 
   const draw = () => {
-    mount.innerHTML = layout(state, online, playable, connected, labelOf);
+    mount.innerHTML = layout(state, online, playable, connected, labelOf,
+                             datasets);
     wire();
   };
 
@@ -105,6 +116,19 @@ export async function generateView(mount) {
       if (state.mode === "from_prompts") cfg.prompts = f.body;
       if (state.mode === "from_topics") cfg.topics = f.body;
       if (state.mode === "from_seeds") cfg.seeds = f.body;
+      if (state.mode === "extend_conversations") {
+        if (!f.source_dataset_id) {
+          return toast("Which dataset should get the extra turns?", "err");
+        }
+        cfg.source_dataset_id = f.source_dataset_id;
+        cfg.source_split = f.source_split || "";
+        cfg.extra_turns = +f.extra_turns || 2;
+        cfg.persona = f.persona || "";
+        cfg.invent_tool_results = f.invent_tool_results === "on";
+        // Every row, unless the box says fewer. Extending half a dataset and
+        // leaving the rest is rarely what anybody means.
+        cfg.count = +f.count || 0;
+      }
 
       const btn = $("#genGo", mount);
       btn.disabled = true;
@@ -125,12 +149,71 @@ export async function generateView(mount) {
   return () => {};
 }
 
+/** Picking the dataset to lengthen, and how far.
+ *
+ *  Deliberately blunt about the one thing that is not true in the result: on a
+ *  tool-calling dataset the model has to invent what the tool returned,
+ *  because no tool ran. That is the right trade for teaching the *shape* of a
+ *  multi-step conversation and the wrong one for teaching facts, and which of
+ *  those you are doing is not something this page can work out for you.
+ */
+function extendPanel(datasets) {
+  const rows = (datasets || []).filter((d) => (d.rows || 0) > 0);
+  return html`
+    <div class="field">
+      <label for="srcDs">Dataset to lengthen</label>
+      <select id="srcDs" name="source_dataset_id" required>
+        <option value="">Choose a dataset…</option>
+        ${raw(rows.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${
+          fmtNum(d.rows)} rows</option>`).join(""))}
+      </select>
+      <div class="hint">Every conversation in it gets carried further. The
+        original is not touched — this writes a new dataset, like every other
+        transformation here.</div>
+    </div>
+    <div class="grid grid-2">
+      <div class="field">
+        <label for="srcSplit">Split</label>
+        <input id="srcSplit" name="source_split" class="mono"
+               placeholder="every row">
+        <div class="hint">Blank for all of them.</div>
+      </div>
+      <div class="field">
+        <label for="extraTurns">Extra exchanges per conversation</label>
+        <input id="extraTurns" name="extra_turns" type="number" min="1" max="12"
+               value="2">
+        <div class="hint">Each one is a new question and its answer — plus any
+          tool calls and results in between.</div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="persona">Who is the person? (optional)</label>
+      <input id="persona" name="persona" class="mono"
+             placeholder="a busy warehouse supervisor, terse, types in lower case">
+      <div class="hint">The model writes the user's turns as well as the
+        assistant's, and left to itself it writes a user who talks like an
+        assistant. A sentence here is the difference between realistic
+        follow-ups and a second assistant interviewing the first.</div>
+    </div>
+    <label class="check"><input type="checkbox" name="invent_tool_results" checked>
+      When the model calls a tool, invent a plausible result so the
+      conversation can carry on</label>
+    <div class="callout callout-warn" style="margin-top:10px">
+      <strong>Invented results are plausible, not true</strong>
+      No tool actually runs. What comes back is what the model imagines the
+      function would return. That is what you want for teaching the shape of a
+      multi-step tool conversation, and never what you want for teaching facts
+      about your systems.
+    </div>`;
+}
+
 const kindOf = (playable, id) =>
   playable.find((p) => p.id === id)?.kind || "finetune_llm";
 
 // ---------------------------------------------------------------------------
 
-function layout(state, online, playable, connected = [], labelOf = {}) {
+function layout(state, online, playable, connected = [], labelOf = {},
+                datasets = []) {
   const mode = MODES.find((m) => m.id === state.mode);
   return html`
     <div class="page-head">
@@ -166,14 +249,15 @@ function layout(state, online, playable, connected = [], labelOf = {}) {
       <div class="grid grid-2" style="align-items:start">
         <div class="card">
           <h3>${mode.title}</h3>
+          ${raw(mode.dataset ? extendPanel(datasets) : html`
           <div class="field">
             <label for="genBody">${bodyLabel(state.mode)}</label>
             <textarea id="genBody" name="body" rows="10" class="mono"
                       placeholder="${bodyPlaceholder(state.mode)}"
                       required></textarea>
             <div class="hint">${bodyHint(state.mode)}</div>
-          </div>
-          ${raw(state.mode !== "from_prompts" ? html`
+          </div>`)}
+          ${raw(state.mode !== "from_prompts" && !mode.dataset ? html`
             <details class="adv">
               <summary>Change what it is asked for</summary>
               <div class="field" style="margin-top:8px">

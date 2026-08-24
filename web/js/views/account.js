@@ -197,12 +197,17 @@ export async function accountView(mount) {
 
     on(mount, "click", "[data-forget-provider]", async (_e, t) => {
       const id = t.dataset.forgetProvider;
+      const scope = t.dataset.scope || "account";
       if (!confirm(`Disconnect ${id}?
 
-The key is deleted from this studio. `
+`
+                   + (scope === "studio"
+                      ? "This one is shared with the whole studio, so it goes "
+                        + "for everybody. "
+                      : "The key is deleted from this studio. ")
                    + "Runs already queued keep going.")) return;
       try {
-        const r = await api.deleteProvider(id);
+        const r = await api.deleteProvider(id, scope);
         hosted = await api.providers();
         toast(r.note || "Disconnected.", "ok");
         draw();
@@ -606,6 +611,10 @@ function hostedCard(hosted, opening) {
               <div style="min-width:0">
                 <strong class="tiny">${p.label}</strong>
                 ${raw(c ? `<span class="badge badge-ok">connected</span>` : "")}
+                ${raw(c?.scope === "studio"
+                  ? `<span class="badge badge-accent" title="Configured for the
+                       whole studio. Anyone who can start a job can spend it."
+                     >shared with the studio</span>` : "")}
                 ${raw(c?.key_hint ? `<span class="badge">key ${esc(c.key_hint)}</span>` : "")}
                 <p class="muted tiny" style="margin:2px 0 0">${p.blurb}</p>
               </div>
@@ -624,7 +633,11 @@ function hostedCard(hosted, opening) {
                        style="max-width:280px" placeholder="${
                          p.id === "azure" ? c.deployment : "model to test"}"
                        value="${c.model || (p.id === "azure" ? c.deployment : "")}">
-                <button class="btn-sm btn-danger" data-forget-provider="${p.id}">Disconnect</button>
+                ${raw(c.scope !== "studio" || hosted.can_manage_studio
+                  ? `<button class="btn-sm btn-danger" data-forget-provider="${p.id}"
+                             data-scope="${esc(c.scope || "account")}">Disconnect</button>`
+                  : `<span class="tiny muted">An administrator set this up for
+                       everyone; only an administrator can remove it.</span>`)}
               </div>` : "")}
 
             <div data-provider-result="${p.id}"></div>
@@ -635,12 +648,18 @@ function hostedCard(hosted, opening) {
                   <div class="field">
                     <label for="pf_${p.id}_${f.name}">${f.label}${
                       raw(f.required ? "" : ` <span class="muted tiny">(optional)</span>`)}</label>
-                    <input id="pf_${p.id}_${f.name}" name="${f.name}" class="mono"
-                           type="${f.secret ? "password" : "text"}"
-                           autocomplete="off"
-                           placeholder="${f.name === "base_url" ? p.base_url : ""}"
-                           value="${f.secret ? "" : (c?.[f.name] || "")}"
-                           ${f.required && !(f.secret && c) ? "required" : ""}>
+                    ${raw(f.choices ? html`
+                      <select id="pf_${p.id}_${f.name}" name="${f.name}">
+                        ${raw(f.choices.map((o) => `<option value="${esc(o.value)}"
+                          ${(c?.[f.name] || f.choices[0].value) === o.value ? "selected" : ""}
+                          >${esc(o.label)} — ${esc(o.hint || "")}</option>`).join(""))}
+                      </select>` : html`
+                      <input id="pf_${p.id}_${f.name}" name="${f.name}" class="mono"
+                             type="${f.secret ? "password" : "text"}"
+                             autocomplete="off"
+                             placeholder="${f.name === "base_url" ? p.base_url : ""}"
+                             value="${f.secret ? "" : (c?.[f.name] || "")}"
+                             ${f.required && !(f.secret && c) ? "required" : ""}>`)}
                     <div class="hint">${f.hint}</div>
                   </div>`).join(""))}
                 <div class="field">
@@ -652,6 +671,20 @@ function hostedCard(hosted, opening) {
                   <div class="hint">Offered first when writing a dataset. You
                     can change it there.</div>
                 </div>
+                ${raw(hosted.can_manage_studio ? html`
+                  <div class="field">
+                    <label for="pf_${p.id}_scope">Who can use it</label>
+                    <select id="pf_${p.id}_scope" name="scope">
+                      <option value="account" ${c?.scope !== "studio" ? "selected" : ""}
+                        >Just me — billed to my own key</option>
+                      <option value="studio" ${c?.scope === "studio" ? "selected" : ""}
+                        >Everyone in this studio</option>
+                    </select>
+                    <div class="hint">A studio connection is for a resource set
+                      up once for the whole team. Be clear-eyed about it:
+                      anyone who can start a job can spend it, and nobody but
+                      an administrator can take it away again.</div>
+                  </div>` : "")}
                 <button class="btn-sm btn-primary" type="submit">${
                   c ? "Save changes" : "Connect"}</button>
               </form>`)}

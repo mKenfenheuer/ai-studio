@@ -213,6 +213,20 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     created_at   REAL NOT NULL
 );
 
+-- Studio-wide settings, as one small key/value store.
+--
+-- There is exactly one thing in here so far and it earns the table: a model
+-- provider connected for the whole studio rather than per account. A hosted
+-- model used to write datasets is frequently a resource somebody set up once
+-- for everybody, and requiring every user to paste the same key is how half a
+-- team ends up unable to generate data.
+CREATE TABLE IF NOT EXISTS settings (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL,
+  updated_at  REAL NOT NULL,
+  updated_by  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL,
@@ -333,6 +347,22 @@ def now() -> float:
 
 
 # ---------------------------------------------------------------- runners
+
+def get_setting(key: str) -> str | None:
+    row = q1("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row else None
+
+
+def set_setting(key: str, value: str, user_id: str | None = None) -> None:
+    ex("INSERT INTO settings (key,value,updated_at,updated_by) VALUES (?,?,?,?) "
+       "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+       "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+       (key, value, now(), user_id))
+
+
+def delete_setting(key: str) -> None:
+    ex("DELETE FROM settings WHERE key=?", (key,))
+
 
 def upsert_runner(runner_id: str, name: str, capabilities: dict) -> None:
     if q1("SELECT id FROM runners WHERE id=?", (runner_id,)):

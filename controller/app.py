@@ -406,6 +406,23 @@ async def _create_job(request: Request, payload: dict) -> str:
             raise HTTPException(400, "Choose a model to write the data with.")
         if not int(cfg.get("count") or 0):
             raise HTTPException(400, "How many rows should it write?")
+        # Extending conversations reads an existing dataset. It travels the
+        # same way a training dataset does -- as a URL the runner fetches with
+        # its join token -- so a private dataset is never made public in order
+        # to be lengthened.
+        if cfg.get("mode") == "extend_conversations":
+            src_id = (cfg.get("source_dataset_id") or "").strip()
+            if not src_id:
+                raise HTTPException(
+                    400, "Which dataset should the extra turns be added to?")
+            d = db.get_dataset(src_id)
+            if not d:
+                raise HTTPException(404, "No such dataset.")
+            security.require_view(request, "dataset", d)
+            cfg["source_dataset"] = "%s/api/datasets/%s/dataset-file" % (
+                str(request.base_url).rstrip("/"), src_id)
+            cfg["source_label"] = d["name"]
+            cfg.setdefault("count", d.get("rows") or 0)
         if model.get("provider"):
             _attach_provider(user, cfg)
         else:

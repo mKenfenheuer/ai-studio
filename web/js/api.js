@@ -110,8 +110,9 @@ export const api = {
   saveProvider:   (id, body) =>
     req(`/api/providers/${encodeURIComponent(id)}`,
         { method: "PUT", body: JSON.stringify(body) }),
-  deleteProvider: (id) =>
-    req(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteProvider: (id, scope = "account") =>
+    req(`/api/providers/${encodeURIComponent(id)}?scope=${encodeURIComponent(scope)}`,
+        { method: "DELETE" }),
   providerModels: (id) =>
     req(`/api/providers/${encodeURIComponent(id)}/models`),
   testProvider:   (id, model) =>

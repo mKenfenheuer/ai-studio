@@ -20,6 +20,11 @@ Three ways to use it, because they solve different problems:
   Self-instruct, roughly.
 * **from_topics** -- you have subject matter and want coverage. It works
   through a list of topics, generating examples about each.
+* **extend_conversations** -- you have conversations and they are too short.
+  It carries each one further, a turn at a time, with the row's own tools
+  declared so the model can call one. This is the mode most tool-calling
+  datasets need: they are almost entirely single exchanges, and a model
+  trained only on those never learns the fourth turn.
 
 The honest caveats are printed into the run's log rather than buried in docs,
 because generated data has failure modes that look like success: a model that
@@ -70,12 +75,21 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     _preamble(ctx, cfg, mode, target, spec)
 
-    sources = _sources(cfg, mode, ctx)
     params = {
         "max_new_tokens": int(cfg.get("max_new_tokens") or DEFAULT_MAX_TOKENS),
         "temperature": float(cfg.get("temperature") or 0.9),
         "top_p": float(cfg.get("top_p") or 0.95),
     }
+    if effort := (cfg.get("reasoning_effort") or "").strip():
+        params["reasoning_effort"] = effort
+
+    if mode == "extend_conversations":
+        # A different shape of work: many calls per row rather than one, and
+        # the row already exists. It gets its own loop rather than being bent
+        # into the single-shot one below.
+        return _extend(cfg, ctx, host, spec, params, out_path, target)
+
+    sources = _sources(cfg, mode, ctx)
 
     seen: set[str] = set()
     written = 0
@@ -213,7 +227,8 @@ class _HostedModel:
                  _stop, _log) -> dict:
         import httpx
 
-        req = self.api.chat_request(self.conn, self.model, messages, params)
+        req = self.api.chat_request(self.conn, self.model, messages, params,
+                                    tools=params.get("tools"))
         body = req["json"]
         started = time.time()
         last = ""
@@ -230,8 +245,15 @@ class _HostedModel:
                 data = r.json()
                 usage = self.api.chat_usage(self.conn, data)
                 elapsed = max(time.time() - started, 1e-6)
+                answer = self.api.reply(self.conn, data)
                 return {
-                    "text": self.api.chat_text(self.conn, data),
+                    "text": answer["content"],
+                    # Kept apart rather than folded into the text. A reasoning
+                    # model's working is not part of the answer, and writing it
+                    # into a dataset as though it were teaches a small model to
+                    # narrate its own thinking out loud to the user.
+                    "reasoning": answer["reasoning"],
+                    "tool_calls": answer["tool_calls"],
                     "tokens_per_sec": round(usage["output_tokens"] / elapsed, 2),
                     "usage": usage,
                 }
@@ -425,6 +447,268 @@ def _clip(text: str, n: int = 110) -> str:
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Carrying an existing conversation further
+# ---------------------------------------------------------------------------
+#
+# The other three modes write conversations from nothing. This one takes the
+# ones you already have and makes them longer, which is a different problem and
+# the one most tool-calling datasets actually have: they are full of single
+# exchanges -- a question, a call, an answer -- and a model trained only on
+# those never learns what to do on the fourth turn, when the context is long
+# and half of it is its own earlier work.
+#
+# Each extra turn is two calls, not one, and deliberately so. A model asked to
+# write "the next exchange" writes both halves in its own voice and produces a
+# user who talks like an assistant: complete sentences, no typos, no shifting
+# subject, never impatient. Asking separately -- once in the character of the
+# person, once as the assistant -- gets a user turn that reads like a user.
+
+_USER_PROMPT = (
+    "You are simulating the PERSON in this conversation, not the assistant.\n"
+    "Write only their next message. Nothing else: no preamble, no quotation "
+    "marks, no explanation of what you are doing.\n"
+    "It should follow naturally from what has been said, and be the kind of "
+    "thing a real person types -- short, direct, and sometimes assuming "
+    "context rather than restating it. Vary what you ask for: a follow-up, a "
+    "correction, a change of mind, a related but different request.\n"
+    "%s"
+)
+
+
+def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
+            out_path: Path, target: int) -> dict:
+    """Make the conversations in a dataset longer, a turn at a time."""
+    from common import conversation as C
+
+    turns = max(1, int(cfg.get("extra_turns") or 2))
+    persona = (cfg.get("persona") or "").strip()
+    invent_results = bool(cfg.get("invent_tool_results", True))
+    rows = _source_rows(cfg, ctx)
+
+    written = extended = failed = 0
+    invented = 0
+    stopped_early = False
+    t0 = time.time()
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            if written >= target:
+                break
+            if ctx.should_cancel():
+                stopped_early = True
+                ctx.log("Stopping after %d rows, and keeping them." % written,
+                        "warn")
+                break
+
+            conv, _ = C.repair(C.from_row(row))
+            if not conv[C.MESSAGES_KEY]:
+                continue
+            tools = C.flat_tools(conv)
+            before = len(conv[C.MESSAGES_KEY])
+
+            try:
+                added, made_up = _extend_one(conv, host, spec, params, turns,
+                                             persona, tools, invent_results)
+                invented += made_up
+            except ProviderRefused:
+                raise
+            except Exception as e:  # noqa: BLE001 - one bad row is not the run
+                failed += 1
+                ctx.log("Row %d could not be extended (%s); it is kept as it "
+                        "was." % (written + 1, type(e).__name__), "debug")
+                added = 0
+
+            if added:
+                extended += 1
+            # Written whether or not it grew. A row that could not be extended
+            # is still a row, and dropping it would quietly shrink the dataset
+            # every time the provider hiccuped.
+            fh.write(json.dumps(
+                C.to_row(conv, split=row.get("split")), ensure_ascii=False) + "\n")
+            fh.flush()
+            written += 1
+
+            rate = written / max(time.time() - t0, 1e-6)
+            ctx.metric(written, {
+                "rows": written, "extended": extended, "failed": failed,
+                "invented_results": invented,
+                "rows_per_sec": round(rate, 3),
+                "eta_s": round((target - written) / max(rate, 1e-6)),
+            })
+            ctx.progress(written, target, stage="training")
+            if written <= 2 or written % max(1, target // 10) == 0:
+                grew = len(conv[C.MESSAGES_KEY]) - before
+                ctx.log("Row %d of %d: %d turns -> %d (+%d)"
+                        % (written, target, before, before + grew, grew))
+
+    if not written:
+        raise ValueError(
+            "No rows in that dataset could be read as conversations. Convert "
+            "it to the standard conversation format first -- the dataset page "
+            "has the button.")
+    if invented:
+        ctx.log("%d tool results in this dataset were INVENTED by the model "
+                "because no real tool was called. They are plausible and they "
+                "are not true. That is usually what you want for teaching the "
+                "*shape* of a tool conversation, and it is never what you want "
+                "for teaching facts." % invented, "warn")
+
+    return _finish(cfg, ctx, out_path, {
+        "written": written, "duplicates": 0, "empty": failed,
+        "stopped_early": stopped_early, "target": target,
+        "duration_s": time.time() - t0, "mode": "extend_conversations",
+    })
+
+
+def _extend_one(conv: dict, host: Any, spec: dict, params: dict, turns: int,
+                persona: str, tools: list[dict], invent_results: bool) -> tuple[int, int]:
+    """Add `turns` exchanges to one conversation, in place."""
+    from common import conversation as C
+
+    msgs = conv[C.MESSAGES_KEY]
+    added = invented = 0
+
+    for _ in range(turns):
+        # 1. The person's next message, written in their character.
+        history = _as_plain(msgs)
+        ask = [{"role": "system", "content": _USER_PROMPT % (
+            ("They are: " + persona) if persona else
+            "Stay consistent with how they have written so far.")},
+            {"role": "user", "content":
+             "The conversation so far:\n\n%s\n\nWrite their next message."
+             % history}]
+        said = (host.generate(spec, ask, {**params, "tools": None},
+                              None, lambda _l: None).get("text") or "").strip()
+        said = said.strip('"').strip()
+        if not said:
+            break
+        msgs.append({"role": "user", "content": said})
+        added += 1
+
+        # 2. The assistant's reply, with this row's own tools declared so it
+        #    can call one -- which is the whole point on a tool dataset.
+        for _step in range(4):
+            reply = host.generate(spec, _for_provider(conv),
+                                  {**params, "tools": tools or None},
+                                  None, lambda _l: None)
+            calls = reply.get("tool_calls") or []
+            turn: dict[str, Any] = {"role": "assistant"}
+            if text := (reply.get("text") or "").strip():
+                turn["content"] = text
+            if thinking := (reply.get("reasoning") or "").strip():
+                turn["reasoning"] = thinking
+            if calls:
+                turn["tool_calls"] = calls
+            if not turn.get("content") and not calls:
+                break
+            msgs.append(turn)
+            added += 1
+            if not calls:
+                break
+            if not invent_results:
+                break
+            # A call with nothing to answer it leaves the conversation
+            # unfinished, and an unfinished conversation is a row that ends on
+            # the model asking a question of a tool that never replied.
+            for call in calls:
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": call["function"]["name"],
+                    "content": _invent_result(host, spec, params, call, tools),
+                })
+                invented += 1
+                added += 1
+    return added, invented
+
+
+def _invent_result(host: Any, spec: dict, params: dict, call: dict,
+                   tools: list[dict]) -> str:
+    """A plausible return value for a call nothing actually executed."""
+    schema = next((t for t in tools
+                   if t.get("name") == call["function"]["name"]), {})
+    ask = [{"role": "system", "content":
+            "You are standing in for a piece of software. Reply with the JSON "
+            "that this function would return, and nothing else -- no prose, no "
+            "code fence, no explanation. Make it realistic and internally "
+            "consistent with the arguments."},
+           {"role": "user", "content":
+            "Function: %s\nWhat it does: %s\nIts schema: %s\n"
+            "It was called with: %s\n\nReturn the JSON it would produce."
+            % (call["function"]["name"], schema.get("description") or "unknown",
+               json.dumps(schema.get("parameters") or {}, ensure_ascii=False),
+               call["function"]["arguments"])}]
+    text = (host.generate(spec, ask, {**params, "tools": None}, None,
+                          lambda _l: None).get("text") or "").strip()
+    # A model told not to use a code fence sometimes uses a code fence.
+    text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text).strip()
+    try:
+        json.loads(text)
+        return text
+    except ValueError:
+        # Not JSON. Wrapped rather than discarded, so the conversation still
+        # has a result in the shape a result goes in.
+        return json.dumps({"result": text[:2000]}, ensure_ascii=False)
+
+
+def _for_provider(conv: dict) -> list[dict]:
+    """The conversation as a provider's chat API wants it."""
+    from common import conversation as C
+    return [{k: v for k, v in m.items() if k != "reasoning"}
+            for m in conv[C.MESSAGES_KEY]]
+
+
+def _as_plain(messages: list[dict]) -> str:
+    """The conversation as readable text, for the user-simulator prompt.
+
+    Deliberately not the training format. What is wanted here is for a model to
+    *read* the conversation and understand who wants what, and turn markers are
+    noise for that -- a tool call is far more legible as one line naming the
+    function than as the syntax of whichever format it will eventually render
+    in.
+    """
+    lines = []
+    for m in messages[-12:]:
+        role = m.get("role")
+        if role == "tool":
+            lines.append("[%s returned: %s]"
+                         % (m.get("name") or "tool", _clip(m.get("content") or "", 200)))
+            continue
+        who = {"user": "Person", "assistant": "Assistant"}.get(role, role)
+        if content := (m.get("content") or "").strip():
+            lines.append("%s: %s" % (who, content))
+        for call in m.get("tool_calls") or []:
+            lines.append("[%s called %s(%s)]"
+                         % (who, call["function"]["name"],
+                            _clip(call["function"]["arguments"], 200)))
+    return "\n".join(lines)
+
+
+def _source_rows(cfg: dict, ctx: Any) -> Iterator[dict]:
+    """Rows of the dataset being extended."""
+    from . import source
+    path = source.local_copy({**cfg, "dataset": cfg.get("source_dataset"),
+                              "dataset_is_local": True,
+                              "dataset_label": cfg.get("source_label")
+                              or "the dataset"}, ctx)
+    want = (cfg.get("source_split") or "").strip()
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if want and (row.get("split") or "train") != want:
+                continue
+            yield row
+
+
 def _preamble(ctx: Any, cfg: dict, mode: str, target: int, spec: dict) -> None:
     who = spec.get("label") or spec.get("base_model") or "the model you trained"
     ctx.log("Writing %s rows with %s." % (f"{target:,}", who))
@@ -441,6 +725,12 @@ def _preamble(ctx: Any, cfg: dict, mode: str, target: int, spec: dict) -> None:
     if mode == "from_seeds":
         ctx.log("Everything it writes will resemble the seeds you gave it. "
                 "That is the point, and it is also the ceiling.")
+    if mode == "extend_conversations":
+        ctx.log("Each extra turn is two requests: one asking the model to be "
+                "the person, one asking it to be the assistant. Asked for both "
+                "at once it writes a user who talks like an assistant, and a "
+                "model trained on that learns to answer questions nobody "
+                "phrases that way.")
 
 
 def _finish(cfg: dict, ctx: Any, path: Path, stats: dict) -> dict:
