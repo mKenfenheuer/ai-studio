@@ -218,6 +218,29 @@ class ModelHost:
             else:
                 log("This model carries no chat template; using the plain "
                     "conversation format instead.")
+
+        # A run whose recorded format is a Jinja template over the raw dataset
+        # ROW rather than over a conversation. Those render a finished example
+        # -- they read row['conversations'] and have no notion of "and now the
+        # assistant speaks" -- so there is no way to ask one for a prompt.
+        #
+        # What used to happen was the worst available answer: the style came
+        # out as "continue" and the model was sent the bare question, with no
+        # turn markers, no system prompt and no tools. A Mistral fine-tune got
+        # a naked sentence where it expected [INST], and produced a plausible
+        # answer to a question nobody could have asked it properly.
+        #
+        # The model's own template is the honest substitute. It is the one the
+        # base was built with, it is what a row template of this kind is
+        # imitating, and it can produce a generation prompt.
+        if fmt.get("mode") == "jinja" and self.chat_template \
+                and "messages" not in (fmt.get("template") or ""):
+            log("This run was trained with a template written against the "
+                "dataset's own columns, which cannot be asked for a prompt. "
+                "Using %s's own chat template to talk to it instead."
+                % (spec.get("base_model") or "the base model"))
+            fmt = {k: v for k, v in fmt.items() if k not in ("mode", "template")}
+            fmt["chat_template"] = self.chat_template
         fmt.setdefault("specials", self.specials)
         if reasoning:
             fmt["reasoning"] = True
