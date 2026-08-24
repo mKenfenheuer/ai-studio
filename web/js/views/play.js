@@ -1,5 +1,6 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, $$, on, fmtAgo, toast } from "../util.js";
+import { conversationHtml, pretty } from "../conversation.js";
 
 // Talking to what you trained.
 //
@@ -127,19 +128,14 @@ function runCard(r) {
 }
 
 // --------------------------------------------------------------- helpers
-const roleLabel = { user: "you", assistant: "model", tool: "tool",
-                    system: "system", developer: "developer" };
+//
+// Drawing a conversation lives in ../conversation.js, shared with the dataset
+// workbench. A held-out row read there and the same row loaded here are the
+// same conversation, so they are drawn by the same code -- two renderers would
+// be two chances for "what the data says" and "what I am sending" to disagree,
+// which is the one disagreement this page exists to rule out.
 
-/** Pretty-print JSON when it is JSON, leave it alone when it is not.
- *  A tool's arguments are the thing you most want to read at a glance and the
- *  thing most often written as one unbroken line. */
-function pretty(text) {
-  const s = String(text ?? "").trim();
-  if (!s.startsWith("{") && !s.startsWith("[")) return s;
-  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
-}
-
-/** One canonical message as readable text, for an editor box. */
+/** One canonical message as plain text, for an editor box. */
 const bodyOf = (m) => m.role === "assistant" && !m.content && m.tool_calls?.length
   ? "" : (m.content || "");
 
@@ -403,8 +399,22 @@ function chatView(mount, run, runs) {
   // ways of getting a message on screen is two ways for the screen to stop
   // matching what will actually be sent.
   function paint() {
-    const parts = turns.map((m, i) => bubble(m, i));
-    log.innerHTML = parts.join("") || html`
+    const last = turns.length - 1;
+    const body = conversationHtml(turns, {
+      // Every turn is editable, including the model's own replies and the tool
+      // results: the useful thing to do with a held-out example is change one
+      // word of it and ask what survives.
+      actions: (_m, i) => `<div class="row turn-actions" style="gap:6px">
+          <button class="btn-sm" data-editrow="${i}">Edit</button>
+          <button class="btn-sm" data-delrow="${i}">Remove</button>
+        </div>`,
+      // Answering a call by hand, when the row recorded no result for it or
+      // you want to see what a different result would do.
+      callAction: (c, _n) => (turns[last]?.tool_calls || []).includes(c)
+        ? `<button class="btn-sm" data-answer="${esc(c.id || "")}">Return a result…</button>`
+        : "",
+    });
+    log.innerHTML = turns.length ? body : html`
       <div class="chat-empty">Nothing said yet. ${ui.title}.</div>`;
     if (pendingText !== null) {
       log.insertAdjacentHTML("beforeend", html`
@@ -419,46 +429,6 @@ function chatView(mount, run, runs) {
   }
 
   let pendingText = null;
-
-  function bubble(m, i) {
-    const mine = m.role === "user";
-    if (m.role === "tool") {
-      return html`
-        <div class="bubble it" data-role="${m.name || "tool"} returned"
-             style="font-family:var(--mono,monospace);font-size:12px">
-          <pre style="white-space:pre-wrap;margin:0"
-               data-edit="${i}">${pretty(m.content)}</pre>
-          <div class="row" style="gap:6px;margin-top:6px">
-            <button class="btn-sm" data-editrow="${i}">Edit</button>
-            <button class="btn-sm" data-delrow="${i}">Remove</button>
-          </div>
-        </div>`;
-    }
-    const calls = (m.tool_calls || []).map((c) => html`
-      <div style="margin-top:6px;padding:6px 8px;border-radius:8px;
-                  background:var(--surface-3,rgba(0,0,0,.08))">
-        <div class="tiny"><strong>⚙ ${c.function.name}</strong>
-          ${raw(c.valid === false
-            ? `<span class="badge badge-err">arguments are not valid JSON</span>` : "")}</div>
-        <pre class="mono tiny" style="white-space:pre-wrap;margin:4px 0 0">${
-          pretty(c.function.arguments)}</pre>
-        ${raw(m.role === "assistant" && i === turns.length - 1
-          ? `<button class="btn-sm" data-answer="${esc(c.id)}"
-                     style="margin-top:6px">Return a result…</button>` : "")}
-      </div>`).join("");
-    return html`
-      <div class="bubble ${mine ? "me" : "it"}" data-role="${roleLabel[m.role] || m.role}">
-        ${raw(m.reasoning ? `<details class="reasoning"><summary>Its reasoning (${
-          m.reasoning.length} characters)</summary><p class="txt">${
-          esc(m.reasoning)}</p></details>` : "")}
-        <span data-edit="${i}">${bodyOf(m)}</span>
-        ${raw(calls)}
-        <div class="row" style="gap:6px;margin-top:6px;opacity:.6">
-          <button class="btn-sm" data-editrow="${i}">Edit</button>
-          <button class="btn-sm" data-delrow="${i}">Remove</button>
-        </div>
-      </div>`;
-  }
 
   // ---------------------------------------------------------- generating
   const finish = () => {
@@ -642,7 +612,10 @@ function chatView(mount, run, runs) {
     const i = +t.dataset.editrow;
     const m = turns[i];
     if (!m) return;
-    const target = $(`[data-edit="${i}"]`, mount);
+    const holder = $(`[data-index="${i}"]`, mount);
+    const target = holder?.querySelector(".bubble-text")
+      || holder?.querySelector("pre")
+      || holder?.querySelector("summary");
     if (!target || target.dataset.editing) return;
     const area = document.createElement("textarea");
     area.className = "mono";

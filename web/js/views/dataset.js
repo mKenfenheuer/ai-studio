@@ -6,6 +6,7 @@
  * and every problem it reports comes with the button that fixes it.
  */
 import { api } from "../api.js";
+import { conversationHtml, toolsHtml, isConversation } from "../conversation.js";
 import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo } from "../util.js";
 import { shareButton, wireShareBox } from "./share.js";
 
@@ -17,7 +18,11 @@ export async function datasetView(mount, [id]) {
   // How the rows are shown, and which of them are ticked. Selection is kept
   // across a redraw because the actions that use it -- delete these, move
   // these -- happen after several pages have been looked at.
+  // A conversation dataset opens as conversations. The table view is the right
+  // default for a table and the wrong one for a chat -- a `messages` column
+  // reads "9 messages" in every row, which is the one thing you already knew.
   let view = "table";
+  let viewChosen = false;
   let selected = new Set();
 
   const draw = () => {
@@ -37,6 +42,7 @@ export async function datasetView(mount, [id]) {
     const split = $("#rowSplit", mount)?.value || "";
     try {
       rows = await api.datasetRows(id, offset, PAGE, q, split);
+      if (!viewChosen && chatty(rows)) view = "chat";
       draw();
     } catch (ex) { toast(ex.message, "err"); }
   }
@@ -53,7 +59,11 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "click", "#loadRows", () => showRows(0));
-    on(mount, "click", "[data-view]", (_e, t) => { view = t.dataset.view; draw(); });
+    on(mount, "click", "[data-view]", (_e, t) => {
+      view = t.dataset.view;
+      viewChosen = true;
+      draw();
+    });
 
     // ---- selection -------------------------------------------------------
     on(mount, "change", "[data-row]", (_e, t) => {
@@ -632,6 +642,8 @@ function rowTable(d, data, view, selected) {
       </div>`;
   }
 
+  if (view === "chat") return html`${raw(conversationList(data))}${raw(pager(data))}`;
+
   return html`
     ${raw(view === "text" ? renderedList(data) : html`
       <div class="table-wrap" style="max-height:460px;overflow:auto">
@@ -659,6 +671,68 @@ function rowTable(d, data, view, selected) {
         </table>
       </div>`)}
 
+    ${raw(pager(data))}`;
+}
+
+/** Whether this page of rows is worth offering the conversation view for. */
+function chatty(data) {
+  return (data?.rows || []).some((r) => isConversation(r.row));
+}
+
+/** The rows as conversations — the view that makes a chat dataset readable.
+ *
+ *  A canonical row printed as JSON is unreadable: the punctuation outweighs
+ *  the content, and a tool call's arguments are an escaped string inside a
+ *  string. The one thing anybody actually wants from training data is who says
+ *  what in what order, and that is exactly what the shape hides hardest. So it
+ *  is drawn the way it will be read.
+ */
+function conversationList(data) {
+  return html`
+    <div style="max-height:62vh;overflow:auto">
+      ${raw((data.rows || []).map((r) => {
+        const row = r.row || {};
+        if (!isConversation(row)) {
+          return html`
+            <div class="convo-row">
+              <div class="row-between">
+                <a class="muted tiny mono" href="#" data-open-row="${r.index}"
+                   >row ${r.index}</a>
+                <span class="muted tiny">not a conversation</span>
+              </div>
+              <p class="mono tiny" style="white-space:pre-wrap;margin:6px 0 0">${
+                (r.rendered || "").slice(0, 400) || "(reads as nothing)"}</p>
+            </div>`;
+        }
+        const turns = row.messages.length;
+        const calls = row.messages.reduce(
+          (n, m) => n + (m.tool_calls?.length || 0), 0);
+        return html`
+          <div class="convo-row">
+            <div class="row-between" style="flex-wrap:wrap;gap:6px">
+              <a class="muted tiny mono" href="#" data-open-row="${r.index}"
+                 >row ${r.index}</a>
+              <span class="row tiny muted" style="gap:6px;flex-wrap:wrap">
+                <span class="badge">${turns} turn${turns === 1 ? "" : "s"}</span>
+                ${raw(calls ? `<span class="badge badge-accent">${calls} tool
+                  call${calls === 1 ? "" : "s"}</span>` : "")}
+                ${raw(row.split ? `<span class="badge">${esc(row.split)}</span>` : "")}
+                <span>${fmtNum((r.rendered || "").length)} characters</span>
+              </span>
+            </div>
+            ${raw(toolsHtml(row.tools))}
+            <div class="convo">${raw(conversationHtml(row.messages))}</div>
+          </div>`;
+      }).join(""))}
+    </div>`;
+}
+
+/** Where you are in the rows, and how to get to the rest of them. */
+function pager(data) {
+  const shown = data.rows.length;
+  const matched = data.matched ?? data.total;
+  const searching = !!data.query;
+  return html`
     <div class="row-between" style="margin-top:8px;flex-wrap:wrap;gap:8px">
       <span class="muted tiny">
         Rows ${fmtNum(data.offset + 1)}–${fmtNum(data.offset + shown)} of
@@ -935,6 +1009,9 @@ function workbench(d, rows, view, selected, canEdit) {
           <button class="btn-sm" id="loadRows">${rows ? "Search" : "Open the rows"}</button>
           ${raw(rows ? html`
             <div class="seg">
+              ${raw(chatty(rows) ? html`
+                <button class="btn-sm ${view === "chat" ? "on" : ""}"
+                        data-view="chat">Conversation</button>` : "")}
               <button class="btn-sm ${view === "table" ? "on" : ""}"
                       data-view="table">Table</button>
               <button class="btn-sm ${view === "text" ? "on" : ""}"
@@ -978,6 +1055,15 @@ function rowEditor(row, rendered) {
   const fields = Object.entries(row);
   return html`
     <div class="grid" style="gap:12px">
+      ${raw(!isConversation(row) ? "" : html`
+        <div>
+          ${raw(toolsHtml(row.tools))}
+          <div class="convo" style="max-height:44vh;overflow:auto">${
+            raw(conversationHtml(row.messages, { openReasoning: false }))}</div>
+        </div>
+        <p class="muted tiny" style="margin:0">The fields below are the same
+          conversation as it is stored. Editing is done there, because no set
+          of inputs is the right shape for a turn that calls two tools.</p>`)}
       ${raw(fields.map(([k, v]) => {
         const simple = v === null || v === undefined
           || ["string", "number", "boolean"].includes(typeof v);
