@@ -332,8 +332,16 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
                               "upstream_error")
             elif kind == "generate_done":
                 calls = _tool_calls(msg)
-                message = {"role": "assistant",
-                           "content": (msg.get("text") or "".join(text)) or None}
+                # The runner's parsed text is authoritative when it sends one,
+                # *including when it is empty*. Falling back to the accumulated
+                # deltas on a falsy value -- as this did -- undid the parsing
+                # completely for the one case that matters: a reply that is
+                # nothing but a tool call has no content, and the deltas are
+                # the raw call syntax the parser had just finished removing.
+                # So a client got the call twice, once as structure and once as
+                # a line of JSON above it.
+                whole = msg["text"] if "text" in msg else "".join(text)
+                message = {"role": "assistant", "content": whole or None}
                 if reasoning := msg.get("reasoning"):
                     # Both spellings. `reasoning_content` is what vLLM, SGLang
                     # and the DeepSeek API emit and what most clients read;
