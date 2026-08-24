@@ -1,5 +1,5 @@
 import { api, events, handleUnauthorized, NotSignedIn } from "./api.js";
-import { $, $$, toast, takeSsoError, skeleton } from "./util.js";
+import { $, $$, toast, takeSsoError, skeleton, resetDelegated } from "./util.js";
 import { initGate, showGate, hideGate } from "./views/gate.js";
 
 import { dashboardView } from "./views/dashboard.js";
@@ -62,6 +62,12 @@ async function render() {
 
   if (typeof teardown === "function") { try { teardown(); } catch { /* ignore */ } }
   teardown = null;
+  // Delegated listeners live on #main, which every route shares. They are kept
+  // one-per-selector and re-pointed at each redraw, which is right within a
+  // page and wrong between two: a control the next page draws would otherwise
+  // run the previous page's handler, closed over the previous page's state.
+  // Cleared here so that can never happen again -- see resetDelegated.
+  resetDelegated(main);
 
   for (const [re, view, nav] of routes) {
     const m = path.match(re);

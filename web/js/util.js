@@ -46,12 +46,42 @@ export function on(root, event, selector, handler) {
     existing.handler = handler;
     return;
   }
-  const entry = { handler };
-  registry.set(key, entry);
-  root.addEventListener(event, (e) => {
+  // The listener is kept by reference so it can be removed again. An
+  // AbortSignal reads better and is not used: it is honoured by browsers but
+  // silently ignored by some DOM implementations, and a teardown that quietly
+  // does nothing is the exact failure this is here to prevent.
+  const entry = { handler, event };
+  entry.listener = (e) => {
     const t = e.target.closest(selector);
     if (t && root.contains(t)) entry.handler(e, t);
-  });
+  };
+  registry.set(key, entry);
+  root.addEventListener(event, entry.listener);
+}
+
+/** Forget every delegated listener on this root.
+ *
+ *  Keeping one listener per selector and swapping the handler works only while
+ *  the next thing drawn registers the same selectors. It does not, when the
+ *  next thing is a different page — and then a button drawn by the NEW page
+ *  runs a handler closed over the OLD page's state.
+ *
+ *  That was not hypothetical. The job page began branching by kind, the
+ *  generation branch did not register the stop controls, and the Stop button
+ *  on a generation run went on calling cancelJob with the job id of whichever
+ *  training run had been looked at last. It stopped the wrong run, and the
+ *  right one could not be stopped at all.
+ *
+ *  So the router clears these between routes. A stale handler cannot fire if
+ *  it is not there, and a page that forgets to wire a control now gets a
+ *  button that does nothing — which is visible, unlike a button that does
+ *  something to something else.
+ */
+export function resetDelegated(root) {
+  const registry = root?.__delegated;
+  if (!registry) return;
+  registry.forEach((entry) => root.removeEventListener(entry.event, entry.listener));
+  registry.clear();
 }
 
 export function fmtBytes(n) {

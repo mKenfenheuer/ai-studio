@@ -249,36 +249,7 @@ export async function jobView(mount, [jobId]) {
     }
   });
 
-  // Delegated, not bound directly: paintHeader() replaces the button element
-  // every time a metric arrives, which would silently discard a direct listener.
-  // Stopping is two different actions wearing one button, and the difference
-  // between them is hours of GPU time. A yes/no confirm can only ask the
-  // question it was written with, so it is replaced by the actual choice.
-  on(mount, "click", "#cancelBtn", () => {
-    $("#stopPanel", mount).innerHTML = stopPanel(job, latest, stage);
-  });
-  on(mount, "click", "#stopCancel", () => { $("#stopPanel", mount).innerHTML = ""; });
-
-  on(mount, "click", "[data-stop]", async (_e, t) => {
-    const save = t.dataset.stop === "keep";
-    $("#stopPanel", mount).innerHTML = "";
-    try {
-      await api.cancelJob(jobId, save);
-      toast(save ? "Stopping, and keeping the model…" : "Stopping…");
-    } catch (e) { toast(e.message, "err"); }
-  });
-
-  on(mount, "click", "#deleteBtn", async () => {
-    const hasModel = job.artifacts?.length;
-    if (!confirm(`Delete "${job.name}"?\n\n` + (hasModel
-      ? "Its trained model file will be deleted too, and cannot be recovered."
-      : "Its logs and measurements will be deleted."))) return;
-    try {
-      await api.deleteJob(jobId);
-      toast("Run deleted.", "ok");
-      location.hash = "#/jobs";
-    } catch (e) { toast(e.message, "err"); }
-  });
+  wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
   return () => {
     unsub(); lossChart.destroy(); lrChart.destroy(); expertChart?.destroy();
@@ -286,6 +257,63 @@ export async function jobView(mount, [jobId]) {
 }
 
 // ---------------------------------------------------------------------------
+
+/** Stop and Delete, wired once for every kind of run.
+ *
+ *  These were registered inside the training path, and the generation branch
+ *  returns before reaching it. Delegated listeners are kept one-per-selector
+ *  on the shared mount, so the buttons a generation run drew went on running
+ *  the handler from whichever training run had been open last -- stopping that
+ *  one instead, and leaving the generation run with no way to stop at all.
+ *
+ *  The state is read through getters rather than captured, because both
+ *  callers redraw on every metric and a captured `job` would go stale within
+ *  seconds of the page opening.
+ */
+function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
+  // Delegated, not bound directly: paintHeader() replaces the button element
+  // every time a metric arrives, which would silently discard a direct
+  // listener. Stopping is two different actions wearing one button, and the
+  // difference between them is hours of GPU time. A yes/no confirm can only
+  // ask the question it was written with, so it is replaced by the actual
+  // choice.
+  on(mount, "click", "#cancelBtn", () => {
+    $("#stopPanel", mount).innerHTML =
+      stopPanel(getJob(), getLatest(), getStage());
+  });
+  on(mount, "click", "#stopCancel", () => {
+    $("#stopPanel", mount).innerHTML = "";
+  });
+
+  on(mount, "click", "[data-stop]", async (_e, t) => {
+    const save = t.dataset.stop === "keep";
+    $("#stopPanel", mount).innerHTML = "";
+    try {
+      await api.cancelJob(jobId, save);
+      toast(getJob().kind === "generate_dataset"
+        ? "Stopping, and keeping the rows written so far…"
+        : save ? "Stopping, and keeping the model…" : "Stopping…");
+    } catch (e) { toast(e.message, "err"); }
+  });
+
+  on(mount, "click", "#deleteBtn", async () => {
+    const job = getJob();
+    const hasModel = job.artifacts?.length;
+    if (!confirm(`Delete "${job.name}"?
+
+` + (
+      job.kind === "generate_dataset"
+        ? "Its log and measurements go. Any dataset it already produced stays."
+        : hasModel
+          ? "Its trained model file will be deleted too, and cannot be recovered."
+          : "Its logs and measurements will be deleted."))) return;
+    try {
+      await api.deleteJob(jobId);
+      toast("Run deleted.", "ok");
+      location.hash = "#/jobs";
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Writing a dataset
@@ -398,6 +426,7 @@ function writingView(mount, job, jobId, metrics, logs) {
 
   let latest = metrics[metrics.length - 1] || {};
   let stage = job.status === "running" ? "" : "training";
+  wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
   const paint = () => {
     paintHeader(mount, job);
