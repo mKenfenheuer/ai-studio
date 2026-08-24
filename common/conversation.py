@@ -781,10 +781,19 @@ def parse_reply(text: str, fmt: dict | None = None,
     # Whatever marker the format ends a message with, left over because
     # generation stopped on it rather than before it.
     for token in ("<|call|>", "<|end|>", "<|return|>", "<|eom_id|>",
-                  "<|eot_id|>", "<|im_end|>", "</s>"):
+                  "<|eot_id|>", "<|im_end|>", "</s>", "[TOOL_CALLS]",
+                  "<tool_call>", "</tool_call>"):
         body = body.replace(token, "")
+    body = body.strip()
 
-    return {"content": body.strip(), "reasoning": reasoning,
+    # Punctuation left behind by lifting a call out of the syntax that wrapped
+    # it -- the brackets of `[TOOL_CALLS] [ {...} ]`, a trailing comma between
+    # two calls. It is not content, and returning it as content puts a stray
+    # "[]" in front of the reply in every client that renders both.
+    if calls and not re.search(r"\w", body):
+        body = ""
+
+    return {"content": body, "reasoning": reasoning,
             "tool_calls": [_parsed_call(c, i) for i, c in enumerate(calls)]}
 
 
