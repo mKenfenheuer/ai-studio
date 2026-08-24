@@ -156,11 +156,18 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
             or m.get("role") or m.get("from") or "user"
         role = str(role).lower()
         # Known aliases first, then any mapping supplied alongside the
-        # selectors. A dataset that calls its tool turns "tool_out" needs them
-        # recognised as tool results, or the format renders them as an unknown
-        # speaker and the model never learns what a tool reply looks like.
+        # selectors. Kept broad on purpose: a dataset that calls its tool turns
+        # "observation", or gives a call a role of its own, needs them
+        # recognised -- or the format renders an unknown speaker and the model
+        # never learns what a tool reply looks like.
         role = {"human": "user", "gpt": "assistant", "bot": "assistant",
-                "system_prompt": "system"}.get(role, role)
+                "chatgpt": "assistant", "model": "assistant",
+                "system_prompt": "system",
+                "function_call": "assistant", "tool_call": "assistant",
+                "functioncall": "assistant", "toolcall": "assistant",
+                "function_response": "tool", "tool_response": "tool",
+                "observation": "tool", "ipython": "tool",
+                }.get(role, role)
         role = {str(k).lower(): str(v).lower()
                 for k, v in (sel.get("role_map") or {}).items()}.get(role, role)
 
@@ -258,7 +265,26 @@ def _name_tool_results(messages: list[dict]) -> list[dict]:
 
 
 def normalize_tools(value: Any) -> list[dict]:
-    """Tool definitions flattened to {name, description, parameters}."""
+    """Tool definitions flattened to {name, description, parameters}.
+
+    A dataset's tool schema arrives as a list of objects, as a single object,
+    or -- very commonly, because Arrow has no union type and the Hub's
+    converter falls back to text -- as a JSON *string* holding one of those.
+    That last case used to produce no tools at all, silently: two of the
+    best-known function-calling datasets on the Hub store their schema exactly
+    that way, and importing either of them gave a model that was asked to call
+    tools it had never been shown.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.startswith(("[", "{")):
+            return []
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return []
+    if isinstance(value, dict):
+        value = [value]
     if not isinstance(value, list):
         return []
     out = []
@@ -272,8 +298,66 @@ def normalize_tools(value: Any) -> list[dict]:
         out.append({
             "name": name,
             "description": fn.get("description") or "",
-            "parameters": _prune(fn.get("parameters")),
+            "parameters": _prune(_as_schema(fn.get("parameters"))),
         })
+    return out
+
+
+# Type names that are not JSON Schema's. Datasets built from Python
+# introspection, or from RapidAPI-style catalogues, write these instead.
+_TYPE_ALIASES = {
+    "str": "string", "string": "string", "text": "string",
+    "int": "integer", "integer": "integer", "long": "integer",
+    "float": "number", "number": "number", "double": "number",
+    "bool": "boolean", "boolean": "boolean",
+    "list": "array", "array": "array", "tuple": "array",
+    "dict": "object", "object": "object", "any": "string",
+}
+
+
+def _as_schema(params: Any) -> Any:
+    """A parameter description as JSON Schema, whatever notation it used.
+
+    JSON Schema is what every published tool encoding renders, so it is what
+    has to come out. What goes in is often not that: a large family of
+    function-calling datasets writes parameters as a flat map of name to
+    `{description, type, default}`, with no `type: object` wrapper and no
+    `required` list. Rendered as-is, that produces a declaration where every
+    parameter is named `description` and `type`, which is worse than useless --
+    the model learns a schema that does not exist.
+
+    A parameter with a default is taken to be optional and one without to be
+    required, which is the convention those catalogues follow.
+    """
+    if not isinstance(params, dict):
+        return params
+    if "properties" in params or params.get("type") == "object":
+        return params
+    if not params:
+        return params
+    # Flat only if every value looks like a parameter description rather than
+    # like a schema keyword. Anything else is left exactly as it arrived.
+    if not all(isinstance(v, dict) and ("type" in v or "description" in v)
+               for v in params.values()):
+        return params
+
+    properties, required = {}, []
+    for name, spec in params.items():
+        kind = str(spec.get("type") or "string").lower().split(",")[0].strip()
+        prop: dict[str, Any] = {
+            "type": _TYPE_ALIASES.get(kind, "string")}
+        if spec.get("description"):
+            prop["description"] = spec["description"]
+        if spec.get("enum"):
+            prop["enum"] = spec["enum"]
+        properties[name] = prop
+        # An empty string default is still a default. `is None` rather than
+        # falsiness, or every parameter defaulting to "" becomes required.
+        if spec.get("default") is None and "default" not in spec:
+            required.append(name)
+    out: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        out["required"] = required
     return out
 
 

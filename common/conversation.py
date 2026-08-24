@@ -192,14 +192,38 @@ def _message(m: dict) -> dict:
     if name := m.get("name"):
         out["name"] = str(name)
     content = m.get("content")
-    out["content"] = "" if content is None else str(content)
+    content = "" if content is None else str(content)
+    if role == "tool":
+        # The wrapper some datasets put around a result. It belongs to the
+        # format, not to the data: the chat format adds its own when rendering,
+        # so keeping this one would nest a <tool_response> inside a
+        # <tool_response> for every result in the file.
+        content = _INLINE_RESULT.sub("", content).strip()
+    out["content"] = content
     if reasoning := (m.get("reasoning") or "").strip():
         out["reasoning"] = reasoning
 
     calls = [_tool_call(c) for c in (m.get("tool_calls") or [])]
     calls = [c for c in calls if c]
+    if not calls:
+        # Datasets that keep the call in the message body rather than in a
+        # `tool_calls` list. Both of the widely used function-calling sets do
+        # this and in different ways: one writes `<tool_call>{...}</tool_call>`
+        # blocks inside the assistant's text, the other gives the turn a role
+        # of its own and makes the body a JSON array of calls. Left as text,
+        # the model is trained to *type* a call rather than to make one, and
+        # nothing downstream -- the validator, the playground, the API -- can
+        # see that the row contains a call at all.
+        lifted, remainder = _calls_in_body(out["content"], role)
+        if lifted:
+            calls = lifted
+            out["content"] = remainder
     if calls:
         out["tool_calls"] = calls
+        if role not in ("assistant",):
+            # A turn that makes a call is the assistant's, whatever the dataset
+            # decided to name the role.
+            out["role"] = role = "assistant"
     if tool_call_id := m.get("tool_call_id"):
         out["tool_call_id"] = str(tool_call_id)
 
@@ -213,6 +237,59 @@ def _message(m: dict) -> dict:
     elif m.get("train") is False:
         out["weight"] = 0
     return out
+
+
+# A role whose whole point is that the body is a call, not prose.
+_CALL_ROLES = ("function_call", "tool_call", "functioncall", "toolcall",
+               "tool_calls")
+# `<tool_call>{...}</tool_call>`, the Hermes and Qwen layout, written into the
+# assistant's text by the datasets that predate a structured field for it.
+_INLINE_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_INLINE_RESULT = re.compile(r"</?tool_response>", re.IGNORECASE)
+
+
+def _calls_in_body(content: str, role: str) -> tuple[list[dict], str]:
+    """Tool calls written into a message's text, and what text is left.
+
+    Returns ([], content) unchanged unless the body really does hold calls --
+    a message that merely mentions a function name is prose and stays prose.
+    """
+    text = (content or "").strip()
+    if not text:
+        return [], content
+
+    found = _INLINE_CALL.findall(text)
+    if found:
+        calls = [c for c in (_tool_call(j) for j in
+                             (_loads(f) for f in found)) if c]
+        if calls:
+            return calls, _INLINE_CALL.sub("", text).strip()
+
+    # A body that is nothing but a call, or a list of them. Only trusted where
+    # the role says so, or where the whole body parses to objects that have a
+    # name and arguments and nothing else -- otherwise a message quoting a JSON
+    # payload would be turned into a call the conversation never made.
+    if not text.startswith(("[", "{")):
+        return [], content
+    parsed = _loads(text)
+    items = parsed if isinstance(parsed, list) else [parsed]
+    if not items or not all(
+            isinstance(i, dict) and i.get("name")
+            and ("arguments" in i or "parameters" in i) for i in items):
+        return [], content
+    if role not in _CALL_ROLES and role != "assistant":
+        return [], content
+    calls = [c for c in (_tool_call(i) for i in items) if c]
+    return (calls, "") if calls else ([], content)
+
+
+def _loads(text: Any) -> Any:
+    if isinstance(text, (dict, list)):
+        return text
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
 
 
 def _tool_call(call: Any) -> dict | None:

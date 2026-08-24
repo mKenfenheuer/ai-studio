@@ -308,10 +308,105 @@ def test_reading_a_reply_back() -> None:
           C.parse_reply("", {"mode": "chat"})["content"] == "")
 
 
+def test_shapes_in_the_wild() -> None:
+    """The two layouts the widely used function-calling datasets actually use.
+
+    Neither stores a tool call the way the format specifies, and both store
+    their tool schema as a JSON *string* -- which is what Arrow does to a
+    column it has no union type for. Importing either of them used to produce
+    conversations with no tools declared and no calls in them, and the only
+    symptom was a fine-tune that never called anything.
+    """
+    print("\nShapes real datasets arrive in")
+
+    # Hermes: ShareGPT turns, calls written into the assistant's text as
+    # <tool_call> blocks, schema as a JSON string in a sibling column.
+    hermes = {
+        "conversations": [
+            {"from": "system", "value": "You are a function calling AI model."},
+            {"from": "human", "value": "Show me the front door camera."},
+            {"from": "gpt", "value": "\n".join([
+                "<tool_call>",
+                '{"name": "get_feed", "arguments": {"id": "front"}}',
+                "</tool_call>",
+                "<tool_call>",
+                '{"name": "record", "arguments": {"id": "front", "secs": 30}}',
+                "</tool_call>"])},
+        ],
+        "tools": json.dumps([
+            {"type": "function", "function": {
+                "name": "get_feed", "description": "Live feed.",
+                "parameters": {"type": "object",
+                               "properties": {"id": {"type": "string"}},
+                               "required": ["id"]}}},
+            {"type": "function", "function": {
+                "name": "record", "description": "Record.",
+                "parameters": {"type": "object",
+                               "properties": {"id": {"type": "string"},
+                                              "secs": {"type": "integer"}}}}}]),
+    }
+    conv, _ = C.repair(C.from_row(hermes))
+    msgs = conv[C.MESSAGES_KEY]
+    check("a tool schema stored as a JSON string is still read",
+          [t["function"]["name"] for t in conv[C.TOOLS_KEY]] == ["get_feed", "record"],
+          conv[C.TOOLS_KEY])
+    check("<tool_call> blocks in the text become real calls",
+          [c["function"]["name"] for c in msgs[2].get("tool_calls", [])]
+          == ["get_feed", "record"], msgs[2])
+    check("and are lifted out of the text rather than left in it",
+          not msgs[2].get("content"), msgs[2].get("content"))
+    check("the hermes row validates clean", C.validate(conv) == [], C.validate(conv))
+
+    # A call given a role of its own, with the body a JSON array of calls, a
+    # reasoning field beside it, and a flat RapidAPI-style parameter map.
+    reasoning_row = {
+        "conversation": [
+            {"from": "human", "reasoning": None, "value": "Is apple.com archived?"},
+            {"from": "function_call",
+             "reasoning": "I should call availability with a timestamp.",
+             "value": '[{"name": "availability", "arguments": {"url": "https://apple.com"}}]'},
+        ],
+        "tools": json.dumps([{
+            "name": "availability",
+            "description": "Checks the Wayback Machine.",
+            "parameters": {
+                "url": {"description": "The URL.", "type": "str"},
+                "timestamp": {"description": "When.", "type": "str",
+                              "default": "20090101"}}}]),
+    }
+    conv, _ = C.repair(C.from_row(reasoning_row))
+    msgs = conv[C.MESSAGES_KEY]
+    check("a `function_call` role becomes an assistant turn",
+          msgs[1]["role"] == "assistant", msgs[1]["role"])
+    check("a JSON array body becomes the call",
+          [c["function"]["name"] for c in msgs[1].get("tool_calls", [])]
+          == ["availability"], msgs[1])
+    check("the reasoning beside it is kept",
+          msgs[1]["reasoning"].startswith("I should call"), msgs[1].get("reasoning"))
+    params = conv[C.TOOLS_KEY][0]["function"]["parameters"]
+    check("a flat parameter map becomes JSON Schema",
+          params.get("type") == "object" and "url" in params.get("properties", {}),
+          params)
+    check("python type names are translated",
+          params["properties"]["url"]["type"] == "string", params["properties"]["url"])
+    check("a parameter with a default is optional, one without is required",
+          params.get("required") == ["url"], params.get("required"))
+    check("the reasoning row validates clean", C.validate(conv) == [], C.validate(conv))
+
+    # The guard: prose that merely quotes JSON is not a tool call.
+    quoted = C.from_row({"messages": [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": '{"name": "Ada", "age": 36}'}]})
+    check("a JSON object that is not a call stays as text",
+          not quoted[C.MESSAGES_KEY][1].get("tool_calls"),
+          quoted[C.MESSAGES_KEY][1])
+
+
 def main() -> int:
     test_import()
     test_repair()
     test_other_shapes()
+    test_shapes_in_the_wild()
     test_formats()
     test_reading_a_reply_back()
     print()
