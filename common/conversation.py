@@ -917,9 +917,11 @@ def for_template(conv: dict, template: str | None = None) -> list[dict]:
     with the first, which is why it is done here and not in `to_row`.
     """
     form = arguments_form(template)
+    ids = _template_ids(conv)
     out = []
     for m in conv.get(MESSAGES_KEY) or []:
         reasoning = m.get("reasoning") or ""
+        called = m.get("tool_call_id")
         item = {
             "role": m.get("role", "user"),
             "content": m.get("content") or "",
@@ -927,17 +929,51 @@ def for_template(conv: dict, template: str | None = None) -> list[dict]:
             "reasoning": reasoning,
             "reasoning_content": reasoning,
             "thinking": reasoning,
-            "tool_call_id": m.get("tool_call_id"),
+            "tool_call_id": ids.get(called, called),
             "weight": m.get("weight", 1),
             "train": m.get("weight", 1) != 0,
-            "tool_calls": [_call_for_template(c, form)
+            "tool_calls": [_call_for_template(c, form, ids)
                            for c in (m.get("tool_calls") or [])],
         }
         out.append(item)
     return out
 
 
-def _call_for_template(call: dict, form: str) -> dict:
+# Mistral's published template does not merely read a tool call's id, it
+# *validates* it: `Tool call IDs should be alphanumeric strings with length 9`,
+# raised from inside the Jinja. Nothing else in the format says so, OpenAI's own
+# ids do not satisfy it, and neither does anything a dataset is likely to carry.
+_ID_LEN = 9
+_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _template_ids(conv: dict) -> dict:
+    """A rendering-safe id for every tool call, mapped from its real one.
+
+    The stored record keeps whatever id the data used -- that id is the link
+    between a call and its result, and rewriting it on disk would be rewriting
+    somebody's data to suit one vendor's template. So the substitution happens
+    here, where the conversation is being handed to Jinja, and both halves of
+    the link are substituted together so they still point at each other.
+
+    Derived from the original id rather than counted, so the same conversation
+    renders identically every time -- which matters because a run's training
+    text and its prompts have to agree token for token.
+    """
+    import hashlib
+    out: dict[str, str] = {}
+    for m in conv.get(MESSAGES_KEY) or []:
+        for c in m.get("tool_calls") or []:
+            real = c.get("id")
+            if not real or real in out:
+                continue
+            digest = hashlib.sha1(str(real).encode("utf-8")).digest()
+            out[real] = "".join(
+                _ID_ALPHABET[b % len(_ID_ALPHABET)] for b in digest[:_ID_LEN])
+    return out
+
+
+def _call_for_template(call: dict, form: str, ids: dict | None = None) -> dict:
     name = call["function"]["name"]
     raw = call["function"].get("arguments") or ""
     args: Any = raw
@@ -950,8 +986,9 @@ def _call_for_template(call: dict, form: str) -> dict:
             # `validate` has already reported them; mangling them here would
             # hide the row that needs fixing.
             args = raw
+    real = call.get("id")
     return {
-        "id": call.get("id"), "type": "function",
+        "id": (ids or {}).get(real, real), "type": "function",
         # Flat, for this studio's own formats in chat_formats.py.
         "name": name, "arguments": args,
         # Nested, for every template published with a model on the Hub.
