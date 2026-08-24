@@ -70,6 +70,58 @@ STARTER_MODELS = [
         "min_vram_gb_4bit": 8,
         "good_for": ["chat", "serious work"],
     },
+    {
+        "id": "Qwen/Qwen2.5-7B-Instruct",
+        "label": "Qwen2.5 7B",
+        "params_b": 7.6,
+        "blurb": "The same size as Mistral 7B and generally stronger at "
+                 "instructions, maths and code. A good default once 4-bit is "
+                 "working.",
+        "min_vram_gb": 24,
+        "min_vram_gb_4bit": 8,
+        "good_for": ["chat", "instructions", "code"],
+    },
+    {
+        "id": "meta-llama/Llama-3.1-8B-Instruct",
+        "label": "Llama 3.1 8B",
+        "params_b": 8.0,
+        "gated": True,
+        "blurb": "Meta's workhorse. Gated: accept the licence on Hugging Face "
+                 "and connect your account before this will download.",
+        "min_vram_gb": 24,
+        "min_vram_gb_4bit": 9,
+        "good_for": ["chat", "instructions"],
+    },
+    {
+        "id": "mistralai/Mistral-Nemo-Instruct-2407",
+        "label": "Mistral Nemo 12B",
+        "params_b": 12.2,
+        "blurb": "Half again the size of a 7B and noticeably better at long, "
+                 "structured answers. Comfortable in 4-bit on a 16GB card.",
+        "min_vram_gb": 32,
+        "min_vram_gb_4bit": 12,
+        "good_for": ["chat", "long answers", "serious work"],
+    },
+    {
+        "id": "Qwen/Qwen2.5-14B-Instruct",
+        "label": "Qwen2.5 14B",
+        "params_b": 14.8,
+        "blurb": "About as large as a 16GB card can fine-tune, in 4-bit. "
+                 "Clearly better than a 7B at anything that needs reasoning.",
+        "min_vram_gb": 40,
+        "min_vram_gb_4bit": 14,
+        "good_for": ["reasoning", "code", "serious work"],
+    },
+    {
+        "id": "Qwen/Qwen2.5-32B-Instruct",
+        "label": "Qwen2.5 32B",
+        "params_b": 32.5,
+        "blurb": "For a 24GB card and up, in 4-bit. Listed so the ceiling is "
+                 "visible rather than guessed at.",
+        "min_vram_gb": 80,
+        "min_vram_gb_4bit": 24,
+        "good_for": ["reasoning", "serious work"],
+    },
 ]
 
 STARTER_DATASETS = [
@@ -362,6 +414,69 @@ def estimate_memory(params_b: float | None) -> dict | None:
     }
 
 
+def recommend_models(runner_caps: dict) -> dict:
+    """Which of the models this studio knows are worth training on this card.
+
+    A flat list with "fits" and "too big" beside it answers the wrong
+    question. The card has a size, and the useful answer is *which model uses
+    it*: a 16GB card running a 4-bit 7B is using six of its sixteen gigabytes
+    and leaving the rest idle, and nothing on the screen said so.
+
+    So each candidate is costed against this machine, and the largest one that
+    still leaves room is marked. Bigger is not automatically better -- it is
+    slower, and a 7B trained on good data beats a 14B trained on bad -- but
+    that is a decision to make on purpose rather than by not being told.
+    """
+    vram = runner_caps.get("vram_gb")
+    has_4bit = bool(runner_caps.get("quantization", {}).get("4bit"))
+    out = []
+    for model in STARTER_MODELS:
+        fit = fit_report(model.get("params_b"), runner_caps)
+        mem = estimate_memory(model.get("params_b")) or {}
+        out.append({**model, "fit": fit,
+                    "needed_gb": fit.get("needed_gb"),
+                    "precision": fit.get("precision"),
+                    "memory": mem,
+                    # How much of the card this would leave unused. The number
+                    # that makes "you could be training something bigger"
+                    # visible without anybody doing the arithmetic.
+                    "spare_gb": (round(vram - fit["needed_gb"], 1)
+                                 if vram and fit.get("needed_gb") else None)})
+
+    usable = [m for m in out if m["fit"]["verdict"] in ("fits", "fits_quantized")]
+    usable.sort(key=lambda m: m.get("params_b") or 0)
+    # The best use of the card is the largest that fits with a little room to
+    # spare -- not the largest that fits exactly, which is the one that dies
+    # at step one when a long batch arrives.
+    roomy = [m for m in usable if (m["spare_gb"] or 0) >= 1.5]
+    best = (roomy or usable)[-1] if usable else None
+    return {
+        "vram_gb": vram,
+        "has_4bit": has_4bit,
+        "models": out,
+        "best": best["id"] if best else None,
+        "ceiling_b": runner_caps.get("max_finetune_params_b"),
+        "note": _recommendation_note(best, usable, vram, has_4bit),
+    }
+
+
+def _recommendation_note(best: dict | None, usable: list, vram, has_4bit) -> str:
+    if not vram:
+        return "This machine has not reported how much memory it has."
+    if not usable:
+        return ("Nothing in this list fits on %.0f GB. Search Hugging Face for "
+                "something smaller." % vram)
+    if not has_4bit:
+        return ("4-bit is not working on this machine, so only models that fit "
+                "in 16-bit are usable -- which is a much lower ceiling than "
+                "the card itself has.")
+    return ("%s is the largest of these that leaves room on a %.0f GB card "
+            "(about %.1f GB needed in %s, %.1f GB spare). Bigger is slower, "
+            "and better data beats a bigger model -- but there is no reason to "
+            "leave the card idle." % (best["label"], vram, best["needed_gb"],
+                                      best["precision"], best["spare_gb"]))
+
+
 def fit_report(params_b: float | None, runner_caps: dict) -> dict:
     """Can this runner train this model? Returns a plain-language verdict."""
     mem = estimate_memory(params_b)
@@ -386,9 +501,15 @@ def fit_report(params_b: float | None, runner_caps: dict) -> dict:
                 "needed_gb": mem["int4_gb"], "available_gb": vram,
                 "message": "This would fit in 4-bit, but this runner has no "
                            "working 4-bit support, so it cannot be used here."}
-    return {"verdict": "too_big", "needed_gb": mem["fp16_gb"], "available_gb": vram,
-            "message": "Too large for this runner's %.1f GB of memory, even "
-                       "compressed. Pick a smaller model." % vram}
+    # The 4-bit figure, not the 16-bit one: this verdict is "even compressed
+    # it does not fit", so the number that belongs beside it is the compressed
+    # one. Reporting 88 GB for a model that would need 22 made the gap look
+    # like a different kind of problem than it is.
+    return {"verdict": "too_big", "needed_gb": mem["int4_gb"],
+            "available_gb": vram,
+            "message": "Too large for this runner's %.1f GB of memory: it "
+                       "needs about %.1f GB even in 4-bit. Pick a smaller "
+                       "model." % (vram, mem["int4_gb"])}
 
 
 async def dataset_preview(dataset_id: str, config_name: str | None = None,

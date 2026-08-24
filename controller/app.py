@@ -942,6 +942,21 @@ async def hub_dataset_configs(id: str = Query(...)) -> dict:
         return {"available": False, "reason": str(e)[:200], "configs": []}
 
 
+@app.get("/api/hub/recommendations")
+async def hub_recommendations(runner_id: str = Query(default="")) -> dict:
+    """Which models are worth training on a particular machine.
+
+    Costed against that runner's own measured memory rather than against a
+    table of assumptions, and ordered so that the largest one which still
+    leaves room is the one being pointed at.
+    """
+    runner = db.get_runner(runner_id) if runner_id else None
+    caps = dict(runner["capabilities"]) if runner else {}
+    out = hub.recommend_models(caps)
+    out["runner"] = runner["name"] if runner else None
+    return out
+
+
 @app.get("/api/hub/model-template")
 async def hub_model_template(id: str = Query(...)) -> dict:
     """The chat template this model was trained to expect."""

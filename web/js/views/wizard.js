@@ -168,6 +168,8 @@ export async function wizardView(mount) {
     // collapsing them into one string is how a job id ends up being passed to
     // `from_pretrained`.
     sourceRun: null, myModels: resource(), sourceTemplate: resource(),
+    // Which models fit this machine, and which one uses it best.
+    fits: resource(),
     // The data step, shared by both paths.
     dataset: null, configs: resource(), config: null, split: "train",
     // A dataset from this studio's library rather than from the Hub. It is
@@ -424,6 +426,8 @@ function stepGoal(body, { state, runners, draw }) {
   on(body, "click", "[data-goal]", (_e, t) => { state.goal = t.dataset.goal; draw(); });
   on(body, "click", "[data-runner]", (_e, t) => {
     state.runnerId = t.dataset.runner;
+    // Another card, another answer to "what fits".
+    state.fits = resource();
     state.sizes = resource();
     state.plan = resource();
     state.ftPlan = resource();
@@ -445,6 +449,11 @@ function stepModel(body, ctx) {
     ensure(state.modelDetail, state.model,
            () => api.modelDetail(state.model), draw);
   }
+  // What this particular machine can actually train, costed against its own
+  // measured memory. Keyed on the runner, because the answer changes entirely
+  // when the run is pointed at a different card.
+  ensure(state.fits, state.runnerId || "none",
+         () => api.recommendations(state.runnerId), draw);
   // Exactly the runs that produced a usable model, already filtered to what
   // this account may see -- the same list the playground offers, for the same
   // reason.
@@ -471,22 +480,7 @@ function stepModel(body, ctx) {
       </div>
     </div>
 
-    <div class="grid grid-2">
-      ${raw(starters.models.map((m) => {
-        const tooBig = ceiling && m.params_b > ceiling;
-        return html`
-          <button class="pick ${state.model === m.id ? "selected" : ""}"
-                  data-model="${m.id}">
-            <span class="t">${m.label}
-              <span class="badge">${m.params_b < 1
-                ? Math.round(m.params_b * 1000) + "M" : m.params_b + "B"}</span>
-              ${raw(tooBig ? `<span class="badge badge-warn">likely too big</span>`
-                           : `<span class="badge badge-ok">fits</span>`)}
-            </span>
-            <span class="d">${m.blurb}</span>
-          </button>`;
-      }).join(""))}
-    </div>
+    ${raw(modelChoices(state, starters))}
 
     ${raw(ownModelPanel(state))}
 
@@ -546,6 +540,69 @@ function stepModel(body, ctx) {
       </tr>`).join(""))}</tbody></table></div>`
       : `<span class="muted tiny">Nothing matched that search.</span>`;
   });
+}
+
+/** The models worth training here, costed against this machine.
+ *
+ *  The old list said "fits" or "likely too big" and left it there, which
+ *  answers the question nobody asked. What a person wants to know standing in
+ *  front of a 16 GB card is *which model uses it* -- because a 4-bit 7B on
+ *  that card leaves ten gigabytes idle, and nothing said so.
+ */
+function modelChoices(state, starters) {
+  const r = state.fits;
+  if (r.status === "loading" || r.status === "idle") {
+    return loading("Working out what this machine can train…");
+  }
+  // The recommendation is an improvement, not a requirement: if it could not
+  // be worked out, the plain list still lets somebody choose a model.
+  const rec = r.status === "ready" ? r.data : null;
+  const models = rec?.models
+    || (starters.models || []).map((m) => ({ ...m, fit: {} }));
+  const best = rec?.best;
+
+  const usable = models.filter((m) => m.fit.verdict !== "too_big");
+  const over = models.filter((m) => m.fit.verdict === "too_big");
+
+  const card = (m) => {
+    const q = m.fit.verdict === "fits_quantized";
+    const blocked = m.fit.verdict === "needs_quantization";
+    return html`
+      <button class="pick ${state.model === m.id ? "selected" : ""}
+                     ${!state.model && m.id === best ? "suggested" : ""}"
+              data-model="${m.id}">
+        <span class="t">${m.label}
+          <span class="badge">${m.params_b < 1
+            ? Math.round(m.params_b * 1000) + "M" : m.params_b + "B"}</span>
+          ${raw(m.id === best
+            ? `<span class="badge badge-ok">best use of this card</span>` : "")}
+          ${raw(m.gated ? `<span class="badge badge-warn">gated</span>` : "")}
+        </span>
+        <span class="d">${m.blurb}</span>
+        ${raw(m.needed_gb ? html`
+          <span class="row tiny muted" style="gap:6px;flex-wrap:wrap">
+            <span class="badge ${blocked ? "badge-warn" : q ? "badge-accent" : "badge-ok"}">${
+              blocked ? "needs 4-bit, unavailable here"
+                      : `${m.precision} · ${m.needed_gb} GB`}</span>
+            ${raw(m.spare_gb > 0 && !blocked
+              ? `<span>${m.spare_gb} GB spare</span>` : "")}
+          </span>` : "")}
+      </button>`;
+  };
+
+  return html`
+    ${raw(rec?.note ? html`
+      <div class="callout" style="margin-bottom:12px">
+        <strong>What this machine can do</strong>${rec.note}
+      </div>` : "")}
+
+    <div class="grid grid-2">${raw(usable.map(card).join(""))}</div>
+
+    ${raw(over.length ? html`
+      <details class="adv">
+        <summary>Too big for this machine (${over.length})</summary>
+        <div class="grid grid-2" style="margin-top:10px">${raw(over.map(card).join(""))}</div>
+      </details>` : "")}`;
 }
 
 function ownModelPanel(state) {

@@ -234,6 +234,8 @@ export const api = {
     req(`/api/hub/models?q=${encodeURIComponent(q)}&task=${encodeURIComponent(task)}`),
   searchDatasets: (q) => req(`/api/hub/datasets?q=${encodeURIComponent(q)}`),
   modelDetail:    (id) => req(`/api/hub/model?id=${encodeURIComponent(id)}`),
+  recommendations: (runnerId) =>
+    req(`/api/hub/recommendations?runner_id=${encodeURIComponent(runnerId || "")}`),
   datasetPreview: (id) => req(`/api/hub/dataset-preview?id=${encodeURIComponent(id)}`),
   datasetConfigs: (id) =>
     req(`/api/hub/dataset-configs?id=${encodeURIComponent(id)}`),
