@@ -787,6 +787,14 @@ async def upload_artifact(job_id: str, file: UploadFile,
         # generation being part of the studio.
         try:
             created = _register_generated(job, dest)
+            # Recorded on the run, so its page can link straight to what it
+            # made. Without this the only way from a finished generation to
+            # its rows was to go and find them by name on the datasets page.
+            summary = dict(job.get("summary") or {})
+            summary["dataset_id"] = created["id"]
+            summary["dataset_name"] = created["name"]
+            summary["rows"] = created.get("rows")
+            db.set_job_summary(job_id, summary)
             db.add_log(job_id, "Saved as the dataset \"%s\" (%s rows). It is "
                        "yours, and private until you share it."
                        % (created["name"], f"{created['rows']:,}"))

@@ -19,7 +19,18 @@ export async function jobView(mount, [jobId]) {
   const metrics = await api.jobMetrics(jobId);
   const logs = await api.jobLogs(jobId);
   const scratch = job.kind === "pretrain_llm";
+  // Writing a dataset is not training. It has no loss, no learning rate and no
+  // held-out set; what it has is rows, and how many of them were worth
+  // keeping. Rendering it through the training layout showed an empty "this
+  // should go down" chart and three paragraphs of advice about what to do when
+  // the learning rate is too high, for a run that has no learning rate.
+  const writing = job.kind === "generate_dataset";
   const experts = +(job.config.arch?.num_local_experts || 0);
+
+  if (writing) {
+    mount.innerHTML = writingLayout(job);
+    return writingView(mount, job, jobId, metrics, logs);
+  }
 
   mount.innerHTML = layout(job, scratch, experts);
 
@@ -275,6 +286,240 @@ export async function jobView(mount, [jobId]) {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Writing a dataset
+// ---------------------------------------------------------------------------
+//
+// A generation run shares almost nothing with a training run except that both
+// are jobs. It has no loss, no learning rate, no held-out set and no model at
+// the end of it -- it has rows, and the interesting question is how many of
+// them were worth keeping. Given the training layout it rendered an empty
+// chart captioned "this should go down" above a paragraph explaining what to
+// do when your learning rate is too high, which is advice about a number this
+// run does not have.
+
+const WRITING_MODES = {
+  from_prompts: "answering your questions",
+  from_topics: "covering your topics",
+  from_seeds: "writing variations on your seeds",
+  extend_conversations: "adding turns to existing conversations",
+};
+
+function writingLayout(job) {
+  const cfg = job.config || {};
+  const model = cfg.model || {};
+  const who = model.model || model.base_model
+    || (model.provider ? `a model at ${model.provider}` : "your own model");
+  const what = WRITING_MODES[cfg.mode] || "writing rows";
+  const extending = cfg.mode === "extend_conversations";
+  return html`
+    <div class="page-head">
+      <a href="#/jobs" class="tiny">← All runs</a>
+      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+        <h1 style="margin:0">${job.name}</h1>
+        <div class="row" id="headerActions"></div>
+      </div>
+      <p class="sub tiny" style="margin-top:4px">
+        <span class="badge badge-accent">writing a dataset</span>
+        ${what} with <span class="mono">${who}</span>${
+          cfg.source_label ? `, from ${cfg.source_label}` : ""}</p>
+    </div>
+
+    <div id="errorCard"></div>
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+    <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
+
+    <div class="card" style="margin-bottom:14px"><div id="rowsChart"></div></div>
+
+    <div class="grid grid-2" style="margin-bottom:14px">
+      <div class="card">
+        <h3>What am I looking at?</h3>
+        <p class="muted tiny">This run is not training anything. It calls a
+          model over and over and keeps what comes back, so there is no loss
+          curve — the number that matters is how many rows survived.</p>
+        <ul class="muted tiny" style="margin:0;padding-left:18px;line-height:1.7">
+          ${raw(extending ? html`
+            <li><strong>Lengthened</strong> — conversations that actually grew.
+              A row the provider refused is still written out, unchanged, so
+              the dataset does not quietly shrink.</li>
+            <li><strong>Invented results</strong> — no tool actually ran, so the
+              model made up what each one returned. Plausible, and not true.
+              Right for teaching the shape of a tool conversation, wrong for
+              teaching facts about your systems.</li>` : html`
+            <li><strong>Repeats</strong> — the same row written twice. A model
+              asked the same thing twice answers it the same way; if this
+              climbs, the prompts are not varied enough or the temperature is
+              too low.</li>
+            <li><strong>Empty</strong> — nothing usable came back. A few is
+              normal; a lot means the instructions are not landing.</li>`)}
+          <li>Nothing here can be better than the model that wrote it. Read the
+            rows on the dataset page before you train on them.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>The data it wrote</h3>
+        <div id="datasetCard"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row-between" style="align-items:center">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">what the run said as it went</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+/** The live half of a generation run: rows over time, and the log. */
+function writingView(mount, job, jobId, metrics, logs) {
+  const extending = job.config?.mode === "extend_conversations";
+  const rowsChart = new LineChart($("#rowsChart", mount), {
+    title: "Rows kept — this should climb steadily",
+    height: 260,
+    format: (v) => fmtNum(v),
+    series: [
+      { key: "kept", label: "Kept" },
+      { key: "lost", label: extending ? "Could not be extended"
+                                      : "Repeats and empties", dashed: true },
+    ],
+  });
+  const lost = (m) => (m.duplicates || 0) + (m.empty || 0) + (m.failed || 0);
+  const withRows = metrics.filter((m) => m.rows != null);
+  rowsChart.setSeries("kept", withRows.map((m) => ({ x: m.step, y: m.rows })));
+  rowsChart.setSeries("lost", withRows.map((m) => ({ x: m.step, y: lost(m) })));
+
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let latest = metrics[metrics.length - 1] || {};
+  let stage = job.status === "running" ? "" : "training";
+
+  const paint = () => {
+    paintHeader(mount, job);
+    paintProgress(mount, job, stage, null, null, 0);
+    const q = $("#queueCard", mount);
+    if (q) q.innerHTML = queueCard(job);
+    paintWritingStats(mount, job, latest, extending);
+    const dc = $("#datasetCard", mount);
+    if (dc) dc.innerHTML = writtenDatasetCard(job);
+  };
+  paint();
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_metric") {
+      latest = { step: msg.step, ...msg.data };
+      if (msg.data.rows != null) {
+        rowsChart.pushSeries("kept", { x: msg.step, y: msg.data.rows });
+        rowsChart.pushSeries("lost", { x: msg.step, y: lost(msg.data) });
+      }
+      paint();
+    } else if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      if (stage === "training") { job.step = msg.step; job.total_steps = msg.total; }
+      paintProgress(mount, job, stage, msg.step, msg.total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+
+  return () => { unsub(); rowsChart.destroy(); };
+}
+
+function paintWritingStats(mount, job, m, extending) {
+  const running = job.status === "running";
+  const cards = extending ? [
+    ["Conversations", m.rows != null ? fmtNum(m.rows) : "—", "written out"],
+    ["Lengthened", m.extended != null ? fmtNum(m.extended) : "—",
+     "rows that actually grew"],
+    ["Invented results", m.invented_results != null
+      ? fmtNum(m.invented_results) : "—", "no tool actually ran"],
+    ["Could not be extended", m.failed != null ? fmtNum(m.failed) : "—",
+     "kept unchanged"],
+    ["Speed", m.rows_per_sec != null ? `${m.rows_per_sec.toFixed(2)}/s` : "—",
+     "rows per second"],
+    ["Time left", m.eta_s != null && running ? fmtDuration(m.eta_s) : "—",
+     "estimate"],
+  ] : [
+    ["Rows kept", m.rows != null ? fmtNum(m.rows) : "—", "written so far"],
+    ["Repeats dropped", m.duplicates != null ? fmtNum(m.duplicates) : "—",
+     "identical to an earlier row"],
+    ["Empty replies", m.empty != null ? fmtNum(m.empty) : "—",
+     "nothing usable came back"],
+    ["Speed", m.rows_per_sec != null ? `${m.rows_per_sec.toFixed(2)}/s` : "—",
+     "rows per second"],
+    ["Model speed", m.tokens_per_sec != null
+      ? `${fmtNum(m.tokens_per_sec)}/s` : "—", "tokens per second"],
+    ["Time left", m.eta_s != null && running ? fmtDuration(m.eta_s) : "—",
+     "estimate"],
+  ];
+
+  const coming = ["queued", "assigned", "running"].includes(job.status);
+  $("#statCards", mount).innerHTML = cards.map(([k, v, sub]) => html`
+    <div class="card stat">
+      <span class="k">${k}</span>
+      <span class="v">${v === "—" && coming ? skeletonValue("4em") : v}</span>
+      <span class="tiny muted">${sub}</span>
+    </div>`).join("");
+}
+
+/** Stopping a generation run, which has nothing half-finished in it.
+ *
+ *  Unlike training, there is no partly-built thing to weigh up: every row
+ *  already written is a complete row and is kept whatever you choose. So this
+ *  asks one question instead of offering a trade-off that does not exist here.
+ */
+function writingStopPanel(job, latest) {
+  const rows = latest?.rows || 0;
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop writing?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        ${raw(rows ? html`
+          <strong>${fmtNum(rows)}</strong> row${rows === 1 ? "" : "s"} have been
+          written and every one of them is finished. They are kept and
+          registered as a dataset — there is no half-written row to lose.`
+          : html`Nothing has been written yet, so stopping now leaves nothing
+          behind.`)}</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button class="btn-primary btn-sm" data-stop="keep">
+          ${raw(rows ? `Stop and keep the ${fmtNum(rows)} rows` : "Stop the run")}</button>
+        <button class="btn-sm" id="stopCancel">Carry on writing</button>
+      </div>
+    </div>`;
+}
+
+/** Where the rows went, once there are any. */
+function writtenDatasetCard(job) {
+  const made = job.summary?.dataset_id || job.dataset_id;
+  if (made) {
+    return html`
+      <p class="muted tiny">Registered as a dataset in this studio. Look at the
+        rows before you train on them — a generated dataset can be fluent and
+        wrong at the same time.</p>
+      <a class="btn btn-primary btn-sm" href="#/data/${esc(made)}">Open it</a>`;
+  }
+  if (["running", "queued", "assigned"].includes(job.status)) {
+    return html`<p class="muted tiny">The dataset is registered when the run
+      finishes. Stopping early keeps every row written so far.</p>`;
+  }
+  if (job.status === "failed") {
+    return html`<p class="muted tiny">This run did not get far enough to leave
+      one behind.</p>`;
+  }
+  return html`<p class="muted tiny">Look for it on the
+    <a href="#/data">datasets page</a>.</p>`;
+}
 
 function layout(job, scratch, experts = 0) {
   const source = job.config.dataset_label || job.config.dataset;
@@ -567,6 +812,7 @@ function publishCard(job) {
 }
 
 function stopPanel(job, latest, stage) {
+  if (job.kind === "generate_dataset") return writingStopPanel(job, latest);
   const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
   // There is only something to keep once training has actually begun.
   // Before that the runner is still downloading text or building a
@@ -610,18 +856,23 @@ function paintHeader(mount, job) {
   const done = ["succeeded", "failed", "cancelled"].includes(job.status);
   // A stopped run that kept its model is as usable as a finished one. The
   // artifact is what decides that, not how the run ended.
-  const usable = job.artifacts?.length
+  // A generation run leaves a dataset, not a model. Offering "Try it out"
+  // pointed the playground at a job it cannot serve, and "Compare" offered to
+  // rank a held-out loss that does not exist.
+  const writing = job.kind === "generate_dataset";
+  const usable = job.artifacts?.length && !writing
     && ["succeeded", "cancelled"].includes(job.status);
   const kept = job.status === "cancelled" && job.artifacts?.length;
   box.innerHTML = html`
     ${statusBadge(job.status)}
-    ${raw(kept ? `<span class="badge badge-ok">model kept</span>` : "")}
+    ${raw(kept ? `<span class="badge badge-ok">${
+      writing ? "rows kept" : "model kept"}</span>` : "")}
     ${raw(usable
       ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>
          <a class="btn btn-sm" href="#/compare" title="Compare its held-out loss with other runs">⇄ Compare</a>` : "")}
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
-           ↓ Download</a>` : "")}
+           ↓ Download${writing ? " the JSONL" : ""}</a>` : "")}
     ${raw(shareButton("job", job))}
     ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>`
                 : `<button class="btn-danger btn-sm" id="deleteBtn">Delete</button>`)}`;

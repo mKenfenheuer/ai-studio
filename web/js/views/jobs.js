@@ -67,12 +67,17 @@ function row(j) {
                j.queue_length} waiting</span>`
           : `<span class="tiny muted">${esc(dur ? fmtDuration(dur) : "—")}</span>`)}
       </td>
-      <td class="mono tiny hide-sm">${j.kind === "pretrain_llm"
+      <td class="mono tiny hide-sm">${j.kind === "generate_dataset"
+        ? "writes data" : j.kind === "pretrain_llm"
         ? "from scratch" : (j.config.base_model || "—")}</td>
       <td class="tiny muted hide-sm">${fmtAgo(j.created_at)}</td>
       <td><div class="row" style="gap:5px">
-        ${raw(j.has_model && ["succeeded", "cancelled"].includes(j.status)
+        ${raw(j.has_model && j.kind !== "generate_dataset"
+          && ["succeeded", "cancelled"].includes(j.status)
           ? `<a class="btn btn-sm btn-primary" href="#/play/${esc(j.id)}">Try</a>` : "")}
+        ${raw(j.kind === "generate_dataset" && j.summary?.dataset_id
+          ? `<a class="btn btn-sm btn-primary" href="#/data/${
+               esc(j.summary.dataset_id)}">Rows</a>` : "")}
         <a class="btn btn-sm" href="#/jobs/${j.id}">Open</a>
         ${raw(["succeeded", "failed", "cancelled"].includes(j.status)
           ? `<button class="btn-sm btn-danger" data-del="${esc(j.id)}"

@@ -209,6 +209,9 @@ class _HostedModel:
         self.model = apimodels.model_name(self.conn, spec.get("model"))
         self.ctx = ctx
         self.warned_limit = False
+        # Corrections this model turned out to need, remembered for the whole
+        # run. Learned once and reapplied, never re-discovered: see `generate`.
+        self.fixes: dict = {}
         if problem := apimodels.problems(self.conn):
             raise ValueError(problem)
         if not self.model:
@@ -229,7 +232,13 @@ class _HostedModel:
 
         req = self.api.chat_request(self.conn, self.model, messages, params,
                                     tools=params.get("tools"))
-        body = req["json"]
+        # Whatever this model objected to last time, it will object to again.
+        # Applying the correction up front is the difference between one
+        # request per row and two: without it every call sent the rejected
+        # parameter, took a 400, fixed it, and sent the whole thing again --
+        # doubling the requests, doubling the latency, and filling the log with
+        # the same sentence thirty-four times in a three-row run.
+        body = self._corrected(req["json"])
         started = time.time()
         last = ""
         for attempt in range(_ATTEMPTS):
@@ -262,9 +271,7 @@ class _HostedModel:
             # A parameter this model spells differently. Fix it once and the
             # rest of the run uses the corrected body.
             if fixed := self.api.retry_body(self.conn, body, r.text):
-                self.ctx.log("Adjusting the request for this model: %s"
-                             % ", ".join(sorted(set(fixed) - set(body))
-                                         or ["dropped an unsupported setting"]))
+                self._remember(body, fixed)
                 body = fixed
                 continue
             if r.status_code in (401, 403, 404):
@@ -274,6 +281,30 @@ class _HostedModel:
                 continue
             raise ProviderRefused(last)
         raise RuntimeError(last or "no reply")
+
+    def _corrected(self, body: dict) -> dict:
+        """This request with the corrections this model already asked for."""
+        if not self.fixes:
+            return body
+        out = dict(body)
+        for name, replacement in self.fixes.items():
+            if name not in out:
+                continue
+            value = out.pop(name)
+            if replacement:
+                out[replacement] = value
+        return out
+
+    def _remember(self, before: dict, after: dict) -> None:
+        """Record what had to change, and say so once rather than per row."""
+        added = set(after) - set(before)
+        for name in set(before) - set(after):
+            self.fixes[name] = next(iter(added), None)
+        self.ctx.log(
+            "%s does not accept %s. Adjusted, and every later request in this "
+            "run is sent that way -- this is not repeated per row."
+            % (self.api.describe(self.conn),
+               ", ".join(sorted(set(before) - set(after))) or "one of the settings"))
 
     def _wait(self, attempt: int, retry_after: str | None, who: str) -> None:
         delay = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
@@ -764,8 +795,16 @@ def _source_rows(cfg: dict, ctx: Any) -> Iterator[dict]:
 
 
 def _preamble(ctx: Any, cfg: dict, mode: str, target: int, spec: dict) -> None:
-    who = spec.get("label") or spec.get("base_model") or "the model you trained"
-    ctx.log("Writing %s rows with %s." % (f"{target:,}", who))
+    who = spec.get("label") or spec.get("base_model") or spec.get("model")
+    if not who and (conn := spec.get("connection")):
+        from common import apimodels
+        who = apimodels.describe(conn)
+    who = who or "the model you trained"
+    if mode == "extend_conversations":
+        ctx.log("Adding turns to %s conversations from %s, using %s."
+                % (f"{target:,}", cfg.get("source_label") or "the dataset", who))
+    else:
+        ctx.log("Writing %s rows with %s." % (f"{target:,}", who))
     ctx.log("Generated data is not free data. Three things go wrong with it, "
             "and none of them look like failure while it runs:")
     ctx.log("  1. The model repeats itself. Watch the duplicate count below; "
