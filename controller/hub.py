@@ -811,6 +811,20 @@ async def training_preview(dataset_id: str, config_name: str | None,
     # but never the special tokens dict -- that is noise in a text box.
     echo = dict(resolved)
     echo.pop("specials", None)
+    # What is IN these rows, alongside the decisions about how to read them.
+    #
+    # `resolved` is `fmt or detected_format`, and the caller nearly always
+    # sends a `fmt` -- the chat format it wants rendered. That is right for
+    # rendering and wrong for describing: it means the observed facts were
+    # thrown away before anything looked at them, and the wizard, which decides
+    # whether to offer "teach it to reason" from this very object, was told a
+    # dataset whose every row carries a reasoning block had none in it.
+    #
+    # Whether these rows contain reasoning is not a thing the caller gets to
+    # assert. It is measured here and put back, overriding whatever came in.
+    for key in ("roles", "has_tool_calls", "has_reasoning"):
+        if key in (base.get("detected_format") or {}):
+            echo[key] = base["detected_format"][key]
     base["format"] = echo
     # Offered back in the playground later. A model fine-tuned with a system
     # prompt behaves quite differently without one, and the prompt it learned
