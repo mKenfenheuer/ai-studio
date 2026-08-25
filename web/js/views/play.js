@@ -248,7 +248,7 @@ function chatView(mount, run, runs) {
           </div>
           <div class="field">
             <label for="maxTok">Length limit</label>
-            <input type="number" id="maxTok" value="512" step="64" min="16" max="4096">
+            <input type="number" id="maxTok" value="2048" step="64" min="16" max="4096">
             <div class="hint">Most tokens it may write before it is stopped.
               You are told in the conversation when a reply reaches this, so a
               cut-off answer is never mistaken for a finished one. Long limits

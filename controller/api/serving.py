@@ -339,8 +339,15 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
             if kind == "generate_delta":
                 text.append(msg.get("delta") or "")
             elif kind == "generate_error":
-                return _error(502, msg.get("error") or "Generation failed.",
-                              "upstream_error")
+                # The explanation, plus the numbers behind it. A caller
+                # holding a 502 cannot see the runner's log or the run's, and
+                # "it ran out of memory" without the size of the conversation
+                # that did it is not something anybody can act on.
+                facts = msg.get("diagnostics") or {}
+                where = ", ".join("%s=%s" % kv for kv in sorted(facts.items()))
+                return _error(502, "%s%s" % (
+                    msg.get("error") or "Generation failed.",
+                    (" (%s)" % where) if where else ""), "upstream_error")
             elif kind == "generate_done":
                 calls = _tool_calls(msg)
                 # The runner's parsed text is authoritative when it sends one,

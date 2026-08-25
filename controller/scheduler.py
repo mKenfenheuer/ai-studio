@@ -427,6 +427,18 @@ class Fleet:
             else:
                 # Passed through whole, reasoning field included.
                 await self.broadcast_ui({**msg, "type": msg["type"]})
+            if kind == "generate_error":
+                # The one part of a conversation worth keeping. It lands in the
+                # run's own log, which is where somebody looking into "the
+                # model would not answer me" already is -- an API caller only
+                # ever sees a 502, and until this there was nothing behind it.
+                if jid := msg.get("job_id"):
+                    facts = msg.get("diagnostics") or {}
+                    db.add_log(jid, "Could not answer: %s%s" % (
+                        msg.get("detail") or msg.get("error") or "unknown",
+                        (" [%s]" % ", ".join(
+                            "%s=%s" % kv for kv in sorted(facts.items()))
+                         ) if facts else ""), "error")
             if kind in ("generate_done", "generate_error"):
                 self.generations.pop(rid, None)
             return

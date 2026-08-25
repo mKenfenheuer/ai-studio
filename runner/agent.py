@@ -402,8 +402,25 @@ class Runner:
                                         msg.get("params") or {}, on_token, log)
             self.outbox.put({"type": "generate_done", "request_id": rid, **result})
         except Exception as e:  # noqa: BLE001
+            # A chat is deliberately never written down, which until now meant
+            # a failed one left nothing at all behind: the reader got a
+            # sentence and everybody else got a 502 with no traceback, no
+            # sizes, and no way to tell an out-of-memory from a broken
+            # template. The reply still is not stored -- the *failure* is.
+            facts = {}
+            try:
+                facts = self.host.diagnostics() if self.host else {}
+            except Exception:  # noqa: BLE001 - never fail while failing
+                pass
+            trace = traceback.format_exc()
+            print("[runner] generation failed (%s): %s" % (
+                ", ".join("%s=%s" % kv for kv in sorted(facts.items())) or "-", e))
+            print(trace[-2000:], flush=True)
             self.outbox.put({"type": "generate_error", "request_id": rid,
-                             "error": _friendly_error(e, "serve")})
+                             "job_id": spec.get("job_id"),
+                             "error": _friendly_error(e, "serve"),
+                             "detail": ("%s: %s" % (type(e).__name__, e))[:400],
+                             "diagnostics": facts})
         finally:
             self.generating = False
 

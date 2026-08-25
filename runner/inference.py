@@ -61,6 +61,25 @@ class OutOfRoom(RuntimeError):
     already_explained = True
 
 
+# How many prompt tokens go through the model at once before writing starts.
+#
+# Attention without flash-attention kernels costs memory with the SQUARE of the
+# length it is handed, which is why this studio's capability probe warns about
+# cards that lack them. Measured on a 16 GB card serving a 7B, with 1.95 GB left
+# after the weights: a 1,024-token prompt in one pass peaks at 0.51 GB, 2,048
+# peaks at 1.59, and 3,072 does not fit at all. That is not a long
+# conversation -- it is about fifteen exchanges.
+#
+# Fed in slices the same prompt costs a slice against the context so far, which
+# grows linearly rather than quadratically and is bounded by this number. The
+# arithmetic is identical either way; only the order changes.
+PREFILL_CHUNK = 256
+
+# Room kept for the working set of one prefill slice and the allocator's slack,
+# on top of the conversation's own key/value cache. Measured: a 256-token slice
+# peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
+PREFILL_HEADROOM_GB = 0.6
+
 # How far back a marker still arriving may reach. `<|channel|>final<|message|>`
 # is the longest this studio's formats use; anything older than this is text.
 _MARKER_REACH = 32
@@ -118,6 +137,13 @@ class ModelHost:
         self.specials: dict = {}
         self.last_used = 0.0
         self.quantized = False
+        # Whether this transformers understands being asked for one position's
+        # logits. Settled on first use, because finding out costs a forward
+        # pass. See _prefill.
+        self._logits_to_keep = None
+        # Enough about the request in flight to explain a failure. See
+        # diagnostics().
+        self.last_request: dict = {}
         self._cancel = threading.Event()
 
     # ------------------------------------------------------------ device
@@ -180,11 +206,19 @@ class ModelHost:
             torch.cuda.ipc_collect()
 
     def _free_gb(self) -> float | None:
-        """What is actually free on the card right now, not what it has.
+        """What this process can still allocate, which is two things added up.
 
         `vram_gb` from the capability probe is the card's size, which is the
-        wrong number to plan a load against: the question is how much is free
-        *now*, after whatever else this machine has been doing.
+        wrong number to plan against: the question is how much is free *now*.
+        But the driver's answer is wrong too, in the other direction. Torch
+        takes memory from the driver in blocks and keeps them after the tensors
+        in them are freed, so the driver counts them as gone while this process
+        can still allocate into them freely.
+
+        Left out, the card appears to fill up as a conversation goes on -- every
+        turn hands its key/value cache back to the allocator and none of it
+        shows as free -- and a budget computed from that shrinks turn by turn
+        until it starts refusing conversations that would have fitted.
         """
         if self.device != "cuda":
             return None
@@ -193,6 +227,8 @@ class ModelHost:
             free, _total = torch.cuda.mem_get_info()
         except Exception:  # noqa: BLE001 - not every backend reports this
             return None
+        with contextlib.suppress(Exception):
+            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         return free / 1024 ** 3
 
     def maybe_unload_idle(self) -> bool:
@@ -452,6 +488,96 @@ class ModelHost:
                                              tools=spec.get("tools"),
                                              reasoning=reasoning)
 
+    def _prefill(self, model, ids, log: Callable[[str], None]):
+        """Build the key/value cache for the prompt, a slice at a time.
+
+        Returns the cache, positioned so the caller can carry straight on from
+        the last token. Nothing is sampled here -- only the last position's
+        logits are ever wanted, and asking for them at every position is a
+        [1, prompt, vocab] tensor thrown away immediately.
+        """
+        import torch
+        past = None
+        total = ids.shape[1]
+        for i in range(0, total, PREFILL_CHUNK):
+            if self._cancel.is_set():
+                break
+            chunk = ids[:, i:i + PREFILL_CHUNK]
+            with torch.no_grad():
+                if self._logits_to_keep is not False:
+                    try:
+                        out = model(input_ids=chunk, past_key_values=past,
+                                    use_cache=True, logits_to_keep=1)
+                    except TypeError:
+                        # An older transformers that computes every position's
+                        # logits whether they are wanted or not. Asked once.
+                        self._logits_to_keep = False
+                        out = model(input_ids=chunk, past_key_values=past,
+                                    use_cache=True)
+                else:
+                    out = model(input_ids=chunk, past_key_values=past,
+                                use_cache=True)
+            past = out.past_key_values
+            del out
+            if total > PREFILL_CHUNK and i == 0:
+                log("Reading %s tokens of conversation…" % f"{total:,}")
+        return past
+
+    def _context_budget(self, model) -> int | None:
+        """How many tokens of conversation this card still has room for.
+
+        The key/value cache is the part that grows with the conversation and
+        does not go away again: two tensors per layer per token, for as long as
+        the exchange lasts. Everything else is bounded by PREFILL_CHUNK.
+
+        Worth computing because the alternative is not a clean failure. A model
+        given more than the card can hold does not reliably raise -- on ROCm it
+        spills over PCIe and sits at 99% "busy" moving almost nothing, so the
+        request hangs for minutes and then dies. Refusing in a sentence is
+        better than that, and it is the same arithmetic either way.
+
+        None when the shape cannot be read, which disables the check rather
+        than guessing at it.
+        """
+        cfg = getattr(model, "config", None)
+        free = self._free_gb()
+        if cfg is None or free is None:
+            return None
+        layers = getattr(cfg, "num_hidden_layers", 0) or 0
+        attn_heads = getattr(cfg, "num_attention_heads", 0) or 0
+        # Grouped-query attention caches one key/value per *key* head, which on
+        # a 7B is a quarter of the attention heads. Reading the wrong one over-
+        # states the cost fourfold and refuses conversations that would fit.
+        kv_heads = getattr(cfg, "num_key_value_heads", None) or attn_heads
+        dim = getattr(cfg, "head_dim", None) or (
+            (getattr(cfg, "hidden_size", 0) or 0) // max(attn_heads, 1))
+        if not (layers and kv_heads and dim):
+            return None
+        per_token = 2 * layers * kv_heads * dim * 2      # key and value, fp16
+        room = (free - PREFILL_HEADROOM_GB) * 1024 ** 3
+        return int(max(room, 0) // per_token)
+
+    def diagnostics(self) -> dict:
+        """What the card and the last request looked like.
+
+        Gathered for an error report rather than for a metric. When serving
+        fails the useful questions are all about size -- how long the
+        conversation was, how much room was left, whether the model was
+        compressed -- and none of them could be answered afterwards, because
+        a chat is deliberately never written down.
+        """
+        out = dict(self.last_request)
+        out["quantized"] = self.quantized
+        if (free := self._free_gb()) is not None:
+            out["free_gb"] = round(free, 2)
+        with contextlib.suppress(Exception):
+            import torch
+            out["peak_gb"] = round(
+                torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+            out["vram_gb"] = round(
+                torch.cuda.mem_get_info()[1] / 1024 ** 3, 2)
+        return out
+
     def cancel(self) -> None:
         self._cancel.set()
 
@@ -480,8 +606,12 @@ class ModelHost:
 
             ids = tok(text, return_tensors="pt").input_ids.to(self.device)
             prompt_len = ids.shape[1]
-
-            max_new = int(params.get("max_new_tokens", 200))
+            max_new = int(params.get("max_new_tokens", 512))
+            self.last_request = {
+                "job_id": spec.get("job_id"),
+                "prompt_tokens": prompt_len,
+                "max_new_tokens": max_new,
+            }
             temperature = float(params.get("temperature", 0.8))
             top_k = int(params.get("top_k", 50))
             top_p = float(params.get("top_p", 0.95))
@@ -497,9 +627,28 @@ class ModelHost:
             # loop ran to the end of its budget.
             stop_reason = "length"
 
+            # Refused before anything is spent, where the arithmetic says it
+            # cannot end well. `budget` counts the whole exchange, because the
+            # reply is cached exactly as the question is.
+            budget = self._context_budget(model)
+            self.last_request["context_budget"] = budget
+            if budget and prompt_len + max_new > budget:
+                raise OutOfRoom(
+                    "This conversation is too long for the memory left on this "
+                    "card: %s tokens of history plus up to %s more of reply, "
+                    "against room for about %s. Start a new conversation, or "
+                    "lower the length limit."
+                    % (f"{prompt_len:,}", f"{max_new:,}", f"{budget:,}"))
+
             produced: list[int] = []
             t0 = time.time()
-            cur = ids
+            # Everything but the final token goes in as cache; the loop below
+            # starts from that token and its logits are the first thing
+            # sampled. Feeding the whole prompt to the loop instead is one
+            # attention matrix the size of the conversation squared.
+            if prompt_len > 1:
+                past = self._prefill(model, ids[:, :-1], log)
+            cur = ids[:, -1:]
 
             # What the reader has already been shown, per channel. A reply is
             # split as it arrives rather than rearranged once it stops, so a
