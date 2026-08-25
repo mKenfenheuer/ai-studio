@@ -32,6 +32,9 @@ async def lifespan(app: FastAPI):
     # Any runner marked online in a previous process is stale until it dials in.
     for r in db.q("SELECT id FROM runners WHERE status != 'offline'"):
         db.mark_runner_offline(r["id"])
+    if filled := _backfill_dataset_facts():
+        print("[studio] worked out what %d existing dataset(s) contain "
+              "(reasoning, tool calls, roles)." % filled, flush=True)
     task = asyncio.create_task(fleet.scheduler_loop())
     sync = asyncio.create_task(_directory_loop())
     yield
@@ -1132,6 +1135,74 @@ async def hub_builtin_template() -> dict:
             "instruction_template": hub.formatting.DEFAULT_INSTRUCTION_TEMPLATE}
 
 
+# What a format records about *reading* a dataset, versus what it records about
+# what is *in* it. The first is a decision and is kept; the second is an
+# observation and is re-made from the rows every time it is needed.
+_CONTENT_FACTS = ("roles", "has_tool_calls", "has_reasoning")
+
+
+def _describe_rows(stored: dict | None, columns: list, rows: list) -> dict:
+    """A dataset's format, with what is actually in these rows measured afresh.
+
+    A stored format is a decision: which column holds the conversation, which
+    chat format to render it in. Those are the user's, and they are kept.
+
+    The content facts are not decisions. Whether a dataset has reasoning in it
+    is true or false about the rows, and reading it off a record written when
+    the dataset was created is how it goes stale -- or, in the case that
+    prompted this, is never written at all. The conversion to conversations
+    stores `{"mode": "chat"}`, which is a complete and correct description of
+    how to read the result and says nothing about what is in it.
+    """
+    stored = dict(stored or {})
+    if not rows:
+        return stored
+    observed = formatting.detect_format(columns, rows)
+    # Only the facts, and only when the observation actually made them. A row
+    # sample that yielded nothing should not overwrite a truth with a silence.
+    for key in _CONTENT_FACTS:
+        if key in observed:
+            stored[key] = observed[key]
+    for key in ("mode", "messages_field", "tools_field"):
+        stored.setdefault(key, observed.get(key))
+    return {k: v for k, v in stored.items() if v is not None}
+
+def _backfill_dataset_facts() -> int:
+    """Fill in what existing datasets never recorded about their own contents.
+
+    A dataset's stored format used to describe only how to *read* it. Whether
+    it contains reasoning, or tool calls, and which roles appear are facts the
+    wizard needs -- it decides whether to offer "teach it to reason" from
+    them -- and a dataset created before those were written down, or by the
+    conversion to conversations, simply has none.
+
+    Reading the rows answers it. Done once per dataset, on startup, and only
+    for the ones actually missing the facts: a dataset that has them is left
+    alone, so this costs nothing on every boot after the first.
+
+    Deliberately not a schema migration with a version number. The condition
+    "this dataset does not know whether it has reasoning in it" is exactly the
+    condition that needs fixing, is cheap to test, and stays correct if a
+    dataset arrives later by some route that still does not record it.
+    """
+    fixed = 0
+    for row in db.q("SELECT id FROM datasets"):
+        d = db.get_dataset(row["id"])
+        if not d:
+            continue
+        fmt = d.get("format") or {}
+        if "has_reasoning" in fmt:
+            continue
+        sample = list(dsets.iter_rows(d["id"], 200))
+        if not sample:
+            continue
+        described = _describe_rows(fmt, d.get("columns") or [], sample)
+        if described != fmt:
+            db.update_dataset(d["id"], format=described)
+            fixed += 1
+    return fixed
+
+
 @app.post("/api/hub/training-preview")
 async def hub_training_preview(request: Request,
                                payload: dict = Body(...)) -> dict:
@@ -1159,8 +1230,19 @@ async def hub_training_preview(request: Request,
             "rows": rows,
             "columns": d.get("columns") or sorted({k for r in rows for k in r}),
             "split": split or "all",
-            "detected_format": d.get("format")
-            or formatting.detect_format(d.get("columns") or [], rows),
+            # A stored format says how to *read* these rows. Whether they
+            # contain reasoning, or tool calls, or which roles appear, is a
+            # fact about the rows themselves -- so it is measured from the rows
+            # every time rather than taken from whatever was recorded when the
+            # dataset was made.
+            #
+            # Trusting the stored copy meant a dataset converted to
+            # conversations, whose recorded format is the bare {"mode":
+            # "chat"}, was reported as having no reasoning in it. The wizard
+            # then greyed out "teach it to reason" over a dataset whose every
+            # row has a reasoning block.
+            "detected_format": _describe_rows(d.get("format"),
+                                              d.get("columns") or [], rows),
         }
     try:
         return await hub.training_preview(

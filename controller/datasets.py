@@ -1253,8 +1253,9 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
     # because it is in saved recipes and in whatever anybody scripted against
     # the endpoint. It means the same thing it always did, which is now this.
     report: dict = {}
+    convs_made: list[dict] = []
     if ops.get("to_conversations") or ops.get("to_chat"):
-        rows, report = _to_conversations(rows, fmt, ops)
+        rows, report, convs_made = _to_conversations(rows, fmt, ops)
         steps.append("Converted %d rows to the standard conversation format"
                      % report["converted"])
         if report.get("dropped"):
@@ -1268,7 +1269,27 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
                          "weight 0, so they are context and not lessons")
 
     if ops.get("to_conversations") or ops.get("to_chat"):
-        out_fmt = {"mode": "chat"}
+        # What was produced, not merely how to read it. "mode: chat" is a
+        # complete description of how to read these rows and says nothing about
+        # what is in them -- and the wizard decides whether to offer "teach it
+        # to reason" from exactly that. A conversion that dropped the fact left
+        # a dataset whose every row has a reasoning block reported as having
+        # none, with the toggle greyed out over it.
+        out_fmt = {"mode": "chat", "messages_field": conversation.MESSAGES_KEY}
+        roles: list[str] = []
+        for conv in convs_made:
+            for m in conv[conversation.MESSAGES_KEY]:
+                if m["role"] not in roles:
+                    roles.append(m["role"])
+        out_fmt["roles"] = roles
+        out_fmt["has_reasoning"] = any(
+            m.get("reasoning") for c in convs_made
+            for m in c[conversation.MESSAGES_KEY])
+        out_fmt["has_tool_calls"] = any(
+            m.get("tool_calls") for c in convs_made
+            for m in c[conversation.MESSAGES_KEY])
+        if any(c[conversation.TOOLS_KEY] for c in convs_made):
+            out_fmt["tools_field"] = conversation.TOOLS_KEY
         if train_on := (ops.get("train_on") or "").strip():
             out_fmt["train_on"] = "assistant" if train_on == "last" else train_on
     elif built:
@@ -1365,7 +1386,7 @@ def _fill_template(template: str, row: dict) -> str:
 
 
 def _to_conversations(rows: list[dict], fmt: dict,
-                      ops: dict) -> tuple[list[dict], dict]:
+                      ops: dict) -> tuple[list[dict], dict, list[dict]]:
     """Rewrite rows into the canonical conversation format.
 
     This is the step the whole workbench exists to reach. Whatever the data
@@ -1431,7 +1452,7 @@ def _to_conversations(rows: list[dict], fmt: dict,
     report["converted"] = len(out)
     report["dropped"] = dropped
     report["repairs"] = [{"what": k, "rows": v} for k, v in repairs.items()]
-    return out, report
+    return out, report, convs
 
 
 def split(dataset: dict, fraction: float, owner_id: str | None,
