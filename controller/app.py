@@ -1176,14 +1176,17 @@ def _backfill_dataset_facts() -> int:
     them -- and a dataset created before those were written down, or by the
     conversion to conversations, simply has none.
 
-    Reading the rows answers it. Done once per dataset, on startup, and only
-    for the ones actually missing the facts: a dataset that has them is left
-    alone, so this costs nothing on every boot after the first.
+    Reading the rows answers it, and the rows are the authority -- so this
+    re-measures rather than only filling blanks, and writes only where the
+    stored answer and the rows disagree. Filling blanks alone was not enough:
+    a dataset imported before the role aliases were broadened still had
+    `function_call` recorded as a role of its own, and having *an* answer meant
+    it was never looked at again.
 
-    Deliberately not a schema migration with a version number. The condition
-    "this dataset does not know whether it has reasoning in it" is exactly the
-    condition that needs fixing, is cheap to test, and stays correct if a
-    dataset arrives later by some route that still does not record it.
+    Because it writes only on disagreement, the second boot is a no-op. It
+    costs one sample read per dataset, which is what makes it safe to repeat
+    rather than needing a version number to remember it has run -- and it means
+    any later improvement to detection heals every dataset by itself.
     """
     fixed = 0
     for row in db.q("SELECT id FROM datasets"):
@@ -1191,8 +1194,6 @@ def _backfill_dataset_facts() -> int:
         if not d:
             continue
         fmt = d.get("format") or {}
-        if "has_reasoning" in fmt:
-            continue
         sample = list(dsets.iter_rows(d["id"], 200))
         if not sample:
             continue
