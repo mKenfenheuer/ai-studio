@@ -63,6 +63,27 @@ def _fmt(n: int) -> str:
     return "%.0fK" % (n / 1e3)
 
 
+def param_count(params) -> int:
+    """How many parameters these tensors hold, not how many elements they use.
+
+    A 4-bit weight is stored packed, two values to a byte, so `numel()` reports
+    half of what the model actually has -- and bitsandbytes keeps the real
+    shape on the tensor's quant_state precisely because the tensor no longer
+    shows it. Counting the stored elements recorded a Mistral-7B fine-tuned in
+    4-bit as a 3.8B model.
+
+    That number is not decoration. It is what every memory guard in this studio
+    compares against, and a size that is wrong by half is worse than a size
+    that is missing: a missing one is visibly unknown, while this one sails
+    through the check and fails on the card.
+    """
+    total = 0
+    for p in params:
+        shape = getattr(getattr(p, "quant_state", None), "shape", None)
+        total += math.prod(tuple(shape)) if shape else p.numel()
+    return int(total)
+
+
 def moe_report(model) -> dict | None:
     """Whether this base model is a mixture of experts, and how large a one."""
     conf = getattr(model, "config", None)
@@ -74,9 +95,9 @@ def moe_report(model) -> dict | None:
         return None
     active = int(getattr(conf, "num_experts_per_tok", 0)
                  or getattr(conf, "moe_top_k", 0) or 0)
-    expert_params = sum(p.numel() for n, p in model.named_parameters()
-                        if ".experts." in n)
-    total = sum(p.numel() for p in model.parameters())
+    expert_params = param_count(p for n, p in model.named_parameters()
+                                if ".experts." in n)
+    total = param_count(model.parameters())
     return {
         "experts": experts,
         "experts_per_token": active or None,
@@ -411,8 +432,8 @@ def run(cfg: dict, ctx: Any) -> dict:
             target_modules=targets,
         )
         model = get_peft_model(model, lconf)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
+    trainable = param_count(p for p in model.parameters() if p.requires_grad)
+    total = param_count(model.parameters())
     ctx.log("Training %s of %s parameters (%.2f%%)"
             % (f"{trainable:,}", f"{total:,}", 100 * trainable / max(total, 1)))
     ctx.emit_meta({"trainable_params": trainable, "total_params": total,

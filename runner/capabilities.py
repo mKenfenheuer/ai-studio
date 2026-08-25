@@ -34,7 +34,8 @@ _NO_FLASH_ATTN_ARCHS = ("gfx1030", "gfx1031", "gfx1032", "gfx1010", "gfx1012")
 _SUBPROCESS_PROBE = r"""
 import json, sys, warnings
 warnings.filterwarnings("ignore")
-out = {"bnb_4bit": False, "bnb_8bit": False, "bnb_optim": False,
+out = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
+       "bnb_optim": False, "bnb_4bit_error": None, "bnb_4bit_decode_error": None,
        "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
 try:
     import torch
@@ -57,12 +58,46 @@ try:
         sys.stderr.write("PARTIAL:" + json.dumps(out) + "\n")
         sys.stderr.flush()
         try:
+            # Whether 4-bit RUNS is the easy half. Whether it is CORRECT is the
+            # half that matters, and they are not the same question: on gfx1030
+            # the 4-bit matmul returns noise for a handful of rows -- exactly
+            # the shape token-by-token generation uses -- while being perfectly
+            # accurate for the wide shapes training uses. Nothing raises. The
+            # model just answers with rubbish.
+            #
+            # So both shapes are measured against the same weights in float16.
+            # Correct 4-bit lands near 0.10 relative error; the broken kernel
+            # measures 0.94 and up, which is the reference's own magnitude --
+            # noise. Anything past a third of the signal is not quantization
+            # loss, whatever it is.
             import bitsandbytes as bnb
-            from bitsandbytes.nn import Linear4bit
-            lin = Linear4bit(256, 256, compute_dtype=torch.float16).to(dev).eval()
-            with torch.no_grad():
-                lin(torch.randn(2, 256, device=dev, dtype=torch.float16))
-            out["bnb_4bit"] = True
+            from bitsandbytes.nn import Linear4bit, Params4bit
+            n_in, n_out = 1024, 2048          # not square: the orientation is
+            ref = torch.nn.Linear(n_in, n_out, bias=False)  # then unambiguous
+            ref = ref.to(dev, torch.float16).eval()
+            lin = Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16)
+            lin.weight = Params4bit(ref.weight.data.clone().cpu(),
+                                    requires_grad=False)
+            lin = lin.to(dev).eval()
+
+            def _relative_error(rows):
+                x = torch.randn(rows, n_in, device=dev, dtype=torch.float16)
+                with torch.no_grad():
+                    want, got = ref(x), lin(x)
+                scale = want.float().abs().mean().clamp(min=1e-6)
+                return float((got.float() - want.float()).abs().mean() / scale)
+
+            # Eight rows is what a training step sees; one row is what writing
+            # the next token of a reply sees.
+            out["bnb_4bit_error"] = round(_relative_error(8), 3)
+            out["bnb_4bit_decode_error"] = round(_relative_error(1), 3)
+            out["bnb_4bit"] = out["bnb_4bit_error"] < 0.35
+            out["bnb_4bit_decode"] = out["bnb_4bit_decode_error"] < 0.35
+            if not out["bnb_4bit"]:
+                out["bnb_error"] = (
+                    "4-bit ran but returned wrong numbers (%.2f relative error "
+                    "against float16). Treating quantization as unavailable."
+                    % out["bnb_4bit_error"])
         except Exception as e:
             out["bnb_error"] = str(e)[:200]
         try:
@@ -98,7 +133,9 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
     The timeout is generous because a cold ROCm container compiles its GPU
     kernels on first use, which can take many minutes with no output.
     """
-    fallback = {"bnb_4bit": False, "bnb_8bit": False, "bnb_optim": False,
+    fallback = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
+                "bnb_optim": False, "bnb_4bit_error": None,
+                "bnb_4bit_decode_error": None,
                 "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
     try:
         proc = subprocess.run(
@@ -249,6 +286,13 @@ def probe(quick: bool = False) -> dict:
         sub = _run_subprocess_probe()
         caps["quantization"] = {
             "4bit": sub["bnb_4bit"],
+            # Separately, because they come apart: a card can quantize
+            # correctly for the wide shapes training uses and return noise for
+            # the one-row shape that writing a reply uses. Serving reads this
+            # one; training reads the other.
+            "4bit_decode": sub.get("bnb_4bit_decode", False),
+            "4bit_error": sub.get("bnb_4bit_error"),
+            "4bit_decode_error": sub.get("bnb_4bit_decode_error"),
             "8bit": sub["bnb_8bit"],
             "optim_8bit": sub["bnb_optim"],
         }
@@ -317,6 +361,17 @@ def _derive_recommendations(caps: dict) -> None:
             "4-bit quantization is unavailable on this runner, so large models "
             "cannot be shrunk to fit. That lowers the biggest model you can "
             "fine-tune here.")
+    elif not caps["quantization"].get("4bit_decode") and caps["backend"] != "cpu":
+        # The half-broken case, and the one worth spelling out: it can train
+        # this way and it must not answer this way. Left unsaid, the studio
+        # would compress a model to make it fit and then hand back noise.
+        caps["warnings"].append(
+            "4-bit works here for training but returns wrong numbers when a "
+            "model writes one token at a time (%.2f relative error against "
+            "float16, where correct is about 0.10). Models are fine-tuned in "
+            "4-bit on this machine and served at full precision, so a model "
+            "too large to serve uncompressed cannot be talked to here."
+            % (caps["quantization"].get("4bit_decode_error") or 0))
 
     caps["max_finetune_params_b"] = _estimate_max_model(caps)
     caps["max_scratch_params_m"] = _estimate_max_scratch(caps)

@@ -41,12 +41,11 @@ CACHE_DIR = artifacts.CACHE_DIR
 # would block the next run for no reason.
 IDLE_UNLOAD_S = 15 * 60
 
-# What to keep free beyond the weights themselves. The conversation grows a
-# key/value cache as it runs, attention needs working room -- more of it on a
-# card with no flash kernels, where that room grows with the square of the
-# sequence -- and the allocator never hands back a perfectly packed heap. A
-# model sized to the last byte of free memory loads and then dies on the first
-# long reply, which is the worst moment to find out.
+# What a loaded model costs beyond its weights: the key/value cache the
+# conversation grows into, attention's working room, and the allocator's own
+# fragmentation. Used to describe what a compressed load will take, not to
+# decide whether an uncompressed one is attempted -- see _plan_precision for
+# why that distinction is worth keeping.
 HEADROOM_GB = 1.5
 
 
@@ -202,44 +201,53 @@ class ModelHost:
 
     # ------------------------------------------------------------ fitting
     def _can_quantize(self) -> bool:
-        """Whether 4-bit is actually usable here, as measured, not as claimed.
+        """Whether 4-bit can be TRUSTED here, which is not whether it runs.
 
-        The capability probe loads a bitsandbytes layer and runs it, because on
-        some ROCm builds the import succeeds and the kernel does not exist.
+        The capability probe quantizes a known layer and compares the answer
+        against float16 at the one-row shape a model writing a reply uses. On
+        some ROCm builds that shape comes back as noise while the wide shapes
+        training uses are perfectly accurate -- nothing raises, and the model
+        simply answers with rubbish. `4bit` says training may use it; only
+        `4bit_decode` says a reply may be generated through it.
+
+        A runner that has not re-probed since this distinction existed reports
+        neither, and is trusted for neither. Refusing to load is recoverable;
+        serving somebody noise is not.
         """
         return self.device == "cuda" \
-            and bool((self.caps.get("quantization") or {}).get("4bit"))
+            and bool((self.caps.get("quantization") or {}).get("4bit_decode"))
 
     def _plan_precision(self, spec: dict, log: Callable[[str], None]) -> bool:
         """Whether to compress this model on the way in.
 
-        Decided against what is free *now* rather than against the card's size,
-        and decided before the load rather than after it fails: loading fourteen
-        gigabytes only to discover that eleven were free wastes minutes, and the
-        answer was knowable at the start.
+        Only when full precision is *hopeless* -- when the weights alone will
+        not fit in what is free. A merely tight fit is attempted as it is and
+        compressed only if it actually fails, because quantizing costs answer
+        quality and the estimate is not good enough to spend that on a guess:
+        a 14.5 GB model on a card with 15.6 GB free fits and answers well, and
+        an allowance for the key/value cache added on top of it says it does
+        not.
 
-        The weights are the part quantization moves -- 4-bit stores each at half
-        a byte against float16's two. Everything else on the card is unchanged,
-        so headroom is added rather than scaled.
+        Decided against what is free *now* rather than against the card's size,
+        and before the load rather than after: a model that cannot fit either
+        way should not be read off disk twice to find that out.
         """
         params_b = spec.get("params_b")
         free = self._free_gb()
         if not params_b or free is None:
             return False
-        if params_b * 2 + HEADROOM_GB <= free:
-            return False
+        if params_b * 2 <= free:
+            return False        # room for the weights; try it and see.
         if not self._can_quantize():
-            # Nothing to be done about it here, but say so before the load
-            # fails, so the error that follows is not a surprise.
-            log("This model needs about %.1f GB and %.1f GB is free. This "
-                "machine has no working 4-bit support to shrink it with, so it "
-                "is being loaded as it is." % (params_b * 2 + HEADROOM_GB, free))
+            log("This model's weights need about %.1f GB and %.1f GB is free. "
+                "This machine cannot compress it to fit -- it is being loaded "
+                "as it is." % (params_b * 2, free))
             return False
-        log("This model wants about %.1f GB and only %.1f GB is free, so it is "
-            "being loaded in 4-bit (about %.1f GB) rather than not at all. "
-            "Answers are slightly worse than at full precision; nothing else "
-            "about the model changes."
-            % (params_b * 2 + HEADROOM_GB, free, params_b * 0.5 + HEADROOM_GB))
+        log("This model needs about %.1f GB at full precision and only %.1f GB "
+            "is free, so it is being loaded in 4-bit (about %.1f GB) rather "
+            "than not at all. Answers are slightly worse; nothing else about "
+            "the model changes."
+            % (params_b * 2, free, params_b * 0.5 + HEADROOM_GB))
         return True
 
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:

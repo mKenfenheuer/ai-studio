@@ -1210,7 +1210,18 @@ def _backfill_job_sizes() -> int:
         summary = job.get("summary") or {}
         counted = summary.get("total_params") or summary.get("params_total")
         measured = round(int(counted) / 1e9, 3) if counted else None
-        size = measured or hub.params_from_name(cfg.get("base_model") or "")
+        named = hub.params_from_name(cfg.get("base_model") or "")
+        # A measurement can be wrong, and one particular way of being wrong is
+        # recoverable here. A run trained in 4-bit counted its packed weights,
+        # which hold two parameters per element, and so reported half the model:
+        # a Mistral-7B came back as 3.8B. A fine-tune contains its base and
+        # cannot be smaller than it, so a count well under what the base model's
+        # own name says is not a measurement, it is an artefact of how the
+        # weights were stored. The runner counts correctly now; this is for the
+        # runs recorded before it did.
+        if measured and named and measured < named * 0.9:
+            measured = None
+        size = measured or named
         if not size or cfg.get("params_b") == size:
             continue
         # A counted size always wins; a guessed one only fills a blank, so a
@@ -1732,7 +1743,13 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
                 # loads a model that will not fit in 4-bit instead. Refusing
                 # here on the 16-bit figure alone turned "slightly worse
                 # answers" into "you cannot talk to this model at all".
-                if not caps.get("quantization", {}).get("4bit"):
+                #
+                # `4bit_decode`, not `4bit`: some cards quantize correctly for
+                # training's wide shapes and return noise for the single-token
+                # shape a reply is written with. Serving through one of those
+                # produces fluent-looking gibberish, which is far worse than
+                # saying the model does not fit.
+                if not caps.get("quantization", {}).get("4bit_decode"):
                     return False
                 if (mem.get("inference_int4_gb") or 0) > caps["vram_gb"]:
                     return False
