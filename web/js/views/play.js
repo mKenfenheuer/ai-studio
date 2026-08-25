@@ -214,6 +214,9 @@ function chatView(mount, run, runs) {
       <div class="chat-input">
         <textarea id="chatBox" rows="2" placeholder="${ui.placeholder}"></textarea>
         <button class="btn-primary" id="sendBtn">Send</button>
+        <button class="btn-primary" id="askBtn" hidden
+          title="Send the conversation as it stands and let the model write the next turn"
+          >Let it answer</button>
         <button class="btn-danger" id="stopBtn" hidden>Stop</button>
       </div>
       <div class="row" style="margin-top:8px;flex-wrap:wrap">
@@ -269,6 +272,7 @@ function chatView(mount, run, runs) {
   const log = $("#chatLog", mount);
   const box = $("#chatBox", mount);
   const sendBtn = $("#sendBtn", mount);
+  const askBtn = $("#askBtn", mount);
   const stopBtn = $("#stopBtn", mount);
   const statusEl = $("#chatStatus", mount);
   const systemBox = $("#systemBox", mount);
@@ -303,8 +307,9 @@ function chatView(mount, run, runs) {
       </div>
       <p class="muted tiny" style="margin:6px 0 10px">A held-out row is one the
         model never trained on, so what it does with it is the only honest
-        answer to “did this work”. Load one, edit it if you like, and the
-        reply the data says is correct is shown beside the model’s.</p>
+        answer to “did this work”. Load one and its question lands in the box
+        below, yours to edit before you send it; the reply the data says is
+        correct is shown here beside the model’s.</p>
 
       <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
         <div class="field" style="margin:0;min-width:200px">
@@ -422,6 +427,12 @@ function chatView(mount, run, runs) {
              data-role="assistant" id="pendingBubble">${pendingText}</div>`);
     }
     pending = $("#pendingBubble", mount);
+    // Something is loaded that the model could answer without another word
+    // being typed -- a row that ends on a tool result, or turns left standing
+    // after an edit. Without this the conversation simply sits there.
+    const tail = turns[turns.length - 1];
+    askBtn.hidden = !(tail && tail.role !== "assistant"
+                      && pendingText === null && !requestId);
     const el = $("#turnCount", mount);
     if (el) el.textContent = turns.length
       ? `${turns.length} message${turns.length > 1 ? "s" : ""} in context` : "";
@@ -523,28 +534,54 @@ function chatView(mount, run, runs) {
     }
   }
 
-  /** Put a held-out row into the conversation, ready to be sent or edited. */
+  /** Put a held-out row into the conversation, ready to be sent or edited.
+   *
+   *  The row arrives already cut at the point a model would have to take over,
+   *  and it lands in three places rather than one: its system turn in the
+   *  system box, everything before the question in the log as context, and the
+   *  question itself in the input box. The reply is deliberately NOT loaded --
+   *  producing it is the model's job, and having it already on screen is how
+   *  you talk yourself into believing a wrong answer was right.
+   */
   function applyRow(s) {
     sample = s;
-    // Everything up to and including the last user turn. The reply is
-    // deliberately NOT loaded: producing it is the model's job, and having it
-    // already on screen is how you talk yourself into believing a wrong answer
-    // was right.
-    turns = JSON.parse(JSON.stringify(s.prompt || []));
+    let prompt = JSON.parse(JSON.stringify(s.prompt || []));
     tools = s.tools || [];
-    const sys = turns.find((m) => m.role === "system");
+    const sys = prompt.find((m) => m.role === "system");
     if (sys && systemBox) systemBox.value = sys.content || "";
     // The system turn lives in the box, not in the log, so it is edited in one
     // place rather than two.
-    turns = turns.filter((m) => m.role !== "system");
+    prompt = prompt.filter((m) => m.role !== "system");
+
+    // The question goes in the input box rather than into the log. Loading a
+    // row used to put the whole prompt straight into the conversation, which
+    // read as though the row had already been sent -- and with nothing left to
+    // type, there was then no way to ask the model to answer it at all. The
+    // box is also the point: the useful thing to do with a held-out example is
+    // to change one word of it and see whether the answer survives, and a
+    // message you can edit before sending is how you do that.
+    const last = prompt[prompt.length - 1];
+    if (last && last.role === "user" && !(last.tool_calls || []).length) {
+      prompt.pop();
+      box.value = last.content || "";
+    } else {
+      // A row that ends on a tool result or a call: there is no question to
+      // type, so "Let it answer" carries it on from where it stands.
+      box.value = "";
+    }
+    turns = prompt;
+
     pendingText = null;
     statusEl.textContent = "";
     drawTrial();
     paint();
+    box.focus();
+    box.setSelectionRange(box.value.length, box.value.length);
   }
 
   // -------------------------------------------------------------- wiring
   sendBtn.addEventListener("click", send);
+  askBtn.addEventListener("click", () => { if (turns.length) ask(); });
   box.addEventListener("keydown", (e) => {
     // Enter sends, Shift+Enter makes a new line — the convention every chat
     // interface uses, so nobody has to be told.

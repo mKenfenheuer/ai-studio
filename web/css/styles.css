@@ -434,7 +434,7 @@ textarea.mono {
   min-height: 220px; max-height: 52vh; overflow-y: auto; padding: 4px;
 }
 .bubble { max-width: 84%; padding: 10px 13px; border-radius: 12px;
-  font-size: 13.5px; line-height: 1.6; white-space: pre-wrap;
+  font-size: 13.5px; line-height: 1.6;
   word-break: break-word; }
 .bubble.me { align-self: flex-end; background: var(--accent); color: #fff;
   border-bottom-right-radius: 4px; }

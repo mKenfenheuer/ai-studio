@@ -402,9 +402,13 @@ async def _create_job(request: Request, payload: dict) -> str:
         cfg.setdefault("base_model", src["config"].get("base_model"))
         cfg.setdefault("base_model_job", src["config"].get("base_model_job"))
         # The merged model answers in the shape the fine-tune was trained in,
-        # so the format travels with it or the playground would guess again.
-        cfg.setdefault("format", src["config"].get("format"))
-        cfg.setdefault("system_prompt", src["config"].get("system_prompt"))
+        # so the format travels with it or the playground would guess again --
+        # and with it the system prompt and the data it learned from, which is
+        # what lets the merged model be tried on the same held-out rows.
+        for key in serving.INHERITED:
+            if src["config"].get(key):
+                cfg.setdefault(key, src["config"][key])
+        cfg[serving.INHERITED_FLAG] = True
         # How big it is and how it was compressed. These are what made the
         # original run fit on the card, and continuing it without them is
         # asking for the same model in a precision that does not fit: a 7B
@@ -916,6 +920,15 @@ def _queue_merge(job: dict) -> None:
         "allow_cpu": True,
         "params_b": cfg.get("params_b"),
         "hf_token": cfg.get("hf_token"),
+        # Everything that says how to *talk to* the result. The merge changed
+        # where the weights live, not what the model was taught to expect, so a
+        # fine-tune trained on conversations is still a conversational model
+        # afterwards. Leaving these behind made it look like a base model: the
+        # playground offered no system prompt and no turns, prompted it with a
+        # bare string, and the model answered a shape it had never seen with
+        # nothing at all. The same fields are carried by the manual merge above.
+        **{k: cfg[k] for k in serving.INHERITED if cfg.get(k)},
+        serving.INHERITED_FLAG: True,
     }
     jid = db.create_job("%s, merged" % job["name"], "merge_adapter",
                         merged_cfg, job.get("owner_id"))
@@ -1744,7 +1757,10 @@ async def playground(request: Request) -> list[dict]:
             continue
         if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
             continue
-        cfg = job["config"]
+        # Resolved, not raw: a merge records how to perform the merge, and
+        # borrows from the run it was made from everything about how to talk
+        # to the result. See controller/serving.resolved_config.
+        cfg = serving.resolved_config(job)
         spec = chat_spec(job)
         entry = {
             "id": job["id"], "name": job["name"], "kind": job["kind"],
@@ -1787,7 +1803,7 @@ async def job_system_prompt(request: Request, job_id: str) -> dict:
     going back for.
     """
     job = _job_or_404(request, job_id)
-    cfg = job["config"]
+    cfg = serving.resolved_config(job)
     if cfg.get("system_prompt"):
         return {"system_prompt": cfg["system_prompt"], "source": "recorded"}
     if not cfg.get("dataset"):

@@ -8,7 +8,49 @@ actually talking to.
 """
 from __future__ import annotations
 
-from . import hub
+from . import db, hub
+
+# What a merge inherits from the fine-tune it was made from.
+#
+# Merging changes where the weights live, not what the model learned to expect.
+# A run trained on conversations is still a conversational model after its
+# adapter has been folded in -- but the merge job's own config records only how
+# to *perform the merge* (which run, which base, which dtype), so every field
+# describing how to *talk to* the result was left behind. The visible symptom
+# was a chat fine-tune that came out of the merge as a base model: prompted
+# with a bare string instead of its own chat format, it saw a shape it had
+# never been trained on and answered with nothing at all.
+INHERITED = ("format", "system_prompt", "dataset", "dataset_config",
+             "dataset_split", "studio_dataset", "base_model")
+
+# Set on a merge whose config has taken what it needs from its source, so the
+# lookup below happens once per run rather than once per message. Every merge
+# created from now on is written with it already true.
+INHERITED_FLAG = "inherited_from_source"
+
+
+def resolved_config(job: dict) -> dict:
+    """This run's config, with a merge's blanks filled in from its source.
+
+    Merges made from now on carry these fields at creation, so there is nothing
+    here for them to do. It exists for the ones already on disk, made before
+    anything carried them, which would otherwise stay unplayable forever: their
+    config is completed on first sight and written back, so the repair happens
+    once and not on every message.
+
+    What the merge already records wins. Nothing is overwritten -- the source
+    is only ever asked about fields the merge has no answer for.
+    """
+    cfg = job.get("config") or {}
+    if job.get("kind") != "merge_adapter" or cfg.get(INHERITED_FLAG):
+        return cfg
+    src = db.get_job(cfg.get("source_job") or "") or {}
+    src_cfg = src.get("config") or {}
+    cfg = {**{k: src_cfg[k] for k in INHERITED if src_cfg.get(k)}, **cfg,
+           INHERITED_FLAG: True}
+    db.update_job_config(job["id"], cfg)
+    job["config"] = cfg
+    return cfg
 
 
 def chat_spec(job: dict) -> dict:
@@ -19,7 +61,7 @@ def chat_spec(job: dict) -> dict:
     playground drift from the model, and a model given a shape it never saw
     looks broken when it is not.
     """
-    cfg = job["config"]
+    cfg = resolved_config(job)
     fmt = dict(cfg.get("format") or {})
     if not fmt and job["kind"] == "pretrain_llm":
         fmt = {"mode": "text"}
