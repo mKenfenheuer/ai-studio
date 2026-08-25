@@ -289,14 +289,10 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     const how = t.dataset.stop;
     const save = how === "keep";
     if (how === "force" && !confirm(
-      "Force stop this run?
-
-"
+      "Force stop this run?\n\n"
       + "The machine will be told to end it and will restart itself if the "
       + "run will not let go. Nothing is kept, and anything else that machine "
-      + "is doing stops too.
-
-"
+      + "is doing stops too.\n\n"
       + "Use this when an ordinary stop has already been tried and the run is "
       + "not responding.")) return;
     $("#stopPanel", mount).innerHTML = "";
