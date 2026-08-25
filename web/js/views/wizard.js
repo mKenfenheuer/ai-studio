@@ -2376,6 +2376,16 @@ function scratchReview(state, runner, caps) {
         ${raw(toggle("optim_8bit", "8-bit optimiser", s.optim_8bit,
           "Stores Adam's two running averages in 8 bits instead of 32. Frees "
           + "memory for a bigger batch at no measurable quality cost."))}
+        ${raw(toggle("merge_after", "Also produce a standalone model",
+          s.merge_after !== false,
+          "A fine-tune produces an adapter, which needs the exact base model "
+          + "it was trained against in order to run anywhere. Merging folds it "
+          + "into the weights, so what you are left with needs nothing else — "
+          + "which is what every tool outside this studio wants. It runs on "
+          + "the processor afterwards and does not hold the card up. The cost "
+          + "is disk: a merged 7B is about 14 GB where its adapter was 50 MB. "
+          + "The adapter is kept as well, and is what a later run continues "
+          + "from."))}
       </div>
     </div>
 
@@ -2453,7 +2463,7 @@ const fields = (rows) => rows.map(([k, label, v, type, hint]) =>
 const FLOAT_SETTINGS = new Set(["learning_rate", "weight_decay", "grad_clip",
                                 "min_lr_ratio", "epochs"]);
 const BOOL_SETTINGS = new Set(["gradient_checkpointing", "optim_8bit",
-                               "adapt_experts", "early_stop"]);
+                               "adapt_experts", "early_stop", "merge_after"]);
 
 function wireSweep(mount, ctx) {
   const { state, draw } = ctx;

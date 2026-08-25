@@ -797,6 +797,9 @@ async def upload_artifact(job_id: str, file: UploadFile,
             "merge_adapter": "model"}.get((job or {}).get("kind"), "adapter")
     db.add_artifact(job_id, kind, dest.name, size)
 
+    if kind == "adapter" and job:
+        _queue_merge(job)
+
     if kind == "dataset" and job:
         # Rows written by a model are only useful once they are a dataset you
         # can look at, clean and train on. Doing that here, rather than making
@@ -820,6 +823,66 @@ async def upload_artifact(job_id: str, file: UploadFile,
                        "as a dataset (%s). The zip on this run still has them."
                        % e, "error")
     return {"ok": True, "size": size}
+
+
+def _queue_merge(job: dict) -> None:
+    """Turn a finished fine-tune into a standalone model, automatically.
+
+    A LoRA fine-tune produces an adapter, which is a few tens of megabytes and
+    useless on its own: it needs the exact base model it was trained against,
+    fetched from the Hub, at serving time. That is fine inside this studio,
+    which records which base and goes and gets it, and it is a nuisance
+    everywhere else -- every other tool wants a model directory it can load.
+
+    So a fine-tune is followed by a merge, and what you are left with is a
+    model that needs nothing. It runs on the processor and takes no GPU, so it
+    does not hold the card up.
+
+    IT IS NOT FREE, and the cost is disk: a merged 7B is about 14 GB where its
+    adapter was 50 MB. The adapter is kept as well -- it is what a later run
+    continues from, and it is the only artifact small enough to keep many of.
+
+    A merged model can still be trained further: the runner sees a directory
+    with no adapter_config.json and uses it as the base for a fresh adapter.
+    What is no longer possible is continuing the *same* adapter, because it has
+    been folded into the weights and there is nothing left to peel off.
+    """
+    cfg = job.get("config") or {}
+    if job.get("kind") != "finetune_llm" or not cfg.get("merge_after", True):
+        return
+    if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
+        return
+    # An adapter whose base is another run in this studio is already standalone
+    # once that run's model is merged; merging again would copy the weights a
+    # second time for nothing.
+    if not cfg.get("base_model"):
+        db.add_log(job["id"], "Not merging: this run has no Hugging Face base "
+                              "model recorded to merge into.")
+        return
+    if db.q("SELECT id FROM jobs WHERE kind='merge_adapter' "
+            "AND json_extract(config, '$.source_job')=?", (job["id"],)):
+        return          # already done, or already queued
+
+    merged_cfg = {
+        "source_job": job["id"],
+        "base_model": cfg.get("base_model"),
+        "source_run_name": job["name"],
+        "dtype": cfg.get("dtype") or "float16",
+        # Merging is arithmetic on the processor. Pinning it to the machine
+        # that trained would make it queue behind the next training run for no
+        # reason.
+        "allow_cpu": True,
+        "params_b": cfg.get("params_b"),
+        "hf_token": cfg.get("hf_token"),
+    }
+    jid = db.create_job("%s, merged" % job["name"], "merge_adapter",
+                        merged_cfg, job.get("owner_id"))
+    db.add_log(job["id"],
+               "Merging the adapter into %s so the result is a model that "
+               "needs nothing else to run. The adapter is kept too -- it is "
+               "what a later run continues from."
+               % cfg.get("base_model"))
+    db.add_log(jid, "Queued automatically after %s finished." % job["name"])
 
 
 def _register_generated(job: dict, archive: Path) -> dict:
