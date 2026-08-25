@@ -72,6 +72,17 @@ GENERATE_TIMEOUT_S = 600.0
 FLEET = None
 
 
+def _finish(msg: dict) -> str:
+    """Why the model stopped, in OpenAI's vocabulary.
+
+    "length" is not decoration: a client that asked for 200 tokens and got 200
+    tokens needs to know whether that was the whole answer or the first part of
+    one, and reporting "stop" for both told it the reply was complete when it
+    had been cut mid-sentence.
+    """
+    return "length" if msg.get("stop_reason") == "length" else "stop"
+
+
 def _error(status: int, message: str, code: str = "invalid_request_error"):
     return JSONResponse({"error": {"message": message, "type": code,
                                    "code": code}}, status_code=status)
@@ -217,7 +228,7 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
         "params": {
             "max_new_tokens": min(int(payload.get("max_tokens")
                                       or payload.get("max_completion_tokens")
-                                      or 256), 2048),
+                                      or 512), config.MAX_NEW_TOKENS),
             "temperature": float(payload.get("temperature", 0.8)),
             "top_p": float(payload.get("top_p", 0.95)),
             "top_k": int(payload.get("top_k") or 50),
@@ -362,7 +373,8 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
                         # driving a tool loop branches on exactly this, so
                         # reporting "stop" would stall the loop at the first
                         # call.
-                        "finish_reason": "tool_calls" if calls else "stop",
+                        "finish_reason": "tool_calls" if calls
+                                         else _finish(msg),
                     }],
                     "usage": {
                         "prompt_tokens": msg.get("prompt_tokens") or 0,
@@ -419,7 +431,7 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 if calls:
                     yield chunk({"tool_calls": [
                         {**c, "index": i} for i, c in enumerate(calls)]})
-                yield chunk({}, "tool_calls" if calls else "stop")
+                yield chunk({}, "tool_calls" if calls else _finish(msg))
                 yield "data: [DONE]\n\n"
                 return
     except asyncio.TimeoutError:

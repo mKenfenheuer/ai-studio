@@ -1,5 +1,6 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast, skeletonValue } from "../util.js";
+import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast,
+         skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 
@@ -271,6 +272,17 @@ export async function jobView(mount, [jobId]) {
  *  seconds of the page opening.
  */
 function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
+  // A run is named when it is created, from the model and the dataset -- a
+  // decent guess and a poor label once there are six of them. Both layouts on
+  // this page draw the same heading, so it is wired once here.
+  on(mount, "click", "#renameRun", () => {
+    inlineRename($("#runTitle", mount), async (name) => {
+      await api.renameJob(jobId, name);
+      const job = getJob?.();
+      if (job) job.name = name;
+    });
+  });
+
   // Delegated, not bound directly: paintHeader() replaces the button element
   // every time a metric arrives, which would silently discard a direct
   // listener. Stopping is two different actions wearing one button, and the
@@ -355,7 +367,11 @@ function writingLayout(job) {
     <div class="page-head">
       <a href="#/jobs" class="tiny">← All runs</a>
       <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${job.name}</h1>
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${job.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
         <div class="row" id="headerActions"></div>
       </div>
       <p class="sub tiny" style="margin-top:4px">
@@ -570,7 +586,11 @@ function layout(job, scratch, experts = 0) {
     <div class="page-head">
       <a href="#/jobs" class="tiny">← All runs</a>
       <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${job.name}</h1>
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${job.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
         <div class="row" id="headerActions"></div>
       </div>
       <p class="sub mono tiny" style="margin-top:4px">${subtitle}</p>

@@ -642,6 +642,10 @@ def add_artifact(job_id: str, kind: str, filename: str, size: int) -> str:
     return aid
 
 
+def rename_job(job_id: str, name: str) -> None:
+    ex("UPDATE jobs SET name=? WHERE id=?", (name, job_id))
+
+
 def update_job_config(job_id: str, cfg: dict) -> None:
     ex("UPDATE jobs SET config=? WHERE id=?", (json.dumps(cfg), job_id))
 

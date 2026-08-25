@@ -53,6 +53,15 @@ HEARTBEAT_TIMEOUT_S: int = int(os.environ.get("AI_STUDIO_HEARTBEAT_TIMEOUT", "45
 
 WEB_DIR: Path = Path(__file__).resolve().parent.parent / "web"
 
+# The longest reply anybody may ask for, in tokens. A ceiling on what a caller
+# can request rather than a target: generation here is one forward pass per
+# token, so a long limit is a long wait, and the Stop button is what a reader
+# uses when they have seen enough. Memory is not the binding constraint -- the
+# key/value cache of a 7B costs about an eighth of a megabyte per token, so
+# even the whole of this is a fraction of what serving the weights already
+# takes.
+MAX_NEW_TOKENS: int = int(os.environ.get("AI_STUDIO_MAX_NEW_TOKENS") or 4096)
+
 
 def ensure_dirs() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)

@@ -130,6 +130,7 @@ function toolResult(m, opts) {
           <div class="tool-result-head">${raw(head)}</div>
           <pre class="mono">${body}</pre>`)}
       </div>
+      ${raw(opts.footer ? opts.footer(m, opts.index) : "")}
       ${raw(opts.actions ? opts.actions(m, opts.index) : "")}
     </div>`;
 }
@@ -163,7 +164,8 @@ function body(content, calls, reasoning, per) {
  *
  * `opts`:
  *   openReasoning  show the working expanded rather than folded
- *   actions        (message, index) => html appended below each turn
+ *   actions        (message, index) => html overlaid on each turn
+ *   footer         (message, index) => html placed under what was said
  *   callAction     (call, index) => html appended beside a tool call
  *   empty          what to show when there are no messages
  */
@@ -201,6 +203,7 @@ export function conversationHtml(messages, opts = {}) {
         ${raw(reasoning
           ? reasoningBlock(reasoning, { open: !!opts.openReasoning }) : "")}
         ${raw(body(content, calls, reasoning, per))}
+        ${raw(opts.footer ? opts.footer(m, i) : "")}
         ${raw(opts.actions ? opts.actions(m, i) : "")}
       </div>`;
   }).join("");

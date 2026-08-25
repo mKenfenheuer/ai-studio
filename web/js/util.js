@@ -254,3 +254,51 @@ export function skeleton({ title = true, cards = 3, rows = 0 } = {}) {
  *  card around it does not resize when it does. */
 export const skeletonValue = (width = "3.5em") =>
   raw(`<span class="sk-value shimmer" style="min-width:${width}"></span>`);
+
+/** Rename something by typing over its heading.
+ *
+ *  A run is named when it is created, from the model and the dataset, which
+ *  is a decent guess and a poor label -- a page of "Mistral-7B on
+ *  support-tickets" says nothing about which one you are actually shipping.
+ *
+ *  Editing in place rather than in a dialog, because the heading is both the
+ *  thing being changed and the thing you are looking at while you decide.
+ *  `save(name)` is awaited; if it throws, the old name goes back, since a
+ *  heading showing a name the server rejected is a lie.
+ */
+export function inlineRename(heading, save) {
+  if (!heading || heading.dataset.renaming) return;
+  const was = heading.textContent.trim();
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "title-edit";
+  input.value = was;
+  input.maxLength = 120;
+
+  let done = false;
+  const finish = async (keep) => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    input.replaceWith(heading);
+    delete heading.dataset.renaming;
+    if (!keep || !name || name === was) return;
+    heading.textContent = name;
+    try {
+      await save(name);
+    } catch (e) {
+      heading.textContent = was;
+      toast(e.message, "err");
+    }
+  };
+
+  heading.dataset.renaming = "1";
+  heading.replaceWith(input);
+  input.focus();
+  input.select();
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}

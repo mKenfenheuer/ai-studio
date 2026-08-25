@@ -490,6 +490,13 @@ class ModelHost:
             past = None
             emitted = ""
             hit_stop = False
+            # Why writing stopped, which the reader is entitled to know. A
+            # reply cut off at the token limit and a reply that finished are
+            # the same string of text and completely different answers, and
+            # only this tells them apart. Nothing else happening means the
+            # loop ran to the end of its budget.
+            stop_reason = "length"
+
             produced: list[int] = []
             t0 = time.time()
             cur = ids
@@ -520,6 +527,7 @@ class ModelHost:
 
             for _ in range(max_new):
                 if self._cancel.is_set():
+                    stop_reason = "cancelled"
                     break
                 with torch.no_grad():
                     out = model(input_ids=cur, past_key_values=past, use_cache=True)
@@ -545,6 +553,7 @@ class ModelHost:
 
                 token_id = int(nxt[0, 0])
                 if token_id == tok.eos_token_id:
+                    stop_reason = "end"
                     break
                 produced.append(token_id)
                 cur = nxt
@@ -560,6 +569,7 @@ class ModelHost:
                     deliver(full)
                     emitted = full
                     hit_stop = True
+                    stop_reason = "end"
                     break
 
                 # Hold back the last few characters, because they may turn out
@@ -600,7 +610,10 @@ class ModelHost:
                 "tokens": len(produced),
                 "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
                 "prompt_tokens": prompt_len,
-                "cancelled": self._cancel.is_set(),
+                # "end" the model finished, "length" it ran out of budget,
+                # "cancelled" somebody pressed stop.
+                "stop_reason": stop_reason,
+                "cancelled": stop_reason == "cancelled",
                 "prompt_preview": text[-600:],
             }
 

@@ -224,6 +224,9 @@ export const api = {
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
         { method: "POST", body: JSON.stringify({ save, force }) }),
   deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  renameJob:   (id, name) =>
+    req(`/api/jobs/${encodeURIComponent(id)}`,
+        { method: "PATCH", body: JSON.stringify({ name }) }),
   // Put a stopped or failed run back on the queue, to carry on from its
   // checkpoint rather than from step one.
   resumeJob:   (id) =>

@@ -1822,6 +1822,25 @@ async def playground(request: Request) -> list[dict]:
     return out
 
 
+@app.patch("/api/jobs/{job_id}")
+async def rename_job(request: Request, job_id: str,
+                     payload: dict = Body(...)) -> dict:
+    """Give a run a name that means something.
+
+    Runs are named when they are created, from the model and the dataset, and
+    that name is a decent guess and a poor label: a page of "Mistral-7B on
+    support-tickets" tells you nothing about which one had the higher learning
+    rate or which one you are actually shipping. Renaming needs edit rights,
+    the same as anything else that changes a run.
+    """
+    job = _job_or_404(request, job_id, "edit")
+    name = (payload.get("name") or "").strip()[:120]
+    if not name:
+        raise HTTPException(400, "A run needs a name.")
+    db.rename_job(job_id, name)
+    return {**job, "name": name}
+
+
 @app.get("/api/jobs/{job_id}/system-prompt")
 async def job_system_prompt(request: Request, job_id: str) -> dict:
     """The system prompt this run was trained with.
@@ -1908,7 +1927,13 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
         "type": "generate", "request_id": request_id, "spec": spec,
         "messages": messages,
         "params": {
-            "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
+            # A ceiling, not a default. 512 was neither: it was low enough
+            # that ordinary answers ran into it and were cut off mid-sentence,
+            # which reads as a broken model rather than as a setting. The
+            # limit that matters is the one the reader chose, and they are
+            # told when a reply reaches it.
+            "max_new_tokens": min(int(payload.get("max_new_tokens") or 512),
+                                  config.MAX_NEW_TOKENS),
             "temperature": float(payload.get("temperature") or 0.8),
             "top_k": int(payload.get("top_k") or 50),
             "top_p": float(payload.get("top_p") or 0.95),

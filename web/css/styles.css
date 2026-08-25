@@ -1146,18 +1146,55 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 /* Per-turn controls. Quiet until the turn is hovered: every message being
    editable is the point, and six buttons per turn shouting for attention is
    not. */
-.turn-actions {
-  position: absolute; top: -5px; right: 0; z-index: 2;
-  opacity: 0; transition: opacity .12s; pointer-events: none;
-  background: var(--bg); border-radius: 8px; padding: 1px;
+/* Editing, removing and regenerating a turn live in a context menu: right
+   click, or hold a message down on a touch screen. Two buttons beside each of
+   twenty messages is forty buttons competing with the thing you came to read,
+   for controls used once in a while. */
+.ctx-menu {
+  position: fixed; z-index: 60; min-width: 168px; padding: 5px;
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: var(--shadow);
 }
-/* The person's turns label themselves on the right, so their controls go left
-   rather than sitting on top of the word. */
-.turn.me .turn-actions { right: auto; left: 0; }
-.turn:hover .turn-actions,
-.turn:focus-within .turn-actions { opacity: 1; pointer-events: auto; }
-@media (hover: none) {
-  .turn-actions { opacity: .7; pointer-events: auto; }
+.ctx-menu button {
+  border: 0; background: transparent; color: var(--text);
+  text-align: left; padding: 7px 10px; border-radius: 6px;
+  font-size: 13px; font-family: inherit; cursor: pointer;
+}
+.ctx-menu button:hover:not(:disabled),
+.ctx-menu button:focus-visible { background: var(--surface-2); outline: none; }
+.ctx-menu button:disabled { opacity: .45; cursor: default; }
+.ctx-menu button.danger { color: var(--err); }
+.ctx-menu button.danger:hover { background: var(--err-bg); }
+
+/* Renaming a run, in the heading rather than in a dialog: the heading is both
+   the thing being changed and the thing you are looking at while you decide. */
+.title-row { min-width: 0; }
+.title-row h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn-quiet {
+  opacity: 0; transition: opacity .12s; padding: 2px 7px;
+  border: 0; background: transparent; color: var(--text-2); font-size: 14px;
+}
+.title-row:hover .btn-quiet, .btn-quiet:focus-visible { opacity: 1; }
+@media (hover: none) { .btn-quiet { opacity: .7; } }
+.btn-quiet:hover { color: var(--text); background: var(--surface-2); }
+input.title-edit {
+  font-size: 1.6rem; font-weight: 650; letter-spacing: -.02em;
+  padding: 2px 8px; width: min(100%, 26em); border-radius: 8px;
+}
+
+/* A turn being rewritten. */
+textarea.turn-edit {
+  width: 100%; font-size: 13px; line-height: 1.55;
+  border-radius: 10px;
+}
+
+/* Something true about a turn that the turn itself does not say -- so far,
+   that a reply was cut off at the length limit rather than finished. */
+.turn-note {
+  font-size: 11.5px; line-height: 1.5; color: var(--warn);
+  background: var(--warn-bg); border-radius: 8px;
+  padding: 6px 10px; max-width: 100%;
 }
 /* One row of a dataset, drawn as its conversation. */
 .convo-row { border-bottom: 1px solid var(--border); padding: 12px 0; }

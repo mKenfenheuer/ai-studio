@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, $$, on, fmtAgo, toast } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtAgo, toast, inlineRename } from "../util.js";
 import { conversationHtml, reasoningBlock, pretty } from "../conversation.js";
 
 // Talking to what you trained.
@@ -164,7 +164,11 @@ function chatView(mount, run, runs) {
     <div class="page-head">
       <a href="#/play" class="tiny">← All finished runs</a>
       <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${run.name}</h1>
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${run.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
         <div class="row">
           <a class="btn btn-sm" href="#/jobs/${run.id}">Training details</a>
           <a class="btn btn-sm" href="/api/jobs/${run.id}/download">↓ Download</a>
@@ -226,6 +230,8 @@ function chatView(mount, run, runs) {
                      title="Ask it to work through the problem first">Reasoning: on</button>`
           : "")}
         <span class="tiny muted" id="turnCount"></span>
+        <span class="tiny muted" id="turnHint">· right-click a message to edit,
+          remove or regenerate it</span>
       </div>
       ${raw(run.reasoning ? html`
         <p class="muted tiny" style="margin:8px 0 0">This model was trained to
@@ -242,8 +248,12 @@ function chatView(mount, run, runs) {
           </div>
           <div class="field">
             <label for="maxTok">Length limit</label>
-            <input type="number" id="maxTok" value="200" step="10" min="10" max="512">
-            <div class="hint">Maximum tokens to write.</div>
+            <input type="number" id="maxTok" value="512" step="64" min="16" max="4096">
+            <div class="hint">Most tokens it may write before it is stopped.
+              You are told in the conversation when a reply reaches this, so a
+              cut-off answer is never mistaken for a finished one. Long limits
+              are long waits — this writes one token at a time — and Stop works
+              at any point.</div>
           </div>
         </div>
         <details class="adv">
@@ -405,13 +415,16 @@ function chatView(mount, run, runs) {
   function paint() {
     const last = turns.length - 1;
     const body = conversationHtml(turns, {
-      // Every turn is editable, including the model's own replies and the tool
-      // results: the useful thing to do with a held-out example is change one
-      // word of it and ask what survives.
-      actions: (_m, i) => `<div class="row turn-actions" style="gap:6px">
-          <button class="btn-sm" data-editrow="${i}">Edit</button>
-          <button class="btn-sm" data-delrow="${i}">Remove</button>
-        </div>`,
+      // Every turn can be edited, removed or regenerated -- the useful thing to
+      // do with a held-out example is change one word of it and ask what
+      // survives. The controls live in a context menu rather than beside every
+      // message: two buttons on each of twenty turns is forty buttons, and the
+      // conversation is the thing you came to read.
+      footer: (m) => (m.stopped_at_limit
+        ? `<div class="turn-note">Stopped at the length limit — this reply is
+             cut off, not finished. Raise the limit in generation settings and
+             regenerate to see the rest.</div>`
+        : ""),
       // Answering a call by hand, when the row recorded no result for it or
       // you want to see what a different result would do.
       callAction: (c, _n) => (turns[last]?.tool_calls || []).includes(c)
@@ -502,7 +515,7 @@ function chatView(mount, run, runs) {
         tools,
         system: systemBox ? systemBox.value : "",
         temperature: parseFloat($("#temp", mount).value) || 0.8,
-        max_new_tokens: parseInt($("#maxTok", mount).value, 10) || 200,
+        max_new_tokens: parseInt($("#maxTok", mount).value, 10) || 512,
         reasoning: think,
       });
       requestId = r.request_id;
@@ -616,6 +629,14 @@ function chatView(mount, run, runs) {
   }
 
   // -------------------------------------------------------------- wiring
+  // The name a run was given when it was created is a guess made from the
+  // model and the dataset. Renaming it here saves a trip to its training page.
+  on(mount, "click", "#renameRun", () => {
+    inlineRename($("#runTitle", mount), async (name) => {
+      await api.renameJob(run.id, name);
+      run.name = name;
+    });
+  });
   sendBtn.addEventListener("click", send);
   askBtn.addEventListener("click", () => { if (turns.length) ask(); });
   box.addEventListener("keydown", (e) => {
@@ -677,41 +698,134 @@ function chatView(mount, run, runs) {
     loadRow(at + 1);
   });
 
-  // Editing a turn in place. The point of loading a held-out row is usually to
-  // change one word of it, so every message is editable -- including the
-  // model's own replies and the tool results, which is how you ask "what would
-  // it have said if the tool had returned something else".
-  on(mount, "click", "[data-editrow]", (_e, t) => {
-    const i = +t.dataset.editrow;
+  // ------------------------------------------------------- the turn menu
+  //
+  // Every message can be edited, removed or regenerated: the useful thing to
+  // do with a held-out example is change one word of it and ask what survives,
+  // and that applies to the model's own replies and to a tool's result -- "what
+  // would it have said if the tool had returned something else" is a question
+  // you can only ask by rewriting the answer.
+  //
+  // Reached by right-click, or by holding a message down on a touch screen.
+  // The controls used to sit beside every turn, which put two buttons on each
+  // of twenty messages and made the conversation hard to read for the sake of
+  // something used occasionally.
+  let menu = null;
+
+  function closeMenu() {
+    menu?.remove();
+    menu = null;
+  }
+
+  /** Edit one turn in place, in a box where the words are. */
+  function editTurn(i) {
     const m = turns[i];
     if (!m) return;
-    const holder = $(`[data-index="${i}"]`, mount);
+    const holder = $(`.turn[data-index="${i}"]`, mount);
     const target = holder?.querySelector(".bubble-text")
       || holder?.querySelector(".tool-result pre")
       || holder?.querySelector(".tool-result summary")
       || holder?.querySelector(".bubble");
     if (!target || target.dataset.editing) return;
     const area = document.createElement("textarea");
-    area.className = "mono";
-    area.rows = Math.min(12, String(bodyOf(m) || m.content || "").split("\n").length + 1);
-    area.style.width = "100%";
+    area.className = "mono turn-edit";
+    area.rows = Math.min(14, String(bodyOf(m) || m.content || "").split("\n").length + 1);
     area.value = m.role === "tool" ? pretty(m.content) : bodyOf(m);
+    const bar = document.createElement("div");
+    bar.className = "row";
+    bar.style.marginTop = "6px";
     const save = document.createElement("button");
     save.className = "btn-sm btn-primary";
     save.textContent = "Save";
-    save.addEventListener("click", () => {
-      m.content = area.value;
-      paint();
+    const cancel = document.createElement("button");
+    cancel.className = "btn-sm";
+    cancel.textContent = "Cancel";
+    save.addEventListener("click", () => { m.content = area.value; paint(); });
+    cancel.addEventListener("click", () => paint());
+    // Escape gets you out of a box you opened by accident; the conversation is
+    // redrawn from `turns`, which the edit has not touched.
+    area.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); paint(); }
     });
+    bar.append(save, cancel);
     target.dataset.editing = "1";
     target.replaceWith(area);
-    area.after(save);
+    area.after(bar);
     area.focus();
-  });
-  on(mount, "click", "[data-delrow]", (_e, t) => {
-    turns.splice(+t.dataset.delrow, 1);
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
+
+  /** Ask again from this point, throwing away what came after it. */
+  function regenerate(i) {
+    if (requestId) return;
+    // Regenerating the model's turn replaces it. Regenerating a turn somebody
+    // else took means "answer this again", so that turn stays and everything
+    // after it goes.
+    turns = turns.slice(0, turns[i]?.role === "assistant" ? i : i + 1);
     paint();
+    if (turns.length) ask();
+  }
+
+  function openMenu(i, x, y) {
+    closeMenu();
+    const m = turns[i];
+    if (!m) return;
+    menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    menu.innerHTML = html`
+      <button data-act="edit">Edit</button>
+      <button data-act="regen" ${requestId ? "disabled" : ""}>${
+        m.role === "assistant" ? "Regenerate" : "Answer again"}</button>
+      <button data-act="remove" class="danger">Remove</button>`;
+    document.body.append(menu);
+    // Placed at the pointer, then pulled back inside the window -- a menu
+    // opened near the bottom edge otherwise opens where it cannot be read.
+    const box = menu.getBoundingClientRect();
+    menu.style.left = `${Math.min(x, window.innerWidth - box.width - 8)}px`;
+    menu.style.top = `${Math.min(y, window.innerHeight - box.height - 8)}px`;
+    menu.addEventListener("click", (e) => {
+      const act = e.target.closest("button")?.dataset.act;
+      closeMenu();
+      if (act === "edit") editTurn(i);
+      else if (act === "remove") { turns.splice(i, 1); paint(); }
+      else if (act === "regen") regenerate(i);
+    });
+    $("button", menu)?.focus();
+  }
+
+  const turnAt = (target) => {
+    const el = target?.closest?.(".turn[data-index]");
+    return el && log.contains(el) ? +el.dataset.index : null;
+  };
+
+  log.addEventListener("contextmenu", (e) => {
+    const i = turnAt(e.target);
+    if (i === null) return;
+    e.preventDefault();
+    openMenu(i, e.clientX, e.clientY);
   });
+
+  // Touch has no right-click, so the same menu is held open. Cancelled by any
+  // movement, because a hold that turns into a scroll was a scroll.
+  let held = null;
+  log.addEventListener("touchstart", (e) => {
+    const i = turnAt(e.target);
+    if (i === null || e.touches.length !== 1) return;
+    const spot = e.touches[0];
+    held = setTimeout(() => {
+      held = null;
+      openMenu(i, spot.clientX, spot.clientY);
+    }, 500);
+  }, { passive: true });
+  const dropHold = () => { clearTimeout(held); held = null; };
+  log.addEventListener("touchmove", dropHold, { passive: true });
+  log.addEventListener("touchend", dropHold);
+  log.addEventListener("touchcancel", dropHold);
+  // A menu that outlives what it was opened on is a menu pointing at nothing.
+  log.addEventListener("scroll", closeMenu, { passive: true });
+  const menuEscape = (e) => { if (e.key === "Escape") closeMenu(); };
+  document.addEventListener("click", closeMenu);
+  document.addEventListener("keydown", menuEscape);
 
   // Answering a call by hand, when the row recorded no result for it or you
   // want to see what a different result would do.
@@ -765,6 +879,9 @@ function chatView(mount, run, runs) {
         content: typeof msg.text === "string" ? msg.text : (live?.content || ""),
         reasoning: msg.reasoning || live?.reasoning || "",
         tool_calls: calls,
+        // Cut off rather than finished. Kept on the message so the note stays
+        // with the reply it describes when turns above it are edited away.
+        stopped_at_limit: msg.stop_reason === "length",
       };
       const empty = !reply.content && !calls.length && !reply.reasoning;
       requestId = null;
@@ -840,5 +957,13 @@ function chatView(mount, run, runs) {
   drawTrial();
   paint();
   box.focus();
-  return () => { unsub(); if (requestId) api.chatCancel(requestId).catch(() => {}); };
+  return () => {
+    unsub();
+    // The menu lives on <body>, so it outlives this view unless it is taken
+    // down with it -- along with the two listeners that dismiss it.
+    closeMenu();
+    document.removeEventListener("click", closeMenu);
+    document.removeEventListener("keydown", menuEscape);
+    if (requestId) api.chatCancel(requestId).catch(() => {});
+  };
 }
