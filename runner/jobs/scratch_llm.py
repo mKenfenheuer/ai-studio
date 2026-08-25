@@ -289,7 +289,13 @@ def _build_tokenizer(cfg: dict, ctx: Any):
         # Written onto the tokenizer so the finished model is self-describing:
         # the playground reads this back the same way it reads a model
         # downloaded from the Hub, and speaks the format it was taught.
-        tok.chat_template = spec["template"]
+        #
+        # The run's system prompt goes in as a default the template applies
+        # when a conversation arrives without one. A model trained under a
+        # system prompt behaves noticeably differently without it, and that
+        # prompt is the part of a run nobody writes down.
+        tok.chat_template = chat_formats.with_default_system(
+            spec["template"], cfg.get("system_prompt"))
     # Documents are encoded whole and then packed into blocks, so a document
     # longer than the context window is expected and correct. Without this the
     # tokenizer prints an alarming length warning for most of the corpus.

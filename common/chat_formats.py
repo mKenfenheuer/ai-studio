@@ -414,6 +414,78 @@ def special_tokens(format_id: str | None, reasoning: bool = False,
     return out
 
 
+# A default system prompt, injected by the saved template when a conversation
+# arrives without one. Written as Jinja rather than baked into the text so the
+# model stays usable both ways: give it a system message and yours is used,
+# give it none and it gets the one it was trained under.
+#
+# `{% set %}` inside `{% if %}` is deliberate and is safe here -- Jinja scopes
+# assignments inside `for`, not inside `if`. Tested, because a template that
+# quietly failed to apply the default would be indistinguishable from one that
+# had no default.
+# Built by substitution rather than %-formatting or .format(): the text is full
+# of Jinja's own `{%-` and `{{`, and both of those mechanisms read those as
+# their own syntax.
+_DEFAULT_SYSTEM = (
+    "{%- if not messages or messages[0]['role'] != 'system' -%}"
+    "{%- set messages = [{'role': 'system', 'content': __PROMPT__}] + messages -%}"
+    "{%- endif -%}"
+)
+
+
+def with_default_system(template: str, prompt: str | None) -> str:
+    """A template that supplies this system prompt when a caller gives none.
+
+    A fine-tune trained with a system prompt behaves noticeably differently
+    without it, and the prompt is the one part of its training nobody writes
+    down. Carrying it in the template means the model behaves as it was taught
+    by default, and still honours a system message when one is sent.
+    """
+    if not (prompt or "").strip():
+        return template
+    import json as _json
+    return _DEFAULT_SYSTEM.replace("__PROMPT__",
+                                   _json.dumps(prompt)) + template
+
+
+def template_for_model(fmt: dict | None, system_prompt: str | None = None
+                       ) -> tuple[str | None, str]:
+    """The chat template a finished model should carry, and why.
+
+    Returns (template, reason). A template of None means "leave whatever the
+    tokenizer already has", which is right in exactly one case: the run trained
+    with the base model's own template, so the base model's own template is the
+    correct thing for it to keep.
+
+    Everything else has to be written down. A run that trained in ChatML on a
+    Mistral base and then shipped Mistral's template is a model that answers in
+    a format it was never taught -- and nothing about the artifact says so.
+    """
+    fmt = dict(fmt or {})
+    if fmt.get("use_model_template"):
+        return None, "the base model's own template, which is what it trained with"
+
+    if name := fmt.get("chat_format"):
+        if spec := chat_format(name):
+            return (with_default_system(spec["template"], system_prompt),
+                    "the %s format this run trained with" % spec["label"])
+
+    template = fmt.get("chat_template")
+    if not template and fmt.get("mode") == "jinja":
+        template = fmt.get("template")
+    if template and "messages" in template:
+        return (with_default_system(template, system_prompt),
+                "the template this run trained with")
+
+    # A Jinja template written against the dataset's own columns. It renders a
+    # finished row, has no notion of a conversation to continue, and cannot be
+    # a chat template -- see the same problem in runner/inference.
+    if template:
+        return None, ("a template written against the dataset's columns, which "
+                      "cannot be used as a chat template")
+    return None, "no chat format was chosen for this run"
+
+
 def public_formats() -> list[dict]:
     """What the UI needs in order to describe the choice, without the Jinja."""
     return [{

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common import conversation
+from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
 from runner import artifacts, checkpoints, earlystop
@@ -151,6 +151,43 @@ def _pick_target_modules(model, moe: dict | None = None,
 # 16 GB card sit around 0.35 with 4-bit weights. Anything above 0.82 has never
 # been a run that finished.
 _WEIGHTS_CEILING = 0.82
+
+
+def _stamp_chat_template(tok, fmt: dict, cfg: dict, ctx: Any) -> dict:
+    """Write the format this run trained with onto the tokenizer, before saving.
+
+    Without this a fine-tune ships whatever template its base model had. That
+    is not a cosmetic mismatch: a run trained in ChatML on a Mistral base was
+    saving Mistral's own 4,000-character template, so anyone who downloaded the
+    model -- or served it with vLLM, or opened it in any tool that reads
+    `chat_template` -- prompted it in a format it had never been taught, and
+    nothing in the artifact said so. Only this studio's own playground got it
+    right, because only the playground had the run's config to read.
+
+    The template is written to the tokenizer, so it lands in
+    `tokenizer_config.json` (and `chat_template.jinja`) inside the saved model
+    and travels with it everywhere.
+
+    The system prompt goes in too, as a default the template applies when a
+    conversation arrives without one. A fine-tune trained under a system prompt
+    behaves noticeably differently without it, and that prompt is the part of a
+    run nobody writes down.
+    """
+    template, why = chat_formats.template_for_model(fmt, cfg.get("system_prompt"))
+    if not template:
+        ctx.log("Saving with %s." % why)
+        return {"chat_template": why, "chat_template_written": False}
+
+    tok.chat_template = template
+    said = "Writing %s into the model, so it carries the format it was trained "
+    said += "in wherever it goes."
+    ctx.log(said % why)
+    if (cfg.get("system_prompt") or "").strip():
+        ctx.log("Its system prompt is written in as a default: send your own "
+                "and yours is used, send none and it gets the one it was "
+                "trained under.")
+    return {"chat_template": why, "chat_template_written": True,
+            "default_system_prompt": bool((cfg.get("system_prompt") or "").strip())}
 
 
 def _check_room_to_train(model, device: str, use_4bit: bool, ctx: Any) -> None:
@@ -859,11 +896,13 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.log("Saving the adapter as it stands." if stopped_early
             else "Saving adapter to %s" % out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    stamped = _stamp_chat_template(tok, fmt, cfg, ctx)
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
 
     summary = {
         "kind": "finetune_llm",
+        **stamped,
         "final_loss": round(running[-1], 5) if running else None,
         "initial_loss": round(first_loss, 5) if first_loss is not None else None,
         # The number that answers "is this one better than last week's". A
