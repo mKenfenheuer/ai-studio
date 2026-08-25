@@ -422,6 +422,10 @@ def estimate_memory(params_b: float | None) -> dict | None:
         "int8_gb": round(params_b * 1 * 1.35, 1),
         "int4_gb": round(params_b * 0.5 * 1.35, 1),
         "inference_fp16_gb": round(params_b * 2 * 1.1, 1),
+        # Serving the same model compressed. Only the weights shrink -- the
+        # key/value cache a conversation grows does not -- so this is the
+        # weights at half a byte each with the same overhead allowance.
+        "inference_int4_gb": round(params_b * 0.5 * 1.1, 1),
     }
 
 

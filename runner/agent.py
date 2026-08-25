@@ -335,11 +335,15 @@ class Runner:
                              "reason": "runner already busy",
                              "current_job": self.current.job_id})
             return
-        if self.host and not self.generating and self.host.loaded_id:
+        if self.host and not self.generating:
             # A model kept resident for the playground is holding VRAM the run
             # about to start has been sized to use. Letting both sit on the
             # card is how a plan that fitted becomes an out-of-memory crash
             # two minutes in.
+            #
+            # Done whether or not one is resident: with nothing loaded this
+            # still collects and returns what an earlier run left behind, and
+            # the run about to start was sized against an empty card.
             self.host.unload()
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders
@@ -395,7 +399,7 @@ class Runner:
             self.outbox.put({"type": "generate_done", "request_id": rid, **result})
         except Exception as e:  # noqa: BLE001
             self.outbox.put({"type": "generate_error", "request_id": rid,
-                             "error": _friendly_error(e)})
+                             "error": _friendly_error(e, "serve")})
         finally:
             self.generating = False
 
@@ -496,6 +500,13 @@ class Runner:
         finally:
             self.current = None
             shutil.rmtree(workdir, ignore_errors=True)
+            # Give the card back before anything else asks for it. A finished
+            # run's model is unreachable but not yet collected, and until it is
+            # the allocator holds every block it was using -- which is how the
+            # playground came to run out of memory on a machine that was doing
+            # nothing at all.
+            if self.host:
+                self.host.unload()
 
     def _upload(self, job_id: str, path: str) -> None:
         url = "%s/api/jobs/%s/artifact" % (self.controller_url, job_id)
@@ -509,7 +520,19 @@ def _friendly_error(e: Exception, kind: str | None = None) -> str:
     """Translate the errors beginners actually hit into plain language."""
     text = str(e)
     low = text.lower()
+    # Something closer to the failure has already said this better than the
+    # rules below can -- it knows what was tried. See inference.OutOfRoom.
+    if getattr(e, "already_explained", False):
+        return text
     if "out of memory" in low or "hip out of memory" in low:
+        if kind == "serve":
+            # Nothing this person can change is on the training screen. What
+            # they *can* do is ask for less at once.
+            return ("The GPU ran out of memory while the model was answering. "
+                    "The conversation's history is held on the card as it "
+                    "runs, so a long exchange costs more than a short one: "
+                    "start a new conversation, or lower the length limit in "
+                    "the generation settings.")
         if kind == "pretrain_llm":
             return ("The GPU ran out of memory. Training every parameter needs "
                     "far more memory than fine-tuning does. Choose a smaller "

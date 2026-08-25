@@ -23,6 +23,8 @@ Three things make it more than a wrapper around `generate()`:
 """
 from __future__ import annotations
 
+import contextlib
+import gc
 import threading
 import time
 from pathlib import Path
@@ -39,6 +41,41 @@ CACHE_DIR = artifacts.CACHE_DIR
 # would block the next run for no reason.
 IDLE_UNLOAD_S = 15 * 60
 
+# What to keep free beyond the weights themselves. The conversation grows a
+# key/value cache as it runs, attention needs working room -- more of it on a
+# card with no flash kernels, where that room grows with the square of the
+# sequence -- and the allocator never hands back a perfectly packed heap. A
+# model sized to the last byte of free memory loads and then dies on the first
+# long reply, which is the worst moment to find out.
+HEADROOM_GB = 1.5
+
+
+class OutOfRoom(RuntimeError):
+    """An out-of-memory that has already been explained in plain language.
+
+    The agent rewrites raw GPU errors into advice, and its advice for an
+    out-of-memory is about training -- batch sizes and sequence lengths, none of
+    which a person in the playground can change. This says "leave my wording
+    alone", so the explanation that knows whether 4-bit was already tried is the
+    one that reaches the screen.
+    """
+    already_explained = True
+
+
+def _is_oom(e: BaseException) -> bool:
+    """Whether this failure was the card running out of room.
+
+    Matched on the message as well as the type, because the same condition
+    arrives under several names: `torch.cuda.OutOfMemoryError` on CUDA, a plain
+    `RuntimeError` carrying "HIP out of memory" on ROCm, and occasionally a
+    bitsandbytes allocation failure that is neither.
+    """
+    with contextlib.suppress(Exception):
+        import torch
+        if isinstance(e, torch.cuda.OutOfMemoryError):
+            return True
+    return "out of memory" in str(e).lower()
+
 
 class ModelHost:
     """Keeps at most one model resident and generates from it."""
@@ -54,6 +91,7 @@ class ModelHost:
         self.chat_template: str | None = None
         self.specials: dict = {}
         self.last_used = 0.0
+        self.quantized = False
         self._cancel = threading.Event()
 
     # ------------------------------------------------------------ device
@@ -82,14 +120,54 @@ class ModelHost:
             self._unload_locked()
 
     def _unload_locked(self) -> None:
-        if self.model is None:
-            return
-        import torch
         self.model = None
         self.tok = None
         self.loaded_id = None
-        if self.device == "cuda":
+        self.quantized = False
+        self._reclaim()
+
+    def _reclaim(self) -> None:
+        """Hand the card back everything this process has finished with.
+
+        Dropping the reference is not enough, and this is where the playground
+        was running out of memory on a card with nothing loaded on it. A
+        transformers model is a graph of objects that refer back to each other,
+        so releasing the last name for it leaves a cycle that only the garbage
+        collector can break; until it runs, every tensor is still live and the
+        allocator is holding every block. `empty_cache` then frees precisely
+        nothing, because nothing is free yet.
+
+        The training that ran an hour ago is the usual culprit -- it finished,
+        its thread ended, and its model sat in an uncollected cycle holding
+        most of the card while the playground tried to load onto what was
+        left. So collect first, THEN return the blocks.
+        """
+        gc.collect()
+        if self.device != "cuda":
+            return
+        import torch
+        with contextlib.suppress(Exception):
             torch.cuda.empty_cache()
+        # Blocks another process borrowed and has since dropped. Not available
+        # on every build, and never worth an exception.
+        with contextlib.suppress(Exception):
+            torch.cuda.ipc_collect()
+
+    def _free_gb(self) -> float | None:
+        """What is actually free on the card right now, not what it has.
+
+        `vram_gb` from the capability probe is the card's size, which is the
+        wrong number to plan a load against: the question is how much is free
+        *now*, after whatever else this machine has been doing.
+        """
+        if self.device != "cuda":
+            return None
+        import torch
+        try:
+            free, _total = torch.cuda.mem_get_info()
+        except Exception:  # noqa: BLE001 - not every backend reports this
+            return None
+        return free / 1024 ** 3
 
     def maybe_unload_idle(self) -> bool:
         if self.model is None or not self.last_used:
@@ -122,16 +200,93 @@ class ModelHost:
             pass
         return {"experts_implementation": kernel}
 
-    def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+    # ------------------------------------------------------------ fitting
+    def _can_quantize(self) -> bool:
+        """Whether 4-bit is actually usable here, as measured, not as claimed.
 
+        The capability probe loads a bitsandbytes layer and runs it, because on
+        some ROCm builds the import succeeds and the kernel does not exist.
+        """
+        return self.device == "cuda" \
+            and bool((self.caps.get("quantization") or {}).get("4bit"))
+
+    def _plan_precision(self, spec: dict, log: Callable[[str], None]) -> bool:
+        """Whether to compress this model on the way in.
+
+        Decided against what is free *now* rather than against the card's size,
+        and decided before the load rather than after it fails: loading fourteen
+        gigabytes only to discover that eleven were free wastes minutes, and the
+        answer was knowable at the start.
+
+        The weights are the part quantization moves -- 4-bit stores each at half
+        a byte against float16's two. Everything else on the card is unchanged,
+        so headroom is added rather than scaled.
+        """
+        params_b = spec.get("params_b")
+        free = self._free_gb()
+        if not params_b or free is None:
+            return False
+        if params_b * 2 + HEADROOM_GB <= free:
+            return False
+        if not self._can_quantize():
+            # Nothing to be done about it here, but say so before the load
+            # fails, so the error that follows is not a surprise.
+            log("This model needs about %.1f GB and %.1f GB is free. This "
+                "machine has no working 4-bit support to shrink it with, so it "
+                "is being loaded as it is." % (params_b * 2 + HEADROOM_GB, free))
+            return False
+        log("This model wants about %.1f GB and only %.1f GB is free, so it is "
+            "being loaded in 4-bit (about %.1f GB) rather than not at all. "
+            "Answers are slightly worse than at full precision; nothing else "
+            "about the model changes."
+            % (params_b * 2 + HEADROOM_GB, free, params_b * 0.5 + HEADROOM_GB))
+        return True
+
+    def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
         job_id = spec["job_id"]
         if self.loaded_id == job_id and self.model is not None:
             return
 
+        # Whatever was resident is not what is wanted, and it is sitting on the
+        # memory the next model needs. This runs even when nothing is loaded:
+        # the card may still be holding a finished training run's weights in a
+        # cycle nobody has collected. See _reclaim.
         self._unload_locked()
         path = self._fetch(job_id, log)
+
+        quantize = self._plan_precision(spec, log)
+        try:
+            self._load(spec, path, quantize, log)
+        except Exception as e:  # noqa: BLE001 - re-raised below unless it fits
+            if not _is_oom(e):
+                raise
+            # The estimate was optimistic, or something else took the card
+            # between planning and loading. Compressing is the one thing left
+            # to try, and it is much better than telling somebody their model
+            # cannot be talked to.
+            self._unload_locked()
+            if quantize or not self._can_quantize():
+                raise OutOfRoom(
+                    "The GPU ran out of memory loading this model%s. The card "
+                    "was cleared first, so nothing else is holding it -- the "
+                    "model is simply too large for this machine. Serve it "
+                    "somewhere with more memory%s."
+                    % (" even compressed to 4-bit" if quantize else "",
+                       "" if quantize else ", or on a runner with working "
+                                           "4-bit support")) from e
+            log("That did not fit. Trying again in 4-bit…")
+            self._load(spec, path, True, log)
+
+        self.loaded_id = job_id
+        self.last_used = time.time()
+        log("Ready.")
+
+    def _load(self, spec: dict, path: Path, quantize: bool,
+              log: Callable[[str], None]) -> None:
+        """Put one model on the card, at the precision asked for."""
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         dtype_name = self.caps.get("recommended_dtype", "float32")
         dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(
             dtype_name, torch.float32)
@@ -145,12 +300,26 @@ class ModelHost:
         # "grouped gemm is not supported on ROCM". Anywhere a model is
         # constructed needs this, not just the trainer.
         extra = self._expert_kwargs()
+        # The same settings the trainer quantizes a frozen base with, so a
+        # model served compressed behaves the way it did while it was learning.
+        if quantize:
+            from transformers import BitsAndBytesConfig
+            extra["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            # bitsandbytes places the weights as it quantizes them; a model
+            # built this way must not be moved afterwards.
+            extra["device_map"] = {"": 0}
+        else:
+            extra["dtype"] = dtype
 
         if spec.get("kind") == "pretrain_llm":
             log("Loading your model…")
             self.tok = AutoTokenizer.from_pretrained(str(path))
-            self.model = AutoModelForCausalLM.from_pretrained(str(path),
-                                                              dtype=dtype, **extra)
+            self.model = AutoModelForCausalLM.from_pretrained(str(path), **extra)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):
@@ -173,7 +342,7 @@ class ModelHost:
                 if (path / "tokenizer_config.json").exists() \
                 else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
             self.model = AutoModelForCausalLM.from_pretrained(
-                base, dtype=dtype, token=spec.get("hf_token"), **extra)
+                base, token=spec.get("hf_token"), **extra)
             self.model = PeftModel.from_pretrained(self.model, str(path))
 
         if self.tok.pad_token is None:
@@ -191,11 +360,11 @@ class ModelHost:
             ("pad_token", self.tok.pad_token), ("unk_token", self.tok.unk_token))
             if v}
 
-        self.model = self.model.to(self.device).eval()
+        self.quantized = quantize
+        if not quantize:
+            self.model = self.model.to(self.device)
+        self.model = self.model.eval()
         self.model.config.use_cache = True
-        self.loaded_id = job_id
-        self.last_used = time.time()
-        log("Ready.")
 
     # --------------------------------------------------------- generating
     def render(self, spec: dict, messages: list, reasoning: bool = False,

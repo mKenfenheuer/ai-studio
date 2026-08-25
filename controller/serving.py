@@ -83,6 +83,12 @@ def chat_spec(job: dict) -> dict:
         # `from_pretrained`, which fails with a confusing "not found on the
         # Hub" for a model that never was on the Hub.
         "base_model_job": cfg.get("base_model_job"),
+        # How large the model is, so the runner can decide what precision it
+        # will fit in *before* spending minutes loading it at one that will
+        # not. Measured by the runner that trained it where there is one, read
+        # off the model's name where there is not.
+        "params_b": cfg.get("params_b") or hub.params_from_name(
+            cfg.get("base_model") or ""),
         "format": fmt,
         "style": hub.formatting.conversation_style(fmt),
         "system_prompt": cfg.get("system_prompt") or "",

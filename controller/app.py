@@ -1728,7 +1728,14 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
             # the bar is far lower than training's.
             mem = hub.estimate_memory(params_b) or {}
             if (mem.get("inference_fp16_gb") or 0) > caps["vram_gb"]:
-                return False
+                # Too big at full precision is not the end of it: the runner
+                # loads a model that will not fit in 4-bit instead. Refusing
+                # here on the 16-bit figure alone turned "slightly worse
+                # answers" into "you cannot talk to this model at all".
+                if not caps.get("quantization", {}).get("4bit"):
+                    return False
+                if (mem.get("inference_int4_gb") or 0) > caps["vram_gb"]:
+                    return False
         return True
 
     trained_on = job.get("runner_id")
