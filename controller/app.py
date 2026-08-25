@@ -1211,23 +1211,29 @@ def _backfill_job_sizes() -> int:
         counted = summary.get("total_params") or summary.get("params_total")
         measured = round(int(counted) / 1e9, 3) if counted else None
         named = hub.params_from_name(cfg.get("base_model") or "")
+
         # A measurement can be wrong, and one particular way of being wrong is
         # recoverable here. A run trained in 4-bit counted its packed weights,
-        # which hold two parameters per element, and so reported half the model:
-        # a Mistral-7B came back as 3.8B. A fine-tune contains its base and
-        # cannot be smaller than it, so a count well under what the base model's
-        # own name says is not a measurement, it is an artefact of how the
-        # weights were stored. The runner counts correctly now; this is for the
-        # runs recorded before it did.
-        if measured and named and measured < named * 0.9:
+        # which hold two parameters per element, and so reported half the
+        # model: a Mistral-7B came back as 3.8B. A fine-tune contains its base
+        # and cannot be smaller than it, so a size well under what the base
+        # model's own name implies was never a measurement of the model -- it
+        # is an artefact of how the weights were stored.
+        def artefact(size) -> bool:
+            return bool(size and named and size < named * 0.9)
+
+        if artefact(measured):
             measured = None
         size = measured or named
         if not size or cfg.get("params_b") == size:
             continue
         # A counted size always wins; a guessed one only fills a blank, so a
         # number somebody set deliberately is never quietly overwritten by an
-        # inference from a filename.
-        if cfg.get("params_b") and not measured:
+        # inference from a filename. A stored size that is itself the packing
+        # artefact is not such a number -- nobody chose it, and leaving it
+        # there is what lets a 7B go on claiming to be a 3.8B.
+        if cfg.get("params_b") and not measured \
+                and not artefact(cfg.get("params_b")):
             continue
         cfg = dict(cfg)
         cfg["params_b"] = size
