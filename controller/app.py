@@ -399,6 +399,15 @@ async def _create_job(request: Request, payload: dict) -> str:
         # so the format travels with it or the playground would guess again.
         cfg.setdefault("format", src["config"].get("format"))
         cfg.setdefault("system_prompt", src["config"].get("system_prompt"))
+        # How big it is and how it was compressed. These are what made the
+        # original run fit on the card, and continuing it without them is
+        # asking for the same model in a precision that does not fit: a 7B
+        # needs 19.6 GB in 16-bit and 4.9 GB in 4-bit, and the machine that
+        # trained the first run has 16. Losing `params_b` was the worse half --
+        # every memory guard is written as "refuse if it does not fit", which
+        # passes silently when the size is unknown.
+        cfg.setdefault("params_b", src["config"].get("params_b"))
+        cfg.setdefault("quantization", src["config"].get("quantization"))
     elif kind == "generate_dataset":
         model = cfg.get("model") or {}
         if not model.get("job_id") and not model.get("base_model") \
@@ -429,6 +438,14 @@ async def _create_job(request: Request, payload: dict) -> str:
             _check_generation_source(request, cfg)
     else:
         raise HTTPException(400, "Unknown kind of training run: %s" % kind)
+
+    # A size for the fit check to work with. Read off the model's name, which
+    # needs no network call and is right for essentially every model on the
+    # Hub -- "Mistral-7B-Instruct-v0.3" is not ambiguous. Without it the checks
+    # below have nothing to compare against and wave the job through.
+    if kind in ("finetune_llm", "merge_adapter") and not cfg.get("params_b"):
+        if guessed := hub.params_from_name(cfg.get("base_model") or ""):
+            cfg["params_b"] = guessed
 
     # Reject work that provably cannot run, at creation time. The scheduler
     # would otherwise skip it silently and the job would sit "queued" forever

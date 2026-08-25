@@ -141,6 +141,64 @@ def _pick_target_modules(model, moe: dict | None = None,
     return sorted(names - _ROUTER_NAMES)[:6]
 
 
+# How much of the card the weights alone may occupy before training is
+# hopeless. Training needs room on top of the weights for activations,
+# gradients and optimiser state; past this there is not enough left and the
+# allocator spends its time evicting rather than computing.
+#
+# 0.82 rather than something tighter because LoRA's own extra is small and
+# gradient checkpointing keeps activations modest -- the successful runs on a
+# 16 GB card sit around 0.35 with 4-bit weights. Anything above 0.82 has never
+# been a run that finished.
+_WEIGHTS_CEILING = 0.82
+
+
+def _check_room_to_train(model, device: str, use_4bit: bool, ctx: Any) -> None:
+    """Refuse a run that cannot fit, while refusing is still cheap.
+
+    A model too large for the card does not reliably raise out-of-memory. It
+    loads, training starts, and then every backward pass fights the allocator
+    for room that is not there -- on ROCm it spills over PCIe and the GPU sits
+    at 99% "busy" doing almost no useful memory traffic. What that looks like
+    from outside is a run that has been going for thirteen hours and completed
+    no steps, which is exactly what it was: a 7B in 16-bit needs about 19.6 GB
+    and the card has 16.
+
+    The controller checks this too, from the model's name, and that check is
+    the one that stops the job being dispatched at all. This one exists because
+    that check can only work when the size is known, and here the weights are
+    already on the card and there is nothing left to guess.
+    """
+    import torch
+    if device != "cuda":
+        return
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception:  # noqa: BLE001 - a backend that cannot say is not a failure
+        return
+    if not total:
+        return
+    used = total - free
+    share = used / total
+    gb = 1024 ** 3
+    ctx.log("The weights take %.1f GB of this card's %.1f GB, leaving %.1f GB "
+            "for the training itself." % (used / gb, total / gb, free / gb))
+    if share <= _WEIGHTS_CEILING:
+        return
+
+    advice = ("Switch this run to 4-bit, which is what the same model needs to "
+              "fit here." if not use_4bit else
+              "It is already in 4-bit, so the remaining levers are a shorter "
+              "sequence length, a smaller batch, or a smaller model.")
+    raise ValueError(
+        "This model does not leave enough room on this card to train. Its "
+        "weights alone occupy %.1f GB of %.1f GB (%.0f%%), and training needs "
+        "room on top of that for activations, gradients and the optimiser. %s "
+        "Stopping now rather than starting a run that would spend hours "
+        "fighting the allocator without completing a single step."
+        % (used / gb, total / gb, share * 100, advice))
+
+
 def run(cfg: dict, ctx: Any) -> dict:
     """Execute a fine-tune. `ctx` supplies log/metric/progress/cancel hooks."""
     import torch
@@ -324,6 +382,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                    "target_modules": targets, "dtype": dtype_name,
                    "quantized": use_4bit, "max_seq_len": max_seq,
                    "moe": moe, "adapt_experts": adapt_experts if moe else None})
+    _check_room_to_train(model, device, use_4bit, ctx)
 
     # ---- dataset -------------------------------------------------------
     ctx.progress(0, 0, stage="loading_dataset")

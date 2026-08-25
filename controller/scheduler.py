@@ -105,11 +105,32 @@ class Fleet:
         if job["kind"] == "pretrain_llm":
             return self._can_pretrain(job, caps)
 
-        params_b = job["config"].get("params_b")
+        # A size the job did not carry is worked out from the model's name
+        # rather than shrugged at. This check reads "refuse if it does not
+        # fit", so an unknown size is not a neutral state -- it disables the
+        # check entirely, and a continued run had lost `params_b` on the way.
+        params_b = job["config"].get("params_b") \
+            or hub.params_from_name(job["config"].get("base_model") or "")
         if params_b and caps.get("vram_gb"):
             fit = hub.fit_report(params_b, caps)
             if fit["verdict"] in ("too_big", "needs_quantization"):
                 return False, fit["message"]
+            # `fits_quantized` means "only in 4-bit". Treating it as a pass
+            # regardless of what the run actually asked for was the whole bug:
+            # a 7B needs 19.6 GB in 16-bit and 4.9 GB in 4-bit, and a run
+            # configured for 16-bit was dispatched to a 16 GB card because the
+            # verdict said the model *could* fit -- in a precision nobody had
+            # selected. It did not crash. It sat in one backward pass for
+            # thirteen hours with the allocator at 99%.
+            if fit["verdict"] == "fits_quantized" \
+                    and job["config"].get("quantization") != "4bit":
+                mem = hub.estimate_memory(params_b) or {}
+                return False, (
+                    "This model needs about %.1f GB in 16-bit and this machine "
+                    "has %.1f GB. It fits in 4-bit, at about %.1f GB — switch "
+                    "this run to 4-bit and it will run here."
+                    % (mem.get("fp16_gb") or 0, caps["vram_gb"],
+                       mem.get("int4_gb") or 0))
         return True, ""
 
     @staticmethod

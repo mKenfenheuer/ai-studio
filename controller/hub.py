@@ -324,6 +324,17 @@ def is_moe_model(model_id: str, config: dict | None = None,
     return "moe" in low_id.split("/")[-1] or "mixtral" in low_id
 
 
+def params_from_name(model_id: str) -> float | None:
+    """How large this model is, read off its name. No network call.
+
+    Public because the scheduler and job creation both need a size for a model
+    nobody looked up interactively -- and a size that is merely *unknown* is
+    the dangerous case: every guard here is written as "refuse if it does not
+    fit", which does nothing at all when the fit cannot be computed.
+    """
+    return _params_from_name(model_id or "")
+
+
 def _params_from_name(model_id: str) -> float | None:
     """Model IDs almost always encode their size ('Qwen2.5-3B-Instruct').
     A cheap heuristic that avoids an extra API round-trip per search result."""
