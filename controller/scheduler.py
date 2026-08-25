@@ -526,6 +526,21 @@ class Fleet:
 
         elif kind == "job_meta":
             meta = msg.get("meta", {})
+            # The size, as counted rather than guessed. The runner has the
+            # model in hand and knows exactly how many parameters it has;
+            # everything else in this app infers it from the model's name,
+            # which works until it does not. Recorded on the run so that a
+            # later run continuing from it inherits a measured number -- the
+            # missing size is what let a 7B be planned in 16-bit for a 16 GB
+            # card.
+            if (counted := meta.get("total_params")) and int(counted) > 0:
+                job = db.get_job(jid)
+                measured = round(int(counted) / 1e9, 3)
+                if job and job["config"].get("params_b") != measured:
+                    cfg = dict(job["config"])
+                    cfg["params_b"] = measured
+                    db.update_job_config(jid, cfg)
+
             if resolved := meta.get("resolved_format"):
                 # The trainer worked out a shape the plan left as "auto". The
                 # job's own record is updated so that everything downstream --

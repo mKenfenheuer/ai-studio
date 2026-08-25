@@ -2178,6 +2178,10 @@ function stepReview(body, ctx) {
     ensure(state.ftPlan, key, () => api.plan({
       runner_id: state.runnerId,
       params_b: state.modelDetail.data?.params_b ?? null,
+      // The name too. Continuing an earlier run never looks the model up, so
+      // its size is not in hand -- and without a size the plan cannot tell
+      // whether 16-bit fits and quietly assumes it does.
+      base_model: state.model || state.sourceRun?.base_model || null,
       goal: state.goal,
       dataset_rows: 2000,
     }), draw);
@@ -2194,6 +2198,48 @@ function stepReview(body, ctx) {
     wireOverrides(body, ctx);
     refreshPlan(ctx, "#reviewIssues", (_s, plan) => issueList(plan.issues));
   }
+}
+
+/** How the frozen base model is held in memory.
+ *
+ *  The single setting that decides whether a model fits on a card at all: a 7B
+ *  is about 19 GB in 16-bit and 5 GB in 4-bit. The plan picks it, and until
+ *  now that pick was invisible and unchangeable -- so a run refused at
+ *  dispatch with "switch this run to 4-bit" offered no way to do that.
+ *
+ *  Only the base is quantised. The adapter being trained stays in full
+ *  precision either way, which is why the quality cost is small and why this
+ *  is not the same choice as `dtype` above.
+ */
+function quantField(s, plan, caps) {
+  const has4bit = !!((caps.quantization || {})["4bit"]);
+  const mem = plan.memory || {};
+  const fits16 = plan.fit?.verdict === "fits";
+  const only4 = plan.fit?.verdict === "fits_quantized";
+  return html`
+    <div class="field">
+      <label for="f_quantization">Base model precision</label>
+      <select id="f_quantization" data-setting="quantization">
+        <option value="none"${s.quantization !== "4bit" ? " selected" : ""}
+          ${only4 ? " disabled" : ""}>16-bit — full quality${
+            mem.fp16_gb ? ` · about ${mem.fp16_gb} GB` : ""}${
+            only4 ? " · too large for this machine" : ""}</option>
+        <option value="4bit"${s.quantization === "4bit" ? " selected" : ""}
+          ${has4bit ? "" : " disabled"}>4-bit — fits far more${
+            mem.int4_gb ? ` · about ${mem.int4_gb} GB` : ""}${
+            has4bit ? "" : " · not available on this machine"}</option>
+      </select>
+      <div class="hint">${raw(only4
+        ? "This model only fits on this card in 4-bit, so that is what the "
+          + "plan chose. Quality drops slightly; not running at all drops it "
+          + "further."
+        : fits16
+          ? "This model fits either way here. 16-bit is the better of the two "
+            + "unless you want the memory back for a longer sequence or a "
+            + "bigger batch."
+          : "Only the frozen base is compressed — the adapter you are training "
+            + "stays at full precision either way.")}</div>
+    </div>`;
 }
 
 function finetuneReview(state, runner, caps) {
@@ -2268,6 +2314,7 @@ function finetuneReview(state, runner, caps) {
             </select>
             <div class="hint">Recommended here: ${caps.recommended_dtype}</div>
           </div>
+          ${raw(quantField(s, plan, caps))}
           ${raw(state.modelDetail.data?.moe
             ? toggle("adapt_experts", "Also adapt the experts",
                 s.adapt_experts,

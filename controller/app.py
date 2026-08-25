@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI):
     if filled := _backfill_dataset_facts():
         print("[studio] worked out what %d existing dataset(s) contain "
               "(reasoning, tool calls, roles)." % filled, flush=True)
+    if sized := _backfill_job_sizes():
+        print("[studio] recorded how large the model is on %d existing run(s), "
+              "so the memory checks apply to them." % sized, flush=True)
     task = asyncio.create_task(fleet.scheduler_loop())
     sync = asyncio.create_task(_directory_loop())
     yield
@@ -1167,6 +1170,48 @@ def _describe_rows(stored: dict | None, columns: list, rows: list) -> dict:
         stored.setdefault(key, observed.get(key))
     return {k: v for k, v in stored.items() if v is not None}
 
+def _backfill_job_sizes() -> int:
+    """Record how large each finished model is, for runs that never said.
+
+    Every memory guard in this app reads "refuse if it does not fit", and an
+    unknown size does not fail safe -- it disables the check. A run created
+    before the size was recorded therefore has no protection, and neither does
+    anything continuing from it: that is exactly how a 7B came to be planned in
+    16-bit for a 16 GB card.
+
+    Two sources, best first. The runner counts the parameters of the model it
+    actually loaded and reports the number, so a finished run knows its size
+    exactly. Failing that the model's name is read, which is unambiguous for
+    essentially everything on the Hub and is at least a number.
+
+    Writes only where the answer is missing or wrong, so the second boot is a
+    no-op.
+    """
+    fixed = 0
+    for row in db.q("SELECT id FROM jobs WHERE kind IN "
+                    "('finetune_llm','merge_adapter')"):
+        job = db.get_job(row["id"])
+        if not job:
+            continue
+        cfg = job.get("config") or {}
+        summary = job.get("summary") or {}
+        counted = summary.get("total_params") or summary.get("params_total")
+        measured = round(int(counted) / 1e9, 3) if counted else None
+        size = measured or hub.params_from_name(cfg.get("base_model") or "")
+        if not size or cfg.get("params_b") == size:
+            continue
+        # A counted size always wins; a guessed one only fills a blank, so a
+        # number somebody set deliberately is never quietly overwritten by an
+        # inference from a filename.
+        if cfg.get("params_b") and not measured:
+            continue
+        cfg = dict(cfg)
+        cfg["params_b"] = size
+        db.update_job_config(job["id"], cfg)
+        fixed += 1
+    return fixed
+
+
 def _backfill_dataset_facts() -> int:
     """Fill in what existing datasets never recorded about their own contents.
 
@@ -1265,12 +1310,23 @@ async def plan(payload: dict = Body(...)) -> dict:
     """
     runner = db.get_runner(payload.get("runner_id", "")) if payload.get("runner_id") else None
     caps = (runner or {}).get("capabilities", {})
-    params_b = payload.get("params_b")
+    # The size, worked out from the model's name when the caller does not have
+    # it. Without it there is no fit report, so the plan quietly chooses
+    # 16-bit -- which is how a 7B was planned for a 16 GB card that can only
+    # hold it in 4-bit, and then refused at dispatch with advice the screen
+    # offered no way to follow.
+    params_b = payload.get("params_b") \
+        or hub.params_from_name(payload.get("base_model") or "")
     goal = payload.get("goal", "instructions")
     rows = int(payload.get("dataset_rows") or 1000)
 
     fit = hub.fit_report(params_b, caps) if params_b else None
     quant = "4bit" if (fit and fit["verdict"] == "fits_quantized") else "none"
+    # Nothing is gained by 16-bit that this machine cannot hold. If 4-bit is
+    # the only precision that fits, that is the plan rather than a suggestion
+    # printed next to a plan that does not work.
+    if fit and fit.get("verdict") == "fits_quantized":
+        quant = "4bit"
     dtype = caps.get("recommended_dtype", "float32")
     seq = min(1024, caps.get("max_recommended_seq_len", 1024))
 
@@ -1282,6 +1338,7 @@ async def plan(payload: dict = Body(...)) -> dict:
 
     lora_r = 32 if goal in ("style", "domain") else 16
     return {
+        "params_b": params_b,
         "settings": {
             "dtype": dtype, "quantization": quant, "max_seq_len": seq,
             "batch_size": batch, "grad_accum": accum, "epochs": epochs,
@@ -1295,6 +1352,9 @@ async def plan(payload: dict = Body(...)) -> dict:
             "early_stop_patience": 4,
         },
         "fit": fit,
+        # What each precision would actually cost, so the choice between them
+        # can be shown as two numbers rather than as two words.
+        "memory": hub.estimate_memory(params_b) if params_b else None,
         "explanations": _explain(dtype, quant, batch, accum, epochs, caps),
         "estimated_minutes": _estimate_minutes(min(steps, 2000), params_b, caps),
     }
