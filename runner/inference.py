@@ -746,8 +746,14 @@ class ModelHost:
             reply = conversation.parse_reply(emitted, fmt,
                                              reasoning_on=want_reasoning)
             return {
-                "text": reply["content"] or (emitted if not reply["tool_calls"]
-                                             else ""),
+                # The fallback is for a reply nothing could be made of: hand
+                # back the raw text rather than nothing. It must NOT fire when
+                # the working was recognised, which is what happens to every
+                # reply cut off mid-thought -- there is no answer yet, and
+                # returning the raw text put the reasoning on screen twice,
+                # once in its panel and once with its tags showing.
+                "text": reply["content"] or (
+                    "" if reply["tool_calls"] or reply["reasoning"] else emitted),
                 "reasoning": reply["reasoning"],
                 # Calls the model actually made, as structure rather than as
                 # syntax. This is what lets the playground show "it called
