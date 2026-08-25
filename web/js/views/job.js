@@ -286,13 +286,27 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   });
 
   on(mount, "click", "[data-stop]", async (_e, t) => {
-    const save = t.dataset.stop === "keep";
+    const how = t.dataset.stop;
+    const save = how === "keep";
+    if (how === "force" && !confirm(
+      "Force stop this run?
+
+"
+      + "The machine will be told to end it and will restart itself if the "
+      + "run will not let go. Nothing is kept, and anything else that machine "
+      + "is doing stops too.
+
+"
+      + "Use this when an ordinary stop has already been tried and the run is "
+      + "not responding.")) return;
     $("#stopPanel", mount).innerHTML = "";
     try {
-      await api.cancelJob(jobId, save);
-      toast(getJob().kind === "generate_dataset"
-        ? "Stopping, and keeping the rows written so far…"
-        : save ? "Stopping, and keeping the model…" : "Stopping…");
+      await api.cancelJob(jobId, save, how === "force");
+      toast(how === "force" ? "Force-stopping. The machine may restart."
+        : getJob().kind === "generate_dataset"
+          ? "Stopping, and keeping the rows written so far…"
+          : save ? "Stopping, and keeping the model…" : "Stopping…",
+        how === "force" ? "err" : "");
     } catch (e) { toast(e.message, "err"); }
   });
 
@@ -840,6 +854,55 @@ function publishCard(job) {
     </div>`;
 }
 
+/** The last resort, offered only where the ordinary stop has visibly failed.
+ *
+ *  Stopping is cooperative: the trainer checks between steps, which is what
+ *  lets a stop keep the model built so far. It only works while steps finish.
+ *  A run wedged inside one -- a model too large for the card, thrashing the
+ *  allocator -- never reaches the check, and the button does nothing however
+ *  many times it is pressed.
+ *
+ *  Not shown by default, because it is worse in every case where the ordinary
+ *  stop works: it keeps nothing, and it takes the machine down with it. It
+ *  appears once a stop has already been asked for and the run carried on
+ *  regardless, which is exactly the situation it is for.
+ */
+function forceOption(job, latest) {
+  const asked = job.status === "running" && (job.error || "").length === 0
+    && (job.cancel_requested || wasAskedToStop(job));
+  if (!asked) {
+    return html`
+      <details class="adv" style="margin-top:10px">
+        <summary>It is not stopping</summary>
+        <p class="muted tiny" style="margin:8px 0 10px">Stopping waits for the
+          current step to finish, so that whatever has been built can be kept.
+          A run that is stuck inside a step never gets that far — the request
+          is received and never acted on. Forcing ends the machine's process
+          instead: nothing is kept, anything else it is doing stops too, and it
+          restarts by itself within seconds.</p>
+        <button class="btn-danger btn-sm" data-stop="force">
+          Force stop, losing everything</button>
+      </details>`;
+  }
+  return html`
+    <div class="callout callout-warn" style="margin-top:10px">
+      <strong>Already asked to stop</strong>
+      This run was asked to stop and has not. That happens when it is stuck
+      inside a step rather than between two, which is where the request is
+      read. Forcing ends the machine's process: nothing is kept, and it
+      restarts by itself.
+      <div style="margin-top:8px">
+        <button class="btn-danger btn-sm" data-stop="force">
+          Force stop, losing everything</button>
+      </div>
+    </div>`;
+}
+
+/** Whether a stop has already been asked for, read from the run's own log. */
+function wasAskedToStop(job) {
+  return !!(job.summary && job.summary.stop_requested);
+}
+
 function stopPanel(job, latest, stage) {
   if (job.kind === "generate_dataset") return writingStopPanel(job, latest);
   const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
@@ -868,7 +931,8 @@ function stopPanel(job, latest, stage) {
           <button class="btn-danger btn-sm" data-stop="discard">
             Stop and discard it</button>
           <button class="btn-sm" id="stopCancel">Keep training</button>
-        </div>` : html`
+        </div>
+        ${raw(forceOption(job, latest))}` : html`
         <p class="muted tiny" style="margin:0 0 12px">
           Training has not started yet — the runner is still preparing your
           data, so there is no ${kind} to keep. Stopping now leaves nothing
@@ -877,6 +941,7 @@ function stopPanel(job, latest, stage) {
           <button class="btn-danger btn-sm" data-stop="discard">Stop the run</button>
           <button class="btn-sm" id="stopCancel">Carry on</button>
         </div>`)}
+      ${raw(forceOption(job, latest))}
     </div>`;
 }
 

@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -52,6 +53,12 @@ JOB_HANDLERS = {
     # Minutes rather than hours, but it is still the machine being occupied.
     "merge_adapter": merge.run,
 }
+
+
+# How long a force stop waits for the job to end politely before ending the
+# whole process. Long enough for a run that is merely between steps to save and
+# exit; short enough that somebody who pressed "force" is not left watching.
+FORCE_GRACE_S = 20
 
 
 class JobContext:
@@ -221,6 +228,11 @@ class Runner:
             elif kind == "job_cancel":
                 if self.current and self.current.job_id == msg.get("job_id"):
                     self.current.cancel(save=bool(msg.get("save")))
+            elif kind == "job_kill":
+                # Off the socket thread: this blocks, and may end the process.
+                threading.Thread(target=self._force_kill,
+                                 args=(msg.get("job_id"),), daemon=True,
+                                 name="force-kill").start()
             elif kind == "reprobe":
                 self.caps = await asyncio.get_event_loop().run_in_executor(
                     None, capabilities.probe)
@@ -386,6 +398,46 @@ class Runner:
                              "error": _friendly_error(e)})
         finally:
             self.generating = False
+
+    def _force_kill(self, job_id: str) -> None:
+        """Stop a job that will not stop being asked.
+
+        Cancelling is cooperative: the trainer checks `should_cancel` between
+        steps, which is right, because a step that is allowed to finish leaves
+        a model worth keeping. It only works while steps finish. A run wedged
+        *inside* one -- a model too large for the card, spilling to host memory
+        with the allocator at 99% -- never reaches the check, so the button did
+        nothing and went on doing nothing, twice.
+
+        Python cannot kill a thread. The honest option is to end the process:
+        one job runs per runner, the container is restarted by the supervisor
+        within seconds, and everything it had in flight is lost. That is what
+        force means, and it is why it is a separate button.
+
+        The controller has already written the job off by the time this
+        arrives, so nothing here needs to report anything -- and nothing here
+        could, since the socket goes with the process.
+        """
+        ctx = self.current
+        if ctx and ctx.job_id == job_id:
+            # Ask nicely first and give it a moment. A run between steps stops
+            # on its own, keeps whatever it was told to keep, and the process
+            # survives -- which is much better than restarting it.
+            ctx.cancel(save=False)
+        deadline = time.time() + FORCE_GRACE_S
+        while time.time() < deadline:
+            if self.current is None or self.current.job_id != job_id:
+                print("[runner] force stop: the job ended on its own.", flush=True)
+                return
+            time.sleep(0.5)
+        print("[runner] force stop: job %s did not respond in %ds, so this "
+              "runner is restarting to end it. Anything in flight is lost."
+              % (job_id, FORCE_GRACE_S), flush=True)
+        # Flushed, then straight out. sys.exit only raises in this thread, and
+        # this thread is not the one that is stuck.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(9)
 
     def _run_job(self, job: dict, ctx: JobContext, workdir: str) -> None:
         jid = job["id"]

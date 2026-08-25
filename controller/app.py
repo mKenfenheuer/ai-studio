@@ -735,7 +735,43 @@ async def cancel_job(request: Request, job_id: str,
         return {"ok": True, "already": job["status"]}
 
     save = bool((payload or {}).get("save", True))
+    force = bool((payload or {}).get("force"))
+
+    if force:
+        # Cancelling is cooperative -- the trainer checks between steps, which
+        # is what lets a stop keep the model it has built. It only works while
+        # steps finish. A run wedged inside one never reaches the check, so the
+        # ordinary button does nothing however many times it is pressed.
+        #
+        # So a force stop does not wait to be agreed to. The job is written off
+        # here and the machine is freed here; the runner is told separately,
+        # and ends its own process if the job will not let go. Nothing is kept,
+        # because there is no cooperating run to keep anything from.
+        db.set_job_status(job_id, "cancelled",
+                          "Force-stopped: the run was not responding to an "
+                          "ordinary stop.")
+        db.clear_checkpoint(job_id)
+        if runner_id := job.get("runner_id"):
+            fleet.busy.pop(runner_id, None)
+            fleet.dispatched_at.pop(runner_id, None)
+            fleet.checkpoints.get(runner_id, set()).discard(job_id)
+            await fleet.send_to_runner(runner_id, {"type": "job_kill",
+                                                   "job_id": job_id})
+        db.add_log(job_id, "Force-stopped. The machine was told to end it, and "
+                           "will restart itself if the run will not let go. "
+                           "Nothing was kept.", "warn")
+        await fleet.broadcast_ui({"type": "jobs_changed"})
+        fleet.wake()
+        return {"ok": True, "forced": True}
+
     if job["runner_id"] and job["runner_id"] in fleet.connections:
+        # Recorded, so the page can tell "asked to stop" from "not asked". A
+        # run that was asked and carried on is stuck inside a step rather than
+        # between two, and that is the only situation where forcing is the
+        # right answer -- so it is the only situation where it is offered
+        # without being gone looking for.
+        db.set_job_summary(job_id, {**(job.get("summary") or {}),
+                                    "stop_requested": db.now()})
         await fleet.send_to_runner(job["runner_id"],
                                    {"type": "job_cancel", "job_id": job_id,
                                     "save": save})

@@ -220,9 +220,9 @@ export const api = {
   jobLogs:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/logs`),
   jobReport:   (id) => req(`/api/jobs/${encodeURIComponent(id)}/report`),
   // `save` decides whether the half-trained model survives the stop.
-  cancelJob:   (id, save = true) =>
+  cancelJob:   (id, save = true, force = false) =>
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
-        { method: "POST", body: JSON.stringify({ save }) }),
+        { method: "POST", body: JSON.stringify({ save, force }) }),
   deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   // Put a stopped or failed run back on the queue, to carry on from its
   // checkpoint rather than from step one.
