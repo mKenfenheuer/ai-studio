@@ -180,7 +180,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 + [{"role": "user", "content": prompt}]
 
             t0 = time.time()
-            out = host.generate(spec, messages, params, lambda _d: None,
+            out = host.generate(spec, messages, params, lambda *_: None,
                                 lambda _l: None)
             answer = (out.get("text") or "").strip()
 

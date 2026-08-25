@@ -427,51 +427,141 @@ textarea.mono {
   font-family: var(--mono); word-break: break-word;
 }
 
-/* ------------------------------------------------------- playground */
-.chat { display: flex; flex-direction: column; gap: 12px; }
+/* ------------------------------------------------------- playground
+   The chat surface. Not two rows of facing bubbles: a conversation with a
+   model is not a conversation between two people, and drawing it that way
+   gives the model's answer -- the thing you are actually reading -- the same
+   cramped column as your own one-line question. So the person's turns are
+   bubbles and the model's are plain blocks with room to breathe, which is
+   what every tool people already use for this does, and for this reason. */
+.chat { display: flex; flex-direction: column; gap: 14px; }
 .chat-log {
-  display: flex; flex-direction: column; gap: 12px;
-  min-height: 220px; max-height: 52vh; overflow-y: auto; padding: 4px;
+  display: flex; flex-direction: column; gap: 18px;
+  min-height: 260px; max-height: 58vh; overflow-y: auto;
+  padding: 6px 2px 2px;
+  scroll-behavior: smooth;
 }
-.bubble { max-width: 84%; padding: 10px 13px; border-radius: 12px;
-  font-size: 13.5px; line-height: 1.6;
-  word-break: break-word; }
-.bubble.me { align-self: flex-end; background: var(--accent); color: #fff;
-  border-bottom-right-radius: 4px; }
-.bubble.it { align-self: flex-start; background: var(--surface-2);
-  border: 1px solid var(--border); border-bottom-left-radius: 4px; }
-.bubble.it.pending::after {
-  content: "▍"; animation: blink 1s steps(2) infinite; color: var(--text-3);
+.chat-empty {
+  text-align: center; color: var(--text-3); padding: 40px 10px;
+  font-size: 13px;
 }
-@keyframes blink { 50% { opacity: 0; } }
-/* The role is named above each bubble, not signalled by its side alone:
-   a conversation with system and tool turns has more than two speakers. */
-.bubble[data-role]::before {
-  content: attr(data-role);
-  display: block; font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
-  text-transform: uppercase; opacity: .65; margin-bottom: 3px;
+
+/* One turn: who spoke, what they were thinking, what they said, and the
+   controls for it -- grouped, so a model's reasoning belongs to its answer
+   instead of floating above the log attached to nothing. */
+.turn { position: relative; display: flex; flex-direction: column;
+  align-items: flex-start; gap: 5px; max-width: 100%; }
+.turn.me { align-self: stretch; align-items: flex-end; }
+.turn.note { align-self: center; align-items: center; width: 100%; }
+.turn-who {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--text-3);
 }
-.bubble.me[data-role]::before { text-align: right; }
-/* A model's working, beside its answer rather than inside it. */
+.turn-mark { color: var(--accent); font-size: 9px; line-height: 1; }
+.turn.not-trained { opacity: .6; }
+
+.bubble {
+  padding: 11px 14px; border-radius: 14px;
+  font-size: 14px; line-height: 1.62; word-break: break-word;
+  max-width: 100%;
+}
+.bubble-text { white-space: pre-wrap; }
+/* The person. A filled bubble, kept narrow -- questions are short and a
+   full-width band of accent colour is a shout. */
+.turn.me .bubble {
+  background: var(--accent); color: #fff;
+  border-bottom-right-radius: 5px; max-width: 78%;
+}
+.turn.me .bubble a { color: #fff; text-decoration: underline; }
+/* The model. A quiet surface at full width, because this is the text that
+   gets read properly rather than glanced at. */
+.turn.it .bubble {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-bottom-left-radius: 5px; width: 100%;
+}
+/* System and tool turns are nobody's side of the conversation. */
+.turn.note .bubble {
+  background: transparent; border: 1px dashed var(--border);
+  color: var(--text-2); font-size: 12.5px; max-width: 94%;
+}
+/* Waiting for the first token. */
+.bubble.pending { min-width: 54px; min-height: 40px; }
+.bubble.pending .bubble-text::after {
+  content: ""; display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--text-3);
+  animation: think-pulse 1.1s ease-in-out infinite;
+}
+@keyframes think-pulse {
+  0%, 100% { opacity: .25; transform: scale(.8); }
+  50%      { opacity: .9;  transform: scale(1.15); }
+}
+
+/* ---- the model's working -------------------------------------------------
+   Folded by default and never mixed into the answer. It is usually longer
+   than the answer and rarely what you are reading for -- but it is the first
+   thing you want when the answer is wrong, so it stays one click away rather
+   than being thrown out. */
 details.reasoning {
-  align-self: flex-start; max-width: 84%; margin: 0 0 -4px;
-  border-left: 2px solid var(--border-2); padding-left: 10px;
+  width: fit-content; max-width: 100%;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface-2); overflow: hidden;
 }
+details.reasoning[open] { width: 100%; }
 details.reasoning > summary {
-  cursor: pointer; font-size: 11.5px; color: var(--text-3); font-weight: 600;
+  cursor: pointer; list-style: none; padding: 5px 11px;
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+  user-select: none;
 }
-details.reasoning .txt {
-  font-size: 12.5px; color: var(--text-2); white-space: pre-wrap;
-  margin: 6px 0 0; font-family: var(--mono); line-height: 1.55;
+/* A disclosure needs to look like one. */
+details.reasoning > summary::before {
+  content: ""; flex: none; width: 0; height: 0; opacity: .55;
+  border-left: 4.5px solid currentColor;
+  border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
+  transition: transform .15s;
 }
-.chat-input { display: flex; gap: 8px; align-items: flex-end; }
+details.reasoning[open] > summary::before { transform: rotate(90deg); }
+details.reasoning > summary::-webkit-details-marker { display: none; }
+details.reasoning > summary:hover { color: var(--text); }
+.reasoning-mark { display: none; }
+details.reasoning.live .reasoning-mark {
+  display: block; width: 6px; height: 6px; border-radius: 50%; flex: none;
+}
+details.reasoning[open] > summary { border-bottom: 1px solid var(--border); }
+/* Still being written. The dot breathes, so a model that thinks for twenty
+   seconds before saying anything does not look like a model that has hung. */
+details.reasoning.live > summary { color: var(--accent); }
+details.reasoning.live .reasoning-mark {
+  background: var(--accent); animation: think-pulse 1.1s ease-in-out infinite;
+}
+details.reasoning.live { border-color: var(--accent); }
+.reasoning-body {
+  padding: 10px 12px; margin: 0;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  color: var(--text-2); white-space: pre-wrap; word-break: break-word;
+  max-height: 300px; overflow: auto;
+}
+
+/* ---- the composer ------------------------------------------------------- */
+.chat-input {
+  display: flex; gap: 8px; align-items: flex-end;
+  border: 1px solid var(--border); border-radius: 14px;
+  background: var(--surface); padding: 8px;
+  transition: border-color .15s, box-shadow .15s;
+}
+.chat-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
 .chat-input textarea {
-  flex: 1; resize: vertical; min-height: 46px; max-height: 180px;
-  font-family: var(--sans); line-height: 1.5;
+  flex: 1; resize: none; min-height: 40px; max-height: 200px;
+  border: 0; background: transparent; padding: 7px 6px;
+  font-family: var(--sans); font-size: 14px; line-height: 1.55;
+  color: var(--text);
 }
-.chat-empty { text-align: center; color: var(--text-3); padding: 28px 10px;
-  font-size: 13px; }
-.wizard-actions { display: flex; gap: 10px; margin-top: 22px; align-items: center; }
+.chat-input textarea:focus { outline: none; box-shadow: none; }
+.chat-input button { flex: none; align-self: flex-end; }
 
 /* Hidden on desktop; becomes the mobile header. */
 .topbar { display: none; }
@@ -579,8 +669,10 @@ details.reasoning .txt {
   .step-chip { flex: none; padding: 6px 11px; font-size: 12px; }
 
   .logbox { height: 220px; font-size: 11.5px; }
-  .chat-log { max-height: 46vh; }
-  .bubble { max-width: 92%; }
+  .chat-log { max-height: 46vh; gap: 15px; }
+  /* A phone has no room for the model's answer to sit inside a margin. */
+  .turn.me .bubble { max-width: 90%; }
+  .reasoning-body { max-height: 220px; }
   .samples { max-height: 260px; }
   .drawer-inner { padding: 24px 18px 40px; border-radius: 14px 14px 0 0; }
   .toasts { left: 12px; right: 12px; bottom: calc(70px + env(safe-area-inset-bottom, 0px)); }
@@ -991,50 +1083,55 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
    The playground draws live turns and the dataset workbench draws rows on
    disk, and they use one renderer (web/js/conversation.js) so the same
    conversation looks the same in both. These styles therefore have to work
-   outside .chat-log as well as inside it. */
+   outside .chat-log as well as inside it -- everything above that is about
+   turns rather than about the chat page applies here too. */
 .convo {
-  display: flex; flex-direction: column; gap: 10px; padding: 4px;
+  display: flex; flex-direction: column; gap: 16px; padding: 4px 2px;
 }
-.convo .bubble { max-width: 88%; }
-/* System and tool turns are nobody's side of the conversation. Centred and
-   quieter, so the eye still reads user-versus-assistant as the shape of it. */
-.bubble.note {
-  align-self: center; max-width: 94%; background: transparent;
-  border: 1px dashed var(--border); color: var(--text-2); font-size: 12.5px;
-}
-.bubble.not-trained { opacity: .62; }
-.bubble.not-trained .badge { margin-bottom: 4px; }
-.bubble-text { white-space: pre-wrap; }
 
-/* A tool call, shown as a call. */
+/* ---- a tool call, shown as a call rather than as syntax ---------------- */
 .tool-call {
-  margin-top: 6px; padding: 6px 9px; border-radius: 8px;
-  background: var(--surface-3, rgba(127, 127, 127, .12));
-  border: 1px solid var(--border);
+  margin-top: 8px; padding: 8px 10px; border-radius: 9px;
+  background: var(--surface); border: 1px solid var(--border);
 }
-.bubble.me .tool-call { background: rgba(255, 255, 255, .16);
-  border-color: rgba(255, 255, 255, .28); }
-.tool-call.bad { border-color: var(--err, #c0392b); }
-.tool-call-head { display: flex; gap: 7px; align-items: baseline;
+.bubble > .tool-call:first-child { margin-top: 0; }
+/* A call with no words around it stands on the page rather than inside a
+   bubble, so it needs the step of contrast the bubble was providing. */
+.turn > .tool-call { margin-top: 0; width: 100%; background: var(--surface-2); }
+.turn.me .tool-call {
+  background: rgba(255, 255, 255, .14);
+  border-color: rgba(255, 255, 255, .3);
+}
+.tool-call.bad { border-color: var(--err); background: var(--err-bg); }
+.tool-call-head { display: flex; gap: 7px; align-items: center;
   flex-wrap: wrap; font-size: 12.5px; }
-.tool-call-name { font-weight: 700; }
-.tool-call-args { opacity: .85; font-size: 12px; word-break: break-all; }
+.tool-call-chip {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--accent);
+  background: var(--accent-bg); border-radius: 4px; padding: 2px 5px;
+}
+.turn.me .tool-call-chip { color: #fff; background: rgba(255, 255, 255, .22); }
+.tool-call-name { font-weight: 700; font-family: var(--mono); }
+.tool-call-args { opacity: .85; font-size: 12px; font-family: var(--mono);
+  word-break: break-all; }
 .tool-call-body > summary { cursor: pointer; font-size: 11px; opacity: .7;
-  margin-top: 4px; }
+  margin-top: 6px; }
 .tool-call pre, .tool-result pre {
-  margin: 5px 0 0; white-space: pre-wrap; word-break: break-word;
-  font-size: 11.5px; line-height: 1.5; max-height: 240px; overflow: auto;
+  margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+  font-size: 11.5px; line-height: 1.55; max-height: 240px; overflow: auto;
 }
 
-/* A tool's answer. Not a bubble: nobody said it. */
+/* ---- a tool's answer. Not a bubble: nobody said it. -------------------- */
 .tool-result {
-  align-self: center; max-width: 94%; width: 94%;
-  border-left: 3px solid var(--border-2); padding: 4px 0 4px 10px;
-  font-size: 12px; color: var(--text-2);
+  width: 100%; border-left: 2px solid var(--accent);
+  background: var(--surface-2); border-radius: 0 9px 9px 0;
+  padding: 8px 12px; font-size: 12px; color: var(--text-2);
 }
 .tool-result > details > summary { cursor: pointer; }
-.tool-result-name { font-weight: 700; font-family: var(--mono); }
-.tool-result-head { opacity: .8; }
+.tool-result-name { font-weight: 700; font-family: var(--mono);
+  color: var(--text); }
+.tool-result-verb { opacity: .8; }
+.tool-result-head { opacity: .9; }
 
 /* What the row says the model may call. */
 .tools-declared { margin: 0 0 10px; }
@@ -1045,15 +1142,23 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 .tool-def { border-left: 2px solid var(--border-2); padding-left: 10px; }
 .tool-params { margin: 4px 0 0; padding-left: 16px; font-size: 11.5px;
   line-height: 1.6; color: var(--text-2); }
-/* Per-turn controls in the playground. Quiet until the turn is hovered:
-   every message being editable is the point, and six buttons per bubble
-   shouting for attention is not. */
-.turn-actions { margin-top: 6px; opacity: 0; transition: opacity .12s; }
-.bubble:hover .turn-actions,
-.bubble:focus-within .turn-actions,
-.tool-result:hover .turn-actions,
-.tool-result:focus-within .turn-actions { opacity: .75; }
-@media (hover: none) { .turn-actions { opacity: .6; } }
+
+/* Per-turn controls. Quiet until the turn is hovered: every message being
+   editable is the point, and six buttons per turn shouting for attention is
+   not. */
+.turn-actions {
+  position: absolute; top: -5px; right: 0; z-index: 2;
+  opacity: 0; transition: opacity .12s; pointer-events: none;
+  background: var(--bg); border-radius: 8px; padding: 1px;
+}
+/* The person's turns label themselves on the right, so their controls go left
+   rather than sitting on top of the word. */
+.turn.me .turn-actions { right: auto; left: 0; }
+.turn:hover .turn-actions,
+.turn:focus-within .turn-actions { opacity: 1; pointer-events: auto; }
+@media (hover: none) {
+  .turn-actions { opacity: .7; pointer-events: auto; }
+}
 /* One row of a dataset, drawn as its conversation. */
 .convo-row { border-bottom: 1px solid var(--border); padding: 12px 0; }
 .convo-row:last-child { border-bottom: 0; }

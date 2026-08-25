@@ -704,6 +704,30 @@ _BARE_CALL = re.compile(
     r'(\{.*?\})\s*\}', re.DOTALL)
 
 
+def split_progressive(text: str, fmt: dict | None = None,
+                      reasoning_on: bool = False) -> tuple[str, str]:
+    """Working and answer, in a reply that has not finished arriving.
+
+    The front half of `parse_reply`, on its own, so a reply can be shown
+    correctly *while* it streams instead of being rearranged once it stops.
+    Without it the playground put a model's entire working in the answer bubble
+    and then snatched it back at the end -- and for a reasoning model that is
+    most of what you watch it do.
+
+    Reading it the same way `parse_reply` will is the whole point: two readings
+    means the answer rearranges itself when the stream ends, which looks exactly
+    like a bug whichever of them is right.
+
+    Called once per token against the whole reply so far, so it is deliberately
+    stateless. What is safe to *show* is the caller's problem: a marker still
+    arriving one character at a time reads as ordinary text until its last
+    bracket lands. See `_showable` in runner/inference.
+    """
+    fmt = formatting.resolve_format(fmt or {})
+    return formatting.split_reasoning(
+        _reopen_reasoning(text or "", fmt, reasoning_on), fmt)
+
+
 def parse_reply(text: str, fmt: dict | None = None,
                 reasoning_on: bool = False) -> dict:
     """A generated reply as {content, reasoning, tool_calls}.

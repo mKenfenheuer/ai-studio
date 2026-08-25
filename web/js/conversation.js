@@ -6,9 +6,15 @@
 // to know when looking at training data — who says what, in what order — is
 // the thing the shape hides hardest.
 //
-// So a conversation is drawn as a conversation: bubbles that pick a side by
-// role, the model's working folded away beside its answer rather than mixed
-// into it, and a tool call shown as a call with its arguments laid out.
+// So a conversation is drawn as a conversation. Each turn is one unit -- who
+// spoke, what they were thinking, what they said -- rather than a run of loose
+// siblings, which is what let a model's reasoning float above its answer
+// belonging to nothing. A tool call is shown as a call with its arguments laid
+// out, and a tool's answer is not a bubble at all, because nobody said it.
+//
+// The two speakers are drawn differently on purpose. A person's turn is a
+// bubble, kept narrow, because questions are short. The model's is a plain
+// block at full width, because that is the text anyone actually reads.
 //
 // This lives outside `views/` because two very different pages need exactly
 // the same picture and they must not drift: the playground, where the turns
@@ -23,11 +29,11 @@ import { html, raw, esc } from "./util.js";
 // and tool turns has more than two speakers, and two sides cannot say which
 // of four is talking.
 const ROLE = {
-  user:      { label: "user",      side: "me" },
-  assistant: { label: "assistant", side: "it" },
-  system:    { label: "system",    side: "note" },
-  developer: { label: "developer", side: "note" },
-  tool:      { label: "tool",      side: "note" },
+  user:      { label: "You",       side: "me",   mark: "" },
+  assistant: { label: "Assistant", side: "it",   mark: "◆" },
+  system:    { label: "System",    side: "note", mark: "" },
+  developer: { label: "Developer", side: "note", mark: "" },
+  tool:      { label: "Tool",      side: "note", mark: "" },
 };
 
 /** Pretty-print JSON when it is JSON, leave it alone when it is not.
@@ -47,8 +53,7 @@ function callSignature(call) {
   let parsed = null;
   try { parsed = JSON.parse(args || "{}"); } catch { /* shown in full below */ }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "";
-  const parts = Object.entries(parsed).map(([k, v]) =>
-    `${k}=${typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v)}`);
+  const parts = Object.entries(parsed).map(([k, v]) => `${k}=${JSON.stringify(v)}`);
   const line = parts.join(", ");
   return line.length > 90 ? "" : line;
 }
@@ -66,7 +71,8 @@ function toolCall(call, i, opts) {
   return html`
     <div class="tool-call ${broken ? "bad" : ""}">
       <div class="tool-call-head">
-        <span class="tool-call-name">⚙ ${name}</span>${
+        <span class="tool-call-chip">call</span>
+        <span class="tool-call-name">${name}</span>${
           raw(signature && !long
             ? `<span class="tool-call-args mono">(${esc(signature)})</span>` : "")}
         ${raw(broken
@@ -81,14 +87,29 @@ function toolCall(call, i, opts) {
     </div>`;
 }
 
-/** The model's working, folded away. Usually longer than the answer and
- *  rarely the thing you are reading for. */
-function reasoningBlock(text, open) {
+/** The model's working, folded away.
+ *
+ *  Its own block above the answer rather than a line mixed into it: it is
+ *  usually longer than the answer and rarely the thing you are reading for,
+ *  but it is the thing you go looking for when the answer is wrong.
+ *
+ *  `live` means it is still being written, which is worth showing plainly --
+ *  a reasoning model can think for a long time before it says anything, and a
+ *  blank screen for twenty seconds reads as a hang.
+ */
+export function reasoningBlock(text, opts = {}) {
   const n = text.length;
+  const label = opts.live
+    ? `Thinking${n ? ` — ${n.toLocaleString()} characters` : "…"}`
+    : `Thought for ${n.toLocaleString()} character${n === 1 ? "" : "s"}`;
   return html`
-    <details class="reasoning" ${open ? "open" : ""}>
-      <summary>reasoning — ${n.toLocaleString()} character${n === 1 ? "" : "s"}</summary>
-      <p class="txt">${text}</p>
+    <details class="reasoning ${opts.live ? "live" : ""}" ${
+      opts.open || opts.live ? "open" : ""}>
+      <summary>
+        <span class="reasoning-mark" aria-hidden="true"></span>
+        <span class="reasoning-label">${label}</span>
+      </summary>
+      <div class="reasoning-body">${text}</div>
     </details>`;
 }
 
@@ -96,27 +117,53 @@ function reasoningBlock(text, open) {
 function toolResult(m, opts) {
   const body = pretty(m.content || "");
   const long = body.includes("\n") || body.length > 160;
-  const head = html`<span class="tool-result-name">${
-    m.name || "tool"}</span> returned`;
+  const head = html`<span class="tool-result-name">${m.name || "tool"}</span>
+    <span class="tool-result-verb">returned</span>`;
   return html`
-    <div class="tool-result" data-index="${opts.index}">
-      ${raw(long ? html`
-        <details>
-          <summary>${raw(head)}</summary>
-          <pre class="mono">${body}</pre>
-        </details>` : html`
-        <div class="tool-result-head">${raw(head)}</div>
-        <pre class="mono">${body}</pre>`)}
+    <div class="turn note" data-index="${opts.index}" data-role="tool">
+      <div class="tool-result">
+        ${raw(long ? html`
+          <details>
+            <summary>${raw(head)}</summary>
+            <pre class="mono">${body}</pre>
+          </details>` : html`
+          <div class="tool-result-head">${raw(head)}</div>
+          <pre class="mono">${body}</pre>`)}
+      </div>
       ${raw(opts.actions ? opts.actions(m, opts.index) : "")}
     </div>`;
+}
+
+/** What was actually said, under the label and the working.
+ *
+ *  A turn that is nothing but a tool call gets no bubble. It used to get one,
+ *  and a call already draws its own card, so the screen showed a box inside a
+ *  box for every call a model made -- which reads as a mistake because it is.
+ */
+function body(content, calls, reasoning, per) {
+  const called = calls.map((c, n) => toolCall(c, n, per)).join("");
+  if (content) {
+    return html`<div class="bubble"><div class="bubble-text">${content}</div>${
+      raw(called)}</div>`;
+  }
+  if (called) return called;
+  // Nothing at all -- but a turn that reasoned and then stopped has said
+  // something, and does not need to be told it is empty.
+  return reasoning ? "" : html`<div class="bubble"><span class="muted tiny"
+    >(nothing in this turn)</span></div>`;
 }
 
 /**
  * A whole conversation as HTML.
  *
+ * Every turn is one `.turn` element -- label, working, words and controls
+ * together -- rather than a run of loose siblings. They used to be separate,
+ * and a model's reasoning floated above its answer belonging to nothing,
+ * which is exactly how it read.
+ *
  * `opts`:
  *   openReasoning  show the working expanded rather than folded
- *   actions        (message, index) => html appended inside each bubble
+ *   actions        (message, index) => html appended below each turn
  *   callAction     (call, index) => html appended beside a tool call
  *   empty          what to show when there are no messages
  */
@@ -128,7 +175,7 @@ export function conversationHtml(messages, opts = {}) {
   }
   return list.map((m, i) => {
     const role = String(m.role || "user").toLowerCase();
-    const spec = ROLE[role] || { label: role, side: "note" };
+    const spec = ROLE[role] || { label: role, side: "note", mark: "" };
     const per = { ...opts, index: i };
 
     if (role === "tool") return toolResult(m, per);
@@ -142,16 +189,18 @@ export function conversationHtml(messages, opts = {}) {
     const muted = m.weight === 0;
 
     return html`
-      ${raw(reasoning ? reasoningBlock(reasoning, !!opts.openReasoning) : "")}
-      <div class="bubble ${spec.side} ${muted ? "not-trained" : ""}"
-           data-role="${spec.label}" data-index="${i}">
-        ${raw(muted
-          ? `<span class="badge badge-soft" title="weight 0 — rendered as
-               context, never learned from">not trained on</span>` : "")}
-        ${raw(content ? `<div class="bubble-text">${esc(content)}</div>` : "")}
-        ${raw(calls.map((c, n) => toolCall(c, n, per)).join(""))}
-        ${raw(!content && !calls.length && !reasoning
-          ? `<span class="muted tiny">(nothing in this turn)</span>` : "")}
+      <div class="turn ${spec.side} ${muted ? "not-trained" : ""}"
+           data-index="${i}" data-role="${role}">
+        <div class="turn-who">
+          ${raw(spec.mark ? `<span class="turn-mark">${spec.mark}</span>` : "")}
+          <span>${spec.label}</span>
+          ${raw(muted
+            ? `<span class="badge badge-soft" title="weight 0 — rendered as
+                 context, never learned from">not trained on</span>` : "")}
+        </div>
+        ${raw(reasoning
+          ? reasoningBlock(reasoning, { open: !!opts.openReasoning }) : "")}
+        ${raw(body(content, calls, reasoning, per))}
         ${raw(opts.actions ? opts.actions(m, i) : "")}
       </div>`;
   }).join("");

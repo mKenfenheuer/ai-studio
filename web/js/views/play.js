@@ -1,6 +1,6 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, $$, on, fmtAgo, toast } from "../util.js";
-import { conversationHtml, pretty } from "../conversation.js";
+import { conversationHtml, reasoningBlock, pretty } from "../conversation.js";
 
 // Talking to what you trained.
 //
@@ -148,7 +148,6 @@ function chatView(mount, run, runs) {
   let turns = [];
   let tools = [];            // declared for this exchange
   let requestId = null;
-  let pending = null;        // the bubble currently being written into
   let early = [];            // events that beat their own POST response
   let think = !!run.reasoning;
 
@@ -419,34 +418,71 @@ function chatView(mount, run, runs) {
         ? `<button class="btn-sm" data-answer="${esc(c.id || "")}">Return a result…</button>`
         : "",
     });
-    log.innerHTML = turns.length ? body : html`
+    log.innerHTML = turns.length || live ? body : html`
       <div class="chat-empty">Nothing said yet. ${ui.title}.</div>`;
-    if (pendingText !== null) {
-      log.insertAdjacentHTML("beforeend", html`
-        <div class="bubble it ${pendingText ? "" : "pending"}"
-             data-role="assistant" id="pendingBubble">${pendingText}</div>`);
-    }
-    pending = $("#pendingBubble", mount);
+    if (live) log.insertAdjacentHTML("beforeend", liveHtml());
     // Something is loaded that the model could answer without another word
     // being typed -- a row that ends on a tool result, or turns left standing
     // after an edit. Without this the conversation simply sits there.
     const tail = turns[turns.length - 1];
     askBtn.hidden = !(tail && tail.role !== "assistant"
-                      && pendingText === null && !requestId);
+                      && !live && !requestId);
     const el = $("#turnCount", mount);
     if (el) el.textContent = turns.length
       ? `${turns.length} message${turns.length > 1 ? "s" : ""} in context` : "";
     scroll();
   }
 
-  let pendingText = null;
+  // The turn being written right now, as its two channels. Null when nothing
+  // is in flight. The runner tags every delta "reasoning" or "content", so
+  // this is a running copy of what it has said rather than a guess made here:
+  // the working goes to the reasoning panel from its first character instead
+  // of being typed into the answer and taken back when the stream ends.
+  let live = null;
+
+  /** The in-flight turn. Shaped exactly like a finished one, so it does not
+   *  jump when the real message replaces it. */
+  function liveHtml() {
+    const reasoning = (live.reasoning || "").trim();
+    const answer = live.content || "";
+    // The working folds itself away once the answer starts, which is the
+    // moment it stops being the interesting thing on screen.
+    return html`
+      <div class="turn it live" id="liveTurn" data-role="assistant">
+        <div class="turn-who"><span class="turn-mark">◆</span><span>Assistant</span></div>
+        ${raw(reasoning
+          ? reasoningBlock(reasoning, { live: !answer }) : "")}
+        ${raw(answer || !reasoning ? html`
+          <div class="bubble ${answer ? "" : "pending"}"
+            ><div class="bubble-text" id="liveText">${answer}</div></div>` : "")}
+      </div>`;
+  }
+
+  /** Grow the live turn in place.
+   *
+   *  Text arrives many times a second and a full repaint each time would
+   *  fight the reader: it closes a reasoning panel they just opened and drops
+   *  the selection they were making. So only a *structural* change -- the
+   *  working appearing, the answer starting -- repaints; everything else
+   *  writes into the node that is already there.
+   */
+  function grow(channel) {
+    const node = $(channel === "reasoning"
+      ? "#liveTurn .reasoning-body" : "#liveText", mount);
+    if (!node) { paint(); return; }
+    node.textContent = live[channel];
+    const label = $("#liveTurn .reasoning-label", mount);
+    if (channel === "reasoning" && label) {
+      label.textContent = `Thinking — ${live.reasoning.length.toLocaleString()} characters`;
+    }
+    scroll();
+  }
 
   // ---------------------------------------------------------- generating
   const finish = () => {
     requestId = null;
     early = [];
-    pendingText = null;
-    pending = null;
+    live = null;
     sendBtn.disabled = false;
     stopBtn.hidden = true;
     paint();
@@ -455,7 +491,7 @@ function chatView(mount, run, runs) {
   /** Send whatever is in `turns` and let the model write the next turn. */
   async function ask() {
     if (requestId) return;
-    pendingText = "";
+    live = { reasoning: "", content: "" };
     paint();
     statusEl.textContent = "Waking the model up…";
     early = [];
@@ -476,7 +512,7 @@ function chatView(mount, run, runs) {
       early = [];
       buffered.forEach(handle);
     } catch (e) {
-      pendingText = null;
+      live = null;
       paint();
       statusEl.textContent = "";
       sendBtn.disabled = false;
@@ -571,7 +607,7 @@ function chatView(mount, run, runs) {
     }
     turns = prompt;
 
-    pendingText = null;
+    live = null;
     statusEl.textContent = "";
     drawTrial();
     paint();
@@ -600,7 +636,7 @@ function chatView(mount, run, runs) {
     turns = [];
     tools = [];
     sample = null;
-    pendingText = null;
+    live = null;
     statusEl.textContent = "";
     drawTrial();
     paint();
@@ -651,8 +687,9 @@ function chatView(mount, run, runs) {
     if (!m) return;
     const holder = $(`[data-index="${i}"]`, mount);
     const target = holder?.querySelector(".bubble-text")
-      || holder?.querySelector("pre")
-      || holder?.querySelector("summary");
+      || holder?.querySelector(".tool-result pre")
+      || holder?.querySelector(".tool-result summary")
+      || holder?.querySelector(".bubble");
     if (!target || target.dataset.editing) return;
     const area = document.createElement("textarea");
     area.className = "mono";
@@ -700,7 +737,7 @@ function chatView(mount, run, runs) {
     if (!String(msg.type || "").startsWith("generate_")) return;
     if (!requestId) {
       // Our own POST has not returned yet; hold it until we can tell.
-      if (pendingText !== null) early.push(msg);
+      if (live) early.push(msg);
       return;
     }
     if (msg.request_id !== requestId) return;
@@ -711,25 +748,27 @@ function chatView(mount, run, runs) {
     if (msg.type === "generate_status") {
       statusEl.textContent = msg.status;
     } else if (msg.type === "generate_delta") {
-      if (pendingText === null) return;
-      pendingText += msg.delta;
+      if (!live) return;
+      // Older runners send no channel at all; their text is the answer, which
+      // is what it always was.
+      const channel = msg.channel === "reasoning" ? "reasoning" : "content";
+      const first = !live[channel];
+      live[channel] += msg.delta;
       statusEl.textContent = "";
-      if (pending) {
-        pending.textContent = pendingText;
-        pending.classList.remove("pending");
-        scroll();
-      }
+      // The first character of a channel is the one that needs the panel or
+      // the bubble built for it; the rest just lengthen what is there.
+      if (first) paint(); else grow(channel);
     } else if (msg.type === "generate_done") {
       const calls = msg.tool_calls || [];
       const reply = {
         role: "assistant",
-        content: typeof msg.text === "string" ? msg.text : (pendingText || ""),
-        reasoning: msg.reasoning || "",
+        content: typeof msg.text === "string" ? msg.text : (live?.content || ""),
+        reasoning: msg.reasoning || live?.reasoning || "",
         tool_calls: calls,
       };
       const empty = !reply.content && !calls.length && !reply.reasoning;
       requestId = null;
-      pendingText = null;
+      live = null;
       sendBtn.disabled = false;
       stopBtn.hidden = true;
       if (empty) {
@@ -762,7 +801,7 @@ function chatView(mount, run, runs) {
         }
       }
     } else if (msg.type === "generate_error") {
-      pendingText = null;
+      live = null;
       requestId = null;
       sendBtn.disabled = false;
       stopBtn.hidden = true;

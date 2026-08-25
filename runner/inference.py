@@ -61,6 +61,33 @@ class OutOfRoom(RuntimeError):
     already_explained = True
 
 
+# How far back a marker still arriving may reach. `<|channel|>final<|message|>`
+# is the longest this studio's formats use; anything older than this is text.
+_MARKER_REACH = 32
+
+
+def _showable(text: str, hold: int) -> str:
+    """How much of this reply is safe to put on screen.
+
+    Two things are held back. The last `hold` characters, because they may turn
+    out to be the opening of a stop sequence -- that rule is older than this
+    function. And anything after an unclosed `<`, because a marker arrives one
+    character at a time and `<thi` is indistinguishable from text until its
+    bracket lands. Showing it means the answer bubble flashes `<think>` and
+    then takes it back.
+
+    Only a RECENT unclosed bracket counts. A model writing "5 < 6" is not
+    opening anything, and holding the rest of the reply behind it would stall
+    the stream for good.
+    """
+    cut = len(text) - hold if hold else len(text)
+    opening = text.rfind("<")
+    if opening >= 0 and opening >= len(text) - _MARKER_REACH \
+            and ">" not in text[opening:]:
+        cut = min(cut, opening)
+    return text[:max(cut, 0)]
+
+
 def _is_oom(e: BaseException) -> bool:
     """Whether this failure was the card running out of room.
 
@@ -429,8 +456,15 @@ class ModelHost:
         self._cancel.set()
 
     def generate(self, spec: dict, messages: list, params: dict,
-                 on_token: Callable[[str], None],
+                 on_token: Callable[[str, str], None] | None,
                  log: Callable[[str], None]) -> dict:
+        """Write the next turn, streaming it as `on_token(delta, channel)`.
+
+        `channel` is "reasoning" or "content", decided here rather than by
+        whoever is displaying it: the runner is the only party that knows which
+        format this model was trained in, and a reader guessing at markers is a
+        second implementation of the one thing that must not disagree.
+        """
         import torch
 
         self._cancel.clear()
@@ -459,6 +493,30 @@ class ModelHost:
             produced: list[int] = []
             t0 = time.time()
             cur = ids
+
+            # What the reader has already been shown, per channel. A reply is
+            # split as it arrives rather than rearranged once it stops, so a
+            # model's working goes to the reasoning panel from the first token
+            # instead of being typed into the answer and then taken back.
+            shown = {"reasoning": "", "content": ""}
+
+            def deliver(so_far: str) -> None:
+                if not on_token:
+                    return
+                parts = conversation.split_progressive(so_far, fmt,
+                                                       want_reasoning)
+                for channel, whole in zip(("reasoning", "content"), parts):
+                    already = shown[channel]
+                    # A split that moved rather than grew -- the working turned
+                    # out to be the answer, or a tool call was recognised and
+                    # taken out. Nothing is sent for it: the finished reply
+                    # travels whole in `generate_done` and is what the screen
+                    # ends up showing, so a rewrite here would only be a
+                    # flicker on the way to the same place.
+                    if len(whole) <= len(already) or not whole.startswith(already):
+                        continue
+                    on_token(whole[len(already):], channel)
+                    shown[channel] = whole
 
             for _ in range(max_new):
                 if self._cancel.is_set():
@@ -499,31 +557,26 @@ class ModelHost:
                 hit = next((s for s in stop_texts if s in full), None)
                 if hit:
                     full = full.split(hit)[0]
-                    if len(full) > len(emitted):
-                        on_token(full[len(emitted):])
+                    deliver(full)
                     emitted = full
                     hit_stop = True
                     break
 
                 # Hold back the last few characters, because they may turn out
-                # to be the start of a stop sequence. Without this the model
-                # streams "…green.Human:" to the browser and only then notices
-                # it should have stopped -- the reply is trimmed server-side but
-                # the reader has already seen the text it was supposed to cut.
-                safe = full[:-hold] if hold else full
-                if len(safe) > len(emitted):
-                    on_token(safe[len(emitted):])
-                    emitted = safe
+                # to be the start of a stop sequence -- or of a reasoning
+                # marker. Without this the model streams "…green.Human:" to the
+                # browser and only then notices it should have stopped, and the
+                # reader has already seen the text it was supposed to cut.
+                emitted = _showable(full, hold)
+                deliver(emitted)
 
             # The loop can also end at the token limit, at end-of-text, or on a
             # cancel -- and in all three the held-back characters were never
             # suspect. Release them, or every reply stops a few letters short.
             # Only a real stop sequence means the tail should stay cut.
             if not hit_stop and produced:
-                tail = tok.decode(produced, skip_special_tokens=True)
-                if len(tail) > len(emitted):
-                    on_token(tail[len(emitted):])
-                    emitted = tail
+                emitted = tok.decode(produced, skip_special_tokens=True)
+                deliver(emitted)
 
             self.last_used = time.time()
             elapsed = time.time() - t0

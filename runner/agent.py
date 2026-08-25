@@ -386,9 +386,13 @@ class Runner:
             self.outbox.put({"type": "generate_status", "request_id": rid,
                              "status": line})
 
-        def on_token(delta: str) -> None:
+        def on_token(delta: str, channel: str = "content") -> None:
+            # Which half of the reply this belongs to, decided by the runner
+            # where the format is known. The browser shows a model's working
+            # in the reasoning panel from the first token rather than typing
+            # it into the answer and taking it back at the end.
             self.outbox.put({"type": "generate_delta", "request_id": rid,
-                             "delta": delta})
+                             "delta": delta, "channel": channel})
 
         try:
             messages = msg.get("messages")
