@@ -393,6 +393,45 @@ def is_canonical(row: dict) -> bool:
 # Repair
 # ---------------------------------------------------------------------------
 
+def _merge_split_replies(conv: dict) -> int:
+    """Join an assistant turn that is only working to the answer after it.
+
+    A writer asked for reasoning and an answer sometimes emits them as two
+    consecutive assistant turns rather than as one turn with two fields. The
+    text is right and the shape is not: rendered, it becomes an assistant turn
+    that ends and a second one that starts, which teaches a model to close its
+    reply and then open another -- a different spelling of the same habit that
+    makes a reply never finish.
+
+    Only the unambiguous case is merged: an assistant turn carrying working and
+    nothing else, immediately followed by another assistant turn. A turn with
+    words or a tool call in it is a real turn and is left where it is, and
+    assistant/tool/assistant is a tool exchange rather than a split reply.
+    """
+    msgs = conv.get(MESSAGES_KEY) or []
+    out: list[dict] = []
+    merged = 0
+    for m in msgs:
+        prev = out[-1] if out else None
+        orphan = (prev is not None
+                  and prev.get("role") == "assistant"
+                  and m.get("role") == "assistant"
+                  and (prev.get("reasoning") or "").strip()
+                  and not (prev.get("content") or "").strip()
+                  and not prev.get("tool_calls"))
+        if orphan:
+            if not (m.get("reasoning") or "").strip():
+                m["reasoning"] = prev["reasoning"]
+            else:
+                m["reasoning"] = "%s" % (prev["reasoning"] + "\n\n" + m["reasoning"])
+            out[-1] = m
+            merged += 1
+            continue
+        out.append(m)
+    conv[MESSAGES_KEY] = out
+    return merged
+
+
 def repair(conv: dict) -> tuple[dict, list[str]]:
     """Fill in the links a dataset left implicit, and say what was inferred.
 
@@ -411,6 +450,10 @@ def repair(conv: dict) -> tuple[dict, list[str]]:
     inference made silently is one nobody can check.
     """
     notes: list[str] = []
+    if joined := _merge_split_replies(conv):
+        notes.append("joined %d reply%s that had been split into a turn of "
+                     "working and a turn of answer"
+                     % (joined, "" if joined == 1 else "s"))
     if unbaked := _unbake_tools(conv):
         notes.append("took the tool schema out of %d system prompt%s, where it "
                      "was written in one format's syntax"
