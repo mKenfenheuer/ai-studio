@@ -1178,9 +1178,25 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
         steps.append("Dropped the columns %s" % ", ".join(dropped))
 
     if ops.get("drop_empty"):
-        rows = [r for r in rows
-                if (formatting.format_example(r, fmt) or "").strip()]
-        steps.append("Dropped rows that render as nothing (%d removed)"
+        def says_something(r: dict) -> bool:
+            if not (formatting.format_example(r, fmt) or "").strip():
+                return False
+            # A conversation whose every assistant turn is empty renders as
+            # something -- the role label and a blank -- and is still a row
+            # with no answer in it. On a reasoning set those are the rows
+            # where the writer ran out of budget mid-thought, and what they
+            # teach is to think until the budget is gone and never answer,
+            # which is the one habit such a set exists to correct.
+            #
+            # A row with no assistant turn at all is left alone: that is a
+            # different shape, not an empty one.
+            turns = [m for m in conversation.from_row(r, fmt)[conversation.MESSAGES_KEY]
+                     if m.get("role") == "assistant"]
+            return not turns or any((m.get("content") or "").strip()
+                                    or m.get("tool_calls") for m in turns)
+
+        rows = [r for r in rows if says_something(r)]
+        steps.append("Dropped rows that say nothing (%d removed)"
                      % (before - len(rows)))
 
     if ops.get("dedupe"):
