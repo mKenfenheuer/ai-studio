@@ -32,7 +32,35 @@ _TEXT_FIELDS = ["text", "content", "document", "sentence", "raw", "body"]
 _MESSAGE_FIELDS = ["messages", "conversations", "conversation", "chat", "turns"]
 _TOOL_FIELDS = ["tools", "functions", "tool_schema"]
 _SYSTEM_FIELDS = ["system", "system_prompt"]
-_REASONING_TAG = re.compile(r"</?(?:think|thinking|reasoning)>", re.IGNORECASE)
+# Control tokens belonging to a chat template, in any message field that holds
+# what somebody SAID. None of them are words: they are the punctuation a
+# template writes around the words, and a template writes its own. One that
+# arrives inside the text is rendered a second time, so the model is trained on
+# a turn that opens twice, or ends in the middle, or claims to be a different
+# speaker -- and at generation time it learns to emit them, which is how a
+# reply runs past its own ending.
+#
+# Matched as a closed set rather than by shape. `<|...|>` is unambiguous, but
+# `[INST]` and `<s>` are also ordinary text in the wrong context, so only the
+# markers real templates actually use are listed.
+_SPECIAL_TOKEN = re.compile(
+    r"<\|[a-z0-9_]{1,32}\|>"                       # ChatML, Llama 3, Harmony
+    r"|</?s>|<\|endoftext\|>"                       # sentence and text bounds
+    r"|\[/?INST\]|<</?SYS>>"                        # Llama 2, Mistral
+    r"|</?(?:start|end)_of_turn>"                   # Gemma
+    r"|</?(?:think|thinking|reasoning)>",           # reasoning blocks
+    re.IGNORECASE)
+
+
+def strip_special(text: str) -> str:
+    """Text with a template's control tokens taken out of it.
+
+    Applied to what a message SAYS -- its words and its working -- and never to
+    a template, which is made of these on purpose.
+    """
+    if not text or "<" not in text and "[" not in text:
+        return text
+    return _SPECIAL_TOKEN.sub("", text)
 _REASONING_FIELDS = ["reasoning", "reasoning_content", "thinking",
                      "thought", "analysis", "rationale"]
 
@@ -199,19 +227,23 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
                 reasoning = found.group(2).strip()
                 text = _THINK_RE.sub("", text, count=1).strip()
         content = text
-        # A reasoning field holds the working ITSELF, never its wrapper --
-        # rendering puts the wrapper on, so a field that arrives carrying one
-        # produces two. Datasets built by splitting replies on `</think>` keep
-        # the closer often enough to matter: 1.4% of the rows in one 7,100-row
-        # set here, which is small enough to survive review and frequent enough
-        # to be learned. What it teaches is exactly what it looks like -- that a
-        # closing tag may be followed by more thinking and another closing tag
-        # -- and a model that has learned it never stops.
+        # What a message SAYS never contains a template's control tokens. The
+        # template writes those around the words, so one that arrives inside
+        # them is rendered a second time: a turn that opens twice, or ends in
+        # the middle, or claims to be a different speaker. Trained on, it is
+        # also emitted, which is how a reply runs past its own ending.
+        #
+        # The reasoning field is where this actually bites. A dataset built by
+        # splitting replies on `</think>` keeps the closer often enough to
+        # matter -- 1.4% of the rows in one 7,100-row set here, small enough to
+        # survive review and frequent enough to be learned -- and the field
+        # holds the working ITSELF, never its wrapper, so a field carrying one
+        # renders with two.
         #
         # Stripped here rather than in any one caller, because this is the only
-        # place a reasoning field is read out of a row.
-        if reasoning and _REASONING_TAG.search(reasoning):
-            reasoning = _REASONING_TAG.sub("", reasoning).strip()
+        # place a message is read out of a row.
+        reasoning = strip_special(reasoning).strip()
+        content = strip_special(content) if isinstance(content, str) else content
 
         raw_calls = m.get("tool_calls")
         if raw_calls is None and m.get("function_call"):

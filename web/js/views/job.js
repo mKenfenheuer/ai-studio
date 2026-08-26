@@ -7,6 +7,12 @@ import { shareButton, wireShareBox } from "./share.js";
 const STAGES = {
   evaluating: "Putting the prompts to each model…",
   loading_model: "Downloading and loading the model…",
+  // Writing a dataset is not training, and a hosted writer is not downloaded.
+  // These runs used to borrow the training vocabulary and report that they
+  // were loading a model and then training, while they were opening an HTTPS
+  // connection and then writing rows.
+  connecting: "Reaching the model that will write it…",
+  writing: "Writing rows",
   loading_dataset: "Downloading and preparing your data…",
   training_tokenizer: "Building a vocabulary from your text…",
   tokenizing: "Reading and tokenizing the text…",
@@ -451,7 +457,8 @@ function writingView(mount, job, jobId, metrics, logs) {
   logBox.scrollTop = logBox.scrollHeight;
 
   let latest = metrics[metrics.length - 1] || {};
-  let stage = job.status === "running" ? "" : "training";
+  // A writing run that is already going is writing; it is never training.
+  let stage = job.status === "running" ? "writing" : "";
   wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
   const paint = () => {
@@ -480,7 +487,6 @@ function writingView(mount, job, jobId, metrics, logs) {
       if (atBottom) logBox.scrollTop = logBox.scrollHeight;
     } else if (msg.type === "job_progress") {
       stage = msg.stage;
-      if (stage === "training") { job.step = msg.step; job.total_steps = msg.total; }
       paintProgress(mount, job, stage, msg.step, msg.total);
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
@@ -998,22 +1004,25 @@ function paintHeader(mount, job) {
 function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
                        checkpointStep = 0) {
   const training = stage === "training" || stage === "";
+  const writing = stage === "writing";
   // Preparation stages count their own units -- documents scanned, tokens
-  // collected -- so the bar follows those while they run, and the step counter
-  // is only shown once those units really are training steps.
+  // collected -- so the bar follows those while they run, and the counter is
+  // only shown once those units are something a person can count: training
+  // steps, or rows written.
   const step = training ? job.step : (rawStep ?? 0);
   const total = training ? job.total_steps : (rawTotal ?? 0);
   const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
   const stageText = STAGES[stage] || (running ? "Working…" : "");
-  const counted = total > 0 && training;
+  const counted = total > 0 && (training || writing);
+  const unit = writing ? "row" : "step";
 
   $("#progressCard", mount).innerHTML = running ? html`
     <div class="card" style="margin-bottom:16px">
       <div class="row-between" style="margin-bottom:8px">
         <strong class="tiny">${stageText}</strong>
         <span class="tiny muted">${counted
-          ? `step ${step} of ${total}` : ""}</span>
+          ? `${unit} ${step} of ${total}` : ""}</span>
       </div>
       <div class="progress"><i style="width:${pct}%"></i></div>
       ${raw(checkpointStep ? html`

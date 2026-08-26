@@ -63,7 +63,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     # Two kinds of writer, one interface. A hosted model is reached over the
     # network and a local one is loaded onto the GPU, and the loop below cares
     # about neither -- it asks for a reply and gets one.
-    if spec.get("connection"):
+    hosted = bool(spec.get("connection"))
+    if hosted:
         host: Any = _HostedModel(spec, ctx)
     elif spec.get("job_id") or spec.get("base_model"):
         host = inference.ModelHost(ctx.controller_url, ctx.runner_token,
@@ -71,7 +72,11 @@ def run(cfg: dict, ctx: Any) -> dict:
     else:
         raise ValueError("No model was chosen to generate the data with.")
 
-    ctx.progress(0, target, stage="loading_model")
+    # Named for what is actually about to happen. A hosted writer is reached
+    # over the network and there is no model to download; saying "downloading
+    # and loading the model" while opening an HTTPS connection describes a
+    # different job entirely, and this one is not training either.
+    ctx.progress(0, target, stage="connecting" if hosted else "loading_model")
     host.ensure_loaded(spec, lambda line: ctx.log(line))
 
     _preamble(ctx, cfg, mode, target, spec)
@@ -161,7 +166,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 "tokens_per_sec": result.get("tokens_per_sec"),
                 "eta_s": round((target - written) / max(rate, 1e-6)),
             })
-            ctx.progress(written, target, stage="training")
+            ctx.progress(written, target, stage="writing")
             if written <= 2 or written % max(1, target // 10) == 0:
                 ctx.log("Row %d of %d: %s" % (written, target, _clip(text)))
 
@@ -496,6 +501,29 @@ def _clip(text: str, n: int = 110) -> str:
 # subject, never impatient. Asking separately -- once in the character of the
 # person, once as the assistant -- gets a user turn that reads like a user.
 
+# Asked of the writer when the conversation being extended shows its working.
+#
+# The hosted APIs will hand back a reasoning summary, but only when the model
+# happened to reason enough to have one: measured over six short follow-up
+# turns, four came back with a summary and two -- "Perfect, thanks." among them
+# -- came back with none, identically whether the summary was asked for as
+# "auto" or as "detailed". That is reasonable behaviour and useless to rely on,
+# because a row where some assistant turns show their working and others do not
+# teaches a model to reason once and then stop.
+#
+# So it is asked for in the open, as a block this studio already knows how to
+# read back -- the same `<think>` split the trainer and the playground use.
+_WRITE_WORKING = (
+    "You are writing the assistant's next turn in a dataset where every turn "
+    "shows its working.\n"
+    "Reply with one JSON object and nothing else, no code fence:\n"
+    '{"reasoning": "<your working>", "content": "<the answer>"}\n'
+    "The working is first-person deliberation and it stops the moment you have "
+    "decided. The answer stands on its own and never refers back to it. Keep "
+    "the working in proportion: a turn that needs little thought gets a "
+    "sentence of it. Always write both fields."
+)
+
 _USER_PROMPT = (
     "You are simulating the PERSON in this conversation, not the assistant.\n"
     "Write only their next message. Nothing else: no preamble, no quotation "
@@ -578,7 +606,8 @@ def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
 
             try:
                 added, made_up = _extend_one(conv, host, spec, params, turns,
-                                             persona, tools, invent_results)
+                                             persona, tools, invent_results,
+                                             wants_reasoning)
                 invented += made_up
             except ProviderRefused:
                 raise
@@ -605,7 +634,7 @@ def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
                 "rows_per_sec": round(rate, 3),
                 "eta_s": round((target - written) / max(rate, 1e-6)),
             })
-            ctx.progress(written, target, stage="training")
+            ctx.progress(written, target, stage="writing")
             if written <= 2 or written % max(1, target // 10) == 0:
                 grew = len(conv[C.MESSAGES_KEY]) - before
                 ctx.log("Row %d of %d: %d turns -> %d (+%d)"
@@ -631,7 +660,8 @@ def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
 
 
 def _extend_one(conv: dict, host: Any, spec: dict, params: dict, turns: int,
-                persona: str, tools: list[dict], invent_results: bool) -> tuple[int, int]:
+                persona: str, tools: list[dict], invent_results: bool,
+                show_working: bool = False) -> tuple[int, int]:
     """Add `turns` exchanges to one conversation, in place."""
     from common import conversation as C
 
@@ -654,12 +684,11 @@ def _extend_one(conv: dict, host: Any, spec: dict, params: dict, turns: int,
         if added:
             # The assistant never got to say what the result meant. Without
             # this the row still ends mid-exchange, one step further along.
-            reply = host.generate(spec, _for_provider(conv),
-                                  {**params, "tools": tools or None},
-                                  None, lambda _l: None)
-            if text := (reply.get("text") or "").strip():
+            text, thinking, _calls = _assistant_turn(
+                conv, host, spec, params, tools, show_working)
+            if text:
                 turn: dict[str, Any] = {"role": "assistant", "content": text}
-                if thinking := (reply.get("reasoning") or "").strip():
+                if thinking:
                     turn["reasoning"] = thinking
                 msgs.append(turn)
                 added += 1
@@ -684,14 +713,12 @@ def _extend_one(conv: dict, host: Any, spec: dict, params: dict, turns: int,
         # 2. The assistant's reply, with this row's own tools declared so it
         #    can call one -- which is the whole point on a tool dataset.
         for _step in range(4):
-            reply = host.generate(spec, _for_provider(conv),
-                                  {**params, "tools": tools or None},
-                                  None, lambda _l: None)
-            calls = reply.get("tool_calls") or []
+            text, thinking, calls = _assistant_turn(
+                conv, host, spec, params, tools, show_working)
             turn: dict[str, Any] = {"role": "assistant"}
-            if text := (reply.get("text") or "").strip():
+            if text:
                 turn["content"] = text
-            if thinking := (reply.get("reasoning") or "").strip():
+            if thinking:
                 turn["reasoning"] = thinking
             if calls:
                 turn["tool_calls"] = calls
@@ -753,6 +780,70 @@ def _unanswered(msgs: list[dict]) -> list[dict]:
     return [c for m in msgs if m.get("role") == "assistant"
             for c in (m.get("tool_calls") or [])
             if c.get("id") not in answered]
+
+
+def _assistant_turn(conv: dict, host: Any, spec: dict, params: dict,
+                    tools: list[dict], show_working: bool) -> tuple:
+    """One reply from the writer, as (answer, working, tool calls).
+
+    Two ways of asking, and the reliable one cannot call a tool.
+
+    A hosted API hands back its own reasoning only when the model happened to
+    reason enough to have a summary worth giving. Measured over six short
+    follow-up turns: four came back with one and two did not, identically
+    whether the summary was requested as "auto" or "detailed", and asking the
+    model in the prompt to write a <think> block instead did worse -- three of
+    six, because a reasoning model does its thinking internally and answers.
+
+    Asking for a JSON object with the two fields in it got six of six. So that
+    is what is asked for whenever a row has no tools to declare -- which is
+    every row of a plain reasoning dataset.
+
+    A row WITH tools is asked the ordinary way, because a tool call has to come
+    back through the API's own machinery and cannot be a field in an object the
+    model typed. Those turns take the API's working when there is one.
+    """
+    if show_working and not tools:
+        msgs = [{"role": "system", "content": _WRITE_WORKING}] + _for_provider(conv)
+        reply = host.generate(spec, msgs, {**params, "tools": None},
+                              None, lambda _l: None)
+        text, thinking = _read_written(reply.get("text") or "")
+        if text or thinking:
+            return _clean(text), _clean(thinking), []
+        # The model did not produce the object. Falling through loses the
+        # working rather than the turn, which is the better of the two.
+    reply = host.generate(spec, _for_provider(conv),
+                          {**params, "tools": tools or None},
+                          None, lambda _l: None)
+    return (_clean(reply.get("text") or ""),
+            _clean(reply.get("reasoning") or ""),
+            reply.get("tool_calls") or [])
+
+
+def _read_written(text: str) -> tuple[str, str]:
+    """The answer and the working out of the object the writer was asked for."""
+    body = (text or "").strip()
+    if m := _FENCE.match(body):
+        body = m.group(1).strip()
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return "", ""
+    if not isinstance(obj, dict):
+        return "", ""
+    return str(obj.get("content") or ""), str(obj.get("reasoning") or "")
+
+
+def _clean(text: str) -> str:
+    """No control token belonging to a chat template reaches a dataset.
+
+    Stripped on the way IN as well as on the way out. Reading a dataset strips
+    these anyway, but a row is also downloaded, published and read by people,
+    and a file that is only clean once something else has been through it is
+    not a clean file.
+    """
+    from common import formatting as F
+    return F.strip_special(text or "").strip()
 
 
 def _for_provider(conv: dict) -> list[dict]:
