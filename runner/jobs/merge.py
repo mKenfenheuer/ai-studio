@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from common import chat_formats
 from runner import artifacts
 from runner.capabilities import expert_kernel
 
@@ -134,6 +135,11 @@ def run(cfg: dict, ctx: Any) -> dict:
         else base_model
     tok = AutoTokenizer.from_pretrained(tok_src, token=ctx.hf_token)
     tok.save_pretrained(str(out_dir))
+    # In both places a reader looks, whatever this version of transformers
+    # decided to write. See chat_formats.stamp_into.
+    if put := chat_formats.stamp_into(out_dir, getattr(tok, "chat_template", None)):
+        ctx.log("Chat template written into %s, so every tool that reads a "
+                "model finds it." % " and ".join(put))
     ctx.log("Tokenizer taken from %s."
             % ("the fine-tune" if tok_src == str(adapter) else "the base model"))
 

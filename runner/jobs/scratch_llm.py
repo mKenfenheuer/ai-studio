@@ -1238,6 +1238,12 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     # loads this model that it has a billion-token context.
     tok.model_max_length = arch["max_position_embeddings"]
     tok.save_pretrained(str(out_dir))
+    # In BOTH places a reader looks, whatever this version of transformers
+    # decided to write. See chat_formats.stamp_into.
+    if put := chat_formats.stamp_into(out_dir, getattr(tok, "chat_template", None)):
+        ctx.log("Chat template written into %s, so every tool that reads a "
+                "model finds it." % " and ".join(put))
+
 
     summary = {
         "kind": "pretrain_llm",

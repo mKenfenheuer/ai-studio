@@ -920,6 +920,12 @@ def run(cfg: dict, ctx: Any) -> dict:
     stamped = _stamp_chat_template(tok, fmt, cfg, ctx)
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
+    # In BOTH places a reader looks, whatever this version of transformers
+    # decided to write. See chat_formats.stamp_into.
+    if put := chat_formats.stamp_into(out_dir, getattr(tok, "chat_template", None)):
+        ctx.log("Chat template written into %s, so every tool that reads a "
+                "model finds it." % " and ".join(put))
+
 
     summary = {
         "kind": "finetune_llm",

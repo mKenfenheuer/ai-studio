@@ -1008,20 +1008,24 @@ async def job_chat_template(request: Request, job_id: str) -> dict:
     if not path.exists():
         return {"available": False, "reason": "This run has no saved model."}
     import zipfile
+    CF = hub.chat_formats
     try:
         with zipfile.ZipFile(path) as z:
             names = {n.rsplit("/", 1)[-1]: n for n in z.namelist()}
-            if "tokenizer_config.json" not in names:
+            if CF.TOKENIZER_CONFIG not in names:
                 return {"available": False, "reason": "no tokenizer in the result"}
-            conf = json.loads(z.read(names["tokenizer_config.json"]))
-    except (OSError, ValueError, zipfile.BadZipFile) as e:
+            # Both places, because which one holds it depends on the version of
+            # transformers that saved it. Looking only in the tokenizer config
+            # found nothing in EVERY model this studio has produced -- so the
+            # wizard told people their instruct fine-tune "ships no chat
+            # template of its own, which usually means it is a base model".
+            files = {n: z.read(names[n]).decode("utf-8")
+                     for n in (CF.TEMPLATE_FILE, CF.TOKENIZER_CONFIG)
+                     if n in names}
+            conf = json.loads(files.get(CF.TOKENIZER_CONFIG) or "{}")
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
         return {"available": False, "reason": str(e)[:200]}
-    template = conf.get("chat_template")
-    if isinstance(template, dict):
-        template = template.get("default") or next(iter(template.values()), None)
-    if isinstance(template, list):        # transformers 5 ships a list of dicts
-        template = next((t.get("template") for t in template
-                         if isinstance(t, dict)), None)
+    template = CF.template_in(files)
     return {"available": bool(template), "chat_template": template,
             "eos_token": conf.get("eos_token")}
 

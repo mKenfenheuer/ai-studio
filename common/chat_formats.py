@@ -63,6 +63,8 @@ a different token.
 """
 from __future__ import annotations
 
+import json
+
 CHAT_FORMATS = [
     {
         "id": "plain",
@@ -500,3 +502,71 @@ def public_formats() -> list[dict]:
         "reasoning_note": f.get("reasoning_note", ""),
         "tool_note": f.get("tool_note", ""),
     } for f in CHAT_FORMATS]
+
+
+# Where a chat template has to end up, and every place a reader might look.
+#
+# Transformers 5 saves it to `chat_template.jinja` and leaves `chat_template`
+# out of `tokenizer_config.json` entirely. Plenty of readers only ever look in
+# the config -- older transformers, several serving stacks, and this studio's
+# own artifact endpoint until recently, which is why the wizard told people
+# their instruct fine-tune "ships no chat template of its own, which usually
+# means it is a base model" about a model whose template it had written itself.
+#
+# A model that carries its template in one of the two places is a model that
+# half the ecosystem reads as a base model. So it goes in both.
+TEMPLATE_FILE = "chat_template.jinja"
+TOKENIZER_CONFIG = "tokenizer_config.json"
+
+
+def template_in(files: dict) -> str | None:
+    """The chat template out of a saved tokenizer, from wherever it is.
+
+    `files` maps a file name to its already-read contents, so the same reading
+    serves a directory on disk and a zip nobody wants to unpack. The dedicated
+    file wins: where both exist it is the one transformers wrote last.
+    """
+    if jinja := (files.get(TEMPLATE_FILE) or "").strip():
+        return jinja
+    try:
+        conf = json.loads(files.get(TOKENIZER_CONFIG) or "{}")
+    except ValueError:
+        return None
+    template = conf.get("chat_template")
+    if isinstance(template, dict):
+        template = template.get("default") or next(iter(template.values()), None)
+    if isinstance(template, list):          # some saves ship a list of dicts
+        template = next((t.get("template") for t in template
+                         if isinstance(t, dict)), None)
+    return template or None
+
+
+def stamp_into(model_dir, template: str | None) -> list[str]:
+    """Put this template in every place a reader looks. Returns what changed.
+
+    Called after the tokenizer has been saved, because `save_pretrained` is
+    what decides where transformers puts it and that answer has changed
+    between versions. Writing both afterwards is version-proof in a way that
+    trusting the library is not.
+    """
+    from pathlib import Path
+    model_dir = Path(model_dir)
+    if not template or not model_dir.is_dir():
+        return []
+    written = []
+    jinja = model_dir / TEMPLATE_FILE
+    if not jinja.exists() or jinja.read_text(encoding="utf-8") != template:
+        jinja.write_text(template, encoding="utf-8")
+        written.append(TEMPLATE_FILE)
+    conf_path = model_dir / TOKENIZER_CONFIG
+    if conf_path.exists():
+        try:
+            conf = json.loads(conf_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return written
+        if conf.get("chat_template") != template:
+            conf["chat_template"] = template
+            conf_path.write_text(json.dumps(conf, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+            written.append(TOKENIZER_CONFIG)
+    return written

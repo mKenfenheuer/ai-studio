@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from common import formatting
+from common import chat_formats, formatting
 
 from . import config
 
@@ -876,15 +876,28 @@ async def model_chat_template(model_id: str) -> dict:
     if model_id in _TEMPLATE_CACHE:
         return _TEMPLATE_CACHE[model_id]
 
-    url = "https://huggingface.co/%s/resolve/main/tokenizer_config.json" % model_id
+    base = "https://huggingface.co/%s/resolve/main/" % model_id
     try:
-        r = await client().get(url, headers=auth_headers())
+        r = await client().get(base + chat_formats.TOKENIZER_CONFIG,
+                               headers=auth_headers())
         r.raise_for_status()
         conf = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return {"available": False, "reason": str(e)[:200], "model": model_id}
 
     template = conf.get("chat_template")
+    # A repository that keeps its template in a file of its own -- which is
+    # where transformers 5 puts it, and increasingly where the Hub has it. The
+    # config is asked first because it is the one that can name several
+    # templates; this fills in when it holds none.
+    if not template:
+        try:
+            r = await client().get(base + chat_formats.TEMPLATE_FILE,
+                                   headers=auth_headers())
+            if r.status_code == 200 and r.text.strip():
+                template = r.text
+        except httpx.HTTPError:
+            pass
     # Some repositories ship several named templates (a default and a
     # tool-using one). Prefer the default, and say which was taken.
     name = None
