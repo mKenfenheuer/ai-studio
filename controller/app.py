@@ -1780,6 +1780,14 @@ async def playground(request: Request) -> list[dict]:
     """Finished runs you can talk to."""
     out = []
     for job in db.visible_jobs(security.current_user(request), 200):
+        # Runs that produce a MODEL. Not every run does: writing a dataset
+        # leaves a zip on disk exactly as training does, and "has an artifact"
+        # was the whole test -- so a run that wrote 1,200 rows of JSONL was
+        # offered here as something to chat with, and in the training wizard,
+        # which reads this same list, as a model to fine-tune from. The
+        # OpenAI-compatible endpoint has always filtered by kind; this did not.
+        if job["kind"] not in serving.MODEL_KINDS:
+            continue
         # A run that was stopped early but kept its model belongs here too.
         # The artifact on disk is the real test of whether there is something
         # to talk to; the status only says how it got there.
@@ -1877,6 +1885,11 @@ async def job_system_prompt(request: Request, job_id: str) -> dict:
 @app.post("/api/jobs/{job_id}/chat")
 async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict:
     job = _job_or_404(request, job_id)
+    if job["kind"] not in serving.MODEL_KINDS:
+        raise HTTPException(
+            400, "That run did not produce a model. It left a file behind -- "
+                 "a dataset, or a set of scores -- which is not something to "
+                 "talk to.")
     # Not "did it succeed" but "is there a model". A run stopped early that
     # kept its model has one, and refusing to talk to it would make the
     # keeping pointless.

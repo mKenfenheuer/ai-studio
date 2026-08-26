@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from . import db, hub
 
+# The kinds of run that leave a MODEL behind. Everything else leaves a file --
+# a dataset, a scorecard -- worth keeping and not something to serve, chat
+# with, or fine-tune from. Shared, because two lists of this drifted apart
+# once already: the OpenAI-compatible endpoint filtered on it and the
+# playground did not, so a run that wrote a dataset was offered as a model.
+MODEL_KINDS = ("pretrain_llm", "finetune_llm", "merge_adapter")
+
 # What a merge inherits from the fine-tune it was made from.
 #
 # Merging changes where the weights live, not what the model learned to expect.

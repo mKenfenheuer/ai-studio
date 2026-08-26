@@ -100,7 +100,7 @@ def _servable(user: dict) -> list[dict]:
             continue
         if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
             continue
-        if job["kind"] not in ("pretrain_llm", "finetune_llm", "merge_adapter"):
+        if job["kind"] not in spec_for.MODEL_KINDS:
             continue
         out.append(job)
     return out

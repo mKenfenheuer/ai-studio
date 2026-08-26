@@ -155,17 +155,29 @@ export async function dataView(mount) {
       zone.addEventListener("drop", (e) => upload(e.dataTransfer?.files));
     }
 
-    on(mount, "click", "#mergeGo", async () => {
+    // The name is typed into the bar rather than asked for with `prompt`.
+    // A browser is free to suppress that dialog -- Chrome does, permanently,
+    // once somebody ticks "prevent this page from creating additional
+    // dialogs" -- and a suppressed prompt returns null, which this code read
+    // as "cancelled" and obeyed in silence. The button did nothing, said
+    // nothing, and logged nothing, which is the worst of the three.
+    on(mount, "click", "#mergeGo", async (_e, btn) => {
       const picked = [...mount.querySelectorAll("[data-pick]:checked")]
         .map((c) => c.dataset.pick);
       if (picked.length < 2) return toast("Tick at least two datasets.", "err");
-      const name = prompt("Name for the merged dataset?", "Merged dataset");
-      if (!name) return;
+      const name = ($("#mergeName", mount)?.value || "").trim() || "Merged dataset";
+      btn.disabled = true;
+      btn.textContent = "Merging…";
       try {
         const d = await api.mergeDatasets({ datasets: picked, name, shuffle: true });
         toast(`Merged into ${fmtNum(d.rows)} rows.`, "ok");
         location.hash = `#/data/${d.id}`;
-      } catch (ex) { toast(ex.message, "err"); }
+      } catch (ex) {
+        toast(ex.message, "err");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Merge them into one";
+      }
     });
 
     on(mount, "change", "[data-pick]", () => {
@@ -319,8 +331,12 @@ function layout(items, filter) {
                value="${filter}" style="max-width:220px">
       </div>
       <div id="mergeBar" class="callout" hidden style="margin-bottom:10px">
-        <strong><span id="mergeCount">0</span> selected</strong>
-        <button class="btn-sm btn-primary" id="mergeGo">Merge them into one</button>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <strong><span id="mergeCount">0</span> selected</strong>
+          <input id="mergeName" type="text" placeholder="Merged dataset"
+                 aria-label="Name for the merged dataset" style="max-width:260px">
+          <button class="btn-sm btn-primary" id="mergeGo">Merge them into one</button>
+        </div>
       </div>
       <div id="dsList">${raw(listing(items, filter))}</div>
     </div>`;
