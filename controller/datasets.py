@@ -1188,8 +1188,19 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
         seen: set[str] = set()
         kept = []
         for r in rows:
-            h = hashlib.sha1((formatting.format_example(r, fmt) or "")
-                             .strip().encode("utf-8")).hexdigest()
+            # Compared as the canonical record, not as `format_example`'s plain
+            # rendering. That rendering is a projection -- on a chat dataset it
+            # writes "user: ... / assistant: ..." and drops the reasoning
+            # entirely -- so two rows with the same question and answer but
+            # different working hashed alike, and one was silently thrown away.
+            #
+            # On a reasoning set that is not a duplicate being removed, it is a
+            # trained field being ignored. The canonical record holds
+            # everything a template can render: the working, the tool calls and
+            # the ids, whether or not this particular rendering shows them.
+            conv = conversation.from_row(r, fmt)
+            h = hashlib.sha1(json.dumps(conv, sort_keys=True, default=str)
+                             .encode("utf-8")).hexdigest()
             if h in seen:
                 continue
             seen.add(h)
