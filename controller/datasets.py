@@ -1538,6 +1538,73 @@ def split(dataset: dict, fraction: float, owner_id: str | None,
     return made
 
 
+# Weakest wins, so a merge of a confidently-read file and a doubtfully-read one
+# is not described as confident.
+# How many rows the merged facts are measured over. Large enough that a shape
+# held by a small fraction of the file is still seen: a thousand rows spread
+# evenly finds anything present in more than about a tenth of a percent.
+_FORMAT_SAMPLE = 1000
+
+_CONFIDENCE_ORDER = ("low", "medium", "high")
+
+
+def merged_format(parts: list[dict], rows: list[dict],
+                  columns: list[str]) -> dict:
+    """One format describing all of these datasets, rather than the first.
+
+    Merge used to take `datasets[0]["format"]` and call it the answer, which is
+    right only when every part happens to be shaped like the first one. Merging
+    a tool-calling set into a plain one recorded `has_tool_calls: false` over
+    6,832 rows that had tool calls in them -- and the wizard reads exactly those
+    flags to decide what to offer.
+
+    Two kinds of thing live in a format and they merge differently.
+
+    A DECISION -- which column holds the conversation, which chat format to
+    render in -- is kept when every part that expresses one agrees, and dropped
+    when they do not. Dropped rather than picked between: two datasets that
+    name different columns have not agreed on a column, and the readers here
+    all fall back to detecting per row, which is the correct answer for a file
+    where it genuinely varies.
+
+    An OBSERVATION -- which roles appear, whether there are tool calls or
+    reasoning -- is not merged at all. It is measured again from the merged
+    rows, because that is what it describes and the merged rows now exist.
+    """
+    decisions: dict[str, set] = {}
+    for part in parts:
+        for key, value in (part or {}).items():
+            if key in formatting.CONTENT_FACTS or key == "confidence":
+                continue
+            if value in (None, "", [], {}):
+                continue
+            decisions.setdefault(key, set()).add(json.dumps(value, sort_keys=True))
+
+    out: dict = {}
+    for key, seen in decisions.items():
+        if len(seen) == 1:
+            out[key] = json.loads(next(iter(seen)))
+    # Where the parts disagree about the shape itself, say so plainly rather
+    # than leaving the key off and letting a default stand in for a decision
+    # nobody made.
+    if "mode" not in out:
+        out["mode"] = "auto"
+
+    # Only a part that actually claims a confidence can lower it. A format
+    # produced by a transform states none -- it was decided rather than
+    # guessed at -- and counting that absence as doubt described a merge of two
+    # well-understood datasets as barely understood at all.
+    stated = [(p or {}).get("confidence") for p in parts]
+    stated = [c for c in stated if c in _CONFIDENCE_ORDER]
+    if stated:
+        out["confidence"] = min(stated, key=_CONFIDENCE_ORDER.index)
+
+    for key, value in (formatting.detect_format(columns, rows) or {}).items():
+        if key in formatting.CONTENT_FACTS:
+            out[key] = value
+    return out
+
+
 def merge(datasets: list[dict], owner_id: str | None, name: str,
           shuffle: bool = True, seed: int = 1234) -> dict:
     rows: list[dict] = []
@@ -1551,8 +1618,16 @@ def merge(datasets: list[dict], owner_id: str | None, name: str,
     if shuffle:
         random.Random(seed).shuffle(rows)
         steps.append("Shuffled together")
+    columns = sorted({k for r in rows[:200] for k in r})
+    # Sampled ACROSS the merged rows rather than off the front of them. With
+    # shuffling off the front is entirely the first dataset, which is how the
+    # facts came to describe only the first dataset in the first place -- and
+    # a minority shape is exactly what a head-sample misses.
+    step = max(1, len(rows) // _FORMAT_SAMPLE)
+    fmt = merged_format([d.get("format") or {} for d in datasets],
+                        rows[::step][:_FORMAT_SAMPLE], columns)
     return register(
         owner_id, name, "derived", iter(rows),
-        columns=sorted({k for r in rows[:200] for k in r}),
-        format=datasets[0].get("format"),
+        columns=columns,
+        format=fmt,
         recipe={"steps": steps, "rows_after": len(rows)})

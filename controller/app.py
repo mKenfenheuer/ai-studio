@@ -1151,10 +1151,10 @@ async def hub_builtin_template() -> dict:
             "instruction_template": hub.formatting.DEFAULT_INSTRUCTION_TEMPLATE}
 
 
-# What a format records about *reading* a dataset, versus what it records about
-# what is *in* it. The first is a decision and is kept; the second is an
-# observation and is re-made from the rows every time it is needed.
-_CONTENT_FACTS = ("roles", "has_tool_calls", "has_reasoning")
+# See formatting.CONTENT_FACTS: what a format records about *reading* a dataset,
+# versus what it records about what is *in* it. The first is a decision and is
+# kept; the second is an observation and is re-made from the rows.
+_CONTENT_FACTS = hub.formatting.CONTENT_FACTS
 
 
 def _describe_rows(stored: dict | None, columns: list, rows: list) -> dict:

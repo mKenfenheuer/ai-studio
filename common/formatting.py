@@ -609,6 +609,12 @@ def format_example(row: dict, fmt: dict) -> str | None:
     return None
 
 
+# What a format records about what is *in* a dataset, as opposed to how to
+# *read* it. The first is an observation and is re-measured from the rows
+# wherever it is needed; the second is a decision somebody made and is kept.
+CONTENT_FACTS = ("roles", "has_tool_calls", "has_reasoning")
+
+
 def detect_format(columns: list[str], rows: list[dict] | None = None) -> dict:
     """Guess how a dataset is laid out, so the UI can pre-fill the mapping."""
     cols = {c.lower() for c in columns if c}
