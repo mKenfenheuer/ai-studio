@@ -289,6 +289,7 @@ export async function datasetView(mount, [id]) {
 function opsFrom(f) {
   return {
     drop_empty: !!f.drop_empty, dedupe: !!f.dedupe, shuffle: !!f.shuffle,
+    max_per_prompt: +f.max_per_prompt || 0,
     min_chars: +f.min_chars || 0, max_chars: +f.max_chars || 0,
     sample: +f.sample || 0, contains: f.contains, excludes: f.excludes,
     to_conversations: !!f.to_conversations, system_prompt: f.system_prompt,
@@ -732,6 +733,18 @@ function toolsCard(d) {
           Drop rows that render as nothing</label>
         <label class="check"><input type="checkbox" name="dedupe" checked>
           Remove exact duplicates</label>
+        <div class="field">
+          <label for="tPerPrompt">Most rows to keep per question</label>
+          <input id="tPerPrompt" name="max_per_prompt" type="number"
+                 min="0" step="1" placeholder="no limit">
+          <div class="hint">Different from the box above, and the one that
+            bites on generated data: a model asked repeatedly for examples on a
+            topic converges on the same obvious question and varies only the
+            answer, so no two rows are identical and one question still takes a
+            large share of the file. Two or three keeps the useful part of that
+            — several good answers to one question — without teaching the
+            question.</div>
+        </div>
         <label class="check"><input type="checkbox" name="shuffle">
           Shuffle</label>
         <div class="callout" style="margin:12px 0">

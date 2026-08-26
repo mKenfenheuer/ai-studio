@@ -1197,6 +1197,32 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
         rows = kept
         steps.append("Removed exact duplicates (%d removed)" % (n0 - len(rows)))
 
+    # Exact duplicates are rare in a generated set and repeated QUESTIONS are
+    # not: a model asked thirty times for an example on one topic converges on
+    # the obvious question and varies only the answer, so `dedupe` above finds
+    # nothing while one question quietly takes 2% of the file. Keeping a few of
+    # each is useful -- two good answers to one question is augmentation -- and
+    # keeping eight is teaching that question rather than the shape.
+    if per_prompt := int(ops.get("max_per_prompt") or 0):
+        n0 = len(rows)
+        seen: dict[str, int] = {}
+        kept = []
+        for r in rows:
+            conv = conversation.from_row(r, fmt)
+            asked = " | ".join(
+                (m.get("content") or "").strip()
+                for m in conv[conversation.MESSAGES_KEY]
+                if m.get("role") in ("user", "system"))
+            key = hashlib.sha1(asked.encode("utf-8")).hexdigest()
+            if seen.get(key, 0) >= per_prompt:
+                continue
+            seen[key] = seen.get(key, 0) + 1
+            kept.append(r)
+        rows = kept
+        steps.append("Kept at most %d row%s per question (%d removed)"
+                     % (per_prompt, "" if per_prompt == 1 else "s",
+                        n0 - len(rows)))
+
     lo = int(ops.get("min_chars") or 0)
     hi = int(ops.get("max_chars") or 0)
     if lo or hi:
