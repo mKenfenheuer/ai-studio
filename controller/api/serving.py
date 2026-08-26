@@ -233,6 +233,7 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
             "top_p": float(payload.get("top_p", 0.95)),
             "top_k": int(payload.get("top_k") or 50),
             "reasoning": bool(payload.get("reasoning")),
+            "deadline_s": config.GENERATION_DEADLINE_S,
         },
     })
     if not sent:

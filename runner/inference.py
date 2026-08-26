@@ -80,6 +80,17 @@ PREFILL_CHUNK = 256
 # peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
 PREFILL_HEADROOM_GB = 0.6
 
+# How long one reply may take before it is stopped and handed back as it
+# stands. A runner answers one message at a time, so this is not really a limit
+# on the reply -- it is a limit on how long everybody else waits.
+#
+# Measured on the card this was written against: 8.1 tokens a second, so a
+# 4,096-token budget is eight and a half minutes of the machine being busy and
+# every other message refused. The reply that comes back at the deadline is a
+# real reply, marked as cut short, which is worth more than a runner nobody
+# else can reach.
+GENERATION_DEADLINE_S = 300.0
+
 # How far back a marker still arriving may reach. `<|channel|>final<|message|>`
 # is the longest this studio's formats use; anything older than this is text.
 _MARKER_REACH = 32
@@ -488,7 +499,8 @@ class ModelHost:
                                              tools=spec.get("tools"),
                                              reasoning=reasoning)
 
-    def _prefill(self, model, ids, log: Callable[[str], None]):
+    def _prefill(self, model, ids, log: Callable[[str], None],
+                 deadline: float | None = None):
         """Build the key/value cache for the prompt, a slice at a time.
 
         Returns the cache, positioned so the caller can carry straight on from
@@ -500,7 +512,7 @@ class ModelHost:
         past = None
         total = ids.shape[1]
         for i in range(0, total, PREFILL_CHUNK):
-            if self._cancel.is_set():
+            if self._cancel.is_set() or (deadline and time.time() > deadline):
                 break
             chunk = ids[:, i:i + PREFILL_CHUNK]
             with torch.no_grad():
@@ -642,12 +654,14 @@ class ModelHost:
 
             produced: list[int] = []
             t0 = time.time()
+            deadline = t0 + float(params.get("deadline_s")
+                                  or GENERATION_DEADLINE_S)
             # Everything but the final token goes in as cache; the loop below
             # starts from that token and its logits are the first thing
             # sampled. Feeding the whole prompt to the loop instead is one
             # attention matrix the size of the conversation squared.
             if prompt_len > 1:
-                past = self._prefill(model, ids[:, :-1], log)
+                past = self._prefill(model, ids[:, :-1], log, deadline)
             cur = ids[:, -1:]
 
             # What the reader has already been shown, per channel. A reply is
@@ -677,6 +691,12 @@ class ModelHost:
             for _ in range(max_new):
                 if self._cancel.is_set():
                     stop_reason = "cancelled"
+                    break
+                if time.time() > deadline:
+                    # Stopped by the clock rather than by the budget. What has
+                    # been written is kept and said to be incomplete; the
+                    # alternative is a machine nobody else can use.
+                    stop_reason = "timeout"
                     break
                 with torch.no_grad():
                     out = model(input_ids=cur, past_key_values=past, use_cache=True)

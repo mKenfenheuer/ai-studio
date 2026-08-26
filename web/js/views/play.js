@@ -420,11 +420,20 @@ function chatView(mount, run, runs) {
       // survives. The controls live in a context menu rather than beside every
       // message: two buttons on each of twenty turns is forty buttons, and the
       // conversation is the thing you came to read.
-      footer: (m) => (m.stopped_at_limit
-        ? `<div class="turn-note">Stopped at the length limit — this reply is
-             cut off, not finished. Raise the limit in generation settings and
-             regenerate to see the rest.</div>`
-        : ""),
+      footer: (m) => {
+        if (m.stopped_at_limit) {
+          return `<div class="turn-note">Stopped at the length limit — this
+            reply is cut off, not finished. Raise the limit in generation
+            settings and regenerate to see the rest.</div>`;
+        }
+        if (m.stopped_at_deadline) {
+          return `<div class="turn-note">Stopped after taking too long — this
+            reply is cut off, not finished. This machine answers one message at
+            a time, so a reply cannot be allowed to run indefinitely. A shorter
+            length limit finishes inside the time.</div>`;
+        }
+        return "";
+      },
       // Answering a call by hand, when the row recorded no result for it or
       // you want to see what a different result would do.
       callAction: (c, _n) => (turns[last]?.tool_calls || []).includes(c)
@@ -492,7 +501,26 @@ function chatView(mount, run, runs) {
   }
 
   // ---------------------------------------------------------- generating
+  //
+  // A reply takes as long as it takes -- on a single consumer card that is
+  // eight or so tokens a second, so a long one is minutes. Silence for that
+  // long is indistinguishable from a hang, so the wait is counted out loud.
+  let started = 0;
+  let ticker = null;
+
+  const stopTicking = () => { clearInterval(ticker); ticker = null; };
+
+  const tick = () => {
+    if (!live) return stopTicking();
+    const secs = Math.round((Date.now() - started) / 1000);
+    const written = (live.reasoning.length + live.content.length);
+    statusEl.textContent = `Writing… ${secs}s`
+      + (written ? ` · ${written.toLocaleString()} characters` : "")
+      + (live.content ? "" : (live.reasoning ? " · still thinking" : ""));
+  };
+
   const finish = () => {
+    stopTicking();
     requestId = null;
     early = [];
     live = null;
@@ -521,11 +549,15 @@ function chatView(mount, run, runs) {
       requestId = r.request_id;
       stopBtn.hidden = false;
       statusEl.textContent = `Running on ${r.runner}…`;
+      started = Date.now();
+      stopTicking();
+      ticker = setInterval(tick, 1000);
       const buffered = early.filter((m) => m.request_id === requestId);
       early = [];
       buffered.forEach(handle);
     } catch (e) {
       live = null;
+      stopTicking();
       paint();
       statusEl.textContent = "";
       sendBtn.disabled = false;
@@ -868,7 +900,7 @@ function chatView(mount, run, runs) {
       const channel = msg.channel === "reasoning" ? "reasoning" : "content";
       const first = !live[channel];
       live[channel] += msg.delta;
-      statusEl.textContent = "";
+      if (started) tick();
       // The first character of a channel is the one that needs the panel or
       // the bubble built for it; the rest just lengthen what is there.
       if (first) paint(); else grow(channel);
@@ -882,10 +914,12 @@ function chatView(mount, run, runs) {
         // Cut off rather than finished. Kept on the message so the note stays
         // with the reply it describes when turns above it are edited away.
         stopped_at_limit: msg.stop_reason === "length",
+        stopped_at_deadline: msg.stop_reason === "timeout",
       };
       const empty = !reply.content && !calls.length && !reply.reasoning;
       requestId = null;
       live = null;
+      stopTicking();
       sendBtn.disabled = false;
       stopBtn.hidden = true;
       if (empty) {
@@ -919,6 +953,7 @@ function chatView(mount, run, runs) {
       }
     } else if (msg.type === "generate_error") {
       live = null;
+      stopTicking();
       requestId = null;
       sendBtn.disabled = false;
       stopBtn.hidden = true;
@@ -959,6 +994,7 @@ function chatView(mount, run, runs) {
   box.focus();
   return () => {
     unsub();
+    stopTicking();
     // The menu lives on <body>, so it outlives this view unless it is taken
     // down with it -- along with the two listeners that dismiss it.
     closeMenu();

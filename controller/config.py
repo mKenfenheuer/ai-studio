@@ -62,6 +62,14 @@ WEB_DIR: Path = Path(__file__).resolve().parent.parent / "web"
 # takes.
 MAX_NEW_TOKENS: int = int(os.environ.get("AI_STUDIO_MAX_NEW_TOKENS") or 4096)
 
+# How long one reply may take before the runner stops and hands back what it
+# has. A runner serves one message at a time, so this bounds how long everybody
+# else is refused -- not how good the reply is. Kept under the API's own wait
+# below, so the runner gives up first and returns a real (if short) answer
+# rather than the caller timing out on a machine still working.
+GENERATION_DEADLINE_S: float = float(
+    os.environ.get("AI_STUDIO_GENERATION_DEADLINE_S") or 300)
+
 
 def ensure_dirs() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)

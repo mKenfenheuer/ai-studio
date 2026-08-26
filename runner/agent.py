@@ -135,6 +135,7 @@ class Runner:
         # a run in progress rather than competing with it for memory.
         self.host: inference.ModelHost | None = None
         self.generating = False
+        self.generating_since = 0.0
 
     def _stable_id(self) -> str:
         """Reuse the same identity across restarts so the controller shows one
@@ -368,12 +369,19 @@ class Runner:
             })
             return
         if self.generating:
+            # How long, not just "busy". This machine answers one message at a
+            # time and a long reply takes minutes on it, so "still answering"
+            # without a number reads as a hang rather than as a queue.
+            waited = int(time.time() - (self.generating_since or time.time()))
             self.outbox.put({
                 "type": "generate_error", "request_id": rid,
-                "error": "Still answering the previous message.",
+                "error": "This machine is still writing the previous reply "
+                         "(%ds so far). It answers one message at a time; wait "
+                         "for it, or press Stop on that one." % waited,
             })
             return
         self.generating = True
+        self.generating_since = time.time()
         threading.Thread(target=self._generate, args=(msg,), daemon=True,
                          name="gen-%s" % rid).start()
 
