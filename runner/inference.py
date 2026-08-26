@@ -638,6 +638,11 @@ class ModelHost:
             # only this tells them apart. Nothing else happening means the
             # loop ran to the end of its budget.
             stop_reason = "length"
+            # Set when the reply had to be cut for leaving its own format.
+            # Reported rather than shown: the answer it produced is complete
+            # and correct, but a model doing this is a model whose training
+            # data taught it to, which is worth being able to see.
+            off_template = False
 
             # Refused before anything is spent, where the arithmetic says it
             # cannot end well. `budget` counts the whole exchange, because the
@@ -741,6 +746,21 @@ class ModelHost:
                     stop_reason = "end"
                     break
 
+                # The same idea as a stop sequence, except that what makes it
+                # one depends on what came before: a reasoning block closed
+                # twice, or reopened after closing. The model has left the
+                # shape it was trained in, and it will not find its own way
+                # back -- the end-of-turn token it learned belongs to a format
+                # it is no longer writing, so it runs to the limit instead.
+                if (cut := formatting.reasoning_violation(full)) is not None:
+                    full = full[:cut]
+                    deliver(full)
+                    emitted = full
+                    hit_stop = True
+                    stop_reason = "end"
+                    off_template = True
+                    break
+
                 # Hold back the last few characters, because they may turn out
                 # to be the start of a stop sequence -- or of a reasoning
                 # marker. Without this the model streams "…green.Human:" to the
@@ -788,6 +808,7 @@ class ModelHost:
                 # "end" the model finished, "length" it ran out of budget,
                 # "cancelled" somebody pressed stop.
                 "stop_reason": stop_reason,
+                "off_template": off_template,
                 "cancelled": stop_reason == "cancelled",
                 "prompt_preview": text[-600:],
             }

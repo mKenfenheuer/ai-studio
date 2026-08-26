@@ -32,6 +32,7 @@ _TEXT_FIELDS = ["text", "content", "document", "sentence", "raw", "body"]
 _MESSAGE_FIELDS = ["messages", "conversations", "conversation", "chat", "turns"]
 _TOOL_FIELDS = ["tools", "functions", "tool_schema"]
 _SYSTEM_FIELDS = ["system", "system_prompt"]
+_REASONING_TAG = re.compile(r"</?(?:think|thinking|reasoning)>", re.IGNORECASE)
 _REASONING_FIELDS = ["reasoning", "reasoning_content", "thinking",
                      "thought", "analysis", "rationale"]
 
@@ -198,6 +199,19 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
                 reasoning = found.group(2).strip()
                 text = _THINK_RE.sub("", text, count=1).strip()
         content = text
+        # A reasoning field holds the working ITSELF, never its wrapper --
+        # rendering puts the wrapper on, so a field that arrives carrying one
+        # produces two. Datasets built by splitting replies on `</think>` keep
+        # the closer often enough to matter: 1.4% of the rows in one 7,100-row
+        # set here, which is small enough to survive review and frequent enough
+        # to be learned. What it teaches is exactly what it looks like -- that a
+        # closing tag may be followed by more thinking and another closing tag
+        # -- and a model that has learned it never stops.
+        #
+        # Stripped here rather than in any one caller, because this is the only
+        # place a reasoning field is read out of a row.
+        if reasoning and _REASONING_TAG.search(reasoning):
+            reasoning = _REASONING_TAG.sub("", reasoning).strip()
 
         raw_calls = m.get("tool_calls")
         if raw_calls is None and m.get("function_call"):
@@ -862,6 +876,42 @@ def split_reasoning(text: str, fmt: dict | None = None) -> tuple[str, str]:
     if open_tag:
         return open_tag.group(2).strip(), ""
     return "", text
+
+
+_REASONING_CLOSE = re.compile(r"</(?:think|thinking|reasoning)>", re.IGNORECASE)
+_REASONING_OPEN = re.compile(r"<(?:think|thinking|reasoning)>", re.IGNORECASE)
+
+
+def reasoning_violation(text: str) -> int | None:
+    """Where a reply stops obeying the shape of its own reasoning block.
+
+    The block opens once and closes once. A model that closes it twice, or
+    opens a new one after closing the first, has left the format it was trained
+    in -- and everything from that point on is noise appended to an answer that
+    was already finished.
+
+    Worth enforcing rather than tidying up afterwards, because the failure is
+    self-sustaining: the model is now writing in a shape it never saw in
+    training, so the thing that would normally stop it -- the end-of-turn token
+    it learned to emit -- is not coming either. Left alone it runs to the token
+    limit every time.
+
+    Returns the index to cut at, or None when the reply is well formed. Stop
+    sequences are how a reply is ended everywhere else here, and this is one:
+    the only difference is that it depends on what came before it rather than
+    being a fixed string.
+    """
+    closes = [m.start() for m in _REASONING_CLOSE.finditer(text)]
+    if not closes:
+        return None
+    # The prompt may have opened the block itself, in which case the reply
+    # carries only the closer. Either way the SECOND one is one too many.
+    cut = closes[1] if len(closes) > 1 else None
+    # A block opened after the working was already closed off.
+    if reopened := _REASONING_OPEN.search(text, closes[0] + 1):
+        if cut is None or reopened.start() < cut:
+            cut = reopened.start()
+    return cut
 
 
 def tool_declaration(tools: list[dict] | None, format_id: str | None = None) -> str:

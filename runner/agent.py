@@ -408,6 +408,13 @@ class Runner:
                 messages = [{"role": "user", "content": msg.get("prompt", "")}]
             result = self.host.generate(spec, messages,
                                         msg.get("params") or {}, on_token, log)
+            if result.get("off_template"):
+                # Not an error -- the answer is complete and was kept. But a
+                # model that closes its reasoning block twice learned to from
+                # somewhere, and that somewhere is its training data.
+                print("[runner] %s left its reasoning format and was cut short; "
+                      "check the dataset for reasoning fields containing their "
+                      "own </think> tags." % spec.get("job_id"), flush=True)
             self.outbox.put({"type": "generate_done", "request_id": rid, **result})
         except Exception as e:  # noqa: BLE001
             # A chat is deliberately never written down, which until now meant
