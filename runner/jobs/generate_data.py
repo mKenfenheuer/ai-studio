@@ -34,6 +34,7 @@ confidently wrong too.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import random
 import re
@@ -507,6 +508,22 @@ _USER_PROMPT = (
 )
 
 
+def _has_reasoning(rows: list[dict]) -> bool:
+    """Whether the conversations being lengthened show their working.
+
+    Read off the rows themselves rather than off the dataset's recorded
+    format: a dataset reached through a URL arrives without one, and guessing
+    "no" silently drops the very thing being extended.
+    """
+    from common import conversation as C
+    for row in rows:
+        conv = C.from_row(row if isinstance(row, dict) else {})
+        for m in conv[C.MESSAGES_KEY]:
+            if (m.get("reasoning") or "").strip():
+                return True
+    return False
+
+
 def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
             out_path: Path, target: int) -> dict:
     """Make the conversations in a dataset longer, a turn at a time."""
@@ -516,6 +533,27 @@ def _extend(cfg: dict, ctx: Any, host: Any, spec: dict, params: dict,
     persona = (cfg.get("persona") or "").strip()
     invent_results = bool(cfg.get("invent_tool_results", True))
     rows = _source_rows(cfg, ctx)
+
+    # A conversation whose existing turns carry working needs its new ones to
+    # carry working too, or the row teaches a model to reason on the first
+    # answer and stop reasoning on every one after it -- which is a stranger
+    # lesson than either reasoning or not. The writing model is asked for it
+    # explicitly, since a hosted model does not volunteer its thinking.
+    #
+    # The rows arrive as a stream, so the ones read to decide are put back
+    # rather than consumed -- reading a dataset twice means downloading it
+    # twice, and dropping the first fifty rows to answer a question about
+    # them would be worse.
+    head = list(itertools.islice(rows, 50))
+    wants_reasoning = _has_reasoning(head)
+    rows = itertools.chain(head, rows)
+    if wants_reasoning:
+        params = {**params, "reasoning": True}
+        ctx.log("These conversations show the model's working, so the added "
+                "turns are written with theirs as well.")
+    else:
+        ctx.log("These conversations carry no working, so the added turns "
+                "carry none either.")
 
     written = extended = failed = 0
     invented = 0

@@ -37,6 +37,11 @@ ANTHROPIC_VERSION = "2023-06-01"
 # stable version; a connection may name its own.
 AZURE_API_VERSION = "2024-10-21"
 
+# Room for a reasoning model's thinking, on top of the answer the caller asked
+# for. Only the Responses API needs this: it counts both against one budget,
+# where Chat Completions does not.
+REASONING_HEADROOM_TOKENS = 2048
+
 # What a connection needs before it can be used. `secret` fields are never
 # sent back to the browser once stored.
 FIELD = {
@@ -423,8 +428,26 @@ def _responses_request(conn: dict, model: str, messages: list[dict],
                           "parameters": t.get("parameters")
                           or {"type": "object", "properties": {}}}
                          for t in tools]
-    if effort := (params.get("reasoning_effort") or "").strip():
-        body["reasoning"] = {"effort": effort}
+    # Getting a model's working back off this API takes TWO settings, and
+    # each is useless without the other. Measured against gpt-5.4:
+    #
+    #   summary alone      no reasoning item at all      0 characters
+    #   effort alone       a reasoning item, empty       0 characters
+    #   effort + summary   a reasoning item with text  322 characters
+    #
+    # `effort` is what makes it think; `summary` is what makes the thinking
+    # visible. Sending one was the same as sending neither, which is how a run
+    # that extended a reasoning dataset produced turns with no reasoning on
+    # them -- the model reasoned, and nobody asked to see it.
+    effort = (params.get("reasoning_effort") or "").strip()
+    if effort or params.get("reasoning"):
+        body["reasoning"] = {"effort": effort or "medium", "summary": "auto"}
+        # Thinking is charged against `max_output_tokens` here, unlike on Chat
+        # Completions, so a small budget is spent thinking and returns a
+        # fragment -- five characters of answer out of 900 tokens, measured.
+        # The caller's number is what they want to READ; the thinking gets
+        # room of its own on top of it.
+        body["max_output_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
     if temperature is not None:
         body["temperature"] = float(temperature)
     if top_p is not None:
@@ -536,6 +559,12 @@ def retry_body(conn: dict, body: dict, error_text: str) -> dict | None:
         changed = True
     if "top_p" in text and "top_p" in fixed:
         fixed.pop("top_p")
+        changed = True
+    # A model on this surface that does not reason at all rejects the field.
+    # Dropped rather than fatal: asking for a summary is an attempt to get
+    # more, never a requirement.
+    if "reasoning" in text and "reasoning" in fixed:
+        fixed.pop("reasoning")
         changed = True
     return fixed if changed else None
 
