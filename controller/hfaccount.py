@@ -241,23 +241,36 @@ async def delete_repo(user: dict, repo_id: str, kind: str) -> None:
 # Model cards
 # ---------------------------------------------------------------------------
 
-def model_card(job: dict, repo_id: str) -> str:
+def model_card(job: dict, repo_id: str, artifact_job: dict | None = None) -> str:
     """The README to put at the top of the repo.
 
     The runner already writes one describing how to load the model. This adds
     the YAML front matter the Hub needs to file it correctly, and the training
     facts -- which are otherwise only visible inside this studio.
+
+    `job` is the run being described, `artifact_job` the run whose files are
+    actually being sent. They differ for the ordinary case of a fine-tune: what
+    goes to the Hub is its merged model, and the facts worth writing down --
+    what it learned from, where it stopped -- belong to the training run.
     """
     cfg = job.get("config") or {}
+    artifact_job = artifact_job or job
     scratch = job.get("kind") == "pretrain_llm"
-    existing = _readme_in_artifact(job["id"])
+    merged = artifact_job.get("kind") == "merge_adapter"
+    existing = _readme_in_artifact(artifact_job["id"])
 
     tags = ["ai-studio", "text-generation"]
-    tags.append("pretrained-from-scratch" if scratch else "lora")
+    # `lora` on the Hub means a repository holding an adapter, and a merged
+    # model is not one -- it is a complete set of weights that happens to have
+    # been trained with LoRA. Tagging it `lora` sends people looking for an
+    # adapter_config.json that is not there.
+    tags.append("pretrained-from-scratch" if scratch
+                else "merged-lora" if merged else "lora")
     front = ["---", "library_name: transformers", "tags:"]
     front += ["  - %s" % t for t in tags]
-    if not scratch and cfg.get("base_model"):
-        front.append("base_model: %s" % cfg["base_model"])
+    base = cfg.get("base_model") or (artifact_job.get("config") or {}).get("base_model")
+    if not scratch and base:
+        front.append("base_model: %s" % base)
     # `datasets:` in the front matter is a Hub id, and the Hub renders it as a
     # link. A dataset from this studio's own library travels as a URL pointing
     # back at the controller, which is not a Hub id and is not reachable from
@@ -273,6 +286,10 @@ def model_card(job: dict, repo_id: str) -> str:
         or "a private dataset"
     head.append("Trained with [AI Studio](https://github.com/) on %s."
                 % trained_on)
+    if merged:
+        head += ["", "The LoRA adapter has been folded into the base weights, "
+                 "so this is a complete model: it loads with `from_pretrained` "
+                 "and needs nothing downloaded alongside it."]
     if stopped:
         head += ["", "> **Stopped before the end of its schedule.** It "
                  "completed %s of %s planned steps, so its learning rate never "

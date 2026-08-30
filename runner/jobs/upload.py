@@ -72,6 +72,15 @@ def run(cfg: dict, ctx: Any) -> dict:
             raise ValueError("No run was given to upload.")
         folder = artifacts.fetch(ctx.controller_url, ctx.runner_token,
                                  cfg["source_job"], ctx.log)
+        # The last place this can be caught. An adapter is 50 MB of low-rank
+        # matrices that load into nothing without the exact base they were
+        # fitted to, and a repository containing only those looks like a model
+        # right up to the moment somebody tries to use it.
+        if (folder / "adapter_config.json").exists():
+            raise ValueError(
+                "That run produced an adapter, not a model. Publish its "
+                "merged run instead: the merge folds the adapter into the "
+                "base weights and the result loads on its own.")
         # Uploaded straight out of the cache rather than copied somewhere
         # first: a copy of a fourteen-gigabyte model, to add one text file
         # beside it, is fourteen gigabytes of disk and several minutes.

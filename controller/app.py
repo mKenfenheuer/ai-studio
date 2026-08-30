@@ -421,6 +421,11 @@ async def _create_job(request: Request, payload: dict) -> str:
         # recording its own base, which older adapters may not.
         cfg.setdefault("base_model", src["config"].get("base_model"))
         cfg.setdefault("base_model_job", src["config"].get("base_model_job"))
+        if not cfg.get("base_model_label"):
+            base_run = db.get_job(cfg.get("base_model_job") or "") \
+                if cfg.get("base_model_job") else None
+            cfg["base_model_label"] = cfg.get("base_model") \
+                or (base_run or {}).get("name") or "its base"
         # The merged model answers in the shape the fine-tune was trained in,
         # so the format travels with it or the playground would guess again --
         # and with it the system prompt and the data it learned from, which is
@@ -504,6 +509,15 @@ async def _create_job(request: Request, payload: dict) -> str:
             src = _job_or_404(request, cfg["source_job"])
             if not (config.ARTIFACT_DIR / ("%s.zip" % src["id"])).exists():
                 raise HTTPException(400, "That run has no saved model.")
+            # The publish endpoint resolves a fine-tune to its merged run
+            # before it gets here. This is the backstop for anything that does
+            # not: an adapter published as a model is a repository that cannot
+            # be loaded, and it looks entirely fine until somebody tries.
+            if src["kind"] == "finetune_llm":
+                raise HTTPException(
+                    400, "That run produced an adapter, not a model. Publish "
+                         "its merged run instead -- an adapter on its own "
+                         "cannot be loaded without the base it was fitted to.")
             cfg["source_run_name"] = src["name"]
         cfg["allow_cpu"] = True
     else:
@@ -901,6 +915,11 @@ async def upload_artifact(job_id: str, file: UploadFile,
     if kind == "adapter" and job:
         _queue_merge(job)
 
+    # A merge is the first moment a fine-tune has a whole model, which is the
+    # moment a publish request that was waiting for one can go.
+    if job and job.get("kind") == "merge_adapter":
+        await _publish_after_merge(job)
+
     if kind == "dataset" and job:
         # Rows written by a model are only useful once they are a dataset you
         # can look at, clean and train on. Doing that here, rather than making
@@ -926,7 +945,7 @@ async def upload_artifact(job_id: str, file: UploadFile,
     return {"ok": True, "size": size}
 
 
-def _queue_merge(job: dict) -> None:
+def _queue_merge(job: dict, force: bool = False) -> str | None:
     """Turn a finished fine-tune into a standalone model, automatically.
 
     A LoRA fine-tune produces an adapter, which is a few tens of megabytes and
@@ -947,26 +966,48 @@ def _queue_merge(job: dict) -> None:
     with no adapter_config.json and uses it as the base for a fresh adapter.
     What is no longer possible is continuing the *same* adapter, because it has
     been folded into the weights and there is nothing left to peel off.
+
+    Returns the merge run's id, or None if there is nothing to merge into.
+    `force` is for publishing, which needs the merged model whatever the run
+    was configured to do afterwards.
     """
     cfg = job.get("config") or {}
-    if job.get("kind") != "finetune_llm" or not cfg.get("merge_after", True):
-        return
+    if job.get("kind") != "finetune_llm":
+        return None
+    if not force and not cfg.get("merge_after", True):
+        return None
     if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
-        return
-    # An adapter whose base is another run in this studio is already standalone
-    # once that run's model is merged; merging again would copy the weights a
-    # second time for nothing.
-    if not cfg.get("base_model"):
-        db.add_log(job["id"], "Not merging: this run has no Hugging Face base "
-                              "model recorded to merge into.")
-        return
-    if db.q("SELECT id FROM jobs WHERE kind='merge_adapter' "
-            "AND json_extract(config, '$.source_job')=?", (job["id"],)):
-        return          # already done, or already queued
+        return None
+    # Where the weights to fold into come from: a model on the Hub, or one this
+    # studio already built. The second case used to be declined outright, on
+    # the reasoning that such an adapter was "already standalone once that run
+    # is merged" -- which is not true and never was. An adapter is an adapter
+    # whatever its base is, and merge.py has always known how to fetch a base
+    # that is another run. What that mistake produced was a fine-tune of a
+    # fine-tune that could never become a model, and got published to the Hub
+    # as 50 MB of matrices with no weights attached.
+    base_job = db.get_job(cfg.get("base_model_job") or "") \
+        if cfg.get("base_model_job") else None
+    if base_job and base_job["kind"] not in ("merge_adapter", "pretrain_llm"):
+        base_job = None         # itself an adapter: not something to merge into
+    if not cfg.get("base_model") and not base_job:
+        db.add_log(job["id"], "Not merging: this run has no base model "
+                              "recorded to merge into.")
+        return None
+    if not force and db.q("SELECT id FROM jobs WHERE kind='merge_adapter' "
+                          "AND json_extract(config, '$.source_job')=?",
+                          (job["id"],)):
+        return None     # already done, or already queued
 
+    into = cfg.get("base_model") or (base_job or {}).get("name") or "its base"
     merged_cfg = {
         "source_job": job["id"],
         "base_model": cfg.get("base_model"),
+        "base_model_job": base_job["id"] if base_job else None,
+        # What to call it. A base that is another run arrives on the runner as
+        # a cache directory, and that path has no business in a log line or on
+        # a model card.
+        "base_model_label": into,
         "source_run_name": job["name"],
         "dtype": cfg.get("dtype") or "float16",
         # Merging is arithmetic on the processor. Pinning it to the machine
@@ -990,9 +1031,9 @@ def _queue_merge(job: dict) -> None:
     db.add_log(job["id"],
                "Merging the adapter into %s so the result is a model that "
                "needs nothing else to run. The adapter is kept too -- it is "
-               "what a later run continues from."
-               % cfg.get("base_model"))
+               "what a later run continues from." % into)
     db.add_log(jid, "Queued automatically after %s finished." % job["name"])
+    return jid
 
 
 def _register_generated(job: dict, archive: Path) -> dict:
@@ -1036,23 +1077,161 @@ async def publish_job(request: Request, job_id: str,
     This queues the upload rather than performing it. Fourteen gigabytes takes
     twenty minutes, which is longer than any browser will hold a request open;
     doing it here is what used to leave an empty repository behind.
+
+    WHAT LEAVES IS ALWAYS A WHOLE MODEL. A fine-tune's own artifact is an
+    adapter -- 50 MB of low-rank matrices that do nothing without the exact
+    base they were fitted to -- and publishing that as "the model" is how a
+    repository ends up looking complete and loading as nothing. So a fine-tune
+    publishes its merged run, and if there is not one yet it is merged first
+    and the upload starts by itself when the merge lands.
     """
     job = _job_or_404(request, job_id)
-    if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+    want = {
+        "repo_id": (payload.get("repo_id") or "").strip(),
+        "private": bool(payload.get("private", True)),
+        "replace": bool(payload.get("replace")),
+        "message": payload.get("message") or "",
+    }
+    if job["kind"] == "finetune_llm":
+        return await _publish_merged(request, job, want)
+    if not _has_artifact(job_id):
         raise HTTPException(400, "This run has no saved model to publish.")
-    repo_id = (payload.get("repo_id") or "").strip()
+    return await _queue_upload(request, job, job, want)
+
+
+def _has_artifact(job_id: str) -> bool:
+    return (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists()
+
+
+def _merged_run(job_id: str) -> dict | None:
+    """The run that folded this fine-tune's adapter into its base.
+
+    A finished one in preference to anything else, because that is the one
+    with a model in it; otherwise the most recent, so the caller can see that
+    a merge is on its way or that the last attempt failed.
+    """
+    fallback = None
+    for r in db.q("SELECT id FROM jobs WHERE kind='merge_adapter' "
+                  "AND json_extract(config, '$.source_job')=? "
+                  "ORDER BY created_at DESC", (job_id,)):
+        m = db.get_job(r["id"])
+        if not m:
+            continue
+        if m["status"] == "succeeded" and _has_artifact(m["id"]):
+            return m
+        fallback = fallback or m
+    return fallback
+
+
+async def _queue_upload(request: Request, trained: dict, artifact: dict,
+                        want: dict) -> dict:
+    """Queue the upload run. `trained` is what the card describes, `artifact`
+    is where the files come from -- the same run for a merge or a from-scratch
+    model, and two different runs when a fine-tune publishes its merge."""
     jid = await _create_job(request, {
-        "name": "Publishing %s" % (repo_id or job["name"]),
+        "name": "Publishing %s" % (want["repo_id"] or trained["name"]),
         "kind": "upload",
         "config": {
-            "target": "model", "source_job": job_id, "repo_id": repo_id,
-            "private": bool(payload.get("private", True)),
-            "replace": bool(payload.get("replace")),
-            "message": payload.get("message") or "",
-            "card": hfaccount.model_card(job, repo_id),
+            "target": "model", "source_job": artifact["id"],
+            "trained_by": trained["id"], **want,
+            "card": hfaccount.model_card(trained, want["repo_id"],
+                                         artifact_job=artifact),
         }})
-    return {"job_id": jid, "repo_id": repo_id,
-            "url": "https://huggingface.co/%s" % repo_id}
+    return {"job_id": jid, "repo_id": want["repo_id"],
+            "url": "https://huggingface.co/%s" % want["repo_id"]}
+
+
+async def _publish_merged(request: Request, job: dict, want: dict) -> dict:
+    """Publish a fine-tune, which means publishing its merged model."""
+    merged = _merged_run(job["id"])
+    if merged and merged["status"] == "succeeded" and _has_artifact(merged["id"]):
+        return await _queue_upload(request, job, merged, want)
+
+    # Checked here as well as at creation. The upload run that would normally
+    # do this is an hour away, and "your token is read-only" is not a thing to
+    # discover after merging fourteen gigabytes.
+    user = security.current_user(request)
+    if problem := (hfaccount.repo_problem(want["repo_id"])
+                   or hfaccount.can_publish_to(user, want["repo_id"])):
+        raise HTTPException(400, problem)
+
+    if not merged or merged["status"] in ("failed", "cancelled"):
+        if not _has_artifact(job["id"]):
+            raise HTTPException(400, "This run has no saved adapter to merge.")
+        new_id = _queue_merge(job, force=True)
+        if not new_id:
+            raise HTTPException(
+                400, "This fine-tune records no base model, so its adapter "
+                     "cannot be folded into anything. Merge it by hand, "
+                     "naming the base, and publish that run.")
+        merged = db.get_job(new_id)
+
+    cfg = dict(merged["config"])
+    # Deliberately not the token: it is looked up from this user when the
+    # merge finishes, so a request that sits in the queue for an hour holds no
+    # credential, and a token revoked in the meantime is not used anyway.
+    cfg["publish_after"] = {**want, "trained_by": job["id"],
+                            "requested_by": user["id"]}
+    db.update_job_config(merged["id"], cfg)
+    db.add_log(merged["id"], "Publishing to %s when this finishes."
+               % want["repo_id"])
+    db.add_log(job["id"],
+               "Publishing waits for the merge (%s). What goes to Hugging "
+               "Face is the merged model -- the adapter on its own needs the "
+               "base model downloaded separately and applied by hand."
+               % merged["id"])
+    await fleet.broadcast_ui({"type": "jobs_changed"})
+    return {"job_id": merged["id"], "pending": True,
+            "repo_id": want["repo_id"],
+            "url": "https://huggingface.co/%s" % want["repo_id"],
+            "message": "Merging first. The upload starts on its own when the "
+                       "merge finishes."}
+
+
+async def _publish_after_merge(merge_job: dict) -> None:
+    """Start the upload a publish request was waiting on.
+
+    Called when a merge's artifact lands, which is the first moment there is a
+    whole model to send.
+    """
+    want = (merge_job.get("config") or {}).get("publish_after")
+    if not want:
+        return
+    # Once. A re-uploaded artifact -- a merge re-run by hand, say -- should not
+    # publish a second time without being asked.
+    cfg = dict(merge_job["config"])
+    cfg.pop("publish_after", None)
+    db.update_job_config(merge_job["id"], cfg)
+
+    user = db.get_user(want.get("requested_by") or "")
+    if not user:
+        db.add_log(merge_job["id"], "Not publishing: the account that asked "
+                                    "for it no longer exists.", "error")
+        return
+    if problem := hfaccount.can_publish_to(user, want["repo_id"]):
+        db.add_log(merge_job["id"], "Not publishing: %s" % problem, "error")
+        return
+    trained = db.get_job(want.get("trained_by") or "") or merge_job
+
+    upload_cfg = {
+        "target": "model", "source_job": merge_job["id"],
+        "trained_by": trained["id"], "source_run_name": merge_job["name"],
+        "repo_id": want["repo_id"], "private": bool(want.get("private", True)),
+        "replace": bool(want.get("replace")),
+        "message": want.get("message") or "",
+        "card": hfaccount.model_card(trained, want["repo_id"],
+                                     artifact_job=merge_job),
+        "allow_cpu": True,
+    }
+    if token := hfaccount.token_for(user):
+        upload_cfg["hf_token"] = token
+    jid = db.create_job("Publishing %s" % want["repo_id"], "upload",
+                        upload_cfg, owner_id=user["id"])
+    db.add_log(jid, "Queued automatically once the merged model existed.")
+    db.add_log(merge_job["id"], "Merged. Publishing to %s now."
+               % want["repo_id"])
+    await fleet.broadcast_ui({"type": "jobs_changed"})
+    fleet.wake()
 
 
 @app.get("/api/jobs/{job_id}/chat-template")

@@ -90,7 +90,10 @@ export function wirePublish(mount, kind, send) {
       });
       // Uploading is a run now, with a log and a progress bar, so the useful
       // thing to do here is go and watch it rather than report "started".
-      toast("Publishing. Watch it here.", "ok");
+      // What is being watched may be the merge: a fine-tune publishes its
+      // merged model, and the upload starts by itself when that lands.
+      toast(r.pending ? (r.message || "Merging first.") : "Publishing. Watch it here.",
+            "ok");
       location.hash = `#/jobs/${r.job_id}`;
     } catch (ex) {
       $("#publishResult", mount).innerHTML =

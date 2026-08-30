@@ -77,9 +77,14 @@ def run(cfg: dict, ctx: Any) -> dict:
         if not (fetched / "adapter_config.json").exists():
             base_model = str(fetched)
 
+    # What the base is CALLED, which is not always where it is. A base that is
+    # another run in this studio arrives as a cache directory, and neither a
+    # log line nor a model card on the Hub should be naming a path on some
+    # runner's disk.
+    label = cfg.get("base_model_label") or base_model
     ctx.log("Merging into %s. The result is a complete model of that size, "
             "not the size of the adapter -- the base is now part of it."
-            % base_model)
+            % label)
 
     extra = {}
     if (kernel := expert_kernel(ctx.capabilities)):
@@ -147,7 +152,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     summary = {
         "kind": "merge_adapter",
         "merged_from": source,
-        "base_model": base_model,
+        "base_model": label,
         "params_total": params,
         "dtype": dtype_name,
         "duration_s": round(time.time() - t0, 1),

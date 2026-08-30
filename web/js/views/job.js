@@ -161,8 +161,14 @@ export async function jobView(mount, [jobId]) {
     const hasModel = job.artifacts?.length;
     box.innerHTML = hasModel ? publishCard({
       kind: "model", slug: repoSlug(job),
-      blurb: `Uploads ${job.kind === "pretrain_llm" ? "the model" : "the adapter"}
-              and a model card to your own account.`,
+      // What a fine-tune publishes is its merged model, not its adapter --
+      // said here because the run's own artifact is the adapter, and being
+      // told afterwards that something else went is worse than knowing.
+      blurb: job.kind === "finetune_llm"
+        ? `Uploads the merged model — this adapter folded into its base, so it
+           loads anywhere — and a model card, to your own account. If it has
+           not been merged yet, that happens first and the upload follows.`
+        : `Uploads the model and a model card to your own account.`,
     }) : "";
     wireShareBox(mount, "job", job, async () => {
       job = await api.job(jobId);
