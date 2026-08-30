@@ -166,7 +166,20 @@ fi
 unset DOCKERHUB_TOKEN
 
 # Sign out again on the way out, but only if this script is what signed in.
-cleanup() { [[ $logged_in -eq 1 ]] && docker logout "$REGISTRY" >/dev/null 2>&1 || true; }
+#
+# Both names, because for Docker Hub they are not the same key. `docker login
+# docker.io` writes the credential under "https://index.docker.io/v1/", and
+# `docker logout docker.io` cheerfully prints "Removing login credentials for
+# docker.io" while leaving that entry exactly where it was. The token then
+# sits in ~/.docker/config.json, base64 of `user:dckr_pat_…`, on a shared box,
+# for as long as nobody looks. Which is how it was found.
+cleanup() {
+  [[ $logged_in -eq 1 ]] || return 0
+  docker logout "$REGISTRY" >/dev/null 2>&1 || true
+  [[ "$REGISTRY" == "docker.io" ]] \
+    && { docker logout https://index.docker.io/v1/ >/dev/null 2>&1 || true; }
+  return 0
+}
 trap cleanup EXIT
 
 # ---- build and push -----------------------------------------------------
