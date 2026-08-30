@@ -20,6 +20,12 @@ Three ways to use it, because they solve different problems:
   Self-instruct, roughly.
 * **from_topics** -- you have subject matter and want coverage. It works
   through a list of topics, generating examples about each.
+* **conversations** -- you have a brief and want whole exchanges, tool calls
+  and all. The reply is constrained to a JSON schema by the provider, so what
+  comes back is a conversation rather than prose that describes one. This is
+  the mode for a dataset that has to teach *calling something*: the model
+  writes the user's turn, the assistant's working, the call, what the function
+  returned and the answer, in one request per row.
 * **extend_conversations** -- you have conversations and they are too short.
   It carries each one further, a turn at a time, with the row's own tools
   declared so the model can call one. This is the mode most tool-calling
@@ -49,6 +55,14 @@ from .lora_llm import Cancelled
 # data; a runaway 4000-token ramble is not a training example, it is noise
 # with a token budget.
 DEFAULT_MAX_TOKENS = 512
+# A whole conversation is not one reply. Cut off at 512 tokens the JSON ends
+# mid-string, the row cannot be read, and the run drops what it paid for.
+CONVERSATION_MAX_TOKENS = 1600
+# Rows written over the network are IO, not computation: the machine waits.
+# Enough in flight to keep a long run to an hour, few enough that a shared
+# endpoint is not being hammered by one studio.
+_HOSTED_WORKERS = 6
+_MAX_WORKERS = 16
 
 
 def run(cfg: dict, ctx: Any) -> dict:
@@ -82,12 +96,32 @@ def run(cfg: dict, ctx: Any) -> dict:
     _preamble(ctx, cfg, mode, target, spec)
 
     params = {
-        "max_new_tokens": int(cfg.get("max_new_tokens") or DEFAULT_MAX_TOKENS),
+        "max_new_tokens": int(cfg.get("max_new_tokens")
+                              or (CONVERSATION_MAX_TOKENS
+                                  if mode == "conversations"
+                                  else DEFAULT_MAX_TOKENS)),
         "temperature": float(cfg.get("temperature") or 0.9),
         "top_p": float(cfg.get("top_p") or 0.95),
     }
     if effort := (cfg.get("reasoning_effort") or "").strip():
         params["reasoning_effort"] = effort
+
+    if mode == "conversations":
+        # Constrained decoding, where the provider can do it. The prompt says
+        # what to write; the schema is what makes it arrive as a conversation
+        # instead of a description of one.
+        from common import apimodels
+
+        params["schema"] = _conversation_schema(cfg)
+        if hosted and not apimodels.supports_schema(spec["connection"]):
+            ctx.log("This provider cannot constrain a reply to a schema, so "
+                    "the shape is asked for in the prompt instead. Rows that "
+                    "come back malformed are counted and dropped.", "warn")
+        elif not hosted:
+            ctx.log("A model on this machine is asked for the shape in the "
+                    "prompt -- there is no constrained decoding here. A small "
+                    "model will get it wrong often; watch the dropped count.",
+                    "warn")
 
     if mode == "extend_conversations":
         # A different shape of work: many calls per row rather than one, and
@@ -101,11 +135,17 @@ def run(cfg: dict, ctx: Any) -> dict:
     written = 0
     duplicates = 0
     empty = 0
+    rejected = 0
     stopped_early = False
     t0 = time.time()
 
+    workers = _workers(cfg, hosted, target)
+    if workers > 1:
+        ctx.log("Writing %d rows at a time, over the network." % workers)
+
     with out_path.open("w", encoding="utf-8") as fh:
-        for i in range(target):
+        for _i, meta, result in _attempts(host, spec, params, sources, target,
+                                          workers, ctx):
             if ctx.should_cancel():
                 # Nothing here is unfinished work: every row already written is
                 # a complete row. Stopping always keeps them, whichever way the
@@ -117,20 +157,6 @@ def run(cfg: dict, ctx: Any) -> dict:
                         "warn")
                 break
 
-            messages, meta = next(sources)
-            try:
-                result = host.generate(spec, messages, params, None,
-                                       lambda _l: None)
-            except ProviderRefused:
-                # A rejected key or a model that does not exist is not a bad
-                # row: it is every row. Carrying on would spend five thousand
-                # attempts discovering the same thing.
-                raise
-            except Exception as e:  # noqa: BLE001 - one bad row must not end the run
-                ctx.log("Row %d failed (%s); carrying on." % (i + 1, type(e).__name__),
-                        "debug")
-                continue
-
             text = (result.get("text") or "").strip()
             if not text:
                 empty += 1
@@ -138,10 +164,19 @@ def run(cfg: dict, ctx: Any) -> dict:
 
             row = _row(text, meta, cfg)
             if row is None:
-                empty += 1
+                # Not an empty reply: something arrived and was refused. On a
+                # conversation that means a call to a function that does not
+                # exist, arguments that are not JSON, a call nothing answered,
+                # or an exchange that stops before the assistant replies.
+                rejected += 1
+                if rejected in (25, 100, 400):
+                    ctx.log("%d replies so far were dropped for not being "
+                            "usable rows. If this keeps climbing, the brief "
+                            "and the tools are asking for something the model "
+                            "cannot produce consistently." % rejected, "warn")
                 continue
 
-            key = json.dumps(row, sort_keys=True)[:2000]
+            key = _dedupe_key(row)
             if key in seen:
                 duplicates += 1
                 if duplicates in (25, 100, 400):
@@ -162,13 +197,15 @@ def run(cfg: dict, ctx: Any) -> dict:
                 "rows": written,
                 "duplicates": duplicates,
                 "empty": empty,
+                "rejected": rejected,
                 "rows_per_sec": round(rate, 3),
                 "tokens_per_sec": result.get("tokens_per_sec"),
                 "eta_s": round((target - written) / max(rate, 1e-6)),
             })
             ctx.progress(written, target, stage="writing")
             if written <= 2 or written % max(1, target // 10) == 0:
-                ctx.log("Row %d of %d: %s" % (written, target, _clip(text)))
+                ctx.log("Row %d of %d: %s"
+                        % (written, target, _describe(row, text)))
 
     if not written:
         raise ValueError(
@@ -177,7 +214,7 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     return _finish(cfg, ctx, out_path, {
         "written": written, "duplicates": duplicates, "empty": empty,
-        "stopped_early": stopped_early, "target": target,
+        "rejected": rejected, "stopped_early": stopped_early, "target": target,
         "duration_s": time.time() - t0, "mode": mode,
     })
 
@@ -237,7 +274,8 @@ class _HostedModel:
         import httpx
 
         req = self.api.chat_request(self.conn, self.model, messages, params,
-                                    tools=params.get("tools"))
+                                    tools=params.get("tools"),
+                                    schema=params.get("schema"))
         # Whatever this model objected to last time, it will object to again.
         # Applying the correction up front is the difference between one
         # request per row and two: without it every call sent the rejected
@@ -327,6 +365,72 @@ class _HostedModel:
         time.sleep(delay)
 
 
+def _attempt(host, spec: dict, messages: list[dict], params: dict,
+             i: int, ctx: Any) -> dict | None:
+    """One request, or None if it failed in a way the run can walk past."""
+    try:
+        return host.generate(spec, messages, params, None, lambda _l: None)
+    except ProviderRefused:
+        # A rejected key or a model that does not exist is not a bad row: it
+        # is every row. Carrying on would spend five thousand attempts
+        # discovering the same thing.
+        raise
+    except Exception as e:  # noqa: BLE001 - one bad row must not end the run
+        ctx.log("Row %d failed (%s); carrying on." % (i + 1, type(e).__name__),
+                "debug")
+        return None
+
+
+def _attempts(host, spec: dict, params: dict, sources: Iterator, target: int,
+              workers: int, ctx: Any) -> Iterator[tuple[int, dict, dict]]:
+    """Finished attempts as (index, metadata, result), as they come back.
+
+    One request at a time is the only honest thing to do to a GPU that can
+    hold one model; against a hosted API it is just slow, and a thousand-row
+    run spends its afternoon waiting on the network. So hosted runs keep
+    several requests in flight and take the answers in whatever order they
+    arrive -- rows are independent, and nothing downstream cares about order.
+    """
+    if workers <= 1:
+        for i in range(target):
+            messages, meta = next(sources)
+            if result := _attempt(host, spec, messages, params, i, ctx):
+                yield i, meta, result
+        return
+
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gen")
+    pending: dict = {}
+    queued = 0
+    try:
+        while queued < target or pending:
+            while queued < target and len(pending) < workers:
+                messages, meta = next(sources)
+                pending[pool.submit(_attempt, host, spec, messages, params,
+                                    queued, ctx)] = (queued, meta)
+                queued += 1
+            done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+            for fut in done:
+                i, meta = pending.pop(fut)
+                if result := fut.result():
+                    yield i, meta, result
+    finally:
+        # Reached on cancellation too, when the consumer closes this generator.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _workers(cfg: dict, hosted: bool, target: int) -> int:
+    """How many requests to keep in flight."""
+    if not hosted:
+        return 1
+    try:
+        asked = int(cfg.get("workers") or _HOSTED_WORKERS)
+    except (TypeError, ValueError):
+        asked = _HOSTED_WORKERS
+    return max(1, min(asked, _MAX_WORKERS, target))
+
+
 def _json(r: Any):
     try:
         return r.json()
@@ -375,6 +479,51 @@ def _sources(cfg: dict, mode: str, ctx: Any) -> Iterator[tuple[list[dict], dict]
                          "content": template.replace("{topic}", topic)})
             yield msgs, {"topic": topic}
 
+    elif mode == "conversations":
+        brief = instruction
+        if not brief.strip():
+            raise ValueError(
+                "Say what the conversations should be about. This mode writes "
+                "whole exchanges from a brief, and an empty brief describes "
+                "every conversation equally.")
+        tools = _tool_specs(cfg)
+        topics = _lines(cfg.get("topics"))
+        languages = _lines(cfg.get("languages"))
+        writer = _conversation_prompt(cfg, tools)
+        ctx.log("Writing whole conversations%s%s%s."
+                % (" with %d tool%s declared" % (len(tools),
+                                                 "" if len(tools) == 1 else "s")
+                   if tools else "",
+                   ", across %d situations" % len(topics) if topics else "",
+                   ", in %s" % ", ".join(languages) if languages else ""))
+        # Situation and language advance at different rates, so ten of each
+        # give a hundred combinations rather than ten. Two lists stepped in
+        # lockstep would ask for the same situation in the same language every
+        # time they came round, and half a dataset would be one language.
+        for i in itertools.count():
+            topic = topics[i % len(topics)] if topics else ""
+            language = ""
+            if languages:
+                # Shifted by one on every pass through the topics, so the
+                # second time round a situation it is asked for in a different
+                # language.
+                nth = i + (i // len(topics) if topics else 0)
+                language = languages[nth % len(languages)]
+            ask = brief.replace("{topic}", topic).replace("{language}",
+                                                          language)
+            if topic and "{topic}" not in brief:
+                ask += "\n\nThis one is about: %s" % topic
+            if language and "{language}" not in brief:
+                ask += "\n\nWrite this one in %s. Everything the person and "  \
+                       "the assistant say is in %s." % (language, language)
+            msgs = [{"role": "system", "content": writer}]
+            if system:
+                msgs[0]["content"] += "\n\n" + system
+            msgs.append({"role": "user", "content":
+                         ask + "\n\nWrite one conversation."})
+            yield msgs, {"conversation": True, "topic": topic,
+                         "language": language, "tools": tools}
+
     elif mode == "from_seeds":
         seeds = _lines(cfg.get("seeds"))
         if len(seeds) < 2:
@@ -400,6 +549,283 @@ def _sources(cfg: dict, mode: str, ctx: Any) -> Iterator[tuple[list[dict], dict]
         raise ValueError("Unknown generation mode %r." % mode)
 
 
+# ---------------------------------------------------------------------------
+# Whole conversations, in a shape the provider enforces
+# ---------------------------------------------------------------------------
+#
+# Every other mode asks for text and hopes. This one states the shape of the
+# answer as a JSON schema and lets the provider constrain decoding to it, which
+# is the difference between a dataset of conversations and a dataset of prose
+# describing conversations. It matters most for tool calls: a model asked in
+# prose to "include a function call" writes one into its answer as text, and
+# the row then teaches a model to TYPE a call rather than to make one.
+#
+# Arguments are a string in the schema rather than an object, for two reasons.
+# Strict mode has no way to say "any object", and a string is exactly what the
+# canonical row stores -- so nothing is re-encoded on the way in, and whatever
+# the model wrote is what a reader sees.
+
+
+def _conversation_schema(cfg: dict) -> dict:
+    """The JSON shape one generated conversation must arrive in."""
+    message: dict[str, Any] = {
+        "role": {"type": "string", "enum": ["user", "assistant", "tool"]},
+        "content": {"type": "string"},
+    }
+    if _wants_reasoning(cfg):
+        message["reasoning"] = {"type": "string"}
+    if _tool_specs(cfg):
+        message["tool_calls"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "string"},
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": False,
+            },
+        }
+    props: dict[str, Any] = {}
+    if cfg.get("system_from_model"):
+        props["system"] = {"type": "string"}
+    props["messages"] = {
+        "type": "array",
+        "items": {"type": "object", "properties": message,
+                  # Strict decoding requires every property to be required.
+                  # "None of these" is an empty string or an empty list, which
+                  # is why nothing here is nullable.
+                  "required": list(message), "additionalProperties": False},
+    }
+    return {"type": "object", "properties": props,
+            "required": list(props), "additionalProperties": False}
+
+
+def _wants_reasoning(cfg: dict) -> bool:
+    return bool(cfg.get("with_reasoning"))
+
+
+def _tool_specs(cfg: dict) -> list[dict]:
+    """The tools these conversations may call, flat and validated.
+
+    Accepts what people actually have in front of them: a bare list of
+    functions, OpenAI's `{"type": "function", "function": {...}}` wrapper, or
+    a single function on its own.
+    """
+    raw = cfg.get("tools")
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError as e:
+            raise ValueError(
+                "The tools could not be read as JSON (%s). Paste the function "
+                "definitions as a JSON array." % e) from None
+    if isinstance(raw, dict):
+        raw = [raw]
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) \
+            else item
+        if not fn.get("name"):
+            raise ValueError("A tool was given with no name.")
+        out.append({"name": str(fn["name"]),
+                    "description": str(fn.get("description") or ""),
+                    "parameters": fn.get("parameters")
+                    or fn.get("input_schema")
+                    or {"type": "object", "properties": {}}})
+    return out
+
+
+_CONVERSATION_RULES = (
+    "You write single training conversations for a dataset. Reply with one "
+    "JSON object in the required shape and nothing else.\n"
+    "\n"
+    "Rules that make a row usable:\n"
+    "* The person speaks first, and speaks like a person: short, direct, "
+    "sometimes assuming context. Not a well-formed request every time.\n"
+    "* Everything said is in the conversation's own language, including the "
+    "assistant's answer. Do not translate, do not add an English gloss.\n"
+    "* The assistant's answer is one or two sentences. It states what was "
+    "done or what is true, and never restates the question back.\n"
+    "* Write the whole exchange: the last message is always the assistant's "
+    "answer, and it is never empty."
+)
+
+_TOOL_RULES = (
+    "\n"
+    "These functions exist. Only these, spelled exactly like this:\n"
+    "%s\n"
+    "* Call one only to DO something or to fetch something you were not told. "
+    "A question about a state you already know is answered without a call.\n"
+    "* `arguments` is a JSON object encoded as a string, and every argument in "
+    "it must appear in that function's schema.\n"
+    "* Every call is answered: the next message has role \"tool\" and its "
+    "content is the JSON that function would have returned. Invent a "
+    "realistic result, consistent with the arguments.\n"
+    "* After the result, the assistant says what happened, in the "
+    "conversation's language."
+)
+
+_REASONING_RULES = (
+    "\n"
+    "* Every assistant message carries `reasoning`: one or two sentences of "
+    "first-person working that stops the moment the decision is made. It "
+    "names the entity or the value it settled on. The answer stands alone and "
+    "never refers back to it. The person's messages and tool results carry an "
+    "empty `reasoning`."
+)
+
+# Without this the writer reasons about the request and leaves the call itself
+# unexplained, which is the half the model has to learn to produce.
+_REASONING_CALL_RULES = (
+    "\n"
+    "* A message that calls a function reasons about the call: which function, "
+    "which entity or value it is passing and why that one. One short sentence, "
+    "in the conversation's language, not the JSON written out in words."
+)
+
+
+def _conversation_prompt(cfg: dict, tools: list[dict]) -> str:
+    """The standing instructions the writer gets for every row."""
+    out = _CONVERSATION_RULES
+    if tools:
+        out += _TOOL_RULES % json.dumps(tools, ensure_ascii=False, indent=None)
+    if _wants_reasoning(cfg):
+        out += _REASONING_RULES
+        if tools:
+            out += _REASONING_CALL_RULES
+    if cfg.get("system_from_model"):
+        out += ("\n"
+                "* `system` is the system prompt this conversation was held "
+                "under. Write it in full, exactly as the brief describes it, "
+                "including any data it is supposed to contain. Everything the "
+                "assistant says must be consistent with it. It belongs there "
+                "and nowhere else: never repeat it inside the conversation.")
+    return out
+
+
+def _echoes(content: str, system: str) -> bool:
+    """Whether a user turn is really the system prompt copied back.
+
+    A writer that was asked for the system prompt sometimes writes it twice,
+    once where it belongs and once as the thing the person said out loud.
+    """
+    head = content[:120].strip()
+    return bool(system) and len(head) > 60 and head in system
+
+
+def _conversation_row(text: str, meta: dict, cfg: dict) -> dict | None:
+    """One generated JSON object as one canonical conversation row.
+
+    Returns None for anything that would be a bad training example rather than
+    repairing it into one: a call to a function that does not exist, arguments
+    that are not JSON, a call nothing answered or unreasoned, a user turn that
+    is the system prompt read back, an exchange that stops before the assistant
+    replies. All
+    of them are cheap to detect and expensive to find later, in a dataset that
+    trained without complaint.
+    """
+    from common import conversation as C
+
+    body = text.strip()
+    if m := _FENCE.match(body):
+        body = m.group(1).strip()
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list):
+        return None
+
+    tools = meta.get("tools") or []
+    known = {t["name"] for t in tools}
+    messages: list[dict] = []
+
+    system = (obj.get("system") or "").strip() \
+        or (cfg.get("dataset_system_prompt") or "").strip()
+    if system:
+        messages.append({"role": "system", "content": _clean(system)})
+
+    waiting: list[dict] = []      # calls made and not yet answered
+    calls_made = 0
+    for item in obj["messages"]:
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "").lower()
+        content = _clean(str(item.get("content") or ""))
+
+        if role == "tool":
+            if not waiting:
+                return None       # a result for a call nobody made
+            call = waiting.pop(0)
+            messages.append({"role": "tool", "name": call["function"]["name"],
+                             "tool_call_id": call["id"], "content": content})
+            continue
+
+        if role == "user":
+            if waiting or not content:
+                return None       # the person spoke over an unanswered call
+            if _echoes(content, system):
+                return None       # the system prompt copied into a user turn
+            messages.append({"role": "user", "content": content})
+            continue
+
+        if role != "assistant":
+            return None
+
+        turn: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning := _clean(str(item.get("reasoning") or "")):
+            turn["reasoning"] = reasoning
+        calls = []
+        for raw in item.get("tool_calls") or []:
+            if not isinstance(raw, dict):
+                return None
+            name = str(raw.get("name") or "")
+            if name not in known:
+                return None
+            args = raw.get("arguments")
+            if isinstance(args, (dict, list)):
+                args = json.dumps(args, ensure_ascii=False)
+            try:
+                json.loads(args or "")
+            except (ValueError, TypeError):
+                return None       # arguments a runtime could not parse
+            calls_made += 1
+            call = {"id": "call_%d" % calls_made, "type": "function",
+                    "function": {"name": name, "arguments": str(args)}}
+            calls.append(call)
+            waiting.append(call)
+        if calls:
+            turn["tool_calls"] = calls
+            if _wants_reasoning(cfg) and not turn.get("reasoning"):
+                return None       # a call with nothing said about why
+        elif not content:
+            return None           # an assistant turn that says nothing
+        messages.append(turn)
+
+    if waiting:
+        return None               # a call the conversation never answered
+    roles = [m["role"] for m in messages]
+    if "user" not in roles or messages[-1]["role"] != "assistant" \
+            or not messages[-1].get("content"):
+        return None
+    if cfg.get("require_tool_call") and not calls_made:
+        return None
+
+    conv, _ = C.repair(C.from_messages(messages, tools))
+    row = C.to_row(conv)
+    for key in ("topic", "language"):
+        if meta.get(key):
+            row[key] = meta[key]
+    return row
+
+
 def _lines(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
@@ -420,6 +846,9 @@ def _row(text: str, meta: dict, cfg: dict) -> dict | None:
     without any further configuration -- a generated dataset should be usable
     from the wizard immediately, not after a conversion step.
     """
+    if meta.get("conversation"):
+        return _conversation_row(text, meta, cfg)
+
     text = text.strip()
     if m := _FENCE.match(text):
         text = m.group(1).strip()
@@ -480,6 +909,39 @@ def _split_pair(text: str) -> tuple[str, str] | None:
 def _clip(text: str, n: int = 110) -> str:
     one = " ".join(text.split())
     return one if len(one) <= n else one[:n] + "…"
+
+
+def _dedupe_key(row: dict) -> str:
+    """What makes two generated rows the same row.
+
+    For a conversation it is what the person said: two rows that open with the
+    same question are the same example even when the invented sensor readings
+    in them differ, and comparing whole rows would have kept both.
+    """
+    for m in row.get("messages") or []:
+        if m.get("role") == "user" and (m.get("content") or "").strip():
+            return " ".join(m["content"].lower().split())[:2000]
+    return json.dumps(row, sort_keys=True)[:2000]
+
+
+def _describe(row: dict, text: str) -> str:
+    """One line about a written row, for the log.
+
+    A conversation's raw JSON says nothing worth reading at 110 characters --
+    the question and whether it called anything is the whole of what someone
+    watching wants to know.
+    """
+    messages = row.get("messages") or []
+    if not messages:
+        return _clip(text)
+    asked = next((m.get("content") for m in messages
+                  if m.get("role") == "user"), "")
+    called = [c["function"]["name"] for m in messages
+              for c in (m.get("tool_calls") or [])]
+    if not asked:
+        return _clip(text)
+    return "%s%s" % (_clip(asked, 80),
+                     " → %s" % ", ".join(called) if called else "")
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1409,12 @@ def _preamble(ctx: Any, cfg: dict, mode: str, target: int, spec: dict) -> None:
     if mode == "from_seeds":
         ctx.log("Everything it writes will resemble the seeds you gave it. "
                 "That is the point, and it is also the ceiling.")
+    if mode == "conversations" and _tool_specs(cfg):
+        ctx.log("The tool results in these conversations are INVENTED. No "
+                "function runs: the model writes what it thinks one would have "
+                "returned. That teaches the shape of a tool exchange -- when to "
+                "call, with which arguments, how to answer afterwards -- and it "
+                "teaches nothing true about your systems.", "warn")
     if mode == "extend_conversations":
         ctx.log("Each extra turn is two requests: one asking the model to be "
                 "the person, one asking it to be the assistant. Asked for both "
@@ -962,17 +1430,22 @@ def _finish(cfg: dict, ctx: Any, path: Path, stats: dict) -> dict:
 
     kept = stats["written"]
     asked = stats["target"]
+    rejected = stats.get("rejected") or 0
     ctx.log("%s %s rows in %.0fs (%d exact repeats and %d empty replies were "
-            "dropped)." % ("Stopped early with" if stats["stopped_early"] else "Wrote",
-                           f"{kept:,}", stats["duration_s"], stats["duplicates"],
-                           stats["empty"]))
+            "dropped%s)." % ("Stopped early with" if stats["stopped_early"] else "Wrote",
+                             f"{kept:,}", stats["duration_s"], stats["duplicates"],
+                             stats["empty"],
+                             ", and %d replies that were not usable rows"
+                             % rejected if rejected else ""))
     if stats["duplicates"] > kept * 0.2:
         ctx.log("More than a fifth of what the model produced was a repeat of "
                 "something it had already written. The dataset is smaller and "
                 "less varied than the number of rows suggests.", "warn")
     if kept < asked and not stats["stopped_early"]:
         ctx.log("Asked for %s rows and kept %s: the difference was dropped as "
-                "repeats or empty replies." % (f"{asked:,}", f"{kept:,}"), "warn")
+                "repeats, empty replies%s." % (f"{asked:,}", f"{kept:,}",
+                                               " or unusable rows" if rejected
+                                               else ""), "warn")
 
     return {
         "kind": "generate_dataset",

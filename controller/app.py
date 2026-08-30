@@ -429,6 +429,23 @@ async def _create_job(request: Request, payload: dict) -> str:
         # same way a training dataset does -- as a URL the runner fetches with
         # its join token -- so a private dataset is never made public in order
         # to be lengthened.
+        if cfg.get("mode") == "conversations":
+            if not (cfg.get("instruction") or "").strip():
+                raise HTTPException(
+                    400, "Say what these conversations should be about.")
+            if tools := (cfg.get("tools") or "").strip():
+                try:
+                    parsed = json.loads(tools)
+                except ValueError as e:
+                    raise HTTPException(
+                        400, "The tools are not valid JSON: %s" % e) from None
+                names = [t for t in (parsed if isinstance(parsed, list)
+                                     else [parsed])
+                         if isinstance(t, dict)]
+                if not names:
+                    raise HTTPException(
+                        400, "The tools must be a JSON array of function "
+                             "definitions.")
         if cfg.get("mode") == "extend_conversations":
             src_id = (cfg.get("source_dataset_id") or "").strip()
             if not src_id:

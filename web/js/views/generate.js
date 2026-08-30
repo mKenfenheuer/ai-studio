@@ -31,6 +31,16 @@ const MODES = [
          + "point, and it is also the ceiling.",
   },
   {
+    id: "conversations",
+    title: "Write whole conversations",
+    blurb: "You supply a brief and the tools; the model writes the whole "
+         + "exchange — what the person asks, the call it makes, what the "
+         + "function returned, and the answer. The reply is held to a schema "
+         + "by the provider, so it arrives as a conversation rather than as "
+         + "prose describing one.",
+    brief: true,
+  },
+  {
     id: "extend_conversations",
     title: "Carry these conversations further",
     blurb: "You supply a dataset; the model adds more turns to every "
@@ -113,6 +123,24 @@ export async function generateView(mount) {
         max_new_tokens: +f.max_new_tokens || 512,
         output: f.output || "chat",
       };
+      if (state.mode === "conversations") {
+        cfg.instruction = f.body;
+        cfg.topics = f.topics || "";
+        cfg.languages = f.languages || "";
+        cfg.tools = f.tools || "";
+        cfg.with_reasoning = f.with_reasoning === "on";
+        cfg.system_from_model = f.system_from_model === "on";
+        cfg.require_tool_call = f.require_tool_call === "on";
+        // Caught here rather than on row 1 of 500, where it is a job that
+        // fails a minute after it was started.
+        if (cfg.tools.trim()) {
+          try {
+            JSON.parse(cfg.tools);
+          } catch (ex) {
+            return toast(`The tools are not valid JSON: ${ex.message}`, "err");
+          }
+        }
+      }
       if (state.mode === "from_prompts") cfg.prompts = f.body;
       if (state.mode === "from_topics") cfg.topics = f.body;
       if (state.mode === "from_seeds") cfg.seeds = f.body;
@@ -207,6 +235,72 @@ function extendPanel(datasets) {
     </div>`;
 }
 
+/** A brief, the tools, and the languages to write it in.
+ *
+ *  The brief is the whole of the instruction — what the assistant is, who is
+ *  talking to it, what a good exchange looks like. Situations and languages
+ *  are cycled across it independently, so a dozen of each is a hundred and
+ *  forty-four combinations rather than a dozen.
+ */
+function conversationPanel() {
+  return html`
+    <div class="field">
+      <label for="genBody">What should these conversations be?</label>
+      <textarea id="genBody" name="body" rows="10" class="mono"
+                placeholder="${BRIEF_PLACEHOLDER}" required></textarea>
+      <div class="hint">Describe the assistant, the person, and what a good
+        exchange looks like. Use <code>{topic}</code> and
+        <code>{language}</code> to place them yourself; otherwise they are
+        appended.</div>
+    </div>
+    <div class="grid grid-2">
+      <div class="field">
+        <label for="genTopics">Situations, one per line</label>
+        <textarea id="genTopics" name="topics" rows="6" class="mono"
+                  placeholder="turning a light off in a named room&#10;asking what the weather will do tomorrow&#10;setting the thermostat before bed&#10;closing the blinds because of the sun"></textarea>
+        <div class="hint">Optional, and the single biggest lever on variety.</div>
+      </div>
+      <div class="field">
+        <label for="genLangs">Languages, one per line</label>
+        <textarea id="genLangs" name="languages" rows="6" class="mono"
+                  placeholder="German&#10;English&#10;French&#10;Spanish"></textarea>
+        <div class="hint">Optional. Each conversation is written entirely in
+          one of them — question and answer both.</div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="genTools">Tools the conversations may call (JSON)</label>
+      <textarea id="genTools" name="tools" rows="8" class="mono"
+                placeholder="${TOOLS_PLACEHOLDER}"></textarea>
+      <div class="hint">A JSON array of function definitions —
+        <code>name</code>, <code>description</code>, <code>parameters</code>.
+        They are stored on every row, so the dataset carries its own tool
+        schema.</div>
+    </div>
+    <label class="check"><input type="checkbox" name="with_reasoning" checked>
+      Each assistant turn shows its working, including why it called
+      what it called</label>
+    <label class="check"><input type="checkbox" name="system_from_model">
+      The model writes each row's system prompt as well</label>
+    <label class="check"><input type="checkbox" name="require_tool_call">
+      Keep only conversations that call a tool</label>
+    <div class="callout callout-warn" style="margin-top:10px">
+      <strong>The results are invented</strong>
+      No function runs. What the tool "returned" is what the model imagined it
+      would return — right in shape, made up in substance. That is what teaches
+      when to call and how to answer afterwards, and it teaches nothing true
+      about your systems.
+    </div>`;
+}
+
+const BRIEF_PLACEHOLDER =
+  "You are writing conversations between a person and the voice assistant "
+  + "that runs their home.\nThe person speaks naturally and does not name "
+  + "entity ids. The assistant acts, then says what it did in one sentence.";
+
+const TOOLS_PLACEHOLDER = `[{"name": "execute_services", "description": "…", `
+  + `"parameters": {"type": "object", "properties": {…}}}]`;
+
 const kindOf = (playable, id) =>
   playable.find((p) => p.id === id)?.kind || "finetune_llm";
 
@@ -249,7 +343,8 @@ function layout(state, online, playable, connected = [], labelOf = {},
       <div class="grid grid-2" style="align-items:start">
         <div class="card">
           <h3>${mode.title}</h3>
-          ${raw(mode.dataset ? extendPanel(datasets) : html`
+          ${raw(mode.dataset ? extendPanel(datasets)
+                : mode.brief ? conversationPanel() : html`
           <div class="field">
             <label for="genBody">${bodyLabel(state.mode)}</label>
             <textarea id="genBody" name="body" rows="10" class="mono"
@@ -257,7 +352,7 @@ function layout(state, online, playable, connected = [], labelOf = {},
                       required></textarea>
             <div class="hint">${bodyHint(state.mode)}</div>
           </div>`)}
-          ${raw(state.mode !== "from_prompts" && !mode.dataset ? html`
+          ${raw(state.mode !== "from_prompts" && !mode.dataset && !mode.brief ? html`
             <details class="adv">
               <summary>Change what it is asked for</summary>
               <div class="field" style="margin-top:8px">
@@ -340,6 +435,7 @@ function layout(state, online, playable, connected = [], labelOf = {},
                 <input id="genCount" name="count" type="number" value="${state.count}"
                        min="1" max="100000" required>
               </div>
+              ${raw(mode.brief ? "" : html`
               <div class="field">
                 <label for="genOut">Shape</label>
                 <select id="genOut" name="output">
@@ -347,7 +443,7 @@ function layout(state, online, playable, connected = [], labelOf = {},
                   <option value="text">Plain text</option>
                   <option value="json">JSON the model writes</option>
                 </select>
-              </div>
+              </div>`)}
             </div>
             <div class="field">
               <label for="genDsSys">System prompt to store in each row</label>
@@ -377,7 +473,11 @@ function layout(state, online, playable, connected = [], labelOf = {},
                 <div class="field">
                   <label for="genMax">Longest reply</label>
                   <input id="genMax" name="max_new_tokens" type="number"
-                         value="512" min="16" max="4096">
+                         value="${mode.brief ? 1600 : 512}" min="16" max="8192">
+                  ${raw(mode.brief ? html`<div class="hint">A whole
+                    conversation, not one answer — it needs the room. Cut
+                    short, the JSON is unfinished and the row is dropped.</div>`
+                    : "")}
                 </div>
               </div>
             </details>

@@ -243,9 +243,27 @@ def model_name(conn: dict, model: str | None) -> str:
 # One completion
 # ---------------------------------------------------------------------------
 
+def supports_schema(conn: dict) -> bool:
+    """Whether this provider can be *made* to answer in a given JSON shape.
+
+    The OpenAI family constrains decoding to a schema, which is a different
+    thing from asking for JSON in the prompt: the reply cannot come back
+    malformed, cannot arrive wrapped in a code fence, and cannot omit a field.
+    Anthropic has no equivalent on the messages API, so a caller that needs a
+    shape there asks for it in words and checks what arrives.
+    """
+    return flavour(conn) in ("openai", "azure", "azure_v1", "responses")
+
+
+# What the schema is called in the request. Providers require a name; none of
+# them do anything with it beyond echoing it back.
+SCHEMA_NAME = "row"
+
+
 def chat_request(conn: dict, model: str, messages: list[dict],
                  params: dict | None = None,
-                 tools: list[dict] | None = None) -> dict:
+                 tools: list[dict] | None = None,
+                 schema: dict | None = None) -> dict:
     """The HTTP request that asks this provider for one reply.
 
     Returns a dict of url/headers/json rather than performing the call, so the
@@ -255,6 +273,12 @@ def chat_request(conn: dict, model: str, messages: list[dict],
     surfaces disagree about it: Chat Completions nests the definition under
     `function`, Responses puts the name and parameters at the top level of each
     tool. Sending one to the other is a 400 that names no field.
+
+    `schema` is a JSON Schema the reply must satisfy. It is spelled twice over
+    as well -- `response_format.json_schema` on Chat Completions, `text.format`
+    on Responses -- and is ignored by a provider that cannot do it, because a
+    request that fails outright is worse than one whose answer has to be
+    checked afterwards.
     """
     spec = provider(conn["provider"])
     if not spec:
@@ -267,7 +291,7 @@ def chat_request(conn: dict, model: str, messages: list[dict],
 
     if shape == "responses":
         return _responses_request(conn, model, messages, params, tools,
-                                  max_tokens, temperature, top_p)
+                                  max_tokens, temperature, top_p, schema)
 
     if shape == "anthropic":
         # The system prompt is a field of its own here, not a message with a
@@ -312,6 +336,11 @@ def chat_request(conn: dict, model: str, messages: list[dict],
                                        "parameters": t.get("parameters")
                                        or {"type": "object", "properties": {}}}}
                          for t in tools]
+    if schema:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": SCHEMA_NAME, "strict": True,
+                            "schema": schema}}
     if temperature is not None:
         body["temperature"] = float(temperature)
     if top_p is not None:
@@ -373,7 +402,8 @@ def _chat_messages(messages: list[dict]) -> list[dict]:
 
 def _responses_request(conn: dict, model: str, messages: list[dict],
                        params: dict, tools: list[dict] | None,
-                       max_tokens: int, temperature, top_p) -> dict:
+                       max_tokens: int, temperature, top_p,
+                       schema: dict | None = None) -> dict:
     """A request to the Responses API.
 
     Not a variant of the chat body -- a different one. The conversation is
@@ -428,6 +458,12 @@ def _responses_request(conn: dict, model: str, messages: list[dict],
                           "parameters": t.get("parameters")
                           or {"type": "object", "properties": {}}}
                          for t in tools]
+    if schema:
+        # Named `text.format` here rather than `response_format`, and the name
+        # sits beside the schema rather than wrapping it. Same constraint, and
+        # the other surface's spelling is a 400.
+        body["text"] = {"format": {"type": "json_schema", "name": SCHEMA_NAME,
+                                   "strict": True, "schema": schema}}
     # Getting a model's working back off this API takes TWO settings, and
     # each is useless without the other. Measured against gpt-5.4:
     #
@@ -565,6 +601,17 @@ def retry_body(conn: dict, body: dict, error_text: str) -> dict | None:
     # more, never a requirement.
     if "reasoning" in text and "reasoning" in fixed:
         fixed.pop("reasoning")
+        changed = True
+    # A gateway that copied the OpenAI shape without copying constrained
+    # decoding. Dropping the schema turns "answer in this shape" back into a
+    # request the model is merely *asked* in the prompt to satisfy, which is
+    # the same deal Anthropic gets and is checked on arrival either way.
+    if "response_format" in text and "response_format" in fixed:
+        fixed.pop("response_format")
+        changed = True
+    if ("json_schema" in text or "format" in text) and "text" in fixed \
+            and isinstance(fixed.get("text"), dict):
+        fixed.pop("text")
         changed = True
     return fixed if changed else None
 
