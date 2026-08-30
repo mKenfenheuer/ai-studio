@@ -375,8 +375,14 @@ async def _create_job(request: Request, payload: dict) -> str:
     # Training on top of something this studio already built. The permission
     # check is the point: without it, any run id pasted into this field would
     # hand out the weights of a model you are not allowed to see.
-    if source_id := (cfg.get("continue_from") or cfg.get("base_model_job")
-                     or cfg.get("source_job")):
+    #
+    # An upload names a source run too, but wants none of the rules below: a
+    # run that failed halfway and kept its model is a perfectly reasonable
+    # thing to publish, and nothing about the base model needs carrying
+    # across. It does its own, narrower check.
+    if kind != "upload" and (
+            source_id := (cfg.get("continue_from") or cfg.get("base_model_job")
+                          or cfg.get("source_job"))):
         src = _job_or_404(request, source_id)
         if not (config.ARTIFACT_DIR / ("%s.zip" % source_id)).exists():
             raise HTTPException(400, "That run has no saved model to build on.")
@@ -477,6 +483,29 @@ async def _create_job(request: Request, payload: dict) -> str:
             _attach_provider(user, cfg)
         else:
             _check_generation_source(request, cfg)
+    elif kind == "upload":
+        # Sending something to Hugging Face. No GPU, no model to load: this
+        # one is network and patience, and it comes through the same door as
+        # everything else so that it gets the same queue, log, progress bar
+        # and stop button. Whether the account may write there is settled
+        # here, at creation, rather than twenty minutes into an upload.
+        cfg["repo_id"] = (cfg.get("repo_id") or "").strip()
+        if problem := hfaccount.repo_problem(cfg["repo_id"]):
+            raise HTTPException(400, problem)
+        if problem := hfaccount.can_publish_to(user, cfg["repo_id"]):
+            raise HTTPException(403, problem)
+        if cfg.get("target") == "dataset":
+            if not cfg.get("studio_dataset"):
+                raise HTTPException(400, "Which dataset should be published?")
+        else:
+            if not cfg.get("source_job"):
+                raise HTTPException(400,
+                                    "Which run's model should be published?")
+            src = _job_or_404(request, cfg["source_job"])
+            if not (config.ARTIFACT_DIR / ("%s.zip" % src["id"])).exists():
+                raise HTTPException(400, "That run has no saved model.")
+            cfg["source_run_name"] = src["name"]
+        cfg["allow_cpu"] = True
     else:
         raise HTTPException(400, "Unknown kind of training run: %s" % kind)
 
@@ -1003,19 +1032,27 @@ async def publish_job(request: Request, job_id: str,
     Anyone who can see the run may publish it, and it goes to *their* account
     using *their* token -- so what appears on the Hub is attributed to the
     person who put it there, which is the only attribution that is true.
+
+    This queues the upload rather than performing it. Fourteen gigabytes takes
+    twenty minutes, which is longer than any browser will hold a request open;
+    doing it here is what used to leave an empty repository behind.
     """
     job = _job_or_404(request, job_id)
-    user = security.current_user(request)
     if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
         raise HTTPException(400, "This run has no saved model to publish.")
-    try:
-        return await hfaccount.publish_job(
-            user, job, (payload.get("repo_id") or "").strip(),
-            bool(payload.get("private", True)), payload.get("message") or "")
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
-    except Exception as e:  # noqa: BLE001 - hub failures are not ours to classify
-        raise HTTPException(502, "Hugging Face refused the upload: %s" % e) from e
+    repo_id = (payload.get("repo_id") or "").strip()
+    jid = await _create_job(request, {
+        "name": "Publishing %s" % (repo_id or job["name"]),
+        "kind": "upload",
+        "config": {
+            "target": "model", "source_job": job_id, "repo_id": repo_id,
+            "private": bool(payload.get("private", True)),
+            "replace": bool(payload.get("replace")),
+            "message": payload.get("message") or "",
+            "card": hfaccount.model_card(job, repo_id),
+        }})
+    return {"job_id": jid, "repo_id": repo_id,
+            "url": "https://huggingface.co/%s" % repo_id}
 
 
 @app.get("/api/jobs/{job_id}/chat-template")

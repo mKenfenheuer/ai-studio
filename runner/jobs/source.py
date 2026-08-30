@@ -23,6 +23,25 @@ def is_studio_dataset(cfg: dict) -> bool:
     return bool(cfg.get("dataset_is_local")) and name.startswith(("http://", "https://"))
 
 
+def _reachable(url: str, controller_url: str) -> str:
+    """The same dataset URL, but at an address this runner can actually reach.
+
+    The controller builds the URL from the address the *browser* used, which is
+    the one address guaranteed to mean nothing here: a job started from
+    http://127.0.0.1 sends the runner to its own loopback, and one started
+    through a public hostname sends it out and back through a proxy that may
+    not even resolve on this network. The runner already knows where its
+    controller is -- it is connected to it -- so the path is kept and the host
+    is replaced.
+    """
+    if not controller_url:
+        return url
+    marker = "/api/datasets/"
+    if marker not in url:
+        return url
+    return controller_url.rstrip("/") + url[url.index(marker):]
+
+
 def local_copy(cfg: dict, ctx: Any) -> str:
     """The dataset as a path on this machine, downloading it if it is remote.
 
@@ -37,8 +56,9 @@ def local_copy(cfg: dict, ctx: Any) -> str:
     dest = Path(ctx.workdir) / "dataset.jsonl"
     ctx.log("Fetching %s from the studio." % label)
 
+    url = _reachable(name, getattr(ctx, "controller_url", ""))
     token = getattr(ctx, "runner_token", "") or os.environ.get("AI_STUDIO_TOKEN", "")
-    with httpx.stream("GET", name, timeout=600, follow_redirects=True,
+    with httpx.stream("GET", url, timeout=600, follow_redirects=True,
                       headers={"X-Runner-Token": token}) as r:
         if r.status_code == 403:
             raise ValueError(

@@ -513,13 +513,27 @@ async def delete_dataset(request: Request, dataset_id: str) -> dict:
 @router.post("/{dataset_id}/publish")
 async def publish_dataset(request: Request, dataset_id: str,
                           payload: dict = Body(...)) -> dict:
+    """Queue an upload of this dataset to the user's Hugging Face account.
+
+    Queued rather than done here: see the note on the model publish endpoint.
+    A dataset is usually small enough to have survived being uploaded inside
+    the request, but "small enough today" is not a design, and one route for
+    publishing means one place where replacing an existing repo is defined.
+    """
+    from ..app import _create_job         # local: avoids an import cycle
+
     d = _get(request, dataset_id)
-    user = current_user(request)
-    try:
-        return await hfaccount.publish_dataset(
-            user, d, ds.path_for(dataset_id), (payload.get("repo_id") or "").strip(),
-            bool(payload.get("private", True)), payload.get("message") or "")
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
-    except Exception as e:  # noqa: BLE001 - hub errors are not ours to classify
-        raise HTTPException(502, "Hugging Face refused the upload: %s" % e) from e
+    repo_id = (payload.get("repo_id") or "").strip()
+    jid = await _create_job(request, {
+        "name": "Publishing %s" % (repo_id or d["name"]),
+        "kind": "upload",
+        "config": {
+            "target": "dataset", "studio_dataset": dataset_id,
+            "repo_id": repo_id,
+            "private": bool(payload.get("private", True)),
+            "replace": bool(payload.get("replace")),
+            "message": payload.get("message") or "",
+            "card": hfaccount.dataset_card(d, repo_id),
+        }})
+    return {"job_id": jid, "repo_id": repo_id,
+            "url": "https://huggingface.co/datasets/%s" % repo_id}

@@ -3,6 +3,7 @@ import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast,
          skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
+import { publishCard, wirePublish } from "./publish.js";
 
 const STAGES = {
   evaluating: "Putting the prompts to each model…",
@@ -13,6 +14,8 @@ const STAGES = {
   // connection and then writing rows.
   connecting: "Reaching the model that will write it…",
   writing: "Writing rows",
+  collecting: "Collecting the files to send…",
+  uploading: "Uploading to Hugging Face",
   loading_dataset: "Downloading and preparing your data…",
   training_tokenizer: "Building a vocabulary from your text…",
   tokenizing: "Reading and tokenizing the text…",
@@ -37,6 +40,10 @@ export async function jobView(mount, [jobId]) {
   if (writing) {
     mount.innerHTML = writingLayout(job);
     return writingView(mount, job, jobId, metrics, logs);
+  }
+  if (job.kind === "upload") {
+    mount.innerHTML = uploadLayout(job);
+    return uploadView(mount, job, jobId, logs);
   }
 
   mount.innerHTML = layout(job, scratch, experts);
@@ -152,7 +159,11 @@ export async function jobView(mount, [jobId]) {
     const box = $("#ownerRow", mount);
     if (!box) return;
     const hasModel = job.artifacts?.length;
-    box.innerHTML = hasModel ? publishCard(job) : "";
+    box.innerHTML = hasModel ? publishCard({
+      kind: "model", slug: repoSlug(job),
+      blurb: `Uploads ${job.kind === "pretrain_llm" ? "the model" : "the adapter"}
+              and a model card to your own account.`,
+    }) : "";
     wireShareBox(mount, "job", job, async () => {
       job = await api.job(jobId);
       paintHeader(mount, job);
@@ -234,27 +245,7 @@ export async function jobView(mount, [jobId]) {
     }
   });
 
-  on(mount, "submit", "#publishForm", async (e) => {
-    e.preventDefault();
-    const f = Object.fromEntries(new FormData(e.target).entries());
-    const btn = $("#pubGo", mount);
-    btn.disabled = true;
-    btn.textContent = "Uploading to Hugging Face…";
-    try {
-      const r = await api.publishJob(jobId, {
-        repo_id: f.repo_id, private: f.visibility === "private" });
-      $("#publishResult", mount).innerHTML =
-        `<div class="callout callout-ok"><strong>Published</strong>
-          <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a></div>`;
-      toast("Published.", "ok");
-    } catch (ex) {
-      $("#publishResult", mount).innerHTML =
-        `<div class="callout callout-err">${esc(ex.message)}</div>`;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "Publish to Hugging Face";
-    }
-  });
+  wirePublish(mount, "model", (body) => api.publishJob(jobId, body));
 
   wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
@@ -560,6 +551,145 @@ function writingStopPanel(job, latest) {
     </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Sending something to Hugging Face
+// ---------------------------------------------------------------------------
+//
+// The plainest run there is: no loss, no rows, no model at the end. One
+// destination, a list of files, and a bar that moves. It gets its own layout
+// for the same reason a generation run does -- given the training one it would
+// draw two empty charts and a paragraph about learning rates.
+
+function uploadLayout(job) {
+  const cfg = job.config || {};
+  const dataset = cfg.target === "dataset";
+  return html`
+    <div class="page-head">
+      <a href="#/jobs" class="tiny">← All runs</a>
+      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${job.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
+        <div class="row" id="headerActions"></div>
+      </div>
+      <p class="sub tiny" style="margin-top:4px">
+        <span class="badge badge-accent">publishing</span>
+        ${dataset ? "a dataset" : "a model"} to
+        <span class="mono">${cfg.repo_id || "Hugging Face"}</span></p>
+    </div>
+
+    <div id="errorCard"></div>
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>Where it is going</h3>
+      <dl class="kv">
+        <dt>Repository</dt>
+        <dd class="mono"><a href="https://huggingface.co/${
+          dataset ? "datasets/" : ""}${cfg.repo_id}"
+          target="_blank" rel="noopener">${cfg.repo_id}</a></dd>
+        <dt>Visibility</dt>
+        <dd>${cfg.private === false ? "Public — anyone can download it"
+                                    : "Private"}
+          <span class="muted tiny">— only applied if the repository is
+            new</span></dd>
+        <dt>What</dt>
+        <dd>${dataset ? cfg.dataset_label || "a dataset from this studio"
+                      : cfg.source_run_name || cfg.source_job
+                        || "a run in this studio"}</dd>
+        <dt>Already there</dt>
+        <dd>${cfg.replace
+          ? "Removed in the same commit as this upload"
+          : "Left alone; files with the same name are overwritten"}</dd>
+      </dl>
+      <div id="uploadResult" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between" style="align-items:center">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">file by file</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function uploadView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "uploading" : "";
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const paint = () => {
+    paintHeader(mount, job);
+    paintProgress(mount, job, stage, job.step, job.total_steps);
+    const q = $("#queueCard", mount);
+    if (q) q.innerHTML = queueCard(job);
+    $("#uploadResult", mount).innerHTML = uploadResult(job);
+  };
+  paint();
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      paintProgress(mount, job, stage, msg.step, msg.total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+function uploadResult(job) {
+  const s = job.summary || {};
+  if (job.status !== "succeeded" || !s.url) return "";
+  return html`
+    <div class="callout callout-ok">
+      <strong>Published</strong>
+      <a href="${s.url}" target="_blank" rel="noopener">${s.url}</a>
+      <div class="tiny muted" style="margin-top:4px">
+        ${fmtNum(s.files || 0)} file${s.files === 1 ? "" : "s"}, ${
+          fmtNum(Math.round((s.bytes || 0) / 1048576))} MB${
+          s.replaced ? `, ${fmtNum(s.replaced)} older file${
+            s.replaced === 1 ? "" : "s"} removed` : ""}${
+          s.created_repo ? ", into a repository this run created" : ""}.</div>
+    </div>`;
+}
+
+/** Stopping an upload, which leaves nothing behind at all.
+ *
+ *  Files are sent first and committed once at the end, so a stop before the
+ *  commit changes nothing on the Hub. Saying so is the whole point of the
+ *  panel: the fear is that half a model is now sitting in a public repository.
+ */
+function uploadStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop the upload?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        Nothing is committed until every file has been sent, so stopping now
+        leaves the repository exactly as it is. What has already gone over the
+        wire is unreferenced and Hugging Face clears it up.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop the upload</button>
+        <button class="btn-sm" id="stopCancel">Carry on uploading</button>
+      </div>
+    </div>`;
+}
+
 /** Where the rows went, once there are any. */
 function writtenDatasetCard(job) {
   const made = job.summary?.dataset_id || job.dataset_id;
@@ -845,35 +975,12 @@ function mergeCard(job) {
     </details>`;
 }
 
-function publishCard(job) {
+/** The repository name to suggest for this run's model. */
+function repoSlug(job) {
   const base = (job.kind === "pretrain_llm"
     ? job.name : (job.config.base_model || "model").split("/").pop() + "-tuned");
-  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "").slice(0, 60) || "my-model";
-  return html`
-    <div class="card">
-      <h3>Publish to Hugging Face</h3>
-      <p class="muted tiny">Uploads ${job.kind === "pretrain_llm"
-        ? "the model" : "the adapter"} and a model card to your own account.
-        Needs a connected account with write access —
-        <a href="#/account">set that up here</a>.</p>
-      <form id="publishForm" style="margin-top:10px">
-        <div class="field">
-          <label for="pubRepo">Repository</label>
-          <input id="pubRepo" name="repo_id" type="text" class="mono" required
-                 placeholder="your-name/${slug}">
-        </div>
-        <div class="field">
-          <label for="pubVis">Visibility</label>
-          <select id="pubVis" name="visibility">
-            <option value="private">Private</option>
-            <option value="public">Public — anyone can download it</option>
-          </select>
-        </div>
-        <button class="btn-sm" type="submit" id="pubGo">Publish to Hugging Face</button>
-      </form>
-      <div id="publishResult"></div>
-    </div>`;
 }
 
 /** The last resort, offered only where the ordinary stop has visibly failed.
@@ -927,6 +1034,7 @@ function wasAskedToStop(job) {
 
 function stopPanel(job, latest, stage) {
   if (job.kind === "generate_dataset") return writingStopPanel(job, latest);
+  if (job.kind === "upload") return uploadStopPanel();
   const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
   // There is only something to keep once training has actually begun.
   // Before that the runner is still downloading text or building a
@@ -976,11 +1084,16 @@ function paintHeader(mount, job) {
   // pointed the playground at a job it cannot serve, and "Compare" offered to
   // rank a held-out loss that does not exist.
   const writing = job.kind === "generate_dataset";
+  // An upload produces nothing here at all -- what it produces is on the Hub.
+  const sending = job.kind === "upload";
   const usable = job.artifacts?.length && !writing
     && ["succeeded", "cancelled"].includes(job.status);
   const kept = job.status === "cancelled" && job.artifacts?.length;
   box.innerHTML = html`
-    ${statusBadge(job.status)}
+    ${statusBadge(job.status, job.kind)}
+    ${raw(sending && job.summary?.url
+      ? `<a class="btn btn-primary btn-sm" target="_blank" rel="noopener"
+            href="${esc(job.summary.url)}">↗ Open on Hugging Face</a>` : "")}
     ${raw(kept ? `<span class="badge badge-ok">${
       writing ? "rows kept" : "model kept"}</span>` : "")}
     ${raw(usable
@@ -989,11 +1102,12 @@ function paintHeader(mount, job) {
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download${writing ? " the JSONL" : ""}</a>` : "")}
-    ${raw(done
+    ${raw(done && !sending
       // Offered for a run that failed or was stopped as much as for one that
       // finished: those are the ones somebody most wants to start again with
       // one thing different. A generation run has a whole page that can edit
-      // its brief, so it goes there instead.
+      // its brief, so it goes there instead. An upload has nothing to vary --
+      // it is started again from whatever it was publishing.
       ? `<a class="btn btn-sm" href="${writing
              ? `#/generate/from/${esc(job.id)}`
              : `#/jobs/${esc(job.id)}/again`}"
@@ -1015,24 +1129,26 @@ function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
                        checkpointStep = 0) {
   const training = stage === "training" || stage === "";
   const writing = stage === "writing";
+  const uploading = stage === "uploading";
   // Preparation stages count their own units -- documents scanned, tokens
   // collected -- so the bar follows those while they run, and the counter is
   // only shown once those units are something a person can count: training
-  // steps, or rows written.
+  // steps, rows written, or megabytes sent.
   const step = training ? job.step : (rawStep ?? 0);
   const total = training ? job.total_steps : (rawTotal ?? 0);
   const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
   const stageText = STAGES[stage] || (running ? "Working…" : "");
-  const counted = total > 0 && (training || writing);
-  const unit = writing ? "row" : "step";
+  const counted = total > 0 && (training || writing || uploading);
+  const count = writing ? `row ${step} of ${total}`
+    : uploading ? `${fmtNum(step)} MB of ${fmtNum(total)}`
+    : `step ${step} of ${total}`;
 
   $("#progressCard", mount).innerHTML = running ? html`
     <div class="card" style="margin-bottom:16px">
       <div class="row-between" style="margin-bottom:8px">
         <strong class="tiny">${stageText}</strong>
-        <span class="tiny muted">${counted
-          ? `${unit} ${step} of ${total}` : ""}</span>
+        <span class="tiny muted">${counted ? count : ""}</span>
       </div>
       <div class="progress"><i style="width:${pct}%"></i></div>
       ${raw(checkpointStep ? html`

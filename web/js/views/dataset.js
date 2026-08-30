@@ -9,6 +9,7 @@ import { api } from "../api.js";
 import { conversationHtml, toolsHtml, isConversation } from "../conversation.js";
 import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo } from "../util.js";
 import { shareButton, wireShareBox } from "./share.js";
+import { publishCard, wirePublish } from "./publish.js";
 
 export async function datasetView(mount, [id]) {
   let d = await api.dataset(id);
@@ -240,27 +241,7 @@ export async function datasetView(mount, [id]) {
       } catch (ex) { toast(ex.message, "err"); }
     });
 
-    on(mount, "submit", "#publishForm", async (e) => {
-      e.preventDefault();
-      const f = Object.fromEntries(new FormData(e.target).entries());
-      const btn = $("#pubGo", mount);
-      btn.disabled = true;
-      btn.textContent = "Uploading…";
-      try {
-        const r = await api.publishDataset(id, {
-          repo_id: f.repo_id, private: f.visibility === "private" });
-        toast("Published.", "ok");
-        $("#publishResult", mount).innerHTML =
-          `<div class="callout callout-ok"><strong>Published</strong>
-            <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url)}</a></div>`;
-      } catch (ex) {
-        $("#publishResult", mount).innerHTML =
-          `<div class="callout callout-err">${esc(ex.message)}</div>`;
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Publish to Hugging Face";
-      }
-    });
+    wirePublish(mount, "dataset", (body) => api.publishDataset(id, body));
 
     on(mount, "click", "#useForTraining", () => {
       sessionStorage.setItem("aistudio.dataset", JSON.stringify(
@@ -498,7 +479,7 @@ function layout(d, stats, rows, view, selected) {
 
       <div>
         ${raw(canEdit ? toolsCard(d) : "")}
-        ${raw(publishCard(d))}
+        ${raw(publishCard({ kind: "dataset", slug: slug(d.name), blurb: "Uploads the rows and a dataset card to your own account." }))}
         ${raw(canEdit ? metaCard(d) : "")}
       </div>
     </div>`;
@@ -881,32 +862,6 @@ function toolsCard(d) {
         </div>
         <button class="btn-sm btn-primary" type="submit">Split</button>
       </form>
-    </div>`;
-}
-
-function publishCard(d) {
-  return html`
-    <div class="card" style="margin-bottom:14px">
-      <h3>Publish to Hugging Face</h3>
-      <p class="muted tiny">Uploads the rows and a dataset card to your own
-        account. Needs a connected account with write access —
-        <a href="#/account">set that up here</a>.</p>
-      <form id="publishForm" style="margin-top:10px">
-        <div class="field">
-          <label for="pubRepo">Repository</label>
-          <input id="pubRepo" name="repo_id" type="text" class="mono" required
-                 placeholder="your-name/${slug(d.name)}">
-        </div>
-        <div class="field">
-          <label for="pubVis">Visibility</label>
-          <select id="pubVis" name="visibility">
-            <option value="private">Private</option>
-            <option value="public">Public — anyone can download it</option>
-          </select>
-        </div>
-        <button class="btn-sm" type="submit" id="pubGo">Publish to Hugging Face</button>
-      </form>
-      <div id="publishResult"></div>
     </div>`;
 }
 

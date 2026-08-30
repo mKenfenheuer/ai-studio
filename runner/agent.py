@@ -25,7 +25,7 @@ import httpx
 import websockets
 
 from . import capabilities, checkpoints, inference
-from .jobs import evaluate, generate_data, lora_llm, merge, scratch_llm
+from .jobs import evaluate, generate_data, lora_llm, merge, scratch_llm, upload
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -52,6 +52,9 @@ JOB_HANDLERS = {
     # Merging needs the base model resident and writes a file the size of it.
     # Minutes rather than hours, but it is still the machine being occupied.
     "merge_adapter": merge.run,
+    # Sending a model to Hugging Face: no GPU, but twenty minutes of network
+    # and every bit as much in need of a progress bar and a stop button.
+    "upload": upload.run,
 }
 
 

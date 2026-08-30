@@ -20,12 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
-import tempfile
 import time
 import zipfile
-from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -185,74 +181,41 @@ def can_publish_to(user: dict, repo_id: str) -> str | None:
     return None
 
 
-def _unpack(job_id: str, into: Path) -> Path:
+# What used to live here did the upload inside the request that asked for it,
+# and that was the whole bug. A merged 7B model is fourteen gigabytes: creating
+# the repository takes a moment and sending the weights takes twenty minutes.
+# Long before the Hub was finished the browser had given up, the request task
+# was cancelled, and the unpacked folder was deleted out from under the thread
+# still reading it. What was left on the Hub was the repository the first line
+# had created and nothing else -- an empty repo, no error anywhere, and every
+# appearance of having worked.
+#
+# Uploading is now a job, in runner/jobs/upload.py, with the queue, the log,
+# the progress bar and the stop button every other long-running thing here
+# already has. What stays in the controller is the half that is genuinely its
+# business: whether this account may write to that name, and what the model
+# card should say.
+
+
+def _readme_in_artifact(job_id: str) -> str:
+    """The README the training run wrote, if there is one.
+
+    Read straight out of the archive rather than by unpacking it: the file is
+    two kilobytes and the archive can be fourteen gigabytes, and the point of
+    keeping it is that it explains how to load the model -- which is worth
+    more on the Hub than anything this file could generate.
+    """
     src = config.ARTIFACT_DIR / ("%s.zip" % job_id)
     if not src.exists():
-        raise ValueError("This run has no saved model to publish.")
-    with zipfile.ZipFile(src) as z:
-        # Refuse a zip that would write outside the directory. These archives
-        # are written by our own runner, so this should never fire -- which is
-        # exactly the kind of assumption worth checking before extracting.
-        for member in z.namelist():
-            target = (into / member).resolve()
-            if not str(target).startswith(str(into.resolve())):
-                raise ValueError("This model archive is not safe to unpack.")
-        z.extractall(into)
-    return into
-
-
-def _publish_blocking(token: str, repo_id: str, folder: Path, private: bool,
-                      kind: str, message: str) -> str:
-    from huggingface_hub import HfApi
-    api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, repo_type=kind, private=private,
-                    exist_ok=True)
-    api.upload_folder(repo_id=repo_id, repo_type=kind, folder_path=str(folder),
-                      commit_message=message)
-    return "https://huggingface.co/%s%s" % (
-        "" if kind == "model" else "datasets/", repo_id)
-
-
-async def publish_job(user: dict, job: dict, repo_id: str, private: bool,
-                      message: str = "") -> dict:
-    """Upload a finished run's model to the user's Hub account."""
-    if problem := (repo_problem(repo_id) or can_publish_to(user, repo_id)):
-        raise ValueError(problem)
-    token = token_for(user)
-    if not token:
-        raise ValueError("Connect your Hugging Face account first.")
-
-    tmp = Path(tempfile.mkdtemp(prefix="aistudio_pub_"))
+        return ""
     try:
-        folder = _unpack(job["id"], tmp)
-        _write_card(folder, job, repo_id)
-        url = await asyncio.to_thread(
-            _publish_blocking, token, repo_id, folder, private, "model",
-            message or "Trained with AI Studio")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return {"url": url, "repo_id": repo_id, "private": private}
-
-
-async def publish_dataset(user: dict, dataset: dict, path: Path, repo_id: str,
-                          private: bool, message: str = "") -> dict:
-    if problem := (repo_problem(repo_id) or can_publish_to(user, repo_id)):
-        raise ValueError(problem)
-    token = token_for(user)
-    if not token:
-        raise ValueError("Connect your Hugging Face account first.")
-
-    tmp = Path(tempfile.mkdtemp(prefix="aistudio_ds_"))
-    try:
-        shutil.copy(path, tmp / "data.jsonl")
-        (tmp / "README.md").write_text(_dataset_card(dataset, repo_id),
-                                       encoding="utf-8")
-        url = await asyncio.to_thread(
-            _publish_blocking, token, repo_id, tmp, private, "dataset",
-            message or "Prepared with AI Studio")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return {"url": url, "repo_id": repo_id, "private": private}
+        with zipfile.ZipFile(src) as z:
+            with z.open("README.md") as fh:
+                text = fh.read().decode("utf-8", errors="replace")
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return ""
+    # Existing front matter is dropped; the block below replaces it.
+    return text.split("---\n", 2)[-1] if text.startswith("---") else text
 
 
 async def delete_repo(user: dict, repo_id: str, kind: str) -> None:
@@ -278,8 +241,8 @@ async def delete_repo(user: dict, repo_id: str, kind: str) -> None:
 # Model cards
 # ---------------------------------------------------------------------------
 
-def _write_card(folder: Path, job: dict, repo_id: str) -> None:
-    """Put a real README at the top of the repo.
+def model_card(job: dict, repo_id: str) -> str:
+    """The README to put at the top of the repo.
 
     The runner already writes one describing how to load the model. This adds
     the YAML front matter the Hub needs to file it correctly, and the training
@@ -287,12 +250,7 @@ def _write_card(folder: Path, job: dict, repo_id: str) -> None:
     """
     cfg = job.get("config") or {}
     scratch = job.get("kind") == "pretrain_llm"
-    existing = ""
-    readme = folder / "README.md"
-    if readme.exists():
-        existing = readme.read_text(encoding="utf-8", errors="replace")
-        existing = existing.split("---\n", 2)[-1] if existing.startswith("---") \
-            else existing
+    existing = _readme_in_artifact(job["id"])
 
     tags = ["ai-studio", "text-generation"]
     tags.append("pretrained-from-scratch" if scratch else "lora")
@@ -300,14 +258,21 @@ def _write_card(folder: Path, job: dict, repo_id: str) -> None:
     front += ["  - %s" % t for t in tags]
     if not scratch and cfg.get("base_model"):
         front.append("base_model: %s" % cfg["base_model"])
-    if cfg.get("dataset"):
+    # `datasets:` in the front matter is a Hub id, and the Hub renders it as a
+    # link. A dataset from this studio's own library travels as a URL pointing
+    # back at the controller, which is not a Hub id and is not reachable from
+    # the internet, so it is named in the text instead of linked to.
+    local = cfg.get("dataset_is_local")
+    if cfg.get("dataset") and not local:
         front += ["datasets:", "  - %s" % cfg["dataset"]]
     front += ["pipeline_tag: text-generation", "---", ""]
 
     stopped = job.get("status") == "cancelled"
     head = ["# %s" % repo_id.split("/")[-1], ""]
+    trained_on = (cfg.get("dataset_label") if local else cfg.get("dataset")) \
+        or "a private dataset"
     head.append("Trained with [AI Studio](https://github.com/) on %s."
-                % (cfg.get("dataset") or "a private dataset"))
+                % trained_on)
     if stopped:
         head += ["", "> **Stopped before the end of its schedule.** It "
                  "completed %s of %s planned steps, so its learning rate never "
@@ -315,10 +280,10 @@ def _write_card(folder: Path, job: dict, repo_id: str) -> None:
                  "to completion."
                  % (job.get("step"), job.get("total_steps"))]
     head.append("")
-    readme.write_text("\n".join(front + head) + existing, encoding="utf-8")
+    return "\n".join(front + head) + existing
 
 
-def _dataset_card(dataset: dict, repo_id: str) -> str:
+def dataset_card(dataset: dict, repo_id: str) -> str:
     fmt = dataset.get("format") or {}
     lines = [
         "---", "license: unknown", "tags:", "  - ai-studio", "---", "",
