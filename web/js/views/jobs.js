@@ -40,6 +40,30 @@ export async function jobsView(mount) {
   return events.subscribe((m) => { if (m.type === "jobs_changed") paint(); });
 }
 
+// What the numbers in the progress column are counting. Steps for training,
+// and the run's own units for everything else -- "0/?" beside "Training" was
+// what a generation run showed for its whole life, which described neither
+// what it was doing nor how far along it was.
+const UNIT = {
+  generate_dataset: "rows",
+  upload: "MB",
+  evaluate: "cases",
+  merge_adapter: "stages",
+};
+
+/** The one thing worth naming about a run, for the column that has room for
+ *  one. A training run is its base model; a generation run is the model doing
+ *  the writing, which is the entire question when the rows come out odd; an
+ *  upload is where it is going. */
+function what(j) {
+  const c = j.config || {};
+  if (j.kind === "generate_dataset")
+    return c.model?.label || c.model?.model || c.model?.base_model || "a model";
+  if (j.kind === "upload") return c.repo_id || "Hugging Face";
+  if (j.kind === "pretrain_llm") return "from scratch";
+  return c.base_model || "—";
+}
+
 function row(j) {
   const pct = j.total_steps ? Math.min(100, (j.step / j.total_steps) * 100) : 0;
   const dur = j.finished_at && j.started_at ? j.finished_at - j.started_at : null;
@@ -49,7 +73,7 @@ function row(j) {
         ${raw(j.config.sweep_id
           ? `<div class="tiny"><a href="#/sweeps/${esc(j.config.sweep_id)}"
                >part of a sweep</a></div>` : "")}</td>
-      <td>${statusBadge(j.status)}${raw(
+      <td>${statusBadge(j.status, j.kind)}${raw(
         j.status === "cancelled" && j.has_model
           ? ` <span class="badge badge-ok">model kept</span>` : "")}${raw(
         j.checkpoint_step && ["failed", "cancelled"].includes(j.status)
@@ -57,7 +81,8 @@ function row(j) {
       <td style="min-width:120px">
         ${raw(["running", "assigned"].includes(j.status)
           ? `<div class="progress"><i style="width:${pct}%"></i></div>
-             <span class="tiny muted">${j.step}/${j.total_steps || "?"}</span>`
+             <span class="tiny muted">${j.step}/${j.total_steps || "?"} ${
+               esc(UNIT[j.kind] || "steps")}</span>`
           : j.status === "queued" && j.queue_position
           // Where it actually sits in the order work is handed out, which is
           // not the order runs were created: the queue is dealt round-robin
@@ -67,9 +92,7 @@ function row(j) {
                j.queue_length} waiting</span>`
           : `<span class="tiny muted">${esc(dur ? fmtDuration(dur) : "—")}</span>`)}
       </td>
-      <td class="mono tiny hide-sm">${j.kind === "generate_dataset"
-        ? "writes data" : j.kind === "pretrain_llm"
-        ? "from scratch" : (j.config.base_model || "—")}</td>
+      <td class="mono tiny hide-sm">${what(j)}</td>
       <td class="tiny muted hide-sm">${fmtAgo(j.created_at)}</td>
       <td><div class="row" style="gap:5px">
         ${raw(j.has_model && j.kind !== "generate_dataset"

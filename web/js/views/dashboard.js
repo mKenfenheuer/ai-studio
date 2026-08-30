@@ -84,7 +84,7 @@ function jobRow(j) {
   return html`
     <a class="card" href="#/jobs/${j.id}" style="color:inherit;display:block">
       <div class="row-between" style="flex-wrap:wrap;gap:6px">
-        <strong>${j.name}</strong>${statusBadge(j.status)}
+        <strong>${j.name}</strong>${statusBadge(j.status, j.kind)}
       </div>
       <div class="tiny muted mono" style="margin:4px 0 8px">${
         j.kind === "pretrain_llm" ? "from scratch · " + (j.config.dataset || "")

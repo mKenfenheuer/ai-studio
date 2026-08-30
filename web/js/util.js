@@ -127,8 +127,19 @@ export const STATUS_STYLE = {
   cancelled: ["badge", "Stopped"],
 };
 
-export function statusBadge(status) {
-  const [cls, label] = STATUS_STYLE[status] || ["badge", status];
+// What a running job of each kind is actually doing. "Training" was shown for
+// all of them, so a run writing rows with a hosted model, or sending a model
+// to Hugging Face, announced itself as training on a GPU it never touched.
+const RUNNING_LABEL = {
+  generate_dataset: "Writing rows",
+  upload: "Uploading",
+  merge_adapter: "Merging",
+  evaluate: "Scoring",
+};
+
+export function statusBadge(status, kind = "") {
+  let [cls, label] = STATUS_STYLE[status] || ["badge", status];
+  if (status === "running" && RUNNING_LABEL[kind]) label = RUNNING_LABEL[kind];
   return raw(`<span class="${cls}">${esc(label)}</span>`);
 }
 

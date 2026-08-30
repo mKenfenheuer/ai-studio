@@ -20,6 +20,12 @@ from . import architectures, db, hub, notify
 # in time to be worth waiting for.
 CHECKPOINT_WAIT_S = 600
 
+# Stages whose counter is the run's actual progress, and so is worth storing
+# on the job for every list and every tab opened later. Everything else a
+# runner reports -- loading a model, tokenizing a corpus -- is preparation
+# counted in its own units, and belongs only in the live stream.
+PERSISTED_STAGES = ("", "training", "writing", "uploading", "evaluating")
+
 
 class Fleet:
     def __init__(self) -> None:
@@ -524,12 +530,19 @@ class Fleet:
 
         elif kind == "job_progress":
             stage = msg.get("stage", "")
-            # Only training steps are persisted. Preparation stages report
-            # their own units -- documents scanned, tokens collected -- and
-            # writing those into the job's step counter makes every list that
-            # reads it announce "step 25000 of 60000" for a 300-step run.
-            # They still stream to open tabs, which is where they belong.
-            if stage in ("", "training"):
+            # Only the stage that *is* the work is persisted. Preparation
+            # stages report their own units -- documents scanned, tokens
+            # collected -- and writing those into the job's step counter makes
+            # every list that reads it announce "step 25000 of 60000" for a
+            # 300-step run. They still stream to open tabs, which is where
+            # they belong.
+            #
+            # The named stages are the counterpart of that: rows written and
+            # megabytes sent are as much the run's real progress as steps are,
+            # and leaving them out is why a generation run sat at "0/?" in
+            # every list from the moment it started until the moment it
+            # finished.
+            if stage in PERSISTED_STAGES:
                 db.set_job_progress(jid, msg.get("step", 0), msg.get("total", 0))
             await self.broadcast_ui({"type": "job_progress", "job_id": jid,
                                      "step": msg.get("step", 0),
