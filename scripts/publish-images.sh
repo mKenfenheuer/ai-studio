@@ -11,6 +11,13 @@
 #   scripts/publish-images.sh controller      just the console
 #   scripts/publish-images.sh cpu cuda        two of the runners
 #   scripts/publish-images.sh --dry-run all   say what it would do
+#   scripts/publish-images.sh --deployed all  push what compose already built
+#
+# --deployed is the one to use on a server. It retags the local
+# `ai-studio/…` images that deploy.sh built and pushes those, instead of
+# building a second copy of thirty gigabytes of ROCm beside the first on a
+# disk that does not have room for it. What goes out is then exactly what is
+# running, which is usually what you wanted anyway.
 #
 # The credential is read from the environment and never written to disk here:
 #
@@ -41,13 +48,16 @@ warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 dry=0
+local_only=0
 targets=()
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry=1 ;;
+    --deployed) local_only=1 ;;
     # Two expressions rather than `^# \?`, which BSD sed does not understand
     # and silently leaves the hashes on.
-    -h|--help) sed -n '2,27p' "$0" | sed -e 's/^# //' -e 's/^#$//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | grep '^#' \
+                 | sed -e 's/^# //' -e 's/^#$//'; exit 0 ;;
     -*) die "Unknown option $arg" ;;
     *) targets+=("$arg") ;;
   esac
@@ -70,13 +80,13 @@ VERSION="${AI_STUDIO_VERSION:-$(date +%Y.%m.%d)-${sha}${dirty}}"
 # 3.2 and `declare -A` is a syntax error there — and a Mac is where this is
 # most likely to be run from.
 #
-#   name -> "<dockerfile>|<repo>|<moving tag>"
+#   name -> "<dockerfile>|<repo>|<moving tag>|<what compose calls it locally>"
 image_spec() {
   case "$1" in
-    controller) echo "docker/Dockerfile.controller|$CONTROLLER_REPO|latest" ;;
-    cpu)        echo "docker/Dockerfile.runner.cpu|$RUNNER_REPO|cpu" ;;
-    cuda)       echo "docker/Dockerfile.runner.cuda|$RUNNER_REPO|cuda" ;;
-    rocm)       echo "docker/Dockerfile.runner.rocm|$RUNNER_REPO|rocm" ;;
+    controller) echo "docker/Dockerfile.controller|$CONTROLLER_REPO|latest|ai-studio/controller:latest" ;;
+    cpu)        echo "docker/Dockerfile.runner.cpu|$RUNNER_REPO|cpu|ai-studio/runner:cpu" ;;
+    cuda)       echo "docker/Dockerfile.runner.cuda|$RUNNER_REPO|cuda|ai-studio/runner:cuda" ;;
+    rocm)       echo "docker/Dockerfile.runner.rocm|$RUNNER_REPO|rocm|ai-studio/runner:rocm" ;;
     *)          return 1 ;;
   esac
 }
@@ -100,7 +110,12 @@ command -v docker >/dev/null || die "docker is not on PATH"
 PLATFORM="${AI_STUDIO_PLATFORM:-linux/amd64}"
 native="linux/$(docker info --format '{{.Architecture}}' 2>/dev/null | sed 's/^x86_64$/amd64/; s/^aarch64$/arm64/')"
 cross=0
-if [[ "$PLATFORM" != "$native" ]]; then
+if [[ $local_only -eq 1 && "$PLATFORM" != "$native" ]]; then
+  # Nothing is being built, so the platform is whatever the local image
+  # already is -- and on a server that is the platform it is running on.
+  PLATFORM="$native"
+fi
+if [[ $local_only -eq 0 && "$PLATFORM" != "$native" ]]; then
   cross=1
   docker buildx version >/dev/null 2>&1 \
     || die "Building $PLATFORM on a $native machine needs docker buildx, which is not installed."
@@ -110,8 +125,10 @@ fi
 
 bold "Publishing to $REGISTRY/$ACCOUNT as $VERSION"
 for t in "${targets[@]}"; do
-  IFS='|' read -r _ repo tag <<<"$(image_spec "$t")"
-  printf '   %-12s → %s/%s:%s\n' "$t" "$ACCOUNT" "$repo" "$tag"
+  IFS='|' read -r _ repo tag local_tag <<<"$(image_spec "$t")"
+  printf '   %-12s %s → %s/%s:%s\n' "$t" \
+    "$([[ $local_only -eq 1 ]] && echo "$local_tag" || echo "(build)")" \
+    "$ACCOUNT" "$repo" "$tag"
 done
 echo
 
@@ -144,7 +161,7 @@ trap cleanup EXIT
 
 # ---- build and push -----------------------------------------------------
 for t in "${targets[@]}"; do
-  IFS='|' read -r dockerfile repo tag <<<"$(image_spec "$t")"
+  IFS='|' read -r dockerfile repo tag local_tag <<<"$(image_spec "$t")"
   moving="$REGISTRY/$ACCOUNT/$repo:$tag"
   pinned="$REGISTRY/$ACCOUNT/$repo:$tag-$VERSION"
 
@@ -153,6 +170,18 @@ for t in "${targets[@]}"; do
     --label "org.opencontainers.image.source=https://github.com/$ACCOUNT/ai-studio"
     --label "org.opencontainers.image.version=$VERSION"
   )
+
+  if [[ $local_only -eq 1 ]]; then
+    docker image inspect "$local_tag" >/dev/null 2>&1 \
+      || die "$local_tag is not on this machine. Run scripts/deploy.sh first, or drop --deployed."
+    bold "── retagging $local_tag"
+    docker tag "$local_tag" "$moving"
+    docker tag "$local_tag" "$pinned"
+    bold "── pushing $moving"
+    docker push "$moving"
+    docker push "$pinned"
+    continue
+  fi
 
   bold "── building $t for $PLATFORM"
   # The runner images are ten to twenty gigabytes of CUDA and torch. The first
