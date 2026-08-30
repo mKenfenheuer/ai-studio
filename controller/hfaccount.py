@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import zipfile
 
 import httpx
 
@@ -193,29 +192,9 @@ def can_publish_to(user: dict, repo_id: str) -> str | None:
 # Uploading is now a job, in runner/jobs/upload.py, with the queue, the log,
 # the progress bar and the stop button every other long-running thing here
 # already has. What stays in the controller is the half that is genuinely its
-# business: whether this account may write to that name, and what the model
-# card should say.
-
-
-def _readme_in_artifact(job_id: str) -> str:
-    """The README the training run wrote, if there is one.
-
-    Read straight out of the archive rather than by unpacking it: the file is
-    two kilobytes and the archive can be fourteen gigabytes, and the point of
-    keeping it is that it explains how to load the model -- which is worth
-    more on the Hub than anything this file could generate.
-    """
-    src = config.ARTIFACT_DIR / ("%s.zip" % job_id)
-    if not src.exists():
-        return ""
-    try:
-        with zipfile.ZipFile(src) as z:
-            with z.open("README.md") as fh:
-                text = fh.read().decode("utf-8", errors="replace")
-    except (KeyError, OSError, zipfile.BadZipFile):
-        return ""
-    # Existing front matter is dropped; the block below replaces it.
-    return text.split("---\n", 2)[-1] if text.startswith("---") else text
+# business: whether this account may write to that name. What the card says
+# moved to controller/cards.py, once a card stopped being something assembled
+# at the moment of publishing and became something a run has all along.
 
 
 async def delete_repo(user: dict, repo_id: str, kind: str) -> None:
@@ -235,90 +214,3 @@ async def delete_repo(user: dict, repo_id: str, kind: str) -> None:
             repo_id=repo_id, repo_type="dataset" if kind == "datasets" else "model")
 
     await asyncio.to_thread(_go)
-
-
-# ---------------------------------------------------------------------------
-# Model cards
-# ---------------------------------------------------------------------------
-
-def model_card(job: dict, repo_id: str, artifact_job: dict | None = None) -> str:
-    """The README to put at the top of the repo.
-
-    The runner already writes one describing how to load the model. This adds
-    the YAML front matter the Hub needs to file it correctly, and the training
-    facts -- which are otherwise only visible inside this studio.
-
-    `job` is the run being described, `artifact_job` the run whose files are
-    actually being sent. They differ for the ordinary case of a fine-tune: what
-    goes to the Hub is its merged model, and the facts worth writing down --
-    what it learned from, where it stopped -- belong to the training run.
-    """
-    cfg = job.get("config") or {}
-    artifact_job = artifact_job or job
-    scratch = job.get("kind") == "pretrain_llm"
-    merged = artifact_job.get("kind") == "merge_adapter"
-    existing = _readme_in_artifact(artifact_job["id"])
-
-    tags = ["ai-studio", "text-generation"]
-    # `lora` on the Hub means a repository holding an adapter, and a merged
-    # model is not one -- it is a complete set of weights that happens to have
-    # been trained with LoRA. Tagging it `lora` sends people looking for an
-    # adapter_config.json that is not there.
-    tags.append("pretrained-from-scratch" if scratch
-                else "merged-lora" if merged else "lora")
-    front = ["---", "library_name: transformers", "tags:"]
-    front += ["  - %s" % t for t in tags]
-    base = cfg.get("base_model") or (artifact_job.get("config") or {}).get("base_model")
-    if not scratch and base:
-        front.append("base_model: %s" % base)
-    # `datasets:` in the front matter is a Hub id, and the Hub renders it as a
-    # link. A dataset from this studio's own library travels as a URL pointing
-    # back at the controller, which is not a Hub id and is not reachable from
-    # the internet, so it is named in the text instead of linked to.
-    local = cfg.get("dataset_is_local")
-    if cfg.get("dataset") and not local:
-        front += ["datasets:", "  - %s" % cfg["dataset"]]
-    front += ["pipeline_tag: text-generation", "---", ""]
-
-    stopped = job.get("status") == "cancelled"
-    head = ["# %s" % repo_id.split("/")[-1], ""]
-    trained_on = (cfg.get("dataset_label") if local else cfg.get("dataset")) \
-        or "a private dataset"
-    head.append("Trained with [AI Studio](https://github.com/) on %s."
-                % trained_on)
-    if merged:
-        head += ["", "The LoRA adapter has been folded into the base weights, "
-                 "so this is a complete model: it loads with `from_pretrained` "
-                 "and needs nothing downloaded alongside it."]
-    if stopped:
-        head += ["", "> **Stopped before the end of its schedule.** It "
-                 "completed %s of %s planned steps, so its learning rate never "
-                 "finished decaying and it is rougher than the same run taken "
-                 "to completion."
-                 % (job.get("step"), job.get("total_steps"))]
-    head.append("")
-    return "\n".join(front + head) + existing
-
-
-def dataset_card(dataset: dict, repo_id: str) -> str:
-    fmt = dataset.get("format") or {}
-    lines = [
-        "---", "license: unknown", "tags:", "  - ai-studio", "---", "",
-        "# %s" % dataset.get("name") or repo_id.split("/")[-1], "",
-        "%s rows, prepared with AI Studio." % f"{dataset.get('rows') or 0:,}", "",
-        "| | |", "|---|---|",
-        "| Rows | %s |" % f"{dataset.get('rows') or 0:,}",
-        "| Columns | %s |" % ", ".join(dataset.get("columns") or []),
-        "| Source | %s |" % (dataset.get("origin") or dataset.get("source")),
-    ]
-    if fmt.get("mode"):
-        lines.append("| Read as | %s |" % fmt["mode"])
-    if dataset.get("notes"):
-        lines += ["", dataset["notes"]]
-    recipe = dataset.get("recipe") or {}
-    if recipe.get("steps"):
-        lines += ["", "## How it was made", ""]
-        lines += ["- %s" % s for s in recipe["steps"]]
-    lines += ["", "```python", "from datasets import load_dataset", "",
-              'ds = load_dataset("%s", split="train")' % repo_id, "```", ""]
-    return "\n".join(lines)

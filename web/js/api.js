@@ -219,6 +219,15 @@ export const api = {
   jobMetrics:  (id) => req(`/api/jobs/${encodeURIComponent(id)}/metrics`),
   jobLogs:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/logs`),
   jobReport:   (id) => req(`/api/jobs/${encodeURIComponent(id)}/report`),
+  // The model card. Reading one never stores it -- a run that has never had
+  // a card generates one to look at, and only saving or finishing writes it.
+  jobCard:     (id) => req(`/api/jobs/${encodeURIComponent(id)}/card`),
+  saveJobCard: (id, markdown) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/card`,
+        { method: "PUT", body: JSON.stringify({ markdown }) }),
+  resetJobCard: (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/card`,
+        { method: "PUT", body: JSON.stringify({ reset: true }) }),
   // `save` decides whether the half-trained model survives the stop.
   cancelJob:   (id, save = true, force = false) =>
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,

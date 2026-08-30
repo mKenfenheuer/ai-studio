@@ -16,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from common import apimodels, formatting
 
 from . import architectures as arch
-from . import config, datasets as dsets, db, diagnose, hfaccount, hub, serving
+from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
+from . import serving
 from .api import (accounts, data, evals, providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
@@ -1140,8 +1141,7 @@ async def _queue_upload(request: Request, trained: dict, artifact: dict,
         "config": {
             "target": "model", "source_job": artifact["id"],
             "trained_by": trained["id"], **want,
-            "card": hfaccount.model_card(trained, want["repo_id"],
-                                         artifact_job=artifact),
+            "card": cards.for_publish(trained, artifact, want["repo_id"]),
         }})
     return {"job_id": jid, "repo_id": want["repo_id"],
             "url": "https://huggingface.co/%s" % want["repo_id"]}
@@ -1225,8 +1225,7 @@ async def _publish_after_merge(merge_job: dict) -> None:
         "repo_id": want["repo_id"], "private": bool(want.get("private", True)),
         "replace": bool(want.get("replace")),
         "message": want.get("message") or "",
-        "card": hfaccount.model_card(trained, want["repo_id"],
-                                     artifact_job=merge_job),
+        "card": cards.for_publish(trained, merge_job, want["repo_id"]),
         "allow_cpu": True,
     }
     if token := hfaccount.token_for(user):
@@ -1238,6 +1237,50 @@ async def _publish_after_merge(merge_job: dict) -> None:
                % want["repo_id"])
     await fleet.broadcast_ui({"type": "jobs_changed"})
     fleet.wake()
+
+
+@app.get("/api/jobs/{job_id}/card")
+async def get_job_card(request: Request, job_id: str) -> dict:
+    """This run's model card, as it would go to the Hub.
+
+    Generated on the spot for a run that has never had one, so a model trained
+    before any of this existed still shows a card rather than an empty box.
+    Nothing is written by a GET: the card is only stored when a run finishes,
+    when an evaluation scores it, or when somebody saves an edit.
+    """
+    job = _job_or_404(request, job_id)
+    if job["kind"] not in ("finetune_llm", "pretrain_llm", "merge_adapter"):
+        raise HTTPException(400, "Only a run that produces a model has a "
+                                 "model card.")
+    return {**cards.card_for(job), "job_id": job_id, "kind": job["kind"]}
+
+
+@app.put("/api/jobs/{job_id}/card")
+async def put_job_card(request: Request, job_id: str,
+                       payload: dict = Body(...)) -> dict:
+    """Save an edited card, or throw the edits away and go back to generated.
+
+    A saved card is marked `edited` and is never rewritten again -- not when
+    the model is evaluated, not when it is merged, not when it is published.
+    That is the point of saving it. `reset` is the way back: it deletes the
+    stored card, and what you get next is generated from the run as it stands
+    today, including anything that has happened since.
+    """
+    job = _job_or_404(request, job_id, "edit")
+    if payload.get("reset"):
+        db.clear_job_card(job_id)
+        return {**cards.card_for(job), "job_id": job_id, "reset": True}
+    text = payload.get("markdown")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "A card cannot be empty. Use reset to go "
+                                 "back to the generated one.")
+    if len(text) > 256_000:
+        raise HTTPException(400, "That card is too long for a README.")
+    db.set_job_card(job_id, text, edited=True)
+    db.add_log(job_id, "Model card edited. It will not be regenerated from "
+                       "now on; reset it to hand it back to the studio.")
+    return {"markdown": text, "edited": True, "saved": True,
+            "job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}/chat-template")

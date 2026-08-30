@@ -395,6 +395,30 @@ class Fleet:
                            % (db.get_runner(runner_id) or {}).get("name", "that machine"),
                            "warn")
 
+    @staticmethod
+    def _refresh_cards(job_id: str, summary: dict) -> None:
+        """Rewrite the model cards this run has just made out of date.
+
+        A card is only worth having if it is true, and there are exactly two
+        moments it stops being true: when the run that made the model reports
+        what it did, and when somebody measures the model afterwards. The
+        second one is why this is not simply done when the artifact arrives --
+        an evaluation produces no artifact at all, and it is the run that adds
+        the numbers people actually want on a card.
+
+        Cards somebody has edited are left alone; cards.refresh enforces that.
+        """
+        from . import cards
+        if summary.get("kind") == "evaluate":
+            for score in summary.get("scores") or []:
+                if mid := score.get("model_job_id"):
+                    cards.refresh(mid, reason="scored against \"%s\""
+                                  % (summary.get("eval_name") or "a prompt set"))
+            return
+        job = db.get_job(job_id) or {}
+        if job.get("kind") in ("finetune_llm", "pretrain_llm", "merge_adapter"):
+            cards.refresh(job_id, reason="the run finished")
+
     async def announce_end(self, job_id: str, status: str) -> None:
         """A run has ended. Tell the browsers, and tell whoever owns it.
 
@@ -644,6 +668,7 @@ class Fleet:
                                "set, ready to compare with later runs."
                                % (written, "" if written == 1 else "s"))
             db.set_job_summary(jid, summary)
+            self._refresh_cards(jid, summary)
             db.clear_checkpoint(jid)
             self.checkpoints.get(runner_id, set()).discard(jid)
             db.add_log(jid, "Finished successfully. %s" % json.dumps(summary)[:600])

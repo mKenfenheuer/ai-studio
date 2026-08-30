@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from common import conversation, formatting
 
 from .. import datasets as ds
-from .. import db, hfaccount, hub
+from .. import cards, db, hfaccount, hub
 from .security import current_user, require_edit, require_owner, require_view
 
 router = APIRouter(prefix="/api/datasets")
@@ -533,7 +533,7 @@ async def publish_dataset(request: Request, dataset_id: str,
             "private": bool(payload.get("private", True)),
             "replace": bool(payload.get("replace")),
             "message": payload.get("message") or "",
-            "card": hfaccount.dataset_card(d, repo_id),
+            "card": cards.dataset_card(d, repo_id),
         }})
     return {"job_id": jid, "repo_id": repo_id,
             "url": "https://huggingface.co/datasets/%s" % repo_id}
