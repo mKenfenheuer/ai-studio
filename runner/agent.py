@@ -560,10 +560,28 @@ class Runner:
                 self.host.unload()
 
     def _upload(self, job_id: str, path: str) -> None:
+        """Send the finished thing to the controller.
+
+        Two things here are deliberate, and both are scars.
+
+        A raw PUT rather than a multipart POST, because multipart makes the
+        controller buffer the whole body to a temp file before it can write it
+        anywhere -- see put_artifact. And a read timeout of hours rather than
+        ten minutes, because the deadline has to cover the far end writing
+        fourteen gigabytes to disk before it can answer, on a machine that is
+        also busy. When that took longer than ten minutes the upload was
+        abandoned and the run was marked failed, having produced a perfectly
+        good model that was then deleted with the working directory.
+        """
         url = "%s/api/jobs/%s/artifact" % (self.controller_url, job_id)
+        timeout = httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=7200.0)
         with open(path, "rb") as fh:
-            r = httpx.post(url, files={"file": (Path(path).name, fh, "application/zip")},
-                           headers={"X-Runner-Token": self.token}, timeout=600)
+            # httpx reads the handle in 64 KB chunks and sets Content-Length
+            # itself from the file's size, so this streams rather than loading
+            # the model into memory to send it.
+            r = httpx.put(url, content=fh, timeout=timeout,
+                          headers={"X-Runner-Token": self.token,
+                                   "Content-Type": "application/zip"})
             r.raise_for_status()
 
 

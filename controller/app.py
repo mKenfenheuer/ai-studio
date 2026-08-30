@@ -897,6 +897,37 @@ async def delete_job(request: Request, job_id: str) -> dict:
     return {"ok": True, "deleted": job_id}
 
 
+@app.put("/api/jobs/{job_id}/artifact")
+async def put_artifact(job_id: str, request: Request,
+                       x_runner_token: str = Header(default="")) -> dict:
+    """Receive a finished model as a raw body, straight to its final place.
+
+    The same thing as the POST below, minus a detour that cost a real run. A
+    multipart upload arrives as Starlette's UploadFile, which buffers the whole
+    body to a spooled temp file *before* the handler is called; the handler
+    then copies it to the artifact directory. For a fourteen-gigabyte merged
+    model that is twenty-eight gigabytes of writes, twice the free space, and
+    several minutes of silence on a loaded box while the runner waits for a
+    response it has a deadline for. It stopped waiting, and a merge that had
+    successfully written every shard was recorded as failed.
+
+    The POST is kept because a runner older than this controller still speaks
+    it, and an artifact is the last thing that should break on a version skew.
+    """
+    if x_runner_token != config.join_token():
+        raise HTTPException(401, "Invalid runner token.")
+    if not db.get_job(job_id):
+        raise HTTPException(404, "No such job.")
+    config.ensure_dirs()
+    dest = config.ARTIFACT_DIR / ("%s.zip" % job_id)
+    size = 0
+    with open(dest, "wb") as fh:
+        async for chunk in request.stream():
+            fh.write(chunk)
+            size += len(chunk)
+    return await _artifact_stored(job_id, dest, size)
+
+
 @app.post("/api/jobs/{job_id}/artifact")
 async def upload_artifact(job_id: str, file: UploadFile,
                           x_runner_token: str = Header(default="")) -> dict:
@@ -911,6 +942,16 @@ async def upload_artifact(job_id: str, file: UploadFile,
         while chunk := await file.read(1 << 20):
             fh.write(chunk)
             size += len(chunk)
+    return await _artifact_stored(job_id, dest, size)
+
+
+async def _artifact_stored(job_id: str, dest: Path, size: int) -> dict:
+    """Everything that happens once the bytes are on disk, however they came.
+
+    Recording what kind of thing it is, and then the two automatic follow-ons:
+    a fine-tune's adapter queues its own merge, and a merge releases whatever
+    publish was waiting for a whole model to exist.
+    """
     # A fine-tune produces an adapter that needs its base model; a from-scratch
     # run produces a standalone model; a generation run produces data. Labelling
     # them apart matters because what you do with each is completely different.
