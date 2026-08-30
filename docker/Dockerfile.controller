@@ -30,7 +30,20 @@ VOLUME ["/data"]
 # /api/health, not /api/status. The latter needs a session and carries the
 # join token, so it answers 401 to a healthcheck and marks a working
 # controller unhealthy forever.
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8420/api/health').status_code==200 else 1)"
+#
+# Patient on purpose. Five seconds is a browser's patience, not a health
+# probe's: on a four-core box with a runner merging a seven-billion-parameter
+# model, the controller answers in milliseconds when it gets a time slice and
+# sometimes waits seconds for one. The old settings called that unhealthy
+# within ninety seconds, every time, for the length of every merge -- so the
+# one signal that is supposed to mean "something is wrong" meant "somebody is
+# working" instead, and got ignored accordingly. Two and a half minutes of
+# consistent failure is a real fault; ten seconds of contention is not.
+#
+# urllib rather than httpx because this runs every thirty seconds forever, and
+# on a loaded box the cheaper interpreter start is the difference between a
+# probe that measures the controller and one that competes with it.
+HEALTHCHECK --interval=30s --timeout=15s --start-period=30s --retries=5 \
+    CMD python -c "import sys,urllib.request as u; sys.exit(0 if u.urlopen('http://127.0.0.1:8420/api/health', timeout=10).status==200 else 1)"
 
 ENTRYPOINT ["python", "-m", "controller"]

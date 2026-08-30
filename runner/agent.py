@@ -183,6 +183,14 @@ class Runner:
                 print("[runner] disconnected (%s); retrying in %ss" % (type(e).__name__, backoff))
             except Exception as e:  # noqa: BLE001 - never let the agent die
                 print("[runner] unexpected error: %r; retrying in %ss" % (e, backoff))
+            # Also while reconnecting, not only while connected. The liveness
+            # file answers "is this process alive", and a runner between
+            # sockets is very much alive -- usually it is halfway through a
+            # merge, which is exactly why the socket dropped. Touched only in
+            # the heartbeat, the file went stale after two minutes of
+            # reconnecting and the container reported unhealthy for a machine
+            # doing the most useful work on the box.
+            self._touch_liveness()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, RECONNECT_MAX_S)
 
