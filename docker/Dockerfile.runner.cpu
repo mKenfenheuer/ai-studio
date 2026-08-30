@@ -7,12 +7,19 @@
 # controller on the same modest machine, and is restricted by
 # AI_STUDIO_RUNNER_KINDS to the kinds of job that need no card.
 #
-# It is deliberately tiny. No runner module imports torch, transformers or
-# datasets at import time -- every trainer imports them inside its own
-# function -- so the agent, the capability probe and these two job kinds run
-# on a plain Python image. Should this machine ever be handed a training job
-# anyway, the import fails with a clear ModuleNotFoundError in that run's log
-# rather than doing something worse.
+# It carries torch, but the CPU build of it. Merging an adapter into its base
+# is one addition per weight and touches no GPU at all, so making it wait for
+# the card is the same mistake as making an upload wait for the card -- worse,
+# because a fine-tune cannot be published until its merge has run, and the
+# merge was queueing behind the next training job. That is the whole reason
+# the CPU wheel is worth the gigabyte it adds: without it this image cannot
+# import torch, and the merge fails on arrival.
+#
+# Nothing here imports torch, transformers or peft at module level -- every
+# job imports what it needs inside its own function -- so the agent and the
+# capability probe still start on a machine where the install went wrong, and
+# a training job handed to this machine anyway fails with a plain message in
+# that run's log rather than doing something worse.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -29,6 +36,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # faster and is optional at runtime.
 RUN pip install --no-cache-dir \
         httpx>=0.27 websockets>=12 "huggingface-hub[hf_transfer]>=0.25"
+
+# The processor build of torch, from PyTorch's own index. The default wheel on
+# PyPI drags in several gigabytes of CUDA libraries that would never be opened
+# on a machine with no card; this one is a fraction of the size and is the
+# same arithmetic. Installed in its own layer so a change to the line above
+# does not rebuild it.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.4"
+RUN pip install --no-cache-dir \
+        "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4"
 
 COPY runner /app/runner
 COPY common /app/common

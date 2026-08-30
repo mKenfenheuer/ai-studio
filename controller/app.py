@@ -443,6 +443,12 @@ async def _create_job(request: Request, payload: dict) -> str:
         # passes silently when the size is unknown.
         cfg.setdefault("params_b", src["config"].get("params_b"))
         cfg.setdefault("quantization", src["config"].get("quantization"))
+        # Merging is arithmetic on the processor, so it may go to a machine
+        # with no card -- and should, since the alternative is holding the card
+        # for an hour of work it takes no part in. The automatic merge has
+        # always said this; a merge asked for by hand said nothing and queued
+        # for the GPU.
+        cfg.setdefault("allow_cpu", True)
     elif kind == "generate_dataset":
         model = cfg.get("model") or {}
         if not model.get("job_id") and not model.get("base_model") \

@@ -104,10 +104,28 @@ def run(cfg: dict, ctx: Any) -> dict:
     # weight and needs no GPU, but it does need the whole model in system
     # memory. In float32 that is four bytes a parameter -- 28 GB for a 7B
     # model -- which many machines running this do not have.
+    #
+    # Whether this one does is worked out before loading rather than caught
+    # afterwards, because on Linux it cannot be caught. Asking for 28 GB on a
+    # machine with 24 does not raise MemoryError: the kernel hands over the
+    # address space, the process touches it, and the OOM killer sends SIGKILL.
+    # There is no exception, no log line and no failed run -- the container
+    # goes away mid-merge and the studio reports that the runner vanished.
+    # This is the difference between merging on a spare CPU and merging on a
+    # training box, so it stopped being a theoretical concern the moment the
+    # controller started taking merges.
+    plan = _memory_plan(cfg.get("params_b"), dtype_name)
+    if plan.get("note"):
+        ctx.log(plan["note"], plan.get("level", "info"))
     try:
-        model = load(torch.float32)
+        model = load(torch.float32 if plan["float32"] else dtype)
     except (MemoryError, RuntimeError, OSError) as e:
+        # Still worth keeping: an allocator that does refuse politely, a
+        # machine whose limit could not be read, and a base model bigger than
+        # the size the run recorded all end up here.
         if "memory" not in str(e).lower() and not isinstance(e, MemoryError):
+            raise
+        if not plan["float32"]:
             raise
         ctx.log("Not enough memory to merge in full precision (%s), so the "
                 "arithmetic is being done in %s instead. Small adapter "
@@ -170,6 +188,88 @@ def run(cfg: dict, ctx: Any) -> dict:
             "it loads with from_pretrained and needs nothing else."
             % (f"{params:,}", archive.stat().st_size / 1024 ** 3))
     return summary
+
+
+# What merging costs on top of simply holding the weights: PEFT builds `BA`
+# for each target module it folds in, and `.to(dtype)` keeps the tensor it is
+# converting alongside the one it produces. A tenth, plus a fixed couple of
+# gigabytes for the Python process, the tokenizer and the safetensors writer.
+_OVERHEAD = 1.12
+_SLACK = 2 * 1024 ** 3
+
+
+def _memory_plan(params_b: float | None, dtype_name: str) -> dict:
+    """Whether to merge in float32, decided against memory this machine has.
+
+    Raises when not even the requested precision fits, which is a far better
+    outcome than starting: an hour of downloading followed by a process that
+    disappears without writing anything tells nobody anything.
+    """
+    have = _memory_available()
+    params = float(params_b or 0) * 1e9
+    if not params or not have:
+        # Nothing to compare -- the run does not record its size, or the
+        # machine will not say what it has. Ask for full precision and let the
+        # caller's fallback deal with it, as this did before it could measure.
+        return {"float32": True}
+
+    need32 = params * 4 * _OVERHEAD + _SLACK
+    if need32 <= have:
+        return {"float32": True,
+                "note": "Merging in float32. It needs about %s and this "
+                        "machine has %s." % (_gb(need32), _gb(have))}
+
+    width = {"float32": 4}.get(dtype_name, 2)
+    need = params * width * _OVERHEAD + _SLACK
+    if need > have:
+        raise ValueError(
+            "There is not enough memory here to merge a model this size: "
+            "holding %s parameters in %s takes about %s and this machine has "
+            "%s. Nothing has been changed -- the adapter and its base are both "
+            "still here -- so this can be merged on a larger machine."
+            % (f"{int(params):,}", dtype_name, _gb(need), _gb(have)))
+    return {
+        "float32": False, "level": "warn",
+        "note": "Merging in %s rather than float32: full precision would need "
+                "about %s and this machine has %s. Small adapter updates can "
+                "round away at that precision, which makes the merged model "
+                "slightly weaker than serving the adapter and its base "
+                "separately." % (dtype_name, _gb(need32), _gb(have)),
+    }
+
+
+def _memory_available() -> int | None:
+    """Bytes this process could actually get, or None if it cannot be told.
+
+    Both the host's free memory and the container's own limit can be the thing
+    that kills the run, and neither implies the other -- /proc/meminfo is not
+    namespaced, so inside a container it describes the machine and says
+    nothing about the cap this process is under. The smaller wins.
+    """
+    limits: list[int] = []
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                limits.append(int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    for cap_file, used_file in (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+             "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            cap = int(Path(cap_file).read_text().strip())
+            used = int(Path(used_file).read_text().strip())
+        except (OSError, ValueError):
+            continue        # "max" for an unlimited cgroup v2, or no cgroup
+        if cap < (1 << 62):  # cgroup v1 writes a vast number to mean no limit
+            limits.append(max(cap - used, 0))
+    return min(limits) if limits else None
+
+
+def _gb(n: float) -> str:
+    return "%.1f GB" % (n / 1024 ** 3)
 
 
 def _write_readme(out_dir: Path, summary: dict, cfg: dict) -> None:
