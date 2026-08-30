@@ -98,6 +98,12 @@ class Fleet:
         gets an instant, explained rejection instead of a crash ten minutes into
         a download.
         """
+        # A machine that was told to take only certain kinds of work. Checked
+        # first, because "this machine only does uploads" explains a skip far
+        # better than the memory arithmetic further down would.
+        if (kinds := caps.get("kinds")) and job["kind"] not in kinds:
+            return False, ("this machine only runs %s"
+                           % ", ".join(str(k) for k in kinds))
         if caps.get("backend") == "cpu" and not job["config"].get("allow_cpu"):
             return False, "runner has no GPU"
         if job["config"].get("quantization") == "4bit" \
@@ -292,10 +298,10 @@ class Fleet:
         return job.get("checkpoint_runner") or None
 
     def _eligible(self, job: dict, idle: list[str]) -> list[str]:
-        """Which of the idle machines may take this job."""
+        """Which of the idle machines may take this job, best first."""
         holder = self.holder_of(job)
         if not holder:
-            return idle
+            return self._by_preference(job, idle)
         if holder in idle:
             return [holder]
         if holder in self.connections:
@@ -313,7 +319,24 @@ class Fleet:
                        % ((runner or {}).get("name", "unknown"),
                           silent_for // 60), "warn")
         db.clear_checkpoint(job["id"])
-        return idle
+        return self._by_preference(job, idle)
+
+    @staticmethod
+    def _by_preference(job: dict, idle: list[str]) -> list[str]:
+        """Machines that specialise in this kind of work, first.
+
+        An upload needs no GPU and will run anywhere, which is exactly the
+        problem: handed to the one machine with a card, it occupies it for
+        twenty minutes of network while training waits. A machine restricted
+        to a list of kinds is a machine somebody set aside for them, so it is
+        asked first and the GPU is left for work that needs it.
+        """
+        def rank(rid: str) -> int:
+            runner = db.get_runner(rid)
+            kinds = ((runner or {}).get("capabilities") or {}).get("kinds")
+            return 0 if kinds and job["kind"] in kinds else 1
+
+        return sorted(idle, key=rank)
 
     async def _dispatch_once(self) -> None:
         queued = db.queued_jobs()

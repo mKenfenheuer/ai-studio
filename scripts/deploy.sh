@@ -16,6 +16,7 @@
 #   deploy.sh                 rebuild and restart everything (guarded)
 #   deploy.sh controller      controller only -- safe while training
 #   deploy.sh runner          runner only
+#   deploy.sh runner-cpu      the GPU-less runner beside the controller
 #   deploy.sh status          what is in flight; change nothing
 #   deploy.sh <target> --force   do it anyway
 set -euo pipefail
@@ -102,6 +103,20 @@ case "$target" in
     docker compose build controller
     docker compose up -d --no-deps controller
     ;;
+  runner-cpu|cpu)
+    # The GPU-less runner beside the controller: uploads and hosted-model
+    # dataset runs. Restarting it interrupts those and nothing else, but
+    # "those" includes an upload that is eighteen minutes into fourteen
+    # gigabytes, so it asks the same question.
+    if [[ "$busy" == "1" && $force -eq 0 ]]; then
+      warn "Something is running. Restarting this runner interrupts whatever"
+      warn "it is doing -- an upload starts over, rows already written are kept."
+      warn "Re-run with --force if that is fine."
+      exit 1
+    fi
+    docker compose build runner-cpu
+    docker compose up -d --no-deps runner-cpu
+    ;;
   runner|runner-rocm|runner-cuda)
     svc="$target"; [[ "$svc" == "runner" ]] && svc="runner-rocm"
     if [[ "$busy" == "1" && $force -eq 0 ]]; then
@@ -127,7 +142,7 @@ case "$target" in
     docker compose up -d
     ;;
   *)
-    die "Unknown target '$target'. Use: all, controller, runner, status."
+    die "Unknown target '$target'. Use: all, controller, runner, runner-cpu, status."
     ;;
 esac
 

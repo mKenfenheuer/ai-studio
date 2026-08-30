@@ -239,6 +239,15 @@ def probe(quick: bool = False) -> dict:
         "notes": [],
     }
 
+    # A machine can be told to take only certain kinds of work. The reason
+    # this exists is the queue: a runner does one job at a time, so an upload
+    # or a dataset written by a hosted model -- neither of which touches the
+    # GPU -- would otherwise sit behind six hours of training. A second,
+    # GPU-less runner set to `upload,generate_dataset` picks those up while
+    # the card carries on training.
+    if only := os.environ.get("AI_STUDIO_RUNNER_KINDS", "").strip():
+        caps["kinds"] = [k.strip() for k in only.split(",") if k.strip()]
+
     try:
         import torch
     except ImportError:

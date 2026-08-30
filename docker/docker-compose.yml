@@ -49,6 +49,29 @@ services:
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-amd-runner}
       HF_TOKEN: ${HF_TOKEN:-}
 
+  # The controller's own machine, working as a runner for the jobs that need
+  # no GPU. A studio with one card has one queue, and an upload or a dataset
+  # written by a hosted model would otherwise wait behind six hours of
+  # training for a card it never touches. Restricted by kind rather than
+  # trusted to behave: without AI_STUDIO_RUNNER_KINDS it would happily accept
+  # anything marked `allow_cpu` and try to train on a CPU.
+  runner-cpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runner.cpu
+    image: ai-studio/runner:cpu
+    restart: unless-stopped
+    depends_on: [controller]
+    volumes:
+      - runner-cpu-data:/data
+    environment:
+      AI_STUDIO_CONTROLLER: http://controller:8420
+      AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
+      AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
+      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset}
+      HF_TOKEN: ${HF_TOKEN:-}
+
 volumes:
   studio-data:
   runner-data:
+  runner-cpu-data:

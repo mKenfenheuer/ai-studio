@@ -97,13 +97,16 @@ function card(r) {
   const dtypes = c.dtypes || {};
   const best = c.recommended_dtype;
 
+  // A machine restricted to uploads is never training, whatever it is doing.
+  const trains = !c.kinds?.length
+    || c.kinds.some((k) => k === "finetune_llm" || k === "pretrain_llm");
   return html`
     <div class="card">
       <div class="row-between" style="flex-wrap:wrap;gap:6px">
         <h3 style="margin:0"><span class="dot ${dot}"></span> ${r.name}</h3>
         <span class="badge ${offline ? "badge-err" : r.status === "busy"
           ? "badge-accent" : "badge-ok"}">${offline ? "offline"
-          : r.status === "busy" ? "training" : "ready"}</span>
+          : r.status === "busy" ? (trains ? "training" : "busy") : "ready"}</span>
       </div>
       <p class="muted tiny mono" style="margin:6px 0 10px">
         ${c.device_name || "unknown device"}${c.arch ? " · " + c.arch : ""}</p>
@@ -116,6 +119,9 @@ function card(r) {
         <dt>Biggest model</dt><dd>${c.max_finetune_params_b
           ? "about " + c.max_finetune_params_b + "B parameters" : "—"}</dd>
         <dt>Last seen</dt><dd>${fmtAgo(r.last_seen)}</dd>
+        ${raw(c.kinds?.length ? html`
+          <dt>Takes</dt><dd>${c.kinds.join(", ").replace(/_/g, " ")}
+            <span class="muted tiny">— and nothing else</span></dd>` : "")}
       </dl>
 
       ${raw(Object.keys(dtypes).length ? html`
