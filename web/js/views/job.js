@@ -989,6 +989,16 @@ function paintHeader(mount, job) {
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download${writing ? " the JSONL" : ""}</a>` : "")}
+    ${raw(done
+      // Offered for a run that failed or was stopped as much as for one that
+      // finished: those are the ones somebody most wants to start again with
+      // one thing different. A generation run has a whole page that can edit
+      // its brief, so it goes there instead.
+      ? `<a class="btn btn-sm" href="${writing
+             ? `#/generate/from/${esc(job.id)}`
+             : `#/jobs/${esc(job.id)}/again`}"
+            title="Start a new run from this one's settings">
+           ⟳ Run again with changes</a>` : "")}
     ${raw(shareButton("job", job))}
     ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>`
                 : `<button class="btn-danger btn-sm" id="deleteBtn">Delete</button>`)}`;

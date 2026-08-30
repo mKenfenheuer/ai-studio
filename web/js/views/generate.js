@@ -51,30 +51,50 @@ const MODES = [
   },
 ];
 
-export async function generateView(mount) {
-  const [runners, playable, hosted, datasets] = await Promise.all([
+export async function generateView(mount, [fromJob] = []) {
+  const [runners, playable, hosted, datasets, jobs] = await Promise.all([
     api.runners(), api.playground(),
     // A studio with no keys connected simply has no hosted options; it must
     // not be a reason for this page to fail to open.
     api.providers().catch(() => ({ providers: [], connected: [] })),
     api.datasets().catch(() => []),
+    api.jobs().catch(() => []),
   ]);
   const online = runners.filter((r) => r.status !== "offline");
   const connected = hosted.connected || [];
   const labelOf = Object.fromEntries(
     (hosted.providers || []).map((p) => [p.id, p.label]));
+  const earlier = (jobs || []).filter((j) => j.kind === "generate_dataset");
+
+  // A run started from an earlier one begins as that one's settings. Nothing
+  // is copied silently: every value lands in a field on this page, where it
+  // can be read and changed before anything is spent on it.
+  let pre = {};
+  let preName = "";
+  if (fromJob) {
+    try {
+      const job = await api.job(fromJob);
+      pre = job.config || {};
+      preName = job.name || fromJob;
+    } catch {
+      toast("That run's settings could not be read; starting blank.", "err");
+    }
+  }
 
   const state = {
-    mode: "from_prompts",
-    runnerId: online[0]?.id || null,
-    source: connected.length
-      ? `api:${connected[0].provider}`
-      : (playable[0] ? `job:${playable[0].id}` : ""),
+    mode: pre.mode || "from_prompts",
+    runnerId: online.some((r) => r.id === pre.required_runner)
+      ? pre.required_runner : (online[0]?.id || null),
+    source: sourceOf(pre, connected, playable),
     // Which model at the provider. Free text, because the list of models a
     // provider offers changes weekly and a dropdown baked in here would be
     // wrong by the time anyone read it.
-    apiModel: connected[0]?.model || "",
-    count: 200,
+    apiModel: pre.model?.model || connected[0]?.model || "",
+    count: pre.count || 200,
+    pre,
+    preName,
+    earlier,
+    from: fromJob || "",
   };
 
   const draw = () => {
@@ -85,6 +105,11 @@ export async function generateView(mount) {
 
   function wire() {
     on(mount, "click", "[data-mode]", (_e, t) => { state.mode = t.dataset.mode; draw(); });
+    on(mount, "change", "#genFrom", (_e, t) => {
+      // A whole page reload of the same view: the earlier run's settings are
+      // read once, at the top, and everything below is drawn from them.
+      location.hash = t.value ? `#/generate/from/${t.value}` : "#/generate";
+    });
     on(mount, "change", "#genRunner", (_e, t) => { state.runnerId = t.value; });
     on(mount, "change", "#genSource", (_e, t) => {
       state.source = t.value;
@@ -119,10 +144,11 @@ export async function generateView(mount) {
         system_prompt: f.system_prompt || "",
         dataset_system_prompt: f.dataset_system_prompt || "",
         instruction: f.instruction || "",
-        temperature: +f.temperature || 0.9,
+        temperature: +f.temperature || 1.05,
         max_new_tokens: +f.max_new_tokens || 512,
         output: f.output || "chat",
       };
+      if (+f.workers > 0) cfg.workers = +f.workers;
       if (state.mode === "conversations") {
         cfg.instruction = f.body;
         cfg.topics = f.topics || "";
@@ -185,14 +211,15 @@ export async function generateView(mount) {
  *  multi-step conversation and the wrong one for teaching facts, and which of
  *  those you are doing is not something this page can work out for you.
  */
-function extendPanel(datasets) {
+function extendPanel(datasets, p = {}) {
   const rows = (datasets || []).filter((d) => (d.rows || 0) > 0);
   return html`
     <div class="field">
       <label for="srcDs">Dataset to lengthen</label>
       <select id="srcDs" name="source_dataset_id" required>
         <option value="">Choose a dataset…</option>
-        ${raw(rows.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} — ${
+        ${raw(rows.map((d) => `<option value="${esc(d.id)}"${
+          sel(d.id, val(p, "source_dataset_id"))}>${esc(d.name)} — ${
           fmtNum(d.rows)} rows</option>`).join(""))}
       </select>
       <div class="hint">Every conversation in it gets carried further. The
@@ -203,13 +230,13 @@ function extendPanel(datasets) {
       <div class="field">
         <label for="srcSplit">Split</label>
         <input id="srcSplit" name="source_split" class="mono"
-               placeholder="every row">
+               value="${val(p, "source_split")}" placeholder="every row">
         <div class="hint">Blank for all of them.</div>
       </div>
       <div class="field">
         <label for="extraTurns">Extra exchanges per conversation</label>
         <input id="extraTurns" name="extra_turns" type="number" min="1" max="12"
-               value="2">
+               value="${val(p, "extra_turns", 2)}">
         <div class="hint">Each one is a new question and its answer — plus any
           tool calls and results in between.</div>
       </div>
@@ -217,13 +244,15 @@ function extendPanel(datasets) {
     <div class="field">
       <label for="persona">Who is the person? (optional)</label>
       <input id="persona" name="persona" class="mono"
+             value="${val(p, "persona")}"
              placeholder="a busy warehouse supervisor, terse, types in lower case">
       <div class="hint">The model writes the user's turns as well as the
         assistant's, and left to itself it writes a user who talks like an
         assistant. A sentence here is the difference between realistic
         follow-ups and a second assistant interviewing the first.</div>
     </div>
-    <label class="check"><input type="checkbox" name="invent_tool_results" checked>
+    <label class="check"><input type="checkbox" name="invent_tool_results"${
+      checked(p, "invent_tool_results", true)}>
       When the model calls a tool, invent a plausible result so the
       conversation can carry on</label>
     <div class="callout callout-warn" style="margin-top:10px">
@@ -242,12 +271,13 @@ function extendPanel(datasets) {
  *  are cycled across it independently, so a dozen of each is a hundred and
  *  forty-four combinations rather than a dozen.
  */
-function conversationPanel() {
+function conversationPanel(p = {}) {
   return html`
     <div class="field">
       <label for="genBody">What should these conversations be?</label>
       <textarea id="genBody" name="body" rows="10" class="mono"
-                placeholder="${BRIEF_PLACEHOLDER}" required></textarea>
+                placeholder="${BRIEF_PLACEHOLDER}" required>${
+                  val(p, "instruction")}</textarea>
       <div class="hint">Describe the assistant, the person, and what a good
         exchange looks like. Use <code>{topic}</code> and
         <code>{language}</code> to place them yourself; otherwise they are
@@ -257,13 +287,17 @@ function conversationPanel() {
       <div class="field">
         <label for="genTopics">Situations, one per line</label>
         <textarea id="genTopics" name="topics" rows="6" class="mono"
-                  placeholder="turning a light off in a named room&#10;asking what the weather will do tomorrow&#10;setting the thermostat before bed&#10;closing the blinds because of the sun"></textarea>
-        <div class="hint">Optional, and the single biggest lever on variety.</div>
+                  placeholder="light control&#10;climate control&#10;weather question&#10;ambiguous request">${
+                    val(p, "topics")}</textarea>
+        <div class="hint">Optional, and the single biggest lever on variety. A
+          short label is enough — the brief says what a good exchange looks
+          like, these only say which one this row is.</div>
       </div>
       <div class="field">
         <label for="genLangs">Languages, one per line</label>
         <textarea id="genLangs" name="languages" rows="6" class="mono"
-                  placeholder="German&#10;English&#10;French&#10;Spanish"></textarea>
+                  placeholder="German&#10;English&#10;French&#10;Spanish">${
+                    val(p, "languages")}</textarea>
         <div class="hint">Optional. Each conversation is written entirely in
           one of them — question and answer both.</div>
       </div>
@@ -271,18 +305,21 @@ function conversationPanel() {
     <div class="field">
       <label for="genTools">Tools the conversations may call (JSON)</label>
       <textarea id="genTools" name="tools" rows="8" class="mono"
-                placeholder="${TOOLS_PLACEHOLDER}"></textarea>
+                placeholder="${TOOLS_PLACEHOLDER}">${val(p, "tools")}</textarea>
       <div class="hint">A JSON array of function definitions —
         <code>name</code>, <code>description</code>, <code>parameters</code>.
         They are stored on every row, so the dataset carries its own tool
         schema.</div>
     </div>
-    <label class="check"><input type="checkbox" name="with_reasoning" checked>
+    <label class="check"><input type="checkbox" name="with_reasoning"${
+      checked(p, "with_reasoning", true)}>
       Each assistant turn shows its working, including why it called
       what it called</label>
-    <label class="check"><input type="checkbox" name="system_from_model">
+    <label class="check"><input type="checkbox" name="system_from_model"${
+      checked(p, "system_from_model", false)}>
       The model writes each row's system prompt as well</label>
-    <label class="check"><input type="checkbox" name="require_tool_call">
+    <label class="check"><input type="checkbox" name="require_tool_call"${
+      checked(p, "require_tool_call", false)}>
       Keep only conversations that call a tool</label>
     <div class="callout callout-warn" style="margin-top:10px">
       <strong>The results are invented</strong>
@@ -304,11 +341,33 @@ const TOOLS_PLACEHOLDER = `[{"name": "execute_services", "description": "…", `
 const kindOf = (playable, id) =>
   playable.find((p) => p.id === id)?.kind || "finetune_llm";
 
+/** The model selector's value for a run being copied. */
+function sourceOf(pre, connected, playable) {
+  const m = pre.model || {};
+  if (m.provider) return `api:${m.provider}`;
+  if (m.job_id) return `job:${m.job_id}`;
+  if (m.base_model) return m.base_model;
+  return connected.length ? `api:${connected[0].provider}`
+    : (playable[0] ? `job:${playable[0].id}` : "");
+}
+
+/** A prefilled value, or the default this page has always used. */
+const val = (pre, name, fallback = "") =>
+  pre[name] === undefined || pre[name] === null || pre[name] === ""
+    ? fallback : pre[name];
+
+const checked = (pre, name, fallback) =>
+  (pre[name] === undefined ? fallback : pre[name]) ? " checked" : "";
+
+const sel = (a, b) => (String(a) === String(b) ? " selected" : "");
+
 // ---------------------------------------------------------------------------
 
 function layout(state, online, playable, connected = [], labelOf = {},
                 datasets = []) {
   const mode = MODES.find((m) => m.id === state.mode);
+  const p = state.pre || {};
+  const hostedSource = state.source.startsWith("api:");
   return html`
     <div class="page-head">
       <a href="#/data" class="tiny">← Datasets</a>
@@ -316,6 +375,29 @@ function layout(state, online, playable, connected = [], labelOf = {},
       <p class="sub">It runs as a job: progress, a log, and a stop button that
         keeps whatever it has written so far.</p>
     </div>
+
+    ${raw(state.earlier?.length ? html`
+      <div class="card" style="margin-bottom:14px">
+        <div class="field" style="margin:0">
+          <label for="genFrom">Start from an earlier run</label>
+          <select id="genFrom">
+            <option value="">Start from scratch</option>
+            ${raw(state.earlier.slice(0, 40).map((j) => `<option value="${
+              esc(j.id)}"${sel(j.id, state.from)}>${esc(j.name)}${
+              j.status === "succeeded" ? "" : ` — ${esc(j.status)}`}</option>`).join(""))}
+          </select>
+          <div class="hint">Its brief, situations, languages, tools and
+            settings are loaded into this page. Change what you want and start
+            a second run — the earlier one and its dataset are untouched.</div>
+        </div>
+      </div>` : "")}
+
+    ${raw(state.preName ? html`
+      <div class="callout" style="margin-bottom:14px">
+        <strong>Copied from “${esc(state.preName)}”</strong>
+        Every setting below came from that run. Nothing is sent until you
+        start this one.
+      </div>` : "")}
 
     ${raw(!online.length ? html`
       <div class="callout callout-err"><strong>No machine is connected</strong>
@@ -343,13 +425,13 @@ function layout(state, online, playable, connected = [], labelOf = {},
       <div class="grid grid-2" style="align-items:start">
         <div class="card">
           <h3>${mode.title}</h3>
-          ${raw(mode.dataset ? extendPanel(datasets)
-                : mode.brief ? conversationPanel() : html`
+          ${raw(mode.dataset ? extendPanel(datasets, p)
+                : mode.brief ? conversationPanel(p) : html`
           <div class="field">
             <label for="genBody">${bodyLabel(state.mode)}</label>
             <textarea id="genBody" name="body" rows="10" class="mono"
                       placeholder="${bodyPlaceholder(state.mode)}"
-                      required></textarea>
+                      required>${bodyValue(state.mode, p)}</textarea>
             <div class="hint">${bodyHint(state.mode)}</div>
           </div>`)}
           ${raw(state.mode !== "from_prompts" && !mode.dataset && !mode.brief ? html`
@@ -358,7 +440,8 @@ function layout(state, online, playable, connected = [], labelOf = {},
               <div class="field" style="margin-top:8px">
                 <label for="genInstr">Instruction template</label>
                 <textarea id="genInstr" name="instruction" rows="3" class="mono"
-                          placeholder="${templateHint(state.mode)}"></textarea>
+                          placeholder="${templateHint(state.mode)}">${
+                            val(p, "instruction")}</textarea>
                 <div class="hint">${state.mode === "from_topics"
                   ? "Use {topic} where the topic should go."
                   : "Use {examples} where the seed examples should go."}</div>
@@ -416,8 +499,8 @@ function layout(state, online, playable, connected = [], labelOf = {},
             <div class="field">
               <label for="genRunner">Machine</label>
               <select id="genRunner" name="runner">
-                ${raw(online.map((r) => html`
-                  <option value="${r.id}">${r.name}</option>`).join(""))}
+                ${raw(online.map((r) => `<option value="${esc(r.id)}"${
+                  sel(r.id, state.runnerId)}>${esc(r.name)}</option>`).join(""))}
               </select>
             </div>
           </div>
@@ -427,7 +510,8 @@ function layout(state, online, playable, connected = [], labelOf = {},
             <div class="field">
               <label for="genName">Call the dataset</label>
               <input id="genName" name="dataset_name" type="text"
-                     value="Generated dataset" required>
+                     value="${val(p, "dataset_name", "Generated dataset")}"
+                     required>
             </div>
             <div class="grid grid-2">
               <div class="field">
@@ -439,15 +523,16 @@ function layout(state, online, playable, connected = [], labelOf = {},
               <div class="field">
                 <label for="genOut">Shape</label>
                 <select id="genOut" name="output">
-                  <option value="chat">Conversation turns</option>
-                  <option value="text">Plain text</option>
-                  <option value="json">JSON the model writes</option>
+                  <option value="chat"${sel("chat", val(p, "output", "chat"))}>Conversation turns</option>
+                  <option value="text"${sel("text", val(p, "output"))}>Plain text</option>
+                  <option value="json"${sel("json", val(p, "output"))}>JSON the model writes</option>
                 </select>
               </div>`)}
             </div>
             <div class="field">
               <label for="genDsSys">System prompt to store in each row</label>
               <input id="genDsSys" name="dataset_system_prompt" type="text"
+                     value="${val(p, "dataset_system_prompt")}"
                      placeholder="optional">
               <div class="hint">Goes into the dataset, so the model you later
                 train sees it during training.</div>
@@ -460,26 +545,42 @@ function layout(state, online, playable, connected = [], labelOf = {},
               <div class="field" style="margin-top:8px">
                 <label for="genSys">System prompt for the writer</label>
                 <textarea id="genSys" name="system_prompt" rows="3"
-                          placeholder="You write concise, factual training examples."></textarea>
+                          placeholder="You write concise, factual training examples.">${
+                            val(p, "system_prompt")}</textarea>
               </div>
               <div class="grid grid-2">
                 <div class="field">
                   <label for="genTemp">Temperature</label>
                   <input id="genTemp" name="temperature" type="number"
-                         value="0.9" step="0.05" min="0" max="2">
+                         value="${val(p, "temperature", 1.05)}" step="0.05"
+                         min="0" max="2">
                   <div class="hint">Higher is more varied and less reliable.
-                    Below about 0.7 it repeats itself.</div>
+                    Set high on purpose: below about 0.9 a long run writes the
+                    same handful of examples over and over.</div>
                 </div>
                 <div class="field">
                   <label for="genMax">Longest reply</label>
                   <input id="genMax" name="max_new_tokens" type="number"
-                         value="${mode.brief ? 1600 : 512}" min="16" max="8192">
+                         value="${val(p, "max_new_tokens", mode.brief ? 1600 : 512)}"
+                         min="16" max="8192">
                   ${raw(mode.brief ? html`<div class="hint">A whole
                     conversation, not one answer — it needs the room. Cut
                     short, the JSON is unfinished and the row is dropped.</div>`
                     : "")}
                 </div>
               </div>
+              ${raw(hostedSource ? html`
+                <div class="field">
+                  <label for="genWorkers">Rows written at once</label>
+                  <input id="genWorkers" name="workers" type="number"
+                         value="${val(p, "workers", 6)}" min="1" max="16">
+                  <div class="hint">Hosted rows are network waiting, not
+                    computation, so several can be in flight together: a
+                    thousand-row run is an hour rather than an afternoon. Too
+                    many and the provider starts refusing — the run backs off
+                    and carries on, more slowly than if you had asked for
+                    fewer.</div>
+                </div>` : "")}
             </details>
           </div>
         </div>
@@ -506,6 +607,11 @@ const bodyPlaceholder = (m) => ({
   from_seeds: "Turn the lights off in the kitchen.\nSet a timer for ten minutes.\n"
             + "What is the temperature in the bedroom?",
 }[m]);
+
+/** What the one big box held in the run being copied. */
+const bodyValue = (m, p) => val(p, {
+  from_prompts: "prompts", from_topics: "topics", from_seeds: "seeds",
+}[m] || "");
 
 const bodyHint = (m) => ({
   from_prompts: "Each one is asked once, then they cycle round until the row "

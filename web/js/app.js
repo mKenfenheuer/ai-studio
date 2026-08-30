@@ -15,6 +15,7 @@ import { ssoView } from "./views/sso.js";
 import { dataView } from "./views/data.js";
 import { datasetView } from "./views/dataset.js";
 import { generateView } from "./views/generate.js";
+import { rerunView } from "./views/rerun.js";
 import { evalsView } from "./views/evals.js";
 import { evalView } from "./views/evalview.js";
 import { compareView } from "./views/compare.js";
@@ -24,6 +25,9 @@ const routes = [
   [/^\/$/,             dashboardView, "dashboard"],
   [/^\/new$/,          wizardView,    "new"],
   [/^\/jobs$/,         jobsView,      "jobs"],
+  // Before the catch-all below, which would otherwise swallow it and open the
+  // run's own page with "<id>/again" as the id.
+  [/^\/jobs\/([\w-]+)\/again$/, rerunView, "jobs"],
   [/^\/jobs\/(.+)$/,   jobView,       "jobs"],
   [/^\/play$/,         playView,      "play"],
   [/^\/play\/(.+)$/,   playView,      "play"],
@@ -35,6 +39,8 @@ const routes = [
   [/^\/data$/,         dataView,      "data"],
   [/^\/data\/(.+)$/,   datasetView,   "data"],
   [/^\/generate$/,     generateView,  "data"],
+  // The same page, opened on an earlier run's settings.
+  [/^\/generate\/from\/([\w-]+)$/, generateView, "data"],
   [/^\/evals$/,        evalsView,     "evals"],
   [/^\/evals\/(.+)$/,  evalView,      "evals"],
   [/^\/compare$/,      compareView,   "evals"],

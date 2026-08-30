@@ -80,6 +80,11 @@ function row(j) {
                esc(j.summary.dataset_id)}">Rows</a>` : "")}
         <a class="btn btn-sm" href="#/jobs/${j.id}">Open</a>
         ${raw(["succeeded", "failed", "cancelled"].includes(j.status)
+          ? `<a class="btn btn-sm" title="Start a new run from this one's settings"
+                href="${j.kind === "generate_dataset"
+                  ? `#/generate/from/${esc(j.id)}`
+                  : `#/jobs/${esc(j.id)}/again`}">⟳</a>` : "")}
+        ${raw(["succeeded", "failed", "cancelled"].includes(j.status)
           ? `<button class="btn-sm btn-danger" data-del="${esc(j.id)}"
                      data-name="${esc(j.name)}" title="Delete this run">✕</button>` : "")}
       </div></td>
