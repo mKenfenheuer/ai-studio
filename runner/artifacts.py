@@ -82,6 +82,32 @@ def fetch(controller_url: str, token: str, job_id: str,
     return dest
 
 
+def pack(root_dir: Path | str, dest: Path | str) -> Path:
+    """Zip a finished model for the journey to the controller, without deflate.
+
+    `shutil.make_archive` compresses, and for weights that is work done for
+    nothing. A safetensors file is dense float data with no structure deflate
+    can find: it comes back about one percent smaller, having read and
+    recompressed every byte on a single core. On the machine that prompted this
+    -- a 7B merged on the CPU while the GPU runner trained beside it -- that was
+    half an hour of the box's remaining capacity spent to save a hundred
+    megabytes out of fourteen thousand, with the run looking hung throughout.
+
+    Stored, the same archive is written at disk speed. It stays a zip, so
+    nothing that reads one has to know this happened.
+
+    Datasets are a different case and keep their compression: JSONL is text and
+    text does compress, often to a fifth.
+    """
+    dest = Path(dest)
+    root = Path(root_dir)
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                z.write(path, path.relative_to(root))
+    return dest
+
+
 def summary(job_id: str) -> dict:
     """What the run that produced this recorded about itself, if anything."""
     try:

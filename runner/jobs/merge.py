@@ -29,7 +29,6 @@ What it costs, said plainly because the numbers surprise people:
 from __future__ import annotations
 
 import json
-import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -179,8 +178,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     _write_readme(out_dir, summary, cfg)
 
     ctx.progress(3, 4, stage="saving")
-    archive = Path(ctx.workdir) / "model.zip"
-    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=out_dir)
+    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "model.zip")
     summary["artifact_path"] = str(archive)
     summary["artifact_size"] = archive.stat().st_size
     ctx.progress(4, 4, stage="saving")

@@ -29,7 +29,6 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -1288,8 +1287,7 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
     _write_readme(out_dir, summary, stats["samples"], cfg)
 
-    archive = Path(ctx.workdir) / "model.zip"
-    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=out_dir)
+    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "model.zip")
     summary["artifact_path"] = str(archive)
     summary["artifact_size"] = archive.stat().st_size
     summary["samples"] = stats["samples"][-3:]

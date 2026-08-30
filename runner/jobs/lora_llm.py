@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -953,8 +952,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
 
-    archive = Path(ctx.workdir) / "adapter.zip"
-    shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=out_dir)
+    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
     summary["artifact_path"] = str(archive)
     summary["artifact_size"] = archive.stat().st_size
     ctx.log("%s Loss %.4f -> %.4f over %d steps%s."
