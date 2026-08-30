@@ -69,11 +69,21 @@ done
 # immovable one so "which build is this?" has an answer six months later. The
 # second is the commit, because that is the only thing that identifies a build
 # of a repo with no release tags.
-sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+#
+# Both questions have to be asked in that order. A deployed copy of the source
+# is rsynced without its .git, so `git diff` there fails the same way a dirty
+# tree does -- and every image pushed from the server came out tagged
+# "unknown-dirty", which says the opposite of the truth about a clean release
+# build.
+sha="unknown"
 dirty=""
-git diff --quiet 2>/dev/null || dirty="-dirty"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  sha="$(git rev-parse --short HEAD)"
+  git diff --quiet || dirty="-dirty"
+fi
 VERSION="${AI_STUDIO_VERSION:-$(date +%Y.%m.%d)-${sha}${dirty}}"
 [[ -n "$dirty" ]] && warn "Working tree has uncommitted changes; tagging $VERSION"
+[[ "$sha" == unknown ]] && warn "Not a git checkout, so the tag cannot name a commit."
 
 # ---- what each target is ------------------------------------------------
 # A function rather than an associative array, because macOS still ships bash
