@@ -270,7 +270,21 @@ async def get_jobs(request: Request, limit: int = 100) -> list[dict]:
         if j["status"] == "queued":
             j["queue_position"] = positions.get(j["id"])
             j["queue_length"] = waiting
+        _hide_credentials(j)
     return jobs
+
+
+def _hide_credentials(job: dict) -> None:
+    """Never hand a credential back to the browser.
+
+    Not the runner's copy of the Hugging Face token, and not the API key a
+    hosted model was written with. Both went in at creation and only the
+    runner needs them -- and a run can be shared with someone who should be
+    able to read its settings without inheriting the owner's token.
+    """
+    job["config"].pop("hf_token", None)
+    if isinstance(job["config"].get("model"), dict):
+        job["config"]["model"].pop("connection", None)
 
 
 def _job_or_404(request: Request, job_id: str, need: str = "view") -> dict:
@@ -667,12 +681,7 @@ async def get_job(request: Request, job_id: str) -> dict:
         job["queue_position"] = positions.get(job_id)
         job["queue_length"] = len(positions)
     job["resumable"] = _resumable(job)
-    # Never hand a credential back to the browser: not the runner's copy of
-    # the Hugging Face token, and not the API key a hosted model was written
-    # with. Both went in at creation and only the runner needs them.
-    job["config"].pop("hf_token", None)
-    if isinstance(job["config"].get("model"), dict):
-        job["config"]["model"].pop("connection", None)
+    _hide_credentials(job)
     return job
 
 
