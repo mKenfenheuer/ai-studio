@@ -212,6 +212,6 @@ done
 
 bold "Done. Pull with:"
 for t in "${targets[@]}"; do
-  IFS='|' read -r _ repo tag <<<"$(image_spec "$t")"
+  IFS='|' read -r _ repo tag _local <<<"$(image_spec "$t")"
   echo "   docker pull $ACCOUNT/$repo:$tag"
 done
