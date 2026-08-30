@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, fmtAgo, statusBadge } from "../util.js";
+import { html, raw, esc, $, fmtAgo, statusBadge, UNIT } from "../util.js";
 
 export async function dashboardView(mount) {
   const paint = async () => {
@@ -22,7 +22,7 @@ export async function dashboardView(mount) {
         <div class="card stat"><span class="k">Machines ready</span>
           <span class="v">${online.length}</span>
           <span class="tiny muted">${runners.length} known in total</span></div>
-        <div class="card stat"><span class="k">Training now</span>
+        <div class="card stat"><span class="k">Running now</span>
           <span class="v">${status.jobs_running}</span>
           <span class="tiny muted">${status.jobs_queued} waiting</span></div>
         <div class="card stat"><span class="k">Finished runs</span>
@@ -79,6 +79,27 @@ function firstRun(status) {
     </div>`;
 }
 
+/** The one line under a card's title: what this particular run is working on.
+ *
+ *  Base model, for the two kinds that have one. The others each have their own
+ *  answer, and showing them a blank line -- or worse, the base model of the run
+ *  they happen to descend from -- said nothing about what was actually
+ *  happening on the machine. */
+function subject(j) {
+  const c = j.config || {};
+  switch (j.kind) {
+    case "pretrain_llm": return "from scratch · " + (c.dataset || "");
+    case "generate_dataset":
+      return "writing rows with " + (c.model?.label || c.model?.base_model
+                                     || "a model");
+    case "upload": return "→ " + (c.repo_id || "Hugging Face");
+    case "merge_adapter":
+      return "folding into " + (c.base_model_label || c.base_model || "its base");
+    case "evaluate": return "scoring against " + (c.eval_name || "a prompt set");
+    default: return c.base_model || "";
+  }
+}
+
 function jobRow(j) {
   const pct = j.total_steps ? Math.min(100, (j.step / j.total_steps) * 100) : 0;
   return html`
@@ -86,13 +107,19 @@ function jobRow(j) {
       <div class="row-between" style="flex-wrap:wrap;gap:6px">
         <strong>${j.name}</strong>${statusBadge(j.status, j.kind)}
       </div>
-      <div class="tiny muted mono" style="margin:4px 0 8px">${
-        j.kind === "pretrain_llm" ? "from scratch · " + (j.config.dataset || "")
-                                  : (j.config.base_model || "")}</div>
+      <div class="tiny muted mono" style="margin:4px 0 8px">${subject(j)}</div>
       ${raw(["running", "assigned"].includes(j.status)
         ? `<div class="progress"><i style="width:${pct}%"></i></div>
-           <div class="tiny muted" style="margin-top:5px">step ${j.step}${
-             j.total_steps ? " of " + j.total_steps : ""}</div>`
+           <div class="tiny muted" style="margin-top:5px">${
+             esc(progressText(j))}</div>`
         : `<div class="tiny muted">${esc(fmtAgo(j.finished_at || j.created_at))}</div>`)}
     </a>`;
+}
+
+/** What the numbers on the bar are counting, in this run's own units. */
+function progressText(j) {
+  const unit = UNIT[j.kind];
+  if (!unit) return `step ${j.step}${j.total_steps ? " of " + j.total_steps : ""}`;
+  return j.total_steps ? `${j.step} of ${j.total_steps} ${unit}`
+                       : `${j.step} ${unit}`;
 }

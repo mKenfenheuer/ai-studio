@@ -24,26 +24,47 @@ const STAGES = {
   saving: "Saving the result…",
 };
 
+// The same stage word means something different depending on what is running.
+// "Downloading and loading the model" is right for training and wrong for a
+// merge, which is loading two sets of weights in order to add them together.
+const KIND_STAGES = {
+  merge_adapter: {
+    loading_model: "Loading the adapter and the weights it was trained on…",
+    saving: "Writing the merged model…",
+  },
+};
+
 export async function jobView(mount, [jobId]) {
   let job = await api.job(jobId);
   const metrics = await api.jobMetrics(jobId);
   const logs = await api.jobLogs(jobId);
   const scratch = job.kind === "pretrain_llm";
-  // Writing a dataset is not training. It has no loss, no learning rate and no
-  // held-out set; what it has is rows, and how many of them were worth
-  // keeping. Rendering it through the training layout showed an empty "this
-  // should go down" chart and three paragraphs of advice about what to do when
-  // the learning rate is too high, for a run that has no learning rate.
-  const writing = job.kind === "generate_dataset";
   const experts = +(job.config.arch?.num_local_experts || 0);
 
-  if (writing) {
-    mount.innerHTML = writingLayout(job);
-    return writingView(mount, job, jobId, metrics, logs);
-  }
-  if (job.kind === "upload") {
-    mount.innerHTML = uploadLayout(job);
-    return uploadView(mount, job, jobId, logs);
+  // Only two of the six kinds of run are training, and the other four were all
+  // being drawn through the training layout: an empty "this should go down"
+  // loss chart, a learning rate that does not exist, and three paragraphs of
+  // advice about what to do when the loss jumps -- above a run that was
+  // writing rows with a hosted model, or sending files to Hugging Face, or
+  // adding two tensors together. Each kind gets the page its own work needs.
+  const OWN_PAGE = {
+    // Writing a dataset has no loss and no held-out set. It has rows, and how
+    // many of them were worth keeping.
+    generate_dataset: [writingLayout, (m, j) => writingView(m, j, jobId, metrics, logs)],
+    // An upload has a destination and a byte count, and produces nothing here
+    // at all -- what it produces is on the Hub.
+    upload: [uploadLayout, (m, j) => uploadView(m, j, jobId, logs)],
+    // A merge has no steps to plot. It has an adapter, a base, and a complete
+    // model at the end of it, which is the thing most worth publishing in the
+    // studio and had nowhere to be published from.
+    merge_adapter: [mergeLayout, (m, j) => mergeView(m, j, jobId, logs)],
+    // A scoring run's result is the comparison, not a curve.
+    evaluate: [evalLayout, (m, j) => evalView(m, j, jobId, logs)],
+  };
+  if (OWN_PAGE[job.kind]) {
+    const [layoutFor, view] = OWN_PAGE[job.kind];
+    mount.innerHTML = layoutFor(job);
+    return view(mount, job);
   }
 
   mount.innerHTML = layout(job, scratch, experts);
@@ -158,27 +179,10 @@ export async function jobView(mount, [jobId]) {
     }
   });
 
-  const paintOwnerRow = () => {
-    const box = $("#ownerRow", mount);
-    if (!box) return;
-    const hasModel = job.artifacts?.length;
-    box.innerHTML = hasModel ? publishCard({
-      kind: "model", slug: repoSlug(job),
-      // What a fine-tune publishes is its merged model, not its adapter --
-      // said here because the run's own artifact is the adapter, and being
-      // told afterwards that something else went is worse than knowing.
-      blurb: job.kind === "finetune_llm"
-        ? `Uploads the merged model — this adapter folded into its base, so it
-           loads anywhere — and a model card, to your own account. If it has
-           not been merged yet, that happens first and the upload follows.`
-        : `Uploads the model and a model card to your own account.`,
-    }) : "";
-    wireShareBox(mount, "job", job, async () => {
-      job = await api.job(jobId);
-      paintHeader(mount, job);
-      paintOwnerRow();
-    });
-  };
+  const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
+    job = await api.job(jobId);
+    paintHeader(mount, job);
+  });
   paintOwnerRow();
 
   // Datasets are only needed by the "train this further" panel, which most
@@ -197,56 +201,8 @@ export async function jobView(mount, [jobId]) {
   };
   paintReport();
 
-  // The card is fetched rather than derived: generating it needs the run's
-  // evaluation history, which this page has never had a reason to load.
-  let card = null;
-  const paintCard = async (refetch = true) => {
-    const box = $("#cardRow", mount);
-    if (!box) return;
-    if (!job.artifacts?.length) { box.innerHTML = ""; return; }
-    if (refetch || !card) {
-      try { card = await api.jobCard(jobId); }
-      catch { box.innerHTML = ""; return; }
-    }
-    const open = $("#cardBox", mount)?.open;
-    box.innerHTML = modelCardPanel(card);
-    if (open) $("#cardBox", mount).open = true;
-  };
+  const paintCard = wireModelCard(mount, jobId, () => job);
   paintCard();
-
-  on(mount, "submit", "#cardForm", async (e) => {
-    e.preventDefault();
-    const btn = $("#cardSave", mount);
-    btn.disabled = true;
-    btn.textContent = "Saving…";
-    try {
-      card = await api.saveJobCard(jobId, $("#cardText", mount).value);
-      toast("Saved. This card is yours now.", "ok");
-      paintCard(false);
-    } catch (ex) {
-      toast(ex.message, "err");
-      btn.disabled = false;
-      btn.textContent = "Save";
-    }
-  });
-
-  on(mount, "click", "#cardReset", async () => {
-    // Deliberately without a confirmation dialog: what is being discarded is
-    // recoverable by anyone who kept the text, and the button says plainly
-    // what it does. What it must not do is silently keep the edits.
-    try {
-      card = await api.resetJobCard(jobId);
-      toast("Back to the generated card.", "ok");
-      paintCard(false);
-    } catch (ex) { toast(ex.message, "err"); }
-  });
-
-  on(mount, "click", "#cardCopy", async () => {
-    try {
-      await navigator.clipboard.writeText($("#cardText", mount).value);
-      toast("Copied.", "ok");
-    } catch { toast("The browser would not allow copying.", "err"); }
-  });
 
   let datasets = [];
   const paintFurther = () => {
@@ -304,8 +260,6 @@ export async function jobView(mount, [jobId]) {
       btn.textContent = "Start the follow-on run";
     }
   });
-
-  wirePublish(mount, "model", (body) => api.publishJob(jobId, body));
 
   wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
@@ -750,6 +704,303 @@ function uploadStopPanel() {
     </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// A merge
+//
+// No steps, no loss, no learning rate: it loads an adapter and the weights it
+// was trained against, adds one to the other, and writes the result. What
+// somebody watching it wants to know is what is being folded into what, how
+// big the answer will be, and -- when it lands -- how to get at it, because
+// this is the artifact that leaves the studio.
+// ---------------------------------------------------------------------------
+
+function mergeLayout(job) {
+  const cfg = job.config || {};
+  const into = cfg.base_model_label || cfg.base_model || "its base model";
+  return html`
+    <div class="page-head">
+      <a href="#/jobs" class="tiny">← All runs</a>
+      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${job.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
+        <div class="row" id="headerActions"></div>
+      </div>
+      <p class="sub tiny" style="margin-top:4px">
+        <span class="badge badge-accent">merging</span>
+        an adapter into <span class="mono">${into}</span></p>
+    </div>
+
+    <div id="errorCard"></div>
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>What this makes</h3>
+      <p class="muted tiny" style="margin:0 0 10px">
+        A LoRA fine-tune produces an <em>adapter</em>: a few megabytes that
+        mean nothing without the exact weights they were trained against.
+        Folding it in writes a complete model that loads on its own — which is
+        what Ollama, llama.cpp and everything else outside this studio want.
+        <strong>It is the size of the base model</strong>, not of the adapter,
+        and the adapter is kept as well.</p>
+      <dl class="kv">
+        <dt>From</dt>
+        <dd>${raw(cfg.source_job
+          ? `<a href="#/jobs/${esc(cfg.source_job)}">${
+               esc(cfg.source_run_name || "the fine-tune")}</a>`
+          : esc(cfg.source_run_name || "a fine-tune"))}</dd>
+        <dt>Into</dt>
+        <dd class="mono">${into}</dd>
+        <dt>Written in</dt>
+        <dd>${cfg.dtype || "float16"}
+          <span class="muted tiny">— the arithmetic is done in full precision
+            either way</span></dd>
+      </dl>
+      <div id="mergeResult" style="margin-top:10px"></div>
+    </div>
+
+    <div id="cardRow"></div>
+
+    <div class="grid grid-2" style="margin-bottom:14px" id="ownerRow"></div>
+
+    <div class="card">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">Newest at the bottom</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function mergeView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "loading_model" : "";
+  let step = job.step, total = job.total_steps;
+
+  const paintCard = wireModelCard(mount, jobId, () => job);
+  const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
+    job = await api.job(jobId);
+    paintHeader(mount, job);
+  });
+
+  const paint = () => {
+    paintHeader(mount, job);
+    paintProgress(mount, job, stage, step, total);
+    $("#queueCard", mount).innerHTML = queueCard(job);
+    $("#mergeResult", mount).innerHTML = mergeResult(job);
+    paintOwnerRow();
+    paintCard();
+  };
+  paint();
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      step = msg.step;
+      total = msg.total;
+      paintProgress(mount, job, stage, step, total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+/** Stopping a merge, which leaves the adapter exactly where it was.
+ *
+ *  There is nothing to keep half of: a model is written in one pass at the
+ *  end, and until then what exists is the adapter that already existed. Saying
+ *  so is the point -- the fear is that stopping has damaged the run this was
+ *  folding.
+ */
+function mergeStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop the merge?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        Nothing is kept: a merged model is written in one pass at the end, so
+        stopping leaves no half-model behind. The fine-tune and its adapter are
+        untouched, and the merge can be started again from that run's page.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop the merge</button>
+        <button class="btn-sm" id="stopCancel">Carry on merging</button>
+      </div>
+    </div>`;
+}
+
+/** Stopping a scoring run. The models are read, never written. */
+function evalStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop scoring?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        The scores are recorded together when every model has answered every
+        prompt, so stopping now records none of them. Nothing is changed about
+        the models themselves — they are only being read.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop scoring</button>
+        <button class="btn-sm" id="stopCancel">Carry on</button>
+      </div>
+    </div>`;
+}
+
+function mergeResult(job) {
+  const s = job.summary || {};
+  if (!job.artifacts?.length) return "";
+  const size = s.artifact_size
+    ? `${(s.artifact_size / 1073741824).toFixed(1)} GB` : null;
+  return html`
+    <div class="callout callout-ok">
+      <strong>A complete model.</strong>
+      ${s.params_total ? `${fmtNum(s.params_total)} parameters` : ""}${
+        size ? `, ${size} on disk` : ""}${
+        s.duration_s ? `, merged in ${fmtDuration(s.duration_s)}` : ""}.
+      It loads with <code>from_pretrained</code> and needs nothing downloaded
+      alongside it.
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// A scoring run
+//
+// Its result is a comparison, and the comparison has a page of its own that
+// keeps every scoring of the same prompt set side by side. This page is what
+// happens while it runs, and the way to that one afterwards.
+// ---------------------------------------------------------------------------
+
+function evalLayout(job) {
+  const cfg = job.config || {};
+  const models = (cfg.models || []).length;
+  return html`
+    <div class="page-head">
+      <a href="#/jobs" class="tiny">← All runs</a>
+      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+        <div class="row title-row" style="gap:4px;min-width:0">
+          <h1 style="margin:0" id="runTitle">${job.name}</h1>
+          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+            aria-label="Rename this run">&#9998;</button>
+        </div>
+        <div class="row" id="headerActions"></div>
+      </div>
+      <p class="sub tiny" style="margin-top:4px">
+        <span class="badge badge-accent">scoring</span>
+        ${models ? `${models} model${models === 1 ? "" : "s"}` : "models"}
+        against ${esc(cfg.eval_name || "a saved prompt set")}</p>
+    </div>
+
+    <div id="errorCard"></div>
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+    <div id="evalResult"></div>
+
+    <div class="card">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">One line per model, as each finishes</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function evalView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "evaluating" : "";
+  let step = job.step, total = job.total_steps;
+
+  const paint = () => {
+    paintHeader(mount, job);
+    paintProgress(mount, job, stage, step, total);
+    $("#queueCard", mount).innerHTML = queueCard(job);
+    $("#evalResult", mount).innerHTML = evalResult(job);
+  };
+  paint();
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      step = msg.step;
+      total = msg.total;
+      paintProgress(mount, job, stage, step, total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+function evalResult(job) {
+  const s = job.summary || {};
+  const scores = s.scores || [];
+  if (!scores.length) return "";
+  // Loss on the expected answer is the column that decides it, so it leads.
+  // The rest are shown because a model can be right and score badly on one of
+  // them -- "contains" in particular is generous and "exact" is merciless.
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="align-items:center;margin-bottom:8px">
+        <h3 style="margin:0">How they did</h3>
+        ${raw(s.eval_id
+          ? `<a class="btn btn-sm" href="#/evals/${esc(s.eval_id)}">
+               Every scoring of this set →</a>` : "")}
+      </div>
+      ${raw(s.verdict ? html`
+        <div class="callout ${s.decisive ? "callout-ok" : "callout-warn"}"
+             style="margin-bottom:10px">${s.verdict}</div>` : "")}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Model</th><th>Loss</th>
+          <th class="hide-sm">Token overlap</th><th class="hide-sm">Exact</th>
+        </tr></thead>
+        <tbody>${raw(scores.map((sc) => {
+          const m = sc.metrics || {};
+          return html`
+            <tr>
+              <td>${raw(sc.model_job_id
+                ? `<a href="#/jobs/${esc(sc.model_job_id)}">${esc(sc.name)}</a>`
+                : esc(sc.name))}${raw(m.error
+                ? ` <span class="badge badge-err">could not be scored</span>` : "")}</td>
+              <td class="mono">${m.expected_loss != null
+                ? m.expected_loss.toFixed(4) : "—"}</td>
+              <td class="mono hide-sm">${m.f1 != null
+                ? (m.f1 * 100).toFixed(0) + "%" : "—"}</td>
+              <td class="mono hide-sm">${m.exact != null
+                ? (m.exact * 100).toFixed(0) + "%" : "—"}</td>
+            </tr>`;
+        }).join(""))}</tbody>
+      </table></div>
+      <p class="muted tiny" style="margin:8px 0 0">
+        Every number is on prompts the models did not train on. Loss is the one
+        to compare between runs; the others reward answers that happen to be
+        worded like the expected one.</p>
+    </div>`;
+}
+
 /** Where the rows went, once there are any. */
 function writtenDatasetCard(job) {
   const made = job.summary?.dataset_id || job.dataset_id;
@@ -1088,6 +1339,95 @@ function mergeCard(job) {
     </details>`;
 }
 
+// ---------------------------------------------------------------------------
+// The panels every run that produces a model gets
+//
+// Publishing, sharing and the model card belong to a *model*, not to training.
+// They lived inside the training view, so a merge -- the run whose whole
+// purpose is to produce the standalone model people publish -- was the one
+// page that offered none of them.
+// ---------------------------------------------------------------------------
+
+/** Publish and share, painted into `#ownerRow`. Returns the repaint. */
+function wireOwnerRow(mount, jobId, getJob, onChange) {
+  const paint = () => {
+    const box = $("#ownerRow", mount);
+    if (!box) return;
+    const job = getJob();
+    box.innerHTML = job.artifacts?.length ? publishCard({
+      kind: "model", slug: repoSlug(job),
+      // What a fine-tune publishes is its merged model, not its adapter --
+      // said here because the run's own artifact is the adapter, and being
+      // told afterwards that something else went is worse than knowing.
+      blurb: job.kind === "finetune_llm"
+        ? `Uploads the merged model — this adapter folded into its base, so it
+           loads anywhere — and a model card, to your own account. If it has
+           not been merged yet, that happens first and the upload follows.`
+        : `Uploads the model and a model card to your own account.`,
+    }) : "";
+    wireShareBox(mount, "job", job, async () => { await onChange(); paint(); });
+  };
+  wirePublish(mount, "model", (body) => api.publishJob(jobId, body));
+  return paint;
+}
+
+/** The model card editor, painted into `#cardRow`. Returns the repaint.
+ *
+ *  The card is fetched rather than derived: generating it needs the run's
+ *  evaluation history, which no page here has ever had a reason to load.
+ */
+function wireModelCard(mount, jobId, getJob) {
+  let card = null;
+  const paint = async (refetch = true) => {
+    const box = $("#cardRow", mount);
+    if (!box) return;
+    if (!getJob().artifacts?.length) { box.innerHTML = ""; return; }
+    if (refetch || !card) {
+      try { card = await api.jobCard(jobId); }
+      catch { box.innerHTML = ""; return; }
+    }
+    const open = $("#cardBox", mount)?.open;
+    box.innerHTML = modelCardPanel(card);
+    if (open) $("#cardBox", mount).open = true;
+  };
+
+  on(mount, "submit", "#cardForm", async (e) => {
+    e.preventDefault();
+    const btn = $("#cardSave", mount);
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    try {
+      card = await api.saveJobCard(jobId, $("#cardText", mount).value);
+      toast("Saved. This card is yours now.", "ok");
+      paint(false);
+    } catch (ex) {
+      toast(ex.message, "err");
+      btn.disabled = false;
+      btn.textContent = "Save";
+    }
+  });
+
+  on(mount, "click", "#cardReset", async () => {
+    // Deliberately without a confirmation dialog: what is being discarded is
+    // recoverable by anyone who kept the text, and the button says plainly
+    // what it does. What it must not do is silently keep the edits.
+    try {
+      card = await api.resetJobCard(jobId);
+      toast("Back to the generated card.", "ok");
+      paint(false);
+    } catch (ex) { toast(ex.message, "err"); }
+  });
+
+  on(mount, "click", "#cardCopy", async () => {
+    try {
+      await navigator.clipboard.writeText($("#cardText", mount).value);
+      toast("Copied.", "ok");
+    } catch { toast("The browser would not allow copying.", "err"); }
+  });
+
+  return paint;
+}
+
 /** The repository name to suggest for this run's model. */
 function repoSlug(job) {
   const base = (job.kind === "pretrain_llm"
@@ -1148,6 +1488,8 @@ function wasAskedToStop(job) {
 function stopPanel(job, latest, stage) {
   if (job.kind === "generate_dataset") return writingStopPanel(job, latest);
   if (job.kind === "upload") return uploadStopPanel();
+  if (job.kind === "merge_adapter") return mergeStopPanel();
+  if (job.kind === "evaluate") return evalStopPanel();
   const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
   // There is only something to keep once training has actually begun.
   // Before that the runner is still downloading text or building a
@@ -1199,6 +1541,12 @@ function paintHeader(mount, job) {
   const writing = job.kind === "generate_dataset";
   // An upload produces nothing here at all -- what it produces is on the Hub.
   const sending = job.kind === "upload";
+  // Neither does a scoring run: what it leaves is rows against a prompt set.
+  const scoring = job.kind === "evaluate";
+  // "Run again with changes" opens the form the run was started from, and two
+  // kinds have no such form: a merge is started from the fine-tune it folds,
+  // and a scoring run from the prompt set it scores.
+  const repeatable = !scoring && job.kind !== "merge_adapter";
   const usable = job.artifacts?.length && !writing
     && ["succeeded", "cancelled"].includes(job.status);
   const kept = job.status === "cancelled" && job.artifacts?.length;
@@ -1210,12 +1558,17 @@ function paintHeader(mount, job) {
     ${raw(kept ? `<span class="badge badge-ok">${
       writing ? "rows kept" : "model kept"}</span>` : "")}
     ${raw(usable
-      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>
-         <a class="btn btn-sm" href="#/compare" title="Compare its held-out loss with other runs">⇄ Compare</a>` : "")}
+      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>`
+        // A merge has no held-out loss of its own -- it did not train. What
+        // there is to compare belongs to the fine-tune it was folded from.
+        + (repeatable
+          ? `<a class="btn btn-sm" href="#/compare"
+                title="Compare its held-out loss with other runs">⇄ Compare</a>`
+          : "") : "")}
     ${raw(done && job.artifacts?.length
       ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
            ↓ Download${writing ? " the JSONL" : ""}</a>` : "")}
-    ${raw(done && !sending
+    ${raw(done && !sending && repeatable
       // Offered for a run that failed or was stopped as much as for one that
       // finished: those are the ones somebody most wants to start again with
       // one thing different. A generation run has a whole page that can edit
@@ -1240,21 +1593,30 @@ function paintHeader(mount, job) {
 
 function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
                        checkpointStep = 0) {
-  const training = stage === "training" || stage === "";
+  // A merge reports its stages as one of four, and a run that is not training
+  // has no `job.step` to fall back on -- an empty stage there means "has not
+  // said yet", not "is training".
+  const trains = ["finetune_llm", "pretrain_llm"].includes(job.kind);
+  const training = trains && (stage === "training" || stage === "");
   const writing = stage === "writing";
   const uploading = stage === "uploading";
+  const scoring = stage === "evaluating";
   // Preparation stages count their own units -- documents scanned, tokens
   // collected -- so the bar follows those while they run, and the counter is
   // only shown once those units are something a person can count: training
-  // steps, rows written, or megabytes sent.
+  // steps, rows written, megabytes sent, or prompts put to a model. A merge is
+  // four coarse stages, and "stage 3 of 4" tells nobody anything, so it gets
+  // the bar and no counter.
   const step = training ? job.step : (rawStep ?? 0);
   const total = training ? job.total_steps : (rawTotal ?? 0);
   const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
-  const stageText = STAGES[stage] || (running ? "Working…" : "");
-  const counted = total > 0 && (training || writing || uploading);
+  const stageText = KIND_STAGES[job.kind]?.[stage] || STAGES[stage]
+    || (running ? "Working…" : "");
+  const counted = total > 0 && (training || writing || uploading || scoring);
   const count = writing ? `row ${step} of ${total}`
     : uploading ? `${fmtNum(step)} MB of ${fmtNum(total)}`
+    : scoring ? `${fmtNum(step)} of ${fmtNum(total)} answers`
     : `step ${step} of ${total}`;
 
   $("#progressCard", mount).innerHTML = running ? html`

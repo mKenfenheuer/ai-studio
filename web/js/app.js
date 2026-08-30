@@ -130,7 +130,10 @@ async function refreshFleet() {
     } else {
       setFleet(s.jobs_running ? "dot-busy" : "dot-ok",
         `${s.runners_online} machine${s.runners_online > 1 ? "s" : ""}` +
-        (s.jobs_running ? ` · ${s.jobs_running} training` : " ready"));
+        // "training" was wrong for four of the six kinds of run: a machine
+        // writing a dataset, scoring one, merging, or uploading to the Hub is
+        // busy, and is not training.
+        (s.jobs_running ? ` · ${s.jobs_running} running` : " ready"));
     }
   } catch {
     setFleet("dot-err", "Controller unreachable");

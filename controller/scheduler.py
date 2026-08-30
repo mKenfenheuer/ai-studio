@@ -689,6 +689,10 @@ class Fleet:
                 # playground, the download, the stats panel, the comparison
                 # table -- reads it the same way.
                 db.set_job_summary(jid, summary)
+                # It has a model, so it has a card -- and the card is where it
+                # says the run was stopped short of its schedule, which is the
+                # one thing somebody downloading this needs told.
+                self._refresh_cards(jid, summary)
                 db.add_log(jid, "Stopped, and the model was kept. %s"
                            % json.dumps(summary)[:600])
             if kind == "job_cancelled":

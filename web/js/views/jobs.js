@@ -1,5 +1,6 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, on, fmtAgo, fmtDuration, statusBadge, toast } from "../util.js";
+import { html, raw, esc, on, fmtAgo, fmtDuration, statusBadge, toast,
+         UNIT } from "../util.js";
 
 export async function jobsView(mount) {
   const paint = async () => {
@@ -40,17 +41,6 @@ export async function jobsView(mount) {
   return events.subscribe((m) => { if (m.type === "jobs_changed") paint(); });
 }
 
-// What the numbers in the progress column are counting. Steps for training,
-// and the run's own units for everything else -- "0/?" beside "Training" was
-// what a generation run showed for its whole life, which described neither
-// what it was doing nor how far along it was.
-const UNIT = {
-  generate_dataset: "rows",
-  upload: "MB",
-  evaluate: "cases",
-  merge_adapter: "stages",
-};
-
 /** The one thing worth naming about a run, for the column that has room for
  *  one. A training run is its base model; a generation run is the model doing
  *  the writing, which is the entire question when the rows come out odd; an
@@ -61,6 +51,9 @@ function what(j) {
     return c.model?.label || c.model?.model || c.model?.base_model || "a model";
   if (j.kind === "upload") return c.repo_id || "Hugging Face";
   if (j.kind === "pretrain_llm") return "from scratch";
+  if (j.kind === "merge_adapter")
+    return c.base_model_label || c.base_model || "its base";
+  if (j.kind === "evaluate") return c.eval_name || "a prompt set";
   return c.base_model || "—";
 }
 

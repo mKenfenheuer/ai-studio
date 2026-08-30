@@ -137,6 +137,17 @@ const RUNNING_LABEL = {
   evaluate: "Scoring",
 };
 
+/** What a run's progress numbers are counting. Steps for training, and the
+ *  run's own units for everything else -- "0/? steps" beside a run writing a
+ *  dataset described neither what it was doing nor how far along it was.
+ *  Absent means steps. */
+export const UNIT = {
+  generate_dataset: "rows",
+  upload: "MB",
+  evaluate: "answers",
+  merge_adapter: "stages",
+};
+
 export function statusBadge(status, kind = "") {
   let [cls, label] = STATUS_STYLE[status] || ["badge", status];
   if (status === "running" && RUNNING_LABEL[kind]) label = RUNNING_LABEL[kind];
