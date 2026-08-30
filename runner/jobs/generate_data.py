@@ -40,6 +40,7 @@ confidently wrong too.
 """
 from __future__ import annotations
 
+import collections
 import itertools
 import json
 import random
@@ -58,11 +59,20 @@ DEFAULT_MAX_TOKENS = 512
 # A whole conversation is not one reply. Cut off at 512 tokens the JSON ends
 # mid-string, the row cannot be read, and the run drops what it paid for.
 CONVERSATION_MAX_TOKENS = 1600
+# Warmer than a chat assistant would be set to, on purpose. Every row here is
+# an independent request, so a cautious temperature makes the writer walk the
+# same well-worn path a few hundred times -- which reads as a fine dataset
+# until you count the distinct examples in it. Variety is the product.
+DEFAULT_TEMPERATURE = 1.05
 # Rows written over the network are IO, not computation: the machine waits.
 # Enough in flight to keep a long run to an hour, few enough that a shared
 # endpoint is not being hammered by one studio.
 _HOSTED_WORKERS = 6
 _MAX_WORKERS = 16
+# Rows already written, shown back to the writer so it stops reinventing the
+# same house. Every request is independent, so without this the model returns
+# to its favourite rooms and names hundreds of times in one run.
+_RECENT_SHOWN = 16
 
 
 def run(cfg: dict, ctx: Any) -> dict:
@@ -100,7 +110,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                               or (CONVERSATION_MAX_TOKENS
                                   if mode == "conversations"
                                   else DEFAULT_MAX_TOKENS)),
-        "temperature": float(cfg.get("temperature") or 0.9),
+        "temperature": float(cfg.get("temperature") or DEFAULT_TEMPERATURE),
         "top_p": float(cfg.get("top_p") or 0.95),
     }
     if effort := (cfg.get("reasoning_effort") or "").strip():
@@ -129,7 +139,8 @@ def run(cfg: dict, ctx: Any) -> dict:
         # into the single-shot one below.
         return _extend(cfg, ctx, host, spec, params, out_path, target)
 
-    sources = _sources(cfg, mode, ctx)
+    recent: collections.deque = collections.deque(maxlen=_RECENT_SHOWN)
+    sources = _sources(cfg, mode, ctx, recent)
 
     seen: set[str] = set()
     written = 0
@@ -191,6 +202,8 @@ def run(cfg: dict, ctx: Any) -> dict:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             fh.flush()
             written += 1
+            if note := _recent_note(row):
+                recent.append(note)
 
             rate = written / max(time.time() - t0, 1e-6)
             ctx.metric(written, {
@@ -442,8 +455,15 @@ def _json(r: Any):
 # What to ask for
 # ---------------------------------------------------------------------------
 
-def _sources(cfg: dict, mode: str, ctx: Any) -> Iterator[tuple[list[dict], dict]]:
-    """An endless stream of (messages, metadata) to send to the model."""
+def _sources(cfg: dict, mode: str, ctx: Any,
+             recent: Any = None) -> Iterator[tuple[list[dict], dict]]:
+    """An endless stream of (messages, metadata) to send to the model.
+
+    `recent` is the last few rows this run has kept, filled in by the writer
+    loop as they are written. A model asked the same question a thousand times
+    answers it much the same way a thousand times; shown what it has already
+    written, it goes somewhere else.
+    """
     system = (cfg.get("system_prompt") or "").strip()
     instruction = (cfg.get("instruction") or "").strip()
     rng = random.Random(int(cfg.get("seed") or 1234))
@@ -516,6 +536,8 @@ def _sources(cfg: dict, mode: str, ctx: Any) -> Iterator[tuple[list[dict], dict]
             if language and "{language}" not in brief:
                 ask += "\n\nWrite this one in %s. Everything the person and "  \
                        "the assistant say is in %s." % (language, language)
+            if already := _already_written(recent):
+                ask += already
             msgs = [{"role": "system", "content": writer}]
             if system:
                 msgs[0]["content"] += "\n\n" + system
@@ -708,6 +730,36 @@ def _conversation_prompt(cfg: dict, tools: list[dict]) -> str:
                 "assistant says must be consistent with it. It belongs there "
                 "and nowhere else: never repeat it inside the conversation.")
     return out
+
+
+def _recent_note(row: dict) -> str:
+    """One line describing a written row, for the next request to avoid.
+
+    The opening and whatever names the model invented for the call: those are
+    what it repeats. Short on purpose -- this is prepended to every later
+    request, so it is paid for on every row of the run.
+    """
+    opening = ""
+    call = ""
+    for m in row.get("messages") or []:
+        if m.get("role") == "user" and not opening:
+            opening = _clean(m.get("content") or "")[:90]
+        for c in m.get("tool_calls") or []:
+            call = call or (c.get("function") or {}).get("arguments") or ""
+    if not opening:
+        return ""
+    return "%s%s" % (opening, "  ->  %s" % call[:110] if call else "")
+
+
+def _already_written(recent: Any) -> str:
+    """The avoid-list, as the writer sees it."""
+    lines = list(recent or [])
+    if not lines:
+        return ""
+    return ("\n\nAlready written in this dataset. Write none of these again, "
+            "and invent different names, rooms, values and people from the "
+            "ones showing here:\n"
+            + "\n".join("- %s" % line for line in lines))
 
 
 def _echoes(content: str, system: str) -> bool:
