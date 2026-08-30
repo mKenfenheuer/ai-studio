@@ -56,6 +56,22 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id, ts);
 
+-- The model card: what a run produced, written the way Hugging Face expects
+-- to read it. Its own table rather than a column on `jobs`, because every
+-- list of runs is a `SELECT j.*` and a card is a few kilobytes of markdown
+-- that no list has ever needed -- a hundred rows would ship half a megabyte
+-- of prose to draw a table of names and dates.
+--
+-- `edited` is the only thing standing between a card somebody wrote and the
+-- generator that would otherwise overwrite it the next time the run is
+-- evaluated.
+CREATE TABLE IF NOT EXISTS job_cards (
+    job_id      TEXT PRIMARY KEY,
+    markdown    TEXT NOT NULL,
+    edited      INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id          TEXT PRIMARY KEY,
     job_id      TEXT NOT NULL,
@@ -476,8 +492,13 @@ def assign_job_runner(job_id: str, runner_id: str) -> None:
 
 
 def orphaned_jobs() -> list[dict]:
-    """Jobs whose machine has been silent past the heartbeat deadline."""
-    cutoff = now() - config.HEARTBEAT_TIMEOUT_S
+    """Jobs whose machine has been silent long enough to be genuinely gone.
+
+    Not the heartbeat deadline: that one only greys a machine out. Taking work
+    off a runner needs a much higher bar, because a busy machine goes quiet for
+    reasons that have nothing to do with being dead. See ORPHAN_TIMEOUT_S.
+    """
+    cutoff = now() - config.ORPHAN_TIMEOUT_S
     return [_hydrate(r) for r in q(
         "SELECT j.* FROM jobs j JOIN runners r ON r.id = j.runner_id"
         " WHERE j.status IN ('assigned','running') AND r.last_seen < ?",
@@ -660,11 +681,48 @@ def delete_job(job_id: str) -> list[str]:
     files = [r["filename"] for r in
              q("SELECT filename FROM artifacts WHERE job_id=?", (job_id,))]
     c = connect()
-    for table in ("metrics", "logs", "artifacts"):
+    for table in ("metrics", "logs", "artifacts", "job_cards"):
         c.execute("DELETE FROM %s WHERE job_id=?" % table, (job_id,))
     c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
     c.commit()
     return files
+
+
+def get_job_card(job_id: str) -> dict | None:
+    return q1("SELECT * FROM job_cards WHERE job_id=?", (job_id,))
+
+
+def set_job_card(job_id: str, markdown: str, edited: bool = False) -> None:
+    ex("INSERT INTO job_cards (job_id,markdown,edited,updated_at)"
+       " VALUES (?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
+       " markdown=excluded.markdown, edited=excluded.edited,"
+       " updated_at=excluded.updated_at",
+       (job_id, markdown, 1 if edited else 0, now()))
+
+
+def clear_job_card(job_id: str) -> None:
+    """Forget an edited card, so the generator owns it again."""
+    ex("DELETE FROM job_cards WHERE job_id=?", (job_id,))
+
+
+def scores_for_model(model_job_id: str, limit: int = 12) -> list[dict]:
+    """Every scoring this model has been through, newest first.
+
+    The mirror of list_scores, which reads the same table from the prompt
+    set's side. A model card needs this direction: not "how did the models
+    compare on this eval" but "what has this model been measured on".
+    """
+    rows = q("SELECT sc.id, sc.eval_id, sc.created_at, sc.metrics,"
+             " sc.run_job_id, e.name AS eval_name, e.notes AS eval_notes"
+             " FROM eval_scores sc LEFT JOIN evals e ON e.id = sc.eval_id"
+             " WHERE sc.model_job_id=? ORDER BY sc.created_at DESC LIMIT ?",
+             (model_job_id, limit))
+    for r in rows:
+        try:
+            r["metrics"] = json.loads(r["metrics"] or "{}")
+        except (TypeError, ValueError):
+            r["metrics"] = {}
+    return rows
 
 
 def list_artifacts(job_id: str) -> list[dict]:

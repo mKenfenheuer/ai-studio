@@ -187,8 +187,20 @@ class Runner:
             backoff = min(backoff * 2, RECONNECT_MAX_S)
 
     async def _session(self) -> None:
+        # Ninety seconds to answer a ping, not twenty. A runner is not a web
+        # browser: it is the machine doing the work, and the work is a merge
+        # writing fourteen gigabytes or a training step that owns every core.
+        # When the box is oversubscribed -- one runner training on the GPU, one
+        # merging on the CPU, four cores between them -- this event loop can go
+        # twenty seconds without a time slice while nothing at all is wrong.
+        # The old timeout read that as a dead connection and reconnected, on
+        # both ends, every couple of minutes for the length of the job.
+        #
+        # A genuinely lost machine is still noticed: silence past that shows it
+        # offline, and the scheduler stops handing it work.
         async with websockets.connect(self.ws_url, max_size=8 * 1024 * 1024,
-                                      ping_interval=20, ping_timeout=20) as ws:
+                                      ping_interval=30, ping_timeout=90,
+                                      close_timeout=10) as ws:
             await ws.send(json.dumps({
                 "type": "register",
                 "token": self.token,

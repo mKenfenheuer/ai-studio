@@ -51,6 +51,22 @@ HF_TOKEN: str | None = os.environ.get("HF_TOKEN") or None
 # A runner that has not sent a heartbeat within this window is shown as lost.
 HEARTBEAT_TIMEOUT_S: int = int(os.environ.get("AI_STUDIO_HEARTBEAT_TIMEOUT", "45"))
 
+# ...and how long it must stay silent before the work it was given is taken
+# off it and put back on the queue. Deliberately much longer than the window
+# above, because the two decisions are not the same size. Greying a machine out
+# in the UI is cosmetic and undoes itself the moment it speaks again; requeuing
+# is destructive, and on a fleet with a second free machine it starts the same
+# work twice.
+#
+# The gap has to cover a runner that is *doing the work asked of it* rather than
+# one that has gone. Merging a 7B on the same box that is training on the GPU
+# oversubscribes four cores, and an event loop that gets no time slice for
+# twenty seconds fails its websocket keepalive and reconnects -- repeatedly,
+# through a merge that takes fifteen minutes. Under the old window each of
+# those blips looked like a dead machine, and the log filled with a run being
+# requeued and re-assigned to the machine that had never stopped running it.
+ORPHAN_TIMEOUT_S: int = int(os.environ.get("AI_STUDIO_ORPHAN_TIMEOUT", "300"))
+
 WEB_DIR: Path = Path(__file__).resolve().parent.parent / "web"
 
 # The longest reply anybody may ask for, in tokens. A ceiling on what a caller
