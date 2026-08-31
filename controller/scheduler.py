@@ -47,6 +47,15 @@ class Fleet:
         self.declined: set[str] = set()
         # runner_id -> the jobs that machine could carry on from a checkpoint.
         self.checkpoints: dict[str, set[str]] = {}
+        # What each runner is holding, from its heartbeat. This is what makes
+        # a second message to the same model fast: `loaded` is on the card and
+        # answers now, `cached` is on that machine's disk and needs no
+        # fourteen-gigabyte download. Without it the controller sent every
+        # conversation to whichever machine trained the model, which for a
+        # merged one was the processor-only box that did the merging.
+        self.loaded: dict[str, list[str]] = {}   # runner_id -> job ids, MRU first
+        self.cached: dict[str, set[str]] = {}    # runner_id -> job ids on disk
+        self.disk: dict[str, dict] = {}          # runner_id -> free/total GB
         self.gave_up_waiting: set[str] = set()
         self._wake = asyncio.Event()
 
@@ -63,6 +72,11 @@ class Fleet:
         # is still there. What the scheduler needs to know is "is that machine
         # reachable", which it reads from self.connections; forgetting what the
         # machine holds would only make the run start over once it came back.
+        #
+        # `loaded` is the exception, and for the same reason: video memory does
+        # not survive a restart, so a machine that comes back has an empty card
+        # and a full disk. Its next heartbeat says so either way.
+        self.loaded.pop(runner_id, None)
 
     def wake(self) -> None:
         self._wake.set()
@@ -419,6 +433,27 @@ class Fleet:
         if job.get("kind") in ("finetune_llm", "pretrain_llm", "merge_adapter"):
             cards.refresh(job_id, reason="the run finished")
 
+    @staticmethod
+    def _record_publication(upload_job_id: str, summary: dict) -> None:
+        """File a finished upload against the run whose model it sent.
+
+        The upload run knows the repository; the trained run is what everything
+        else asks about. Without this, a fine-tune built on a model that was
+        published from this studio has no way to name it on the Hub, and its
+        card drops the `base_model:` line rather than print a job id.
+        """
+        cfg = (db.get_job(upload_job_id) or {}).get("config") or {}
+        trained_by = cfg.get("trained_by") or cfg.get("source_job")
+        if not trained_by or not db.get_job(trained_by):
+            return
+        db.record_publication(trained_by, {
+            "repo_id": summary["repo_id"],
+            "url": summary.get("url"),
+            "artifact_kind": cfg.get("artifact_kind") or "model",
+            "upload_job": upload_job_id,
+        })
+        db.add_log(trained_by, "Published to %s." % summary["repo_id"])
+
     async def announce_end(self, job_id: str, status: str) -> None:
         """A run has ended. Tell the browsers, and tell whoever owns it.
 
@@ -500,6 +535,16 @@ class Fleet:
             db.touch_runner(runner_id, "busy" if msg.get("busy") else "online")
             if (held := msg.get("checkpoints")) is not None:
                 self.note_checkpoints(runner_id, held)
+            if (resident := msg.get("loaded")) is not None:
+                self.loaded[runner_id] = list(resident)
+            if (on_disk := msg.get("cached")) is not None:
+                # `<id>-adapter` is one artifact of a run rather than a run, and
+                # what the chat router asks is "does this machine have that
+                # model": the bare id is the answer to that.
+                self.cached[runner_id] = {str(c).split("-adapter")[0]
+                                          for c in on_disk}
+            if (space := msg.get("disk")) is not None:
+                self.disk[runner_id] = space
             # The runner is the authority on what it is doing. Deriving this
             # from dispatch bookkeeping alone loses track the moment the
             # controller restarts, and then hands work to a machine that is
@@ -667,6 +712,9 @@ class Fleet:
                     db.add_log(jid, "Recorded %d score%s against the prompt "
                                "set, ready to compare with later runs."
                                % (written, "" if written == 1 else "s"))
+            if summary.get("kind") == "upload" and summary.get("repo_id") \
+                    and summary.get("target") == "model":
+                self._record_publication(jid, summary)
             db.set_job_summary(jid, summary)
             self._refresh_cards(jid, summary)
             db.clear_checkpoint(jid)

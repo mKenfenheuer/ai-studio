@@ -36,11 +36,6 @@ from . import artifacts, capabilities
 
 CACHE_DIR = artifacts.CACHE_DIR
 
-# How long a model may sit loaded with nobody talking to it. The GPU is shared
-# with training, and holding 6 GB for a conversation that ended an hour ago
-# would block the next run for no reason.
-IDLE_UNLOAD_S = 15 * 60
-
 # What a loaded model costs beyond its weights: the key/value cache the
 # conversation grows into, attention's working room, and the allocator's own
 # fragmentation. Used to describe what a compressed load will take, not to
@@ -91,31 +86,20 @@ PREFILL_HEADROOM_GB = 0.6
 # else can reach.
 GENERATION_DEADLINE_S = 300.0
 
-# How far back a marker still arriving may reach. `<|channel|>final<|message|>`
-# is the longest this studio's formats use; anything older than this is text.
-_MARKER_REACH = 32
+def _added_tokens(tok) -> list[str]:
+    """Every string this tokenizer treats as a token of its own.
 
-
-def _showable(text: str, hold: int) -> str:
-    """How much of this reply is safe to put on screen.
-
-    Two things are held back. The last `hold` characters, because they may turn
-    out to be the opening of a stop sequence -- that rule is older than this
-    function. And anything after an unclosed `<`, because a marker arrives one
-    character at a time and `<thi` is indistinguishable from text until its
-    bracket lands. Showing it means the answer bubble flashes `<think>` and
-    then takes it back.
-
-    Only a RECENT unclosed bracket counts. A model writing "5 < 6" is not
-    opening anything, and holding the rest of the reply behind it would stall
-    the stream for good.
+    Part of the inventory a reply is buffered against. These are exact -- the
+    model's own vocabulary, not a guess at what its template looks like -- and
+    the ones that are *not* marked special are precisely the ones that survive
+    `skip_special_tokens` and reach the screen a character at a time.
     """
-    cut = len(text) - hold if hold else len(text)
-    opening = text.rfind("<")
-    if opening >= 0 and opening >= len(text) - _MARKER_REACH \
-            and ">" not in text[opening:]:
-        cut = min(cut, opening)
-    return text[:max(cut, 0)]
+    out: list[str] = []
+    with contextlib.suppress(Exception):
+        out += [str(t) for t in (tok.all_special_tokens or [])]
+    with contextlib.suppress(Exception):
+        out += [str(t) for t in (tok.get_added_vocab() or {})]
+    return list(dict.fromkeys(t for t in out if t))
 
 
 def _is_oom(e: BaseException) -> bool:
@@ -133,14 +117,51 @@ def _is_oom(e: BaseException) -> bool:
     return "out of memory" in str(e).lower()
 
 
+class _Resident:
+    """One model on the card, and everything that describes it.
+
+    A record rather than fields on the host, because the host now keeps
+    several: talking to two models in turn used to reload both of them on
+    every message.
+    """
+    __slots__ = ("job_id", "model", "tok", "chat_template", "specials",
+                 "quantized", "params_b", "added_tokens", "last_used")
+
+    def __init__(self, job_id: str, model, tok, chat_template, specials,
+                 quantized: bool, params_b: float | None,
+                 added_tokens: list[str]):
+        self.job_id = job_id
+        self.model = model
+        self.tok = tok
+        self.chat_template = chat_template
+        self.specials = specials
+        self.quantized = quantized
+        self.params_b = params_b
+        self.added_tokens = added_tokens
+        self.last_used = time.time()
+
+
 class ModelHost:
-    """Keeps at most one model resident and generates from it."""
+    """Keeps models resident on the card and generates from them.
+
+    Residency is least-recently-used and bounded by memory rather than by
+    time. A model is dropped when the card needs the room -- for another model,
+    or because a training run is starting -- and not because a conversation
+    went quiet: an idle timer means the 9am and the 11am chat each pay a full
+    load, for space nobody was waiting for.
+    """
 
     def __init__(self, controller_url: str, token: str, caps: dict):
         self.controller_url = controller_url.rstrip("/")
         self.token = token
         self.caps = caps
         self.lock = threading.Lock()
+        # Insertion-ordered, oldest use first: the next one to go.
+        self._residents: dict[str, _Resident] = {}
+        # A view onto the most recently used resident. Everything that reads a
+        # model -- render, generate, the context budget, the diagnostics, and
+        # the two job kinds that build their own host -- goes through these, so
+        # holding more than one model changed nothing outside this class.
         self.loaded_id: str | None = None
         self.model = None
         self.tok = None
@@ -175,19 +196,45 @@ class ModelHost:
         Shared with training, which needs exactly the same thing to fine-tune
         a model this studio produced. One cache, one set of rules about what a
         half-finished download counts as -- see runner/artifacts.
+
+        `keep` names the models on the card right now: the cache is allowed to
+        evict to make room, and deleting the directory under a loaded model is
+        the one thing it must never do.
         """
-        return artifacts.fetch(self.controller_url, self.token, job_id, log)
+        return artifacts.fetch(self.controller_url, self.token, job_id, log,
+                               keep=set(self._residents))
 
-    def unload(self) -> None:
+    def loaded_ids(self) -> list[str]:
+        """What is on the card, most recently used first."""
+        return list(reversed(list(self._residents)))
+
+    def unload(self, job_id: str | None = None) -> None:
+        """Drop one model, or -- with no argument -- every one of them."""
         with self.lock:
-            self._unload_locked()
+            self._unload_locked(job_id)
 
-    def _unload_locked(self) -> None:
-        self.model = None
-        self.tok = None
-        self.loaded_id = None
-        self.quantized = False
+    def unload_all(self) -> None:
+        self.unload()
+
+    def _unload_locked(self, job_id: str | None = None) -> None:
+        if job_id is None:
+            self._residents.clear()
+        else:
+            self._residents.pop(job_id, None)
+        self._refresh_view()
         self._reclaim()
+
+    def _refresh_view(self) -> None:
+        """Point the plain attributes at the most recently used resident."""
+        current = next(reversed(self._residents.values()), None) \
+            if self._residents else None
+        self.loaded_id = current.job_id if current else None
+        self.model = current.model if current else None
+        self.tok = current.tok if current else None
+        self.chat_template = current.chat_template if current else None
+        self.specials = current.specials if current else {}
+        self.quantized = bool(current.quantized) if current else False
+        self.last_used = current.last_used if current else self.last_used
 
     def _reclaim(self) -> None:
         """Hand the card back everything this process has finished with.
@@ -242,13 +289,35 @@ class ModelHost:
             free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         return free / 1024 ** 3
 
-    def maybe_unload_idle(self) -> bool:
-        if self.model is None or not self.last_used:
-            return False
-        if time.time() - self.last_used < IDLE_UNLOAD_S:
-            return False
-        self.unload()
-        return True
+    def _make_room(self, need_gb: float | None, log: Callable[[str], None]
+                   ) -> None:
+        """Evict least-recently-used models until this one has somewhere to go.
+
+        Called before the precision is planned, so the decision to compress is
+        made against the memory eviction actually released rather than against
+        what the card looked like while somebody else's conversation was still
+        resident.
+
+        With no estimate to work against, everything goes -- which is what this
+        class did unconditionally before it could hold more than one model.
+        """
+        if need_gb is None:
+            if self._residents:
+                log("Clearing %d model%s off the card to make room."
+                    % (len(self._residents),
+                       "" if len(self._residents) == 1 else "s"))
+            self._unload_locked()
+            return
+        while self._residents:
+            free = self._free_gb()
+            if free is None or free >= need_gb:
+                return
+            victim = next(iter(self._residents.values()))
+            self._residents.pop(victim.job_id, None)
+            self._reclaim()
+            log("Unloaded %s to make room: %.1f GB free, about %.1f GB needed."
+                % (victim.job_id, self._free_gb() or 0.0, need_gb))
+        self._refresh_view()
 
     def _expert_kwargs(self) -> dict:
         """`experts_implementation`, when this backend needs it and the
@@ -326,26 +395,34 @@ class ModelHost:
 
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
         job_id = spec["job_id"]
-        if self.loaded_id == job_id and self.model is not None:
+        if resident := self._residents.get(job_id):
+            # Already here. Moved to the front of the queue and nothing else:
+            # no fetch, no load, no unloading of whatever else is resident.
+            # This is the whole point of keeping more than one.
+            resident.last_used = time.time()
+            self._residents.pop(job_id)
+            self._residents[job_id] = resident
+            self._refresh_view()
             return
 
-        # Whatever was resident is not what is wanted, and it is sitting on the
-        # memory the next model needs. This runs even when nothing is loaded:
-        # the card may still be holding a finished training run's weights in a
-        # cycle nobody has collected. See _reclaim.
-        self._unload_locked()
         path = self._fetch(job_id, log)
+
+        # What this model wants at full precision. The eviction aims at that
+        # rather than at the compressed size: quantizing costs answer quality
+        # and is worth avoiding while there is anything left to evict.
+        params_b = spec.get("params_b")
+        self._make_room(params_b * 2 + HEADROOM_GB if params_b else None, log)
 
         quantize = self._plan_precision(spec, log)
         try:
-            self._load(spec, path, quantize, log)
+            resident = self._load(spec, path, quantize, log)
         except Exception as e:  # noqa: BLE001 - re-raised below unless it fits
             if not _is_oom(e):
                 raise
             # The estimate was optimistic, or something else took the card
-            # between planning and loading. Compressing is the one thing left
-            # to try, and it is much better than telling somebody their model
-            # cannot be talked to.
+            # between planning and loading. Everything else goes, and then
+            # compressing is the one thing left to try -- much better than
+            # telling somebody their model cannot be talked to.
             self._unload_locked()
             if quantize or not self._can_quantize():
                 raise OutOfRoom(
@@ -357,14 +434,14 @@ class ModelHost:
                        "" if quantize else ", or on a runner with working "
                                            "4-bit support")) from e
             log("That did not fit. Trying again in 4-bit…")
-            self._load(spec, path, True, log)
+            resident = self._load(spec, path, True, log)
 
-        self.loaded_id = job_id
-        self.last_used = time.time()
+        self._residents[job_id] = resident
+        self._refresh_view()
         log("Ready.")
 
     def _load(self, spec: dict, path: Path, quantize: bool,
-              log: Callable[[str], None]) -> None:
+              log: Callable[[str], None]) -> _Resident:
         """Put one model on the card, at the precision asked for."""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -398,10 +475,16 @@ class ModelHost:
         else:
             extra["dtype"] = dtype
 
-        if spec.get("kind") == "pretrain_llm":
+        # Asked of the FILES rather than of the run that produced them. A
+        # fine-tune now saves its merged model beside its adapter, so the kind
+        # of run no longer says which of the two is in this directory -- and an
+        # adapter served as a whole model loads as nothing at all.
+        is_adapter = (path / "adapter_config.json").exists()
+
+        if not is_adapter:
             log("Loading your model…")
-            self.tok = AutoTokenizer.from_pretrained(str(path))
-            self.model = AutoModelForCausalLM.from_pretrained(str(path), **extra)
+            tok = AutoTokenizer.from_pretrained(str(path))
+            model = AutoModelForCausalLM.from_pretrained(str(path), **extra)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):
@@ -411,7 +494,8 @@ class ModelHost:
                 # run produced was itself an adapter, in which case the base
                 # is still the Hub model underneath it.
                 fetched = artifacts.fetch(self.controller_url, self.token,
-                                          base_job, log)
+                                          base_job, log,
+                                          keep=set(self._residents))
                 if not (fetched / "adapter_config.json").exists():
                     base = str(fetched)
             if not base:
@@ -420,33 +504,33 @@ class ModelHost:
                     "trained on, but that model is not recorded on the run.")
             log("Loading %s, then applying what you trained…" % base)
             from peft import PeftModel
-            self.tok = AutoTokenizer.from_pretrained(str(path)) \
+            tok = AutoTokenizer.from_pretrained(str(path)) \
                 if (path / "tokenizer_config.json").exists() \
                 else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
-            self.model = AutoModelForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 base, token=spec.get("hf_token"), **extra)
-            self.model = PeftModel.from_pretrained(self.model, str(path))
+            model = PeftModel.from_pretrained(model, str(path))
 
-        if self.tok.pad_token is None:
-            self.tok.pad_token = self.tok.eos_token
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
 
         # The template this model actually carries, read off the tokenizer that
         # is about to run. Training reads the same field, so the playground and
         # the run it is talking to cannot disagree about the format.
-        template = getattr(self.tok, "chat_template", None)
+        template = getattr(tok, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default") or next(iter(template.values()), None)
-        self.chat_template = template
-        self.specials = {k: v for k, v in (
-            ("bos_token", self.tok.bos_token), ("eos_token", self.tok.eos_token),
-            ("pad_token", self.tok.pad_token), ("unk_token", self.tok.unk_token))
+        specials = {k: v for k, v in (
+            ("bos_token", tok.bos_token), ("eos_token", tok.eos_token),
+            ("pad_token", tok.pad_token), ("unk_token", tok.unk_token))
             if v}
 
-        self.quantized = quantize
         if not quantize:
-            self.model = self.model.to(self.device)
-        self.model = self.model.eval()
-        self.model.config.use_cache = True
+            model = model.to(self.device)
+        model = model.eval()
+        model.config.use_cache = True
+        return _Resident(spec["job_id"], model, tok, template, specials,
+                         quantize, spec.get("params_b"), _added_tokens(tok))
 
     # --------------------------------------------------------- generating
     def render(self, spec: dict, messages: list, reasoning: bool = False,
@@ -615,6 +699,12 @@ class ModelHost:
             fmt, text = self.render(spec, messages, want_reasoning, log)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
+            # Everything this exact template writes around a message, read off
+            # the template itself. What the stream may not show half of.
+            resident = self._residents.get(spec["job_id"])
+            markers = formatting.boundary_markers(
+                fmt, self.specials,
+                added=resident.added_tokens if resident else None)
 
             ids = tok(text, return_tensors="pt").input_ids.to(self.device)
             prompt_len = ids.shape[1]
@@ -623,11 +713,12 @@ class ModelHost:
                 "job_id": spec.get("job_id"),
                 "prompt_tokens": prompt_len,
                 "max_new_tokens": max_new,
+                "boundary_markers": len(markers),
+                "resident": self.loaded_ids(),
             }
             temperature = float(params.get("temperature", 0.8))
             top_k = int(params.get("top_k", 50))
             top_p = float(params.get("top_p", 0.95))
-            hold = max((len(s) for s in stop_texts), default=0)
 
             past = None
             emitted = ""
@@ -761,12 +852,13 @@ class ModelHost:
                     off_template = True
                     break
 
-                # Hold back the last few characters, because they may turn out
-                # to be the start of a stop sequence -- or of a reasoning
-                # marker. Without this the model streams "…green.Human:" to the
-                # browser and only then notices it should have stopped, and the
-                # reader has already seen the text it was supposed to cut.
-                emitted = _showable(full, hold)
+                # Hold back exactly as much of the tail as could still turn
+                # into one of this template's boundaries, and not a character
+                # more. Without it the model streams "…green.Human:" or
+                # "…done.<|im_" to the browser and only then notices it should
+                # have stopped, and the reader has already seen the text it was
+                # supposed to cut.
+                emitted = full[:len(full) - formatting.held(full, markers)]
                 deliver(emitted)
 
             # The loop can also end at the token limit, at end-of-text, or on a
@@ -785,6 +877,14 @@ class ModelHost:
             # format-specific, so they live with the formats rather than here.
             reply = conversation.parse_reply(emitted, fmt,
                                              reasoning_on=want_reasoning)
+            # Last line of defence, on the finished text rather than the
+            # stream. A complete marker the splitter had no use for is a
+            # control token that ended up in the middle of a sentence, not
+            # something the model meant to say. The buffering above is what
+            # keeps it off the screen while it arrives; this is what keeps it
+            # out of what is stored and handed back.
+            content = formatting.strip_special(reply["content"])
+            reasoning = formatting.strip_special(reply["reasoning"])
             return {
                 # The fallback is for a reply nothing could be made of: hand
                 # back the raw text rather than nothing. It must NOT fire when
@@ -792,9 +892,9 @@ class ModelHost:
                 # reply cut off mid-thought -- there is no answer yet, and
                 # returning the raw text put the reasoning on screen twice,
                 # once in its panel and once with its tags showing.
-                "text": reply["content"] or (
-                    "" if reply["tool_calls"] or reply["reasoning"] else emitted),
-                "reasoning": reply["reasoning"],
+                "text": content or (
+                    "" if reply["tool_calls"] or reasoning else emitted),
+                "reasoning": reasoning,
                 # Calls the model actually made, as structure rather than as
                 # syntax. This is what lets the playground show "it called
                 # get_order(order_id=12345)" and then hand back a result so the

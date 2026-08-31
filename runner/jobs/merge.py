@@ -1,6 +1,14 @@
 """Folding an adapter back into its base, to get a model that can leave.
 
-A fine-tune here produces an *adapter*: a few megabytes of low-rank matrices
+This is a library, not a job. Merging used to be a second run queued after a
+training run finished: it downloaded the base again, onto whichever machine was
+free, to redo arithmetic the trainer had the weights for in memory a minute
+earlier. A fine-tune now merges its own adapter as its last step -- see
+`lora_llm.run` -- and what is left here is the slow path it falls back to when
+the training model cannot be merged where it stands, plus the memory
+arithmetic, both of which the trainer calls into.
+
+Training here produces an *adapter*: a few megabytes of low-rank matrices
 that mean nothing without the multi-gigabyte model they were trained against.
 That is exactly the right thing to produce -- it is what makes fine-tuning
 cheap, and this studio can serve it by loading both halves.
@@ -23,8 +31,9 @@ What it costs, said plainly because the numbers surprise people:
   precision the adapter was fitted to, and the result is quietly worse than
   serving the two halves separately.
 
-* **Reversibility.** None. The output is a new run; the adapter it came from
-  is untouched and still there.
+* **Reversibility.** None -- but nothing is lost either: the run keeps the
+  adapter it merged from as a second artifact, so both are downloadable and
+  both are publishable.
 """
 from __future__ import annotations
 
@@ -34,53 +43,55 @@ from pathlib import Path
 from typing import Any
 
 from common import chat_formats
-from runner import artifacts
 from runner.capabilities import expert_kernel
 
 
-def run(cfg: dict, ctx: Any) -> dict:
+def merge_into(adapter_dir: Path | str, base_model: str, dtype_name: str,
+               ctx: Any, out_dir: Path | str,
+               label: str | None = None,
+               params_b: float | None = None) -> dict:
+    """Fold `adapter_dir` into `base_model` and write the result to `out_dir`.
+
+    The reload path. The trainer prefers to merge the model it already has in
+    memory; it comes here when it cannot -- a 4-bit base, which must be
+    re-read at full precision, or a training model that had to be freed first.
+    The base is loaded by name, which means from the local Hugging Face cache
+    when the run that just finished pulled it: disk, not network.
+
+    Returns what the caller needs for its summary. Writing the summary, the
+    README and the zip is the caller's, because a merged fine-tune describes
+    itself as a fine-tune.
+    """
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    source = cfg.get("source_job")
-    if not source:
-        raise ValueError("No run was given to merge.")
-    base_model = cfg.get("base_model")
-    dtype_name = cfg.get("dtype") or "float16"
+    adapter = Path(adapter_dir)
+    out_dir = Path(out_dir)
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
              "float32": torch.float32}.get(dtype_name, torch.float16)
 
     t0 = time.time()
-    ctx.progress(0, 4, stage="loading_model")
-    adapter = artifacts.fetch(ctx.controller_url, ctx.runner_token, source,
-                              ctx.log)
     if not (adapter / "adapter_config.json").exists():
         raise ValueError(
             "That run did not produce an adapter, so there is nothing to "
             "merge. A model built from scratch is already standalone -- "
             "download it directly.")
 
-    conf = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
     if not base_model:
+        conf = json.loads(
+            (adapter / "adapter_config.json").read_text(encoding="utf-8"))
         base_model = conf.get("base_model_name_or_path")
     if not base_model:
         raise ValueError(
             "The adapter does not record which model it was trained on, and "
             "none was given. Merging needs the base it was fitted to.")
 
-    # A base that is itself one of this studio's runs, fetched the same way.
-    if base_job := cfg.get("base_model_job"):
-        fetched = artifacts.fetch(ctx.controller_url, ctx.runner_token,
-                                  base_job, ctx.log)
-        if not (fetched / "adapter_config.json").exists():
-            base_model = str(fetched)
-
     # What the base is CALLED, which is not always where it is. A base that is
     # another run in this studio arrives as a cache directory, and neither a
     # log line nor a model card on the Hub should be naming a path on some
     # runner's disk.
-    label = cfg.get("base_model_label") or base_model
+    label = label or base_model
     ctx.log("Merging into %s. The result is a complete model of that size, "
             "not the size of the adapter -- the base is now part of it."
             % label)
@@ -113,7 +124,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     # This is the difference between merging on a spare CPU and merging on a
     # training box, so it stopped being a theoretical concern the moment the
     # controller started taking merges.
-    plan = _memory_plan(cfg.get("params_b"), dtype_name)
+    plan = memory_plan(params_b, dtype_name)
     if plan.get("note"):
         ctx.log(plan["note"], plan.get("level", "info"))
     try:
@@ -137,15 +148,12 @@ def run(cfg: dict, ctx: Any) -> dict:
     # update the adapter makes to the nearest representable value at the
     # *base* weight's magnitude, which for small adapter deltas is often zero
     # -- a merge that quietly does nothing. It is cast down once, afterwards.
-    ctx.progress(1, 4, stage="loading_model")
     ctx.log("Applying the adapter…")
     model = PeftModel.from_pretrained(model, str(adapter))
 
-    ctx.progress(2, 4, stage="saving")
     merged = model.merge_and_unload()
     merged = merged.to(dtype)
 
-    out_dir = Path(ctx.workdir) / "model"
     out_dir.mkdir(parents=True, exist_ok=True)
     merged.config.use_cache = True
     merged.save_pretrained(str(out_dir), safe_serialization=True)
@@ -156,36 +164,30 @@ def run(cfg: dict, ctx: Any) -> dict:
     tok_src = str(adapter) if (adapter / "tokenizer_config.json").exists() \
         else base_model
     tok = AutoTokenizer.from_pretrained(tok_src, token=ctx.hf_token)
+    save_tokenizer(tok, out_dir, ctx,
+                   "the fine-tune" if tok_src == str(adapter) else "the base model")
+
+    params = sum(p.numel() for p in merged.parameters())
+    del merged, model
+    return {"params_total": params, "dtype": dtype_name,
+            "base_model": label, "merge_s": round(time.time() - t0, 1)}
+
+
+def save_tokenizer(tok: Any, out_dir: Path, ctx: Any, whose: str) -> None:
+    """The tokenizer beside the weights, with the chat template stamped in.
+
+    Shared with the fast path in the trainer, which merges the model it has in
+    memory and never comes through `merge_into`. The tokenizer must be the
+    fine-tune's: it may carry tokens the base does not, and shipping the base's
+    would produce a model that cannot read its own chat template.
+    """
     tok.save_pretrained(str(out_dir))
     # In both places a reader looks, whatever this version of transformers
     # decided to write. See chat_formats.stamp_into.
     if put := chat_formats.stamp_into(out_dir, getattr(tok, "chat_template", None)):
         ctx.log("Chat template written into %s, so every tool that reads a "
                 "model finds it." % " and ".join(put))
-    ctx.log("Tokenizer taken from %s."
-            % ("the fine-tune" if tok_src == str(adapter) else "the base model"))
-
-    params = sum(p.numel() for p in merged.parameters())
-    summary = {
-        "kind": "merge_adapter",
-        "merged_from": source,
-        "base_model": label,
-        "params_total": params,
-        "dtype": dtype_name,
-        "duration_s": round(time.time() - t0, 1),
-    }
-    (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
-    _write_readme(out_dir, summary, cfg)
-
-    ctx.progress(3, 4, stage="saving")
-    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "model.zip")
-    summary["artifact_path"] = str(archive)
-    summary["artifact_size"] = archive.stat().st_size
-    ctx.progress(4, 4, stage="saving")
-    ctx.log("Done. %s parameters, %.1f GB on disk. This is a complete model: "
-            "it loads with from_pretrained and needs nothing else."
-            % (f"{params:,}", archive.stat().st_size / 1024 ** 3))
-    return summary
+    ctx.log("Tokenizer taken from %s." % whose)
 
 
 # What merging costs on top of simply holding the weights: PEFT builds `BA`
@@ -196,7 +198,7 @@ _OVERHEAD = 1.12
 _SLACK = 2 * 1024 ** 3
 
 
-def _memory_plan(params_b: float | None, dtype_name: str) -> dict:
+def memory_plan(params_b: float | None, dtype_name: str) -> dict:
     """Whether to merge in float32, decided against memory this machine has.
 
     Raises when not even the requested precision fits, which is a far better
@@ -270,7 +272,7 @@ def _gb(n: float) -> str:
     return "%.1f GB" % (n / 1024 ** 3)
 
 
-def _write_readme(out_dir: Path, summary: dict, cfg: dict) -> None:
+def write_readme(out_dir: Path, summary: dict) -> None:
     (out_dir / "README.md").write_text(
         "# Merged model from AI Studio\n\n"
         "`%s` with a fine-tuned adapter folded in. Nothing else is needed to "

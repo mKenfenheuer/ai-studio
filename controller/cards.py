@@ -95,20 +95,43 @@ def refresh(job_id: str, *, artifact_job: dict | None = None,
     return text
 
 
-def for_publish(trained: dict, artifact: dict, repo_id: str) -> str:
+def published_repo(job: dict | str, prefer: str = "model") -> str | None:
+    """Where this run's model can be found on the Hub, if it is there.
+
+    A run can have gone to two repositories -- the merged model and the
+    adapter -- and which one to name depends on who is asking. A card
+    declaring its base wants the whole model where there is one: an adapter
+    stacked on an adapter is not something the Hub can resolve for a reader.
+    """
+    job_id = job if isinstance(job, str) else job.get("id")
+    entries = db.publications(job_id or "")
+    for want in (prefer, "model", "adapter"):
+        for entry in entries:
+            if entry.get("artifact_kind") == want and entry.get("repo_id"):
+                return entry["repo_id"]
+    return entries[0].get("repo_id") if entries else None
+
+
+def for_publish(trained: dict, artifact: dict, repo_id: str,
+                adapter: bool | None = None) -> str:
     """The card to send with an upload.
 
     An edited card goes as it was written -- it is somebody's words about
     their own model, and rewriting them on the way out would be worse than
     having no editor at all. A generated one is regenerated here instead of
     reused, because publishing is the first moment two facts are known that
-    the stored card could not have: which repository this is, and which run's
-    files are actually being sent.
+    the stored card could not have: which repository this is, and which of the
+    run's artifacts is actually being sent. `adapter` is that last one: one
+    fine-tune can publish either the merged model or the adapter, and the two
+    repositories need different front matter -- `peft` against `transformers`,
+    `base_model_relation: adapter` against `merge` -- for the Hub to offer a
+    widget that can load what is in them.
     """
     row = db.get_job_card(trained["id"])
     if row and row["edited"]:
         return row["markdown"]
-    return generate(trained, artifact_job=artifact, repo_id=repo_id)
+    return generate(trained, artifact_job=artifact, repo_id=repo_id,
+                    adapter=adapter)
 
 
 # ---------------------------------------------------------------------------
@@ -116,40 +139,56 @@ def for_publish(trained: dict, artifact: dict, repo_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def generate(job: dict, *, artifact_job: dict | None = None,
-             repo_id: str | None = None) -> str:
+             repo_id: str | None = None, adapter: bool | None = None) -> str:
     """The whole card: front matter, then prose.
 
     `job` is the run being described and `artifact_job` the run whose files
-    the card will sit beside. They are the same thing except for a fine-tune,
-    where what goes to the Hub is the merged model and what is worth writing
-    down -- the data, the hyperparameters, where the loss got to -- belongs to
-    the training run.
+    the card will sit beside; they differ only for the merges made back when
+    merging was a run of its own. `adapter` says which of a fine-tune's two
+    artifacts this card belongs to, and is the caller's to decide -- there is
+    nothing in the run itself that can answer it, because both were produced.
     """
     artifact_job = artifact_job or job
-    facts = _facts(job, artifact_job, repo_id)
+    facts = _facts(job, artifact_job, repo_id, adapter)
     return "\n".join(_front_matter(facts) + _body(facts)).rstrip() + "\n"
 
 
-def _facts(job: dict, artifact_job: dict, repo_id: str | None) -> dict:
+def _facts(job: dict, artifact_job: dict, repo_id: str | None,
+           adapter: bool | None = None) -> dict:
     cfg = serving.resolved_config(job) if job.get("kind") == "merge_adapter" \
         else (job.get("config") or {})
     summary = job.get("summary") or {}
     scratch = job.get("kind") == "pretrain_llm"
-    merged = artifact_job.get("kind") == "merge_adapter"
-    # What is in the repository, which is not always what the run produced: a
-    # fine-tune's own artifact is an adapter, and its merged run's is a model.
-    adapter = not scratch and not merged
+    # Whether this run has a standalone model at all: it merged its own
+    # adapter as its last step, or it is one of the separate merge runs from
+    # when that was a job, or it never used an adapter in the first place.
+    has_model = scratch or bool(summary.get("merged")) \
+        or artifact_job.get("kind") == "merge_adapter"
+    # What is in THIS repository. Left to the caller where it has an opinion,
+    # because a fine-tune can publish either of the two things it made, and
+    # the run itself cannot answer which of them this card is for.
+    adapter = (not has_model) if adapter is None else bool(adapter)
+    merged = not scratch and not adapter
 
     base = cfg.get("base_model") \
         or (artifact_job.get("config") or {}).get("base_model") \
         or summary.get("base_model")
     # A base that is another run in this studio is named, not linked: its id
     # means nothing on the Hub, and `base_model:` there must be a Hub id or
-    # the card fails to render.
+    # the card fails to render. Unless that run has been published, in which
+    # case there IS a Hub id for it and this is precisely the line that makes
+    # a fine-tune of a fine-tune legible: `base_model: me/my-first-tune`.
+    #
+    # The publication wins over `base_model` even when that holds a Hub id,
+    # because for a continued fine-tune it holds the *grandparent*: the run
+    # was started from a studio run and inherited the id that run was itself
+    # trained from, so naming it would skip the model this one actually came
+    # from. An unpublished base falls back to that inherited id -- a true
+    # ancestor, if a less precise one -- and the run is named in prose.
     base_run = db.get_job(cfg.get("base_model_job") or "") \
         if cfg.get("base_model_job") else None
-    if base_run and not _is_hub_id(base):
-        base = None
+    if base_run:
+        base = published_repo(base_run) or (base if _is_hub_id(base) else None)
 
     return {
         "job": job, "artifact_job": artifact_job, "cfg": cfg,

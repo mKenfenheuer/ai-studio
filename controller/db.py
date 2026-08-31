@@ -671,6 +671,35 @@ def update_job_config(job_id: str, cfg: dict) -> None:
     ex("UPDATE jobs SET config=? WHERE id=?", (json.dumps(cfg), job_id))
 
 
+def publications(job_id: str) -> list[dict]:
+    """Where this run's model has been put on Hugging Face, if anywhere."""
+    job = get_job(job_id)
+    return list((job or {}).get("config", {}).get("published") or [])
+
+
+def record_publication(job_id: str, entry: dict) -> None:
+    """Remember that this run went to a repository, and which one.
+
+    Lineage. A fine-tune of a fine-tune can only say `base_model: someone/x`
+    on its card if we know where `x` ended up, and nothing recorded that
+    before: the upload run knew the repository, said so in its own summary,
+    and the trained run it came from was never told. What that produced was a
+    model on the Hub with no parentage at all -- the card silently dropped the
+    line rather than name a job id nobody outside this studio can resolve.
+
+    Kept in the run's config rather than in a column of its own, so there is
+    no migration and an older controller reading the same database simply sees
+    a key it does not use.
+    """
+    cfg = dict((get_job(job_id) or {}).get("config") or {})
+    published = [p for p in (cfg.get("published") or [])
+                 if not (p.get("repo_id") == entry.get("repo_id")
+                         and p.get("artifact_kind") == entry.get("artifact_kind"))]
+    published.append({**entry, "at": entry.get("at") or now()})
+    cfg["published"] = published
+    update_job_config(job_id, cfg)
+
+
 def delete_job(job_id: str) -> list[str]:
     """Remove a job and everything hanging off it.
 

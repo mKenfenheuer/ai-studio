@@ -57,6 +57,21 @@ function what(j) {
   return c.base_model || "—";
 }
 
+/** The repositories this run went to, if any.
+ *
+ *  Recorded when an upload finishes, so this is the list of a run's models
+ *  that actually exist on the Hub -- and the name a fine-tune of it will give
+ *  as its base model. Worth a line here because the alternative is opening
+ *  every run to find out which ones are already out.
+ */
+function hubLinks(j) {
+  const rows = j.config?.published || [];
+  if (!rows.length) return "";
+  return html`<div class="tiny muted">${raw(rows.map((p) => html`
+    <a href="${p.url || `https://huggingface.co/${p.repo_id}`}"
+       target="_blank" rel="noopener">↗ ${p.repo_id}</a>`).join(" "))}</div>`;
+}
+
 function row(j) {
   const pct = j.total_steps ? Math.min(100, (j.step / j.total_steps) * 100) : 0;
   const dur = j.finished_at && j.started_at ? j.finished_at - j.started_at : null;
@@ -65,7 +80,8 @@ function row(j) {
       <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a>
         ${raw(j.config.sweep_id
           ? `<div class="tiny"><a href="#/sweeps/${esc(j.config.sweep_id)}"
-               >part of a sweep</a></div>` : "")}</td>
+               >part of a sweep</a></div>` : "")}
+        ${raw(hubLinks(j))}</td>
       <td>${statusBadge(j.status, j.kind)}${raw(
         j.status === "cancelled" && j.has_model
           ? ` <span class="badge badge-ok">model kept</span>` : "")}${raw(

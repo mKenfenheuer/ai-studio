@@ -2428,11 +2428,12 @@ function scratchReview(state, runner, caps) {
           "A fine-tune produces an adapter, which needs the exact base model "
           + "it was trained against in order to run anywhere. Merging folds it "
           + "into the weights, so what you are left with needs nothing else — "
-          + "which is what every tool outside this studio wants. It runs on "
-          + "the processor afterwards and does not hold the card up. The cost "
-          + "is disk: a merged 7B is about 14 GB where its adapter was 50 MB. "
-          + "The adapter is kept as well, and is what a later run continues "
-          + "from."))}
+          + "which is what every tool outside this studio wants. It is the "
+          + "last step of this run, on the machine that still has the weights "
+          + "in memory: no second run appears and nothing is downloaded again. "
+          + "The cost is disk: a merged 7B is about 14 GB where its adapter "
+          + "was 50 MB. The adapter is kept as well — it is what a later run "
+          + "continues from, and either can be published."))}
       </div>
     </div>
 

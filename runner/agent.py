@@ -24,8 +24,8 @@ from typing import Any
 import httpx
 import websockets
 
-from . import capabilities, checkpoints, inference
-from .jobs import evaluate, generate_data, lora_llm, merge, scratch_llm, upload
+from . import artifacts, capabilities, checkpoints, inference
+from .jobs import evaluate, generate_data, lora_llm, scratch_llm, upload
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -49,9 +49,9 @@ JOB_HANDLERS = {
     # time, and it belongs in the queue with everything else competing for
     # the same card.
     "evaluate": evaluate.run,
-    # Merging needs the base model resident and writes a file the size of it.
-    # Minutes rather than hours, but it is still the machine being occupied.
-    "merge_adapter": merge.run,
+    # Merging is no longer a job: a fine-tune merges its own adapter as the
+    # last step of the run that produced it, while the base is still in
+    # memory. See runner/jobs/merge.py, now a library.
     # Sending a model to Hugging Face: no GPU, but twenty minutes of network
     # and every bit as much in need of a progress bar and a stop button.
     "upload": upload.run,
@@ -268,17 +268,17 @@ class Runner:
                     self.host.cancel()
             elif kind == "unload_model":
                 if self.host and not self.generating:
-                    self.host.unload()
+                    self.host.unload(msg.get("job_id"))
             elif kind == "purge_model":
                 # The run was deleted. Drop the cached copy so the disk space
                 # actually comes back, and let go of it first if it happens to
                 # be the model currently loaded. Its checkpoint goes too --
                 # keeping the ability to resume a run that no longer exists
                 # would be several gigabytes held for nothing.
-                if self.host:
-                    if self.host.loaded_id == msg.get("job_id"):
-                        self.host.unload()
-                    inference.clear_cache(msg.get("job_id"))
+                if gone := msg.get("job_id"):
+                    if self.host:
+                        self.host.unload(gone)
+                    inference.clear_cache(gone)
                 checkpoints.discard(msg.get("job_id") or "")
             elif kind == "discard_checkpoint":
                 checkpoints.discard(msg.get("job_id") or "")
@@ -322,17 +322,20 @@ class Runner:
     async def _heartbeat(self, ws) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
-            if self.host and not self.generating:
-                # Release the GPU if nobody has spoken to the model in a while;
-                # otherwise a finished conversation would keep memory reserved
-                # against the next training run.
-                if self.host.maybe_unload_idle():
-                    print("[runner] unloaded idle model")
+            # What this machine is holding, so the controller can send a
+            # conversation to the runner that already has the model instead of
+            # to the one that happened to train it. `loaded` is on the card and
+            # answers immediately; `cached` is on disk and needs no network.
+            # Nothing is unloaded on a timer: a model stays until the card
+            # needs the room, because throwing it away is what made the
+            # playground slow.
             await ws.send(json.dumps({
                 "type": "heartbeat",
                 "busy": self.current is not None,
                 "job_id": self.current.job_id if self.current else None,
-                "serving": self.host.loaded_id if self.host else None,
+                "loaded": self.host.loaded_ids() if self.host else [],
+                "cached": artifacts.cached_ids(),
+                "disk": artifacts.usage(),
                 "checkpoints": checkpoints.list_ids(),
             }))
             self._touch_liveness()
@@ -368,7 +371,11 @@ class Runner:
             # Done whether or not one is resident: with nothing loaded this
             # still collects and returns what an earlier run left behind, and
             # the run about to start was sized against an empty card.
-            self.host.unload()
+            #
+            # Everything, not the least recently used one: a training run is
+            # the single case where the whole card is wanted, and it is the
+            # reason the playground is allowed to keep models otherwise.
+            self.host.unload_all()
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders
         # an unset HF_TOKEN as an empty string, and passing "" to huggingface_hub
@@ -518,9 +525,19 @@ class Runner:
                 raise ValueError("this runner cannot handle job type %r" % job["kind"])
             result = handler(job["config"], ctx)
 
+            # One run can leave two things now: a fine-tune keeps the merged
+            # model *and* the adapter it was merged from. The merged model
+            # travels under no kind at all -- it is the primary artifact, the
+            # one every existing reader on the controller already expects.
+            paths = result.pop("artifact_paths", None) or {}
             if path := result.pop("artifact_path", None):
-                ctx.log("Uploading result to the controller...")
-                self._upload(jid, path)
+                paths.setdefault("model", path)
+            for artifact_kind, path in paths.items():
+                if not path:
+                    continue
+                ctx.log("Uploading %s to the controller..."
+                        % ("result" if artifact_kind == "model" else artifact_kind))
+                self._upload(jid, path, kind=artifact_kind)
             # A run that was stopped and saved returns normally and has a real
             # model behind it, but it is not a run that finished. Reporting it
             # as "succeeded" would put a half-trained model beside fully
@@ -565,9 +582,9 @@ class Runner:
             # playground came to run out of memory on a machine that was doing
             # nothing at all.
             if self.host:
-                self.host.unload()
+                self.host.unload_all()
 
-    def _upload(self, job_id: str, path: str) -> None:
+    def _upload(self, job_id: str, path: str, kind: str = "model") -> None:
         """Send the finished thing to the controller.
 
         Two things here are deliberate, and both are scars.
@@ -582,12 +599,15 @@ class Runner:
         good model that was then deleted with the working directory.
         """
         url = "%s/api/jobs/%s/artifact" % (self.controller_url, job_id)
+        # No parameter for the primary artifact, so an older controller -- one
+        # that has never heard of a second one -- still stores the model.
+        params = None if kind in (None, "", "model") else {"kind": kind}
         timeout = httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=7200.0)
         with open(path, "rb") as fh:
             # httpx reads the handle in 64 KB chunks and sets Content-Length
             # itself from the file's size, so this streams rather than loading
             # the model into memory to send it.
-            r = httpx.put(url, content=fh, timeout=timeout,
+            r = httpx.put(url, content=fh, params=params, timeout=timeout,
                           headers={"X-Runner-Token": self.token,
                                    "Content-Type": "application/zip"})
             r.raise_for_status()

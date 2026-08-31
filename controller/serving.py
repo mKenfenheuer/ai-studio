@@ -15,9 +15,17 @@ from . import db, hub
 # with, or fine-tune from. Shared, because two lists of this drifted apart
 # once already: the OpenAI-compatible endpoint filtered on it and the
 # playground did not, so a run that wrote a dataset was offered as a model.
-MODEL_KINDS = ("pretrain_llm", "finetune_llm", "merge_adapter")
+#
+# `merge_adapter` is here for the runs that already exist. Merging stopped
+# being a run of its own -- a fine-tune now merges its own adapter as its last
+# step and keeps both artifacts -- but the merges made before that are still
+# models, still servable and still publishable, and nothing about them should
+# stop working because the way they are made changed.
+LEGACY_MODEL_KINDS = ("merge_adapter",)
+MODEL_KINDS = ("pretrain_llm", "finetune_llm") + LEGACY_MODEL_KINDS
 
-# What a merge inherits from the fine-tune it was made from.
+# What a merge inherits from the fine-tune it was made from. Legacy: only the
+# separate merge runs described above ever needed this.
 #
 # Merging changes where the weights live, not what the model learned to expect.
 # A run trained on conversations is still a conversational model after its

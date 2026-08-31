@@ -100,7 +100,7 @@ on screen. When a run finishes, the **Playground** lets you talk to it.
 | Trains | ~0.1% of the weights (LoRA) | every weight |
 | Realistic size on one GPU | up to ~21B (4-bit) | up to ~100M |
 | Time | minutes to hours | hours to days |
-| Produces | an adapter file | a complete model |
+| Produces | an adapter *and* the merged model | a complete model |
 | The model can | answer, once fine-tuned on instructions | continue text |
 
 **Fine-tuning is what you want almost every time.** From-scratch is included
@@ -496,7 +496,9 @@ console with `too much recursion`.
 Working end-to-end:
 
 - **LoRA and QLoRA fine-tuning** — browse Hugging Face, preview your data,
-  guided setup, live loss charts, cancel mid-run, download the adapter.
+  guided setup, live loss charts, cancel mid-run, and two artifacts at the
+  end: the adapter, and the same adapter merged into its base as a standalone
+  model that loads anywhere. Publish either, or both.
 - **Training from scratch** — trained tokenizer, packed corpus, held-out loss,
   live text samples, a standalone model with usage instructions in the zip.
 - **Playground** — streaming chat with any finished run, template-aware.

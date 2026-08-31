@@ -70,17 +70,25 @@ def run(cfg: dict, ctx: Any) -> dict:
     else:
         if not cfg.get("source_job"):
             raise ValueError("No run was given to upload.")
+        # Which of the run's artifacts is being published. A fine-tune keeps
+        # both the merged model and the adapter it was merged from, and either
+        # is a legitimate thing to send -- to different repositories.
+        wanted = cfg.get("artifact_kind") or "model"
         folder = artifacts.fetch(ctx.controller_url, ctx.runner_token,
-                                 cfg["source_job"], ctx.log)
-        # The last place this can be caught. An adapter is 50 MB of low-rank
-        # matrices that load into nothing without the exact base they were
-        # fitted to, and a repository containing only those looks like a model
-        # right up to the moment somebody tries to use it.
-        if (folder / "adapter_config.json").exists():
+                                 cfg["source_job"], ctx.log,
+                                 kind=None if wanted == "model" else wanted)
+        # The last place a mismatch can be caught. Publishing an adapter as an
+        # adapter is fine and the card says so. Publishing one *as a model* is
+        # not: 50 MB of low-rank matrices load into nothing without the exact
+        # base they were fitted to, and a repository containing only those
+        # looks like a model right up to the moment somebody tries to use it.
+        is_adapter = (folder / "adapter_config.json").exists()
+        if is_adapter != (cfg.get("expect", wanted) == "adapter"):
             raise ValueError(
-                "That run produced an adapter, not a model. Publish its "
-                "merged run instead: the merge folds the adapter into the "
-                "base weights and the result loads on its own.")
+                "That run's %s artifact is %s. Publishing an adapter as a "
+                "model produces a repository that cannot be loaded, so this "
+                "one has been stopped before anything was created."
+                % (wanted, "an adapter" if is_adapter else "a whole model"))
         # Uploaded straight out of the cache rather than copied somewhere
         # first: a copy of a fourteen-gigabyte model, to add one text file
         # beside it, is fourteen gigabytes of disk and several minutes.

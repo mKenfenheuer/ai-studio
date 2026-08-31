@@ -50,12 +50,12 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
 
   # The controller's own machine, working as a runner for the jobs that need
-  # no GPU. A studio with one card has one queue, and an upload, a dataset
-  # written by a hosted model, or a merge -- none of which touch a GPU --
-  # would otherwise wait behind six hours of training for a card they never
-  # use. The merge is the one that hurts: a fine-tune cannot be published
-  # until it has one, so publishing a model meant waiting for the next gap in
-  # training. Restricted by kind rather than trusted to behave: without
+  # no GPU. A studio with one card has one queue, and an upload or a dataset
+  # written by a hosted model -- neither of which touches a GPU -- would
+  # otherwise wait behind six hours of training for a card it never uses.
+  # Uploading is the one that hurts: twenty minutes of sending a model to the
+  # Hub is twenty minutes the card is not training. Restricted by kind rather
+  # than trusted to behave: without
   # AI_STUDIO_RUNNER_KINDS this would happily accept anything marked
   # `allow_cpu` and try to train on a CPU.
   runner-cpu:
@@ -71,7 +71,7 @@ services:
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
-      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset,merge_adapter}
+      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset}
       HF_TOKEN: ${HF_TOKEN:-}
 
 volumes:

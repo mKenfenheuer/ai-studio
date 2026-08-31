@@ -18,7 +18,7 @@ from common.formatting import (conversation_style, detect_format,
 from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import expert_kernel
 
-from . import source
+from . import merge, source
 
 # How much of the training set is held back to measure honestly. A fine-tune
 # had no held-out set at all until now, which meant the only number on screen
@@ -951,19 +951,147 @@ def run(cfg: dict, ctx: Any) -> dict:
         "moe": moe,
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
+    adapter_zip = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
 
-    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
-    summary["artifact_path"] = str(archive)
-    summary["artifact_size"] = archive.stat().st_size
     ctx.log("%s Loss %.4f -> %.4f over %d steps%s."
-            % ("Stopped early." if stopped_early else "Done.",
+            % ("Stopped early." if stopped_early else "Training done.",
                summary["initial_loss"] or 0, summary["final_loss"] or 0, step,
                " of the %d planned" % total_steps if stopped_early else ""))
     if summary["best_val_loss"] is not None:
         ctx.log("Best held-out loss %.4f, on %d examples it never trained on. "
                 "That is the number to compare against another run."
                 % (summary["best_val_loss"], summary["held_out_rows"]))
+
+    # ---- merge, as the last step of this run ---------------------------
+    # Not a second run queued afterwards. The base is loaded, the adapter is
+    # in memory, and the machine is already this one; a follow-on run threw
+    # all three away and downloaded fourteen gigabytes to get them back.
+    # Handed over in a box, and this frame lets go of it: the 4-bit path has
+    # to give the whole card back before it can read the base again, and a
+    # `del` inside the callee would leave this frame's reference holding every
+    # weight it was trying to free. Nothing below uses the model.
+    model_box = [model]
+    del model
+    merged_zip = _merge_here(model_box, tok, cfg, ctx, summary, out_dir,
+                             base_model, dtype_name, use_4bit, torch)
+
+    # The merged model is the primary artifact when there is one -- it is what
+    # somebody means by "the model" -- and the adapter travels beside it.
+    summary["artifact_paths"] = ({"model": str(merged_zip),
+                                  "adapter": str(adapter_zip)}
+                                 if merged_zip else {"model": str(adapter_zip)})
+    summary["artifact_size"] = (merged_zip or adapter_zip).stat().st_size
     return summary
+
+
+def _merge_here(model_box: list, tok, cfg: dict, ctx: Any, summary: dict,
+                adapter_dir: Path, base_model: str, dtype_name: str,
+                use_4bit: bool, torch) -> Path | None:
+    """Fold this run's adapter into its base and pack the result. Or don't.
+
+    Both artifacts are kept, and each answers a different question. The adapter
+    is a few megabytes, is what the studio prefers to carry on training from,
+    and is what says "this is a fine-tune of *that*" on the Hub. The merged
+    model is the size of the base and loads with `from_pretrained` alone, which
+    is what anybody outside this studio needs.
+
+    Never fatal. The adapter is already saved and packed by the time this runs,
+    so a merge that will not fit or will not load costs a warning and a
+    `merged: False`, not the run.
+    """
+    summary["merged"] = False
+    if not cfg.get("merge_after", True):
+        ctx.log("Not merging: this run was asked for the adapter only. It can "
+                "still be served here, and needs %s to run anywhere else."
+                % (cfg.get("base_model_label") or base_model))
+        return None
+
+    model_dir = Path(ctx.workdir) / "model"
+    label = cfg.get("base_model_label") or cfg.get("base_model") or base_model
+    try:
+        # Whether the arithmetic fits in system memory, worked out before
+        # anything is moved: on Linux, asking for more than there is does not
+        # raise, it gets the process killed. See merge.memory_plan.
+        plan = merge.memory_plan(cfg.get("params_b"), dtype_name)
+        if plan.get("note"):
+            ctx.log(plan["note"], plan.get("level", "info"))
+        target = torch.float32 if plan["float32"] else \
+            {"float16": torch.float16, "bfloat16": torch.bfloat16,
+             "float32": torch.float32}.get(dtype_name, torch.float16)
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                 "float32": torch.float32}.get(dtype_name, torch.float16)
+
+        ctx.log("Merging the adapter into %s, so this run also produces a "
+                "model that loads on its own." % label)
+        if use_4bit:
+            # A 4-bit base cannot be merged into: the weights the adapter was
+            # fitted against have already lost the precision it was fitted to.
+            # Free the training copy, then re-read the base at full precision
+            # -- from the local Hugging Face cache, which this run just filled.
+            info = _merge_by_reload(model_box, ctx, adapter_dir, base_model,
+                                    dtype_name, model_dir, label, cfg, torch)
+        else:
+            # The fast path, and the reason this is part of the run: the
+            # weights are already here. Moved to the processor first, because
+            # holding the merged copy beside the training copy on the card is
+            # how a run that fitted ends in an out-of-memory error at the very
+            # last step -- and because the addition is done in float32 where
+            # there is room for it, small adapter deltas rounding to nothing
+            # being the classic quietly-useless merge.
+            merged = model_box[0].to("cpu", dtype=target).merge_and_unload()
+            model_box.clear()
+            merged = merged.to(dtype)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            merged.config.use_cache = True
+            merged.save_pretrained(str(model_dir), safe_serialization=True)
+            merge.save_tokenizer(tok, model_dir, ctx, "the fine-tune")
+            info = {"params_total": sum(p.numel() for p in merged.parameters()),
+                    "dtype": dtype_name, "base_model": label}
+            del merged
+    except Exception as e:  # noqa: BLE001 - the adapter is safe either way
+        ctx.log("The merged copy could not be made (%s: %s), so this run keeps "
+                "the adapter alone. It still serves here, and it can be merged "
+                "on a larger machine later." % (type(e).__name__, e), "warn")
+        return None
+
+    # The merged directory describes the run that made it -- a fine-tune, of
+    # that base, in that chat format -- and not a merge of unknown parentage.
+    # It is what the serving side reads back out of the cache.
+    merged_summary = {**{k: v for k, v in summary.items()
+                         if k not in ("artifact_paths", "artifact_size")},
+                      "merged": True,
+                      "params_total": info.get("params_total"),
+                      "base_model": summary.get("base_model")}
+    (model_dir / "ai_studio_summary.json").write_text(
+        json.dumps(merged_summary, indent=2))
+    merge.write_readme(model_dir, {**merged_summary, "base_model": label})
+
+    archive = artifacts.pack(model_dir, Path(ctx.workdir) / "model.zip")
+    summary["merged"] = True
+    summary["params_total"] = info.get("params_total")
+    ctx.log("Done. The merged model is %.1f GB and loads with "
+            "from_pretrained; the adapter is kept beside it at %.0f MB."
+            % (archive.stat().st_size / 1024 ** 3,
+               (Path(ctx.workdir) / "adapter.zip").stat().st_size / 1048576))
+    return archive
+
+
+def _merge_by_reload(model_box: list, ctx: Any, adapter_dir: Path,
+                     base_model: str, dtype_name: str, model_dir: Path,
+                     label: str, cfg: dict, torch) -> dict:
+    """Give the card back, then merge from disk. The 4-bit path."""
+    import gc
+
+    model_box.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    ctx.log("This run trained against a 4-bit copy of the base, which cannot "
+            "be merged into. Reading the base again at full precision -- from "
+            "this machine's cache, not over the network.")
+    return merge.merge_into(adapter_dir, base_model, dtype_name, ctx,
+                            model_dir, label=label,
+                            params_b=cfg.get("params_b"))
 
 
 def _resume_state(resume: dict, ctx: Any, opt, scaler, use_scaler: bool,

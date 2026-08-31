@@ -841,6 +841,181 @@ def stop_sequences(fmt: dict | None, specials: dict | None = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Where a reply may not be shown mid-way through
+# ---------------------------------------------------------------------------
+#
+# A chat template's boundaries are only invisible when the tokenizer reserved
+# them: those never reach the text at all. Everything else -- `[INST]`, `###
+# Response:`, `<|im_start|>` on a model that never registered it, whatever a
+# community template invented -- arrives one character at a time, and until the
+# last character lands it is indistinguishable from prose. Shown as it arrives,
+# the answer bubble flashes half a marker and takes it back.
+#
+# The markers are READ OFF THE TEMPLATE rather than matched by shape. A
+# template can be anything, so a pattern that knows what a marker looks like is
+# the same mistake in a new place: it is right about the four formats somebody
+# thought of and silently wrong about the fifth. Instead the template is
+# rendered with sentinels where the words go, and whatever comes back that is
+# not a sentinel is, by construction, exactly the literal text this template
+# emits around a reply.
+
+# Distinctive, alphanumeric, and unchanged by anything a template plausibly
+# does to a message body -- a sentinel with punctuation in it can come back
+# JSON-escaped or stripped, and then it is not found and the whole probe is
+# discarded as one long marker.
+_PROBE_RE = re.compile(r"AiStudioProbe\d+")
+
+
+def _probe(n: int) -> str:
+    return "AiStudioProbe%d" % n
+
+
+# What a marker may cost to hold. A literal can be as long as a default system
+# prompt, and holding two hundred characters of a reply because it happens to
+# begin the way that prompt does is worse than the leak. Sixty-four is longer
+# than any real boundary and short enough that a false hold is over in a token.
+_MARKER_CAP = 64
+
+_LITERAL_CACHE: dict[str, list[str]] = {}
+
+
+def _probe_conversations() -> list[dict]:
+    """Conversations that make a template show every boundary it has.
+
+    Deliberately several, because a template only emits its reasoning markers
+    when a turn carries reasoning and its tool markers when there is a call to
+    render. A format with no such markers simply produces nothing extra.
+    """
+    return [
+        {"messages": [{"role": "system", "content": _probe(0)},
+                      {"role": "user", "content": _probe(1)},
+                      {"role": "assistant", "content": _probe(2)},
+                      {"role": "user", "content": _probe(3)}]},
+        {"messages": [{"role": "user", "content": _probe(4)}]},
+        {"messages": [{"role": "user", "content": _probe(5)},
+                      {"role": "assistant", "content": _probe(6),
+                       "reasoning": _probe(7)},
+                      {"role": "user", "content": _probe(8)}],
+         "reasoning": True},
+        {"messages": [{"role": "user", "content": _probe(9)},
+                      {"role": "assistant", "content": "",
+                       "tool_calls": [{"name": _probe(10),
+                                       "arguments": {"query": _probe(11)}}]},
+                      {"role": "tool", "name": _probe(10),
+                       "content": _probe(12)},
+                      {"role": "assistant", "content": _probe(13)},
+                      {"role": "user", "content": _probe(14)}]},
+    ]
+    # No tool *schema* on that last one, deliberately. Declaring one makes the
+    # template write its instructions for calling tools into the system turn --
+    # several sentences of ordinary English that are not boundaries and would
+    # be held back whenever a reply happened to start the same way. What is
+    # wanted is the syntax of a call, and rendering the call gives that.
+
+
+def _template_literals(fmt: dict) -> list[str]:
+    """Every run of literal text this format writes around what is said.
+
+    Rendered through `render_prompt`, which is the function that builds the
+    real prompt -- so these are the boundaries of the template actually in use,
+    including the model's own when it carries one, and not of a format somebody
+    assumed it was.
+    """
+    out: list[str] = []
+    for probe in _probe_conversations():
+        try:
+            text = render_prompt(probe["messages"], fmt,
+                                 tools=probe.get("tools"),
+                                 reasoning=bool(probe.get("reasoning")))
+        except Exception:  # noqa: BLE001
+            # Templates refuse things all the time -- a system role they do not
+            # have, a tool message they were never written for. The other
+            # probes still describe the format, and a marker inventory is never
+            # worth failing a reply over.
+            continue
+        for piece in _PROBE_RE.split(text or ""):
+            if not piece.strip():
+                continue
+            out.append(piece[:_MARKER_CAP])
+            # A model that wrongly starts the next turn usually starts it at a
+            # line of its own, and the literal it came from may be several
+            # lines long -- `<|im_end|>\n<|im_start|>user\n` holds a boundary
+            # that can also appear on its own. Cutting at newlines is
+            # structural rather than a guess about syntax.
+            for line in piece.split("\n")[1:]:
+                if line.strip():
+                    out.append(line[:_MARKER_CAP])
+    return out
+
+
+def boundary_markers(fmt: dict | None = None, specials: dict | None = None,
+                     added: list[str] | None = None) -> list[str]:
+    """Strings a reply must not be shown part-way through.
+
+    Three exact sources, unioned: the literal text this template renders around
+    a message, the tokenizer's own reserved strings, and where the reply is
+    meant to stop. Nothing is guessed at, and holding back more than necessary
+    costs a token of latency while showing too little costs correctness.
+    """
+    fmt = resolve_format(fmt or {})
+    if specials:
+        fmt = {**fmt, "specials": {**(fmt.get("specials") or {}), **specials}}
+
+    key = json.dumps({"t": fmt.get("chat_template"), "m": fmt.get("mode"),
+                      "j": fmt.get("template"), "f": fmt.get("chat_format"),
+                      "s": fmt.get("specials"), "r": fmt.get("reasoning")},
+                     sort_keys=True, default=str)
+    literals = _LITERAL_CACHE.get(key)
+    if literals is None:
+        if len(_LITERAL_CACHE) > 32:
+            _LITERAL_CACHE.clear()
+        literals = _LITERAL_CACHE[key] = _template_literals(fmt)
+
+    out = list(literals)
+    out += [t for t in (added or []) if isinstance(t, str)]
+    out += stop_sequences(fmt, fmt.get("specials"))
+    # A newline is not a boundary. Kept as one, every line break in a reply
+    # would be held back until the next character arrived.
+    return list(dict.fromkeys(
+        m[:_MARKER_CAP] for m in out if m and m.strip() and len(m) > 1))
+
+
+_PREFIX_CACHE: dict[tuple[str, ...], frozenset[str]] = {}
+
+
+def _prefixes(markers: tuple[str, ...]) -> frozenset[str]:
+    got = _PREFIX_CACHE.get(markers)
+    if got is None:
+        if len(_PREFIX_CACHE) > 8:
+            _PREFIX_CACHE.clear()
+        got = _PREFIX_CACHE[markers] = frozenset(
+            m[:n] for m in markers for n in range(1, len(m)))
+    return got
+
+
+def held(text: str, markers: list[str] | tuple[str, ...]) -> int:
+    """How many characters at the end of `text` may still become a marker.
+
+    The longest suffix that is a *proper* prefix of some boundary -- so a tail
+    that cannot begin one is released immediately, and only a tail that really
+    is the start of `<|im_start|>` or `[INST` or `### Res` waits for the next
+    token to settle it. A complete marker is not held: recognising one is the
+    caller's job and it has already run by the time this is asked.
+    """
+    if not text or not markers:
+        return 0
+    keys = tuple(markers)
+    prefixes = _prefixes(keys)
+    if not prefixes:
+        return 0
+    longest = max(len(m) for m in keys)
+    for n in range(min(longest - 1, len(text)), 0, -1):
+        if text[-n:] in prefixes:
+            return n
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Named message formats
 # ---------------------------------------------------------------------------
 

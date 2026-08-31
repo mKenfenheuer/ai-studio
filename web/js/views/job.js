@@ -1,6 +1,6 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast,
-         skeletonValue, inlineRename } from "../util.js";
+import { html, raw, esc, $, on, fmtNum, fmtDuration, fmtAgo, statusBadge,
+         toast, skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
@@ -207,7 +207,7 @@ export async function jobView(mount, [jobId]) {
   let datasets = [];
   const paintFurther = () => {
     const box = $("#furtherRow", mount);
-    if (box) box.innerHTML = mergeCard(job) + furtherCard(job, datasets);
+    if (box) box.innerHTML = artifactsCard(job) + furtherCard(job, datasets);
   };
   paintFurther();
   if (job.artifacts?.length) {
@@ -223,25 +223,6 @@ export async function jobView(mount, [jobId]) {
       job = await api.job(jobId);
       stats();
     } catch (e) { toast(e.message, "err"); t.disabled = false; }
-  });
-
-  on(mount, "submit", "#mergeForm", async (e) => {
-    e.preventDefault();
-    const btn = $("#mergeGo", mount);
-    btn.disabled = true;
-    btn.textContent = "Queueing…";
-    try {
-      const { id } = await api.createJob({
-        kind: "merge_adapter",
-        config: { source_job: jobId, dtype: $("#mergeDtype", mount).value },
-      });
-      toast("Queued.", "ok");
-      location.hash = `#/jobs/${id}`;
-    } catch (ex) {
-      toast(ex.message, "err");
-      btn.disabled = false;
-      btn.textContent = "Merge into a standalone model";
-    }
   });
 
   on(mount, "submit", "#furtherForm", async (e) => {
@@ -1261,7 +1242,7 @@ function furtherJob(job, form) {
  *  the half most worth checking before publishing.
  *
  *  Editing is one-way on purpose. The generator rewrites this card whenever
- *  the run is evaluated or re-merged, which is right up until somebody has
+ *  the run is evaluated or published, which is right up until somebody has
  *  written something the generator could not know; from then on it is theirs
  *  and "reset" is the only way back.
  */
@@ -1304,38 +1285,34 @@ function modelCardPanel(card) {
     </details>`;
 }
 
-function mergeCard(job) {
+/** What this run left behind, when it left more than one thing.
+ *
+ *  This used to be a form that queued a merge as a second run. Merging is the
+ *  last step of the training run now -- it happens on the machine that still
+ *  has the weights in memory, instead of downloading the base again onto
+ *  whichever box was free -- so by the time this page is drawn the standalone
+ *  model either exists or could not be made, and there is nothing left to ask.
+ *  What remains worth saying is which of the two to reach for.
+ */
+function artifactsCard(job) {
   if (job.kind !== "finetune_llm" || !job.artifacts?.length) return "";
-  if (!["succeeded", "cancelled"].includes(job.status)) return "";
+  const kinds = new Set(job.artifacts.map((a) => a.kind));
+  if (!kinds.has("model") || !kinds.has("adapter")) return "";
   return html`
     <details class="card" style="margin-bottom:14px">
-      <summary><strong>Make a standalone model</strong>
-        <span class="muted tiny"> — one file set, no base model needed</span>
+      <summary><strong>This run kept two things</strong>
+        <span class="muted tiny"> — the adapter, and a standalone model</span>
       </summary>
       <p class="muted tiny" style="margin:10px 0 0">
-        This run produced an <em>adapter</em>: a few megabytes that mean
-        nothing without <code>${job.config.base_model || "its base model"}</code>.
-        Merging folds it in and writes a complete model that loads on its own —
-        which is what you need to run it in Ollama, llama.cpp, or anywhere
-        outside this studio.</p>
+        The <em>adapter</em> is a few megabytes and means nothing without
+        <code>${job.config.base_model || "its base model"}</code>. The
+        <em>merged model</em> is that adapter folded into the base: the size of
+        the base, and it loads on its own — which is what you need to run it in
+        Ollama, llama.cpp, or anywhere outside this studio.</p>
       <p class="muted tiny" style="margin:6px 0 0">
-        <strong>It will be the size of the base model</strong>, not of the
-        adapter. The adapter stays where it is and is still the better thing
-        to use inside the studio.</p>
-      <form id="mergeForm" style="margin-top:10px">
-        <div class="field">
-          <label for="mergeDtype">Precision</label>
-          <select id="mergeDtype" name="dtype">
-            <option value="float16">float16 — half the size, the usual choice</option>
-            <option value="bfloat16">bfloat16</option>
-            <option value="float32">float32 — exact, twice the size</option>
-          </select>
-          <div class="hint">The arithmetic is done in full precision either
-            way; this is only what gets written out.</div>
-        </div>
-        <button class="btn-primary btn-sm" type="submit" id="mergeGo">
-          Merge into a standalone model</button>
-      </form>
+        Inside the studio the adapter is still the better thing to use, and
+        it is what a further fine-tune of this run carries on training.
+        Publishing lets you send either, or both.</p>
     </details>`;
 }
 
@@ -1348,26 +1325,59 @@ function mergeCard(job) {
 // page that offered none of them.
 // ---------------------------------------------------------------------------
 
+/** Where this run has already been published.
+ *
+ *  Recorded when the upload finishes, not when it is queued, so what is listed
+ *  here is what is actually on the Hub. It is also what a fine-tune *of* this
+ *  run will name as its `base_model:`, which is the reason for keeping it at
+ *  all -- and the reason for showing it: somebody who cannot see it has no way
+ *  of knowing whether the lineage will come out right.
+ */
+function publishedCard(job) {
+  const rows = job.config?.published || [];
+  if (!rows.length) return "";
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3>On Hugging Face</h3>
+      <ul class="tiny" style="margin:8px 0 0;padding-left:18px">
+        ${raw(rows.map((p) => html`
+          <li><a href="${p.url || `https://huggingface.co/${p.repo_id}`}"
+                 target="_blank" rel="noopener" class="mono">${p.repo_id}</a>
+            <span class="muted"> — ${
+              p.artifact_kind === "adapter" ? "the adapter" : "the model"}${
+              p.at ? `, ${fmtAgo(p.at)}` : ""}</span></li>`).join(""))}
+      </ul>
+    </div>`;
+}
+
 /** Publish and share, painted into `#ownerRow`. Returns the repaint. */
 function wireOwnerRow(mount, jobId, getJob, onChange) {
   const paint = () => {
     const box = $("#ownerRow", mount);
     if (!box) return;
     const job = getJob();
-    box.innerHTML = job.artifacts?.length ? publishCard({
-      kind: "model", slug: repoSlug(job),
-      // What a fine-tune publishes is its merged model, not its adapter --
-      // said here because the run's own artifact is the adapter, and being
-      // told afterwards that something else went is worse than knowing.
-      blurb: job.kind === "finetune_llm"
-        ? `Uploads the merged model — this adapter folded into its base, so it
-           loads anywhere — and a model card, to your own account. If it has
-           not been merged yet, that happens first and the upload follows.`
-        : `Uploads the model and a model card to your own account.`,
-    }) : "";
+    // What this run actually kept, read off its artifact rows rather than
+    // guessed from its kind: a fine-tune normally holds both the merged model
+    // and the adapter, but a machine with too little memory to merge keeps
+    // only the adapter, and offering a choice it cannot honour is worse than
+    // offering none.
+    const targets = [...new Set((job.artifacts || []).map((a) => a.kind))];
+    box.innerHTML = publishedCard(job) + (job.artifacts?.length ? publishCard({
+      kind: "model", slug: repoSlug(job), targets,
+      blurb: targets.includes("model") && targets.includes("adapter")
+        ? `Uploads a model card and whichever of this run's two artifacts you
+           choose — the merged model, which loads anywhere on its own, or the
+           adapter, which is small and needs its base — to your own account.`
+        : targets.includes("adapter")
+          ? `Uploads the adapter and a model card to your own account. It names
+             the base model it was fitted to, so the Hub shows it as a
+             fine-tune of it.`
+          : `Uploads the model and a model card to your own account.`,
+    }) : "");
     wireShareBox(mount, "job", job, async () => { await onChange(); paint(); });
   };
-  wirePublish(mount, "model", (body) => api.publishJob(jobId, body));
+  wirePublish(mount, "model", (body) => api.publishJob(jobId, body),
+              () => api.publishInfo(jobId));
   return paint;
 }
 
@@ -1544,8 +1554,9 @@ function paintHeader(mount, job) {
   // Neither does a scoring run: what it leaves is rows against a prompt set.
   const scoring = job.kind === "evaluate";
   // "Run again with changes" opens the form the run was started from, and two
-  // kinds have no such form: a merge is started from the fine-tune it folds,
-  // and a scoring run from the prompt set it scores.
+  // kinds have no such form: a scoring run comes from the prompt set it
+  // scores, and a merge -- which can no longer be created at all, merging
+  // being part of training now -- came from the fine-tune it folded.
   const repeatable = !scoring && job.kind !== "merge_adapter";
   const usable = job.artifacts?.length && !writing
     && ["succeeded", "cancelled"].includes(job.status);

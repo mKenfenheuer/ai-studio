@@ -15,35 +15,249 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import httpx
 
 CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
+HF_CACHE_DIR = Path(
+    os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or (Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface"))) / "hub"))
+
+#: Written into a cached directory every time it is used, so eviction can pick
+#: the least recently *used* model rather than the least recently downloaded.
+USED_MARKER = ".ai_studio_used"
+
+GB = float(1 << 30)
 
 
-def cached_dir(job_id: str) -> Path:
-    return CACHE_DIR / job_id
+def _suffix(kind: str | None) -> str:
+    """A run can leave two artifacts, and they cache side by side.
+
+    The merged model is the primary one and keeps the bare job id, so
+    everything that cached a model before this existed still finds it.
+    """
+    return "" if kind in (None, "", "model") else "-" + kind
 
 
-def is_present(job_id: str) -> bool:
-    d = cached_dir(job_id)
+def cached_dir(job_id: str, kind: str | None = None) -> Path:
+    return CACHE_DIR / (job_id + _suffix(kind))
+
+
+def is_present(job_id: str, kind: str | None = None) -> bool:
+    d = cached_dir(job_id, kind)
     return (d / "config.json").exists() or (d / "adapter_config.json").exists()
 
 
+def touch(job_id: str, kind: str | None = None) -> None:
+    """Mark a cached model as used now. Never raises: this is bookkeeping."""
+    try:
+        (cached_dir(job_id, kind) / USED_MARKER).write_text(
+            str(int(time.time())), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def cached_ids() -> list[str]:
+    """Names of the models this machine has on disk, most recently used first.
+
+    Names, not ids: an adapter kept beside its merged model is `<id>-adapter`,
+    which is what a caller has to ask for to get it back.
+    """
+    try:
+        dirs = [d for d in CACHE_DIR.iterdir()
+                if d.is_dir() and not d.name.endswith(".partial")]
+    except OSError:
+        return []
+    dirs = [d for d in dirs
+            if (d / "config.json").exists() or (d / "adapter_config.json").exists()]
+    return [d.name for d in sorted(dirs, key=_used_at, reverse=True)]
+
+
+def _used_at(d: Path) -> float:
+    for candidate in (d / USED_MARKER, d):
+        try:
+            return candidate.stat().st_mtime
+        except OSError:
+            continue
+    return 0.0
+
+
+def _dir_bytes(root: Path) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+        for name in filenames:
+            try:
+                total += os.stat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def min_free_bytes() -> int:
+    """How much room to leave for the next model and the next dataset.
+
+    A cache that fills the volume is worse than no cache: the fetch that fails
+    leaves a `.partial`, the model looks absent, and the next request downloads
+    it again into the same wall. The default is a fifth of a large model or a
+    tenth of the volume, whichever is more.
+    """
+    override = os.environ.get("AI_STUDIO_MIN_FREE_GB")
+    if override:
+        try:
+            return int(float(override) * GB)
+        except ValueError:
+            pass
+    try:
+        total = shutil.disk_usage(_usable_cache_dir()).total
+    except OSError:
+        total = 0
+    return max(int(20 * GB), int(total * 0.10))
+
+
+def _usable_cache_dir() -> Path:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return CACHE_DIR
+    except OSError:
+        return Path("/")
+
+
+_usage_cache: tuple[float, dict] = (0.0, {})
+
+
+def usage(max_age_s: float = 60.0) -> dict:
+    """Free space and what the two caches are using, in GB.
+
+    Walking the caches costs a few thousand stat calls, and the heartbeat asks
+    every fifteen seconds, so the answer is remembered for a minute.
+    """
+    global _usage_cache
+    now = time.time()
+    if now - _usage_cache[0] < max_age_s and _usage_cache[1]:
+        return _usage_cache[1]
+    root = _usable_cache_dir()
+    try:
+        du = shutil.disk_usage(root)
+        free_gb, total_gb = du.free / GB, du.total / GB
+    except OSError:
+        free_gb = total_gb = 0.0
+    out = {
+        "free_gb": round(free_gb, 1),
+        "total_gb": round(total_gb, 1),
+        "models_gb": round(_dir_bytes(CACHE_DIR) / GB, 1),
+        "hf_gb": round(_dir_bytes(HF_CACHE_DIR) / GB, 1),
+    }
+    _usage_cache = (now, out)
+    return out
+
+
+def _protected(keep: Iterable[str]) -> set[str]:
+    names = set()
+    for job_id in keep or ():
+        names.add(job_id)
+        names.add(job_id + "-adapter")
+    return names
+
+
+def _shortfall(need_bytes: int) -> int:
+    try:
+        free = shutil.disk_usage(_usable_cache_dir()).free
+    except OSError:
+        return 0
+    return int(need_bytes) + min_free_bytes() - free
+
+
+def _oldest_model(protected: set[str]) -> Path | None:
+    try:
+        candidates = [d for d in CACHE_DIR.iterdir()
+                      if d.is_dir() and d.name not in protected]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    # Leftovers from an interrupted download are worth nothing: go first.
+    partials = [d for d in candidates if d.name.endswith(".partial")]
+    return min(partials or candidates, key=_used_at)
+
+
+def _evict_hf(log: Callable[[str], None]) -> bool:
+    """Drop the least recently used revision from the Hugging Face cache.
+
+    Second in line after our own cache, because a base model here was pulled
+    from the network once and may be shared by several of our models, whereas
+    a studio artifact can always be fetched back from the controller.
+
+    Wrapped whole: a `huggingface_hub` too old for `scan_cache_dir`, or a cache
+    mid-write, must slow a fetch down rather than fail it.
+    """
+    try:
+        if not HF_CACHE_DIR.exists():
+            return False
+        if os.stat(HF_CACHE_DIR).st_dev != os.stat(_usable_cache_dir()).st_dev:
+            return False  # a different volume; deleting there frees nothing here
+        from huggingface_hub import scan_cache_dir
+
+        info = scan_cache_dir(HF_CACHE_DIR)
+        revisions = [(rev, repo) for repo in info.repos for rev in repo.revisions]
+        if not revisions:
+            return False
+        rev, repo = min(revisions, key=lambda pair: pair[0].last_modified or 0)
+        freed = rev.size_on_disk / GB
+        info.delete_revisions(rev.commit_hash).execute()
+        log("Cache full: dropped %s from the Hugging Face cache (%.1f GB)."
+            % (repo.repo_id, freed))
+        return True
+    except Exception:
+        return False
+
+
+def ensure_room(need_bytes: int, keep: Iterable[str] = (),
+                log: Callable[[str], None] = lambda _s: None) -> bool:
+    """Free space until `need_bytes` fits above the watermark. True if it does.
+
+    Evicts our own cache first, least recently used, then the Hugging Face
+    cache. Models named in `keep` -- loaded on the card, or being fetched right
+    now -- are never candidates. Returning False rather than raising is
+    deliberate: the fetch is still worth attempting, and the disk's own error
+    is a better one than a guess made in advance.
+    """
+    protected = _protected(keep)
+    while _shortfall(need_bytes) > 0:
+        victim = _oldest_model(protected)
+        if victim is not None:
+            freed = _dir_bytes(victim) / GB
+            shutil.rmtree(victim, ignore_errors=True)
+            log("Cache full: evicted %s (%.1f GB)." % (victim.name, freed))
+            continue
+        if _evict_hf(log):
+            continue
+        log("Cache full and nothing left to evict; the download may fail.")
+        return False
+    return True
+
+
 def fetch(controller_url: str, token: str, job_id: str,
-          log: Callable[[str], None] = lambda _s: None) -> Path:
+          log: Callable[[str], None] = lambda _s: None,
+          kind: str | None = None,
+          keep: Iterable[str] = ()) -> Path:
     """This run's result as a directory on local disk, downloading if needed.
 
     Unpacked into a staging directory and moved into place, so an interrupted
     download cannot leave a half-extracted model that `is_present` then
     reports as ready -- the failure that would produce is a missing-weights
     error hours later, blamed on the model rather than on the download.
+
+    `kind="adapter"` asks for the LoRA a fine-tune kept beside its merged
+    model. `keep` names models that must survive the eviction this may need.
     """
-    dest = cached_dir(job_id)
-    if is_present(job_id):
+    dest = cached_dir(job_id, kind)
+    if is_present(job_id, kind):
+        touch(job_id, kind)
         return dest
 
     log("Fetching the trained model from the studio...")
@@ -53,8 +267,10 @@ def fetch(controller_url: str, token: str, job_id: str,
     zip_path = staging / "artifact.zip"
 
     url = "%s/api/jobs/%s/download" % (controller_url.rstrip("/"), job_id)
+    params = {"kind": kind} if _suffix(kind) else None
     size = 0
-    with httpx.stream("GET", url, timeout=1800, follow_redirects=True,
+    with httpx.stream("GET", url, params=params, timeout=1800,
+                      follow_redirects=True,
                       headers={"X-Runner-Token": token}) as r:
         if r.status_code in (401, 403):
             raise ValueError(
@@ -66,6 +282,10 @@ def fetch(controller_url: str, token: str, job_id: str,
                 "That run has no saved model on the controller any more. It "
                 "may have been deleted.")
         r.raise_for_status()
+        # The zip and the unpacked copy live side by side in staging until the
+        # extract finishes, so room is made for both.
+        declared = int(r.headers.get("Content-Length") or 0)
+        ensure_room(declared * 2, list(keep) + [job_id], log)
         with open(zip_path, "wb") as fh:
             for chunk in r.iter_bytes(1 << 20):
                 fh.write(chunk)
@@ -78,6 +298,7 @@ def fetch(controller_url: str, token: str, job_id: str,
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging.rename(dest)
+    touch(job_id, kind)
     log("Got %.0f MB." % (size / 1048576))
     return dest
 
@@ -108,19 +329,20 @@ def pack(root_dir: Path | str, dest: Path | str) -> Path:
     return dest
 
 
-def summary(job_id: str) -> dict:
+def summary(job_id: str, kind: str | None = None) -> dict:
     """What the run that produced this recorded about itself, if anything."""
     try:
-        return json.loads(
-            (cached_dir(job_id) / "ai_studio_summary.json").read_text(encoding="utf-8"))
+        return json.loads((cached_dir(job_id, kind) / "ai_studio_summary.json")
+                          .read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def clear(job_id: str | None = None) -> None:
+    """Forget a run's cached artifacts -- both of them -- or the lot."""
     if job_id:
-        shutil.rmtree(cached_dir(job_id), ignore_errors=True)
-        shutil.rmtree(cached_dir(job_id).with_name(job_id + ".partial"),
-                      ignore_errors=True)
+        for name in (job_id, job_id + "-adapter"):
+            shutil.rmtree(CACHE_DIR / name, ignore_errors=True)
+            shutil.rmtree(CACHE_DIR / (name + ".partial"), ignore_errors=True)
     else:
         shutil.rmtree(CACHE_DIR, ignore_errors=True)

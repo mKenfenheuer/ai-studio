@@ -104,6 +104,8 @@ export const api = {
   publishJob:  (id, body) =>
     req(`/api/jobs/${encodeURIComponent(id)}/publish`,
         { method: "POST", body: JSON.stringify(body) }),
+  publishInfo: (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/publish-info`),
 
   // ---- hosted model providers -------------------------------------------
   providers:      () => req("/api/providers"),
