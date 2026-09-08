@@ -129,6 +129,11 @@ export async function evalView(mount, [evalId]) {
           max_new_tokens: +$("#evMaxTokens", mount).value || 200,
           temperature: +$("#evTemp", mount).value || 0,
           system_prompt: $("#evSystem", mount).value || "",
+          judge: $("#evJudge", mount)?.value ? {
+            provider: $("#evJudge", mount).value,
+            model: $("#evJudgeModel", mount)?.value || "",
+            rubric: $("#evRubric", mount)?.value || "",
+          } : null,
         });
         toast("Scoring queued.", "ok");
         location.hash = `#/jobs/${id}`;
@@ -319,6 +324,27 @@ function runPanel(ev, candidates, state) {
             all of them, which is a fair test of a specific instruction and a
             different measurement from the one above.</div>
         </div>
+        ${raw((hosted.connected || []).length ? html`
+          <div class="field">
+            <label for="evJudge">A judge <span class="muted tiny">(optional)</span></label>
+            <div class="row" style="gap:8px">
+              <select id="evJudge">
+                <option value="">none — measured numbers only</option>
+                ${raw((hosted.connected || []).map((c) => html`
+                  <option value="${c.provider}">${((hosted.providers || []).find((p) => p.id === c.provider) || {}).label || c.provider}</option>`).join(""))}
+              </select>
+              <input id="evJudgeModel" type="text" class="mono" style="flex:1"
+                     value="${esc((hosted.connected || [])[0]?.model || "")}"
+                     placeholder="which model judges">
+            </div>
+            <textarea id="evRubric" rows="2" style="margin-top:6px"
+              placeholder="What a good answer looks like — optional. The judge grades one to five."></textarea>
+            <div class="hint">A hosted model reads each answer and gives it a
+              grade. Use it where nothing else can measure — free text with no
+              single right answer. The grade is that judge's opinion: shown
+              beside the measured numbers, never instead of them, and the
+              judge's name is recorded with every score.</div>
+          </div>` : "")}
         <div class="row" style="gap:10px">
           <div class="field" style="flex:1">
             <label for="evMaxTokens">Longest answer</label>
@@ -570,6 +596,7 @@ const MEASURES = {
           fmt: (v) => (v * 100).toFixed(0) + "%" },
   f1: { label: "Token overlap", lower: false,
         fmt: (v) => (v * 100).toFixed(0) + "%" },
+  judge_score: { label: "Judge's score", lower: false, fmt: (v) => v.toFixed(2) + "/5" },
 };
 
 /** A published benchmark's results: one number, and how wide it is. */
@@ -693,6 +720,9 @@ function scoreTable(scores, answered, total) {
   const decisive = total >= ENOUGH_PROMPTS && latest.ranking_decisive !== false;
   const verdict = latest.verdict;
   const anyJson = scores.some((s) => s.metrics.json_valid != null);
+  const anyJudge = scores.some((s) => s.metrics.judge_score != null);
+  const anySchema = scores.some((s) => s.metrics.schema_valid != null);
+  const anyTool = scores.some((s) => s.metrics.tool_name_ok != null);
 
   return html`
     <div class="card" style="margin-bottom:14px;padding:0">
@@ -711,6 +741,9 @@ function scoreTable(scores, answered, total) {
           <th class="hide-sm" title="Token overlap with the expected answer">Overlap</th>
           <th class="hide-sm">Exact</th>
           ${raw(anyJson ? `<th class="hide-sm" title="Answers that parsed as JSON, and answers that parsed to the expected value">JSON</th>` : "")}
+          ${raw(anySchema ? `<th class="hide-sm" title="Answers that fit the shape the prompt asked for">Schema</th>` : "")}
+          ${raw(anyTool ? `<th class="hide-sm" title="Called the tool the prompt expected; and with the expected arguments">Tool</th>` : "")}
+          ${raw(anyJudge ? `<th title="A hosted model's grade, one to five. Its opinion, not a measurement.">Judge</th>` : "")}
           <th class="hide-sm">Speed</th>
           <th>When</th><th></th>
         </tr></thead>
@@ -756,6 +789,15 @@ function scoreTable(scores, answered, total) {
                     ? `${(m.json_valid * 100).toFixed(0)}% valid`
                     : "—"}${raw(m.json_match != null
                       ? `<div class="muted">${(m.json_match * 100).toFixed(0)}% right</div>` : "")}</td>` : "")}
+                ${raw(anySchema ? html`
+                  <td class="hide-sm tiny">${m.schema_valid != null ? `${(m.schema_valid * 100).toFixed(0)}%` : "—"}</td>` : "")}
+                ${raw(anyTool ? html`
+                  <td class="hide-sm tiny">${m.tool_name_ok != null ? `${(m.tool_name_ok * 100).toFixed(0)}% right tool` : "—"}${raw(
+                    m.tool_args_ok != null ? `<div class="muted">${(m.tool_args_ok * 100).toFixed(0)}% right arguments</div>` : "")}</td>` : "")}
+                ${raw(anyJudge ? html`
+                  <td>${m.judge_score != null ? html`<strong>${m.judge_score.toFixed(2)}</strong><span class="muted tiny"> /5</span>${raw(
+                    key === "judge_score" ? `<div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>` : "")}${raw(
+                    s.settings?.judge ? `<div class="muted tiny">${esc(s.settings.judge)}</div>` : "")}` : `<span class="muted">—</span>`}</td>` : "")}
                 <td class="hide-sm tiny muted">${m.tokens_per_sec
                   ? m.tokens_per_sec.toFixed(0) + " tok/s" : "—"}
                   ${raw(m.seconds ? `<div>${esc(fmtDuration(m.seconds))}</div>` : "")}</td>
@@ -858,6 +900,13 @@ function scoreDetail(score) {
                   : i.contains ? ` <span class="badge">contains</span>` : "")}
                 ${raw(i.json_valid === false
                   ? ` <span class="badge badge-warn">not JSON</span>` : "")}
+                ${raw(i.schema_valid === false
+                  ? ` <span class="badge badge-warn" title="${esc(i.schema_error || "")}">off-schema</span>`
+                  : i.schema_valid ? ` <span class="badge badge-ok">fits</span>` : "")}
+                ${raw(i.tool_name_ok === true ? ` <span class="badge badge-ok">right tool${i.tool_args_ok === false ? ", wrong arguments" : ""}</span>`
+                  : i.tool_name_ok === false ? ` <span class="badge badge-warn">${i.tool_called ? "wrong tool" : "no call"}</span>` : "")}
+                ${raw(i.judge_score != null
+                  ? ` <span class="badge" title="${esc(i.judge_reason || "")}">judge ${i.judge_score}/5</span>` : "")}
               </td>
             </tr>`).join(""))}
         </tbody>

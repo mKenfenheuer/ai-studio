@@ -540,10 +540,17 @@ and two more measures:
   its verifier library; TruthfulQA MC2 is a third scoring protocol.
 
 Remaining in this phase:
-- **Metrics**: schema conformance beyond "it parses"; tool-call correctness
-  (name, arguments); LLM-as-judge using the hosted providers that already
-  exist in `common/apimodels.py`; pass@k with `n>1` sampling for code sets
-  (sandboxed on a CPU runner).
+- **Metrics.** *Done:* schema conformance (a small validator -- types,
+  required keys, enums, nested objects and arrays, no extra keys -- with the
+  first failure named per row); tool-call correctness, the right *function*
+  and the right *arguments* kept apart because they need different fixes,
+  with the set's tools declared to every model scored; and a judge -- a
+  hosted model grading one to five against an optional rubric, reported
+  beside the measured numbers and never instead of them, with the judge's
+  name recorded on every score and the reason kept per row. A prompt can
+  carry `schema` and `expected_tool`; the editor takes them as JSON lines.
+  *Still to do:* pass@k with `n>1` sampling for code sets, which needs the
+  same sandbox the code benchmarks need.
 - **Regression view.** *Done:* an "Over time" tab on a prompt set draws every
   scoring in the order it happened with the best-so-far beside it, names the
   champion, and offers to serve it under a registered name -- which is the

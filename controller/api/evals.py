@@ -14,6 +14,8 @@ each measure is worth.
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from common import apimodels, conversation, formatting
@@ -57,9 +59,26 @@ def _clean_items(raw: object) -> list[dict]:
         prompt = str(entry.get("prompt") or "").strip()
         if not prompt:
             continue
-        out.append({"prompt": prompt,
-                    "expected": str(entry.get("expected") or "").strip(),
-                    "note": str(entry.get("note") or "").strip()})
+        item = {"prompt": prompt,
+                "expected": str(entry.get("expected") or "").strip(),
+                "note": str(entry.get("note") or "").strip()}
+        # What else a prompt may ask to be scored on: the shape the answer
+        # must have, and the tool it should call. Kept only when given, so an
+        # ordinary set does not grow two empty fields per row.
+        for key in ("schema", "expected_tool"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    if key == "schema":
+                        raise HTTPException(
+                            400, "The schema on \"%s\" is not valid JSON."
+                                 % prompt[:60]) from None
+                    value = {"name": value.strip()}
+            if isinstance(value, dict) and value:
+                item[key] = value
+        out.append(item)
     if not out:
         raise HTTPException(400, "There are no prompts in this set.")
     if len(out) > MAX_ITEMS:
@@ -93,8 +112,33 @@ async def create_eval(request: Request, payload: dict = Body(...)) -> dict:
     if not name:
         raise HTTPException(400, "Give this prompt set a name.")
     items = _clean_items(payload.get("items") or [])
-    eid = db.create_eval(user["id"], name, items, payload.get("notes") or "")
+    # Tools the prompts may call, declared once for the set. Stored with the
+    # set rather than per prompt: a tool-calling model is scored on whether
+    # it picks the right one from the same list every time.
+    source = None
+    if tools := _clean_tools(payload.get("tools")):
+        source = {"tools": tools}
+    eid = db.create_eval(user["id"], name, items, payload.get("notes") or "", source)
     return _decorate(db.get_eval(eid), user)
+
+
+def _clean_tools(raw: object) -> list[dict]:
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise HTTPException(400, "The tools are not valid JSON.") from None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for t in raw:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if "function" in t else t
+        if isinstance(fn, dict) and fn.get("name"):
+            out.append({"name": fn["name"], "description": fn.get("description") or "",
+                        "parameters": fn.get("parameters") or {}})
+    return out[:40]
 
 
 @router.post("/evals/from-dataset")
@@ -405,11 +449,35 @@ async def run_eval(request: Request, eval_id: str,
         for m in models:
             m["system_prompt"] = override
 
+    # A judge: a hosted model grading every answer one to five. Resolved to a
+    # usable connection here, like a hosted baseline, and stripped from every
+    # response that hands the job back to a browser.
+    judge = None
+    if isinstance(payload.get("judge"), dict) and payload["judge"].get("provider"):
+        j = payload["judge"]
+        conn = providers.connection(user, j.get("provider"))
+        if not conn:
+            raise HTTPException(400, "The judge's provider is not connected to "
+                                     "your account.")
+        if problem := apimodels.problems(conn):
+            raise HTTPException(400, problem)
+        model = apimodels.model_name(conn, j.get("model"))
+        if not model:
+            raise HTTPException(400, "Which model at %s should judge?"
+                                % apimodels.describe(conn))
+        judge = {"connection": conn, "model": model,
+                 "label": "%s · %s" % (apimodels.describe(conn), model),
+                 "rubric": (j.get("rubric") or "")[:2000]}
+
     cfg = {
         "eval_id": eval_id,
         "eval_name": row["name"],
         "items": row["items"],
         "models": models,
+        "judge": judge,
+        # Tools the set declares, for scoring tool calls. Stored on the set
+        # as JSON text; sent to the runner parsed.
+        "tools": (row.get("source") or {}).get("tools") or None,
         "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
         "temperature": float(payload.get("temperature") or 0.0),
         "system_prompt": override,
@@ -512,6 +580,9 @@ def record_scores(job: dict, summary: dict) -> int:
                 "system_prompt": score.get("system_prompt") or "",
                 "system_prompt_override": bool(cfg.get("system_prompt_override")),
                 "source": score.get("source") or "run",
+                # Which judge, when there was one: a score from a judge is a
+                # score from that judge.
+                "judge": (cfg.get("judge") or {}).get("label"),
                 "runner": (runner or {}).get("name") or job.get("runner_id"),
             })
         written += 1

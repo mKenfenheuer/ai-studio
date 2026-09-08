@@ -324,6 +324,8 @@ def _hide_credentials(job: dict) -> None:
             m.pop("connection", None)
             if isinstance(m.get("spec"), dict):
                 m["spec"].pop("hf_token", None)
+    if isinstance(job["config"].get("judge"), dict):
+        job["config"]["judge"].pop("connection", None)
 
 
 def _job_or_404(request: Request, job_id: str, need: str = "view") -> dict:

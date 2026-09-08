@@ -129,7 +129,10 @@ export async function evalsView(mount) {
     const dlg = modal({ title: "New prompt set", width: 620, body: html`
       <p class="muted tiny">One prompt per line. Add the answer you would call
         correct after <code>=&gt;</code> — without it there is nothing to score
-        against, only text to read.</p>
+        against, only text to read. A line that is a JSON object can say more:
+        <code>{"prompt": …, "schema": {…}}</code> scores the answer against a
+        shape, <code>{"prompt": …, "expected_tool": {"name": …, "arguments": {…}}}</code>
+        against a call.</p>
       <form id="newEvalForm">
         <div class="field">
           <label for="evName">Name</label>
@@ -321,6 +324,19 @@ function parsePrompts(text) {
   for (const line of String(text).split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    // A line that is a JSON object is a prompt with more on it: the shape
+    // the answer must fit (`schema`), the tool it should call
+    // (`expected_tool`), and the expected answer beside them.
+    if (trimmed.startsWith("{")) {
+      try {
+        const o = JSON.parse(trimmed);
+        if (o && typeof o === "object" && o.prompt) {
+          items.push(o);
+          if (o.expected) withAnswers++;
+          continue;
+        }
+      } catch { /* not JSON after all: a prompt that happens to start with a brace */ }
+    }
     const at = trimmed.indexOf("=>");
     if (at > 0) {
       const expected = trimmed.slice(at + 2).trim();

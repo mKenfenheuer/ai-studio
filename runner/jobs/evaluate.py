@@ -188,6 +188,185 @@ def _json_check(answer: str, expected: str) -> dict | None:
     return {"json_valid": True, "json_match": got == want}
 
 
+def _tool_call_check(out: dict, item: dict) -> dict | None:
+    """Did the model call the tool the prompt set said it should?
+
+    Only asked when the item names an expected call. Two facts, kept apart:
+    the right *function* was called, and its *arguments* match -- as JSON,
+    not as text, so `{"a": 1, "b": 2}` and `{"b":2,"a":1}` are the same call.
+    A model that calls the right function with the wrong arguments needs a
+    different fix from one that never calls anything.
+    """
+    want = item.get("expected_tool")
+    if not want:
+        return None
+    if isinstance(want, str):
+        try:
+            want = json.loads(want)
+        except ValueError:
+            want = {"name": want}
+    if not isinstance(want, dict) or not want.get("name"):
+        return None
+    calls = out.get("tool_calls") or []
+    names = [((c.get("function") or {}).get("name") or c.get("name") or "")
+             for c in calls]
+    hit = want["name"] in names
+    args_ok = None
+    if hit and want.get("arguments") is not None:
+        wanted_args = want["arguments"]
+        if isinstance(wanted_args, str):
+            try:
+                wanted_args = json.loads(wanted_args)
+            except ValueError:
+                pass
+        args_ok = False
+        for c in calls:
+            fn = c.get("function") or c
+            if (fn.get("name") or "") != want["name"]:
+                continue
+            got = fn.get("arguments")
+            if isinstance(got, str):
+                try:
+                    got = json.loads(got)
+                except ValueError:
+                    pass
+            if got == wanted_args:
+                args_ok = True
+                break
+    return {"tool_called": bool(calls), "tool_name_ok": hit,
+            "tool_args_ok": args_ok}
+
+
+def _schema_check(answer: str, item: dict) -> dict | None:
+    """Does the answer fit the shape the prompt set asked for?
+
+    A small validator rather than a dependency: required keys, types, enums,
+    nested objects and arrays. It covers what a prompt set here asks for --
+    "a JSON object with these fields" -- and refuses nothing it does not
+    understand, so an exotic keyword is ignored rather than failing every
+    row.
+    """
+    schema = item.get("schema")
+    if not schema:
+        return None
+    if isinstance(schema, str):
+        try:
+            schema = json.loads(schema)
+        except ValueError:
+            return None
+    text = (answer or "").strip()
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        got = json.loads(text)
+    except ValueError:
+        return {"schema_valid": False, "schema_error": "not JSON"}
+    problem = _conforms(got, schema, "$")
+    return {"schema_valid": problem is None, "schema_error": problem}
+
+
+_TYPES = {"object": dict, "array": list, "string": str, "boolean": bool,
+          "null": type(None)}
+
+
+def _conforms(value, schema: dict, where: str) -> str | None:
+    if not isinstance(schema, dict):
+        return None
+    t = schema.get("type")
+    if t:
+        types = t if isinstance(t, list) else [t]
+        ok = False
+        for name in types:
+            if name == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                ok = True
+            elif name == "integer" and isinstance(value, int) and not isinstance(value, bool):
+                ok = True
+            elif name in _TYPES and isinstance(value, _TYPES[name]) \
+                    and not (name != "boolean" and isinstance(value, bool)):
+                ok = True
+        if not ok:
+            return "%s should be %s" % (where, "/".join(types))
+    if "enum" in schema and value not in schema["enum"]:
+        return "%s is not one of %s" % (where, schema["enum"])
+    if isinstance(value, dict):
+        for key in schema.get("required") or []:
+            if key not in value:
+                return "%s is missing %r" % (where, key)
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in value:
+                if p := _conforms(value[key], sub, "%s.%s" % (where, key)):
+                    return p
+        if schema.get("additionalProperties") is False:
+            extra = set(value) - set(schema.get("properties") or {})
+            if extra:
+                return "%s has unexpected %s" % (where, sorted(extra))
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for i, v in enumerate(value):
+            if p := _conforms(v, schema["items"], "%s[%d]" % (where, i)):
+                return p
+    return None
+
+
+JUDGE_PROMPT = """You are grading one answer to one question.
+
+Question:
+{prompt}
+
+{reference}Answer to grade:
+{answer}
+
+{rubric}
+Reply with a JSON object and nothing else: {{"score": <integer 1-5>, "reason": "<one sentence>"}}.
+5 means the answer is fully correct and complete; 1 means it is wrong or missing."""
+
+
+class Judge:
+    """A hosted model grading answers on a one-to-five scale.
+
+    Used where nothing else can measure -- free text with no single right
+    answer -- and never on its own: the score is reported beside the others,
+    the reason is kept per row, and the judge's name is recorded, because a
+    number from a judge is a number from a *particular* judge and changes
+    when the judge does. Asked at temperature zero, and asked to answer in
+    JSON so a grade is a grade and not a paragraph to parse.
+    """
+
+    def __init__(self, spec: dict, ctx: Any) -> None:
+        from .generate_data import HostedModel
+        self.model = HostedModel({"connection": spec.get("connection"),
+                                  "model": spec.get("model")}, ctx)
+        self.name = spec.get("label") or spec.get("model") or "a judge"
+        self.rubric = (spec.get("rubric") or "").strip()
+        self.ctx = ctx
+        self.failed = 0
+
+    def grade(self, prompt: str, expected: str, answer: str) -> dict:
+        text = JUDGE_PROMPT.format(
+            prompt=prompt[:4000],
+            reference=("Reference answer:\n%s\n\n" % expected[:2000]) if expected else "",
+            answer=(answer or "(nothing)")[:4000],
+            rubric=("Grade against this rubric:\n%s\n" % self.rubric) if self.rubric else "")
+        try:
+            out = self.model.generate({}, [{"role": "user", "content": text}],
+                                      {"max_new_tokens": 120, "temperature": 0.0},
+                                      None, None)
+            raw = (out.get("text") or "").strip()
+            fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.S)
+            if fenced:
+                raw = fenced.group(1)
+            got = json.loads(raw)
+            score = int(got.get("score"))
+            if not 1 <= score <= 5:
+                raise ValueError("score out of range")
+            return {"judge_score": score, "judge_reason": str(got.get("reason") or "")[:300]}
+        except Exception as e:  # noqa: BLE001 - one ungraded row, counted
+            self.failed += 1
+            if self.failed in (1, 10, 50):
+                self.ctx.log("The judge could not grade a row (%s)." % e, "warn")
+            return {"judge_score": None, "judge_reason": ""}
+
+
 def _expected_loss(host, prompt_text: str, expected: str, torch) -> float | None:
     """How surprised this model is by the answer you called correct.
 
@@ -258,6 +437,18 @@ def run(cfg: dict, ctx: Any) -> dict:
     if any(m.get("source", "run") != "api" for m in models):
         shared = inference.ModelHost(ctx.controller_url, ctx.runner_token,
                                      ctx.capabilities)
+    judge = Judge(cfg["judge"], ctx) if cfg.get("judge") else None
+    if judge is not None:
+        ctx.log("Answers are also graded by %s, one to five. A judge's score "
+                "is that judge's opinion: reported beside the measured "
+                "numbers, never instead of them." % judge.name)
+    # Tools the prompts declare, so a tool-calling model can be scored on
+    # whether it calls the right one. Sent on the spec, which is where the
+    # runner reads them when it renders the prompt.
+    if tools := cfg.get("tools"):
+        for m in models:
+            if isinstance(m.get("spec"), dict):
+                m["spec"]["tools"] = tools
 
     per_model = (min(int(recipe.get("sample") or 0) or bench["size"],
                      bench["size"]) if bench else len(items))
@@ -385,6 +576,12 @@ def run(cfg: dict, ctx: Any) -> dict:
                     _fmt, rendered = host.render(spec, messages)
                     loss = _expected_loss(host, rendered, expected, _torch())
                     row["expected_loss"] = round(loss, 5) if loss is not None else None
+            if tc := _tool_call_check(out, item):
+                row.update(tc)
+            if sc := _schema_check(answer, item):
+                row.update(sc)
+            if judge is not None:
+                row.update(judge.grade(prompt, expected, answer))
             results.append(row)
 
             done += 1
@@ -459,6 +656,12 @@ def _aggregate(rows: list[dict], seconds: float) -> dict:
         # ordinary prompt set does not grow two empty columns.
         "json_valid": _rate(scored, "json_valid"),
         "json_match": _rate(scored, "json_match"),
+        # Present only when the prompt set asked for them.
+        "tool_name_ok": _rate(rows, "tool_name_ok"),
+        "tool_args_ok": _rate(rows, "tool_args_ok"),
+        "schema_valid": _rate(rows, "schema_valid"),
+        "judge_score": _mean(rows, "judge_score"),
+        "judge_graded": sum(1 for r in rows if r.get("judge_score") is not None),
         "expected_loss": round(sum(losses) / len(losses), 5) if losses else None,
         # Perplexity of the expected answer, which is the same number in the
         # units people actually have intuitions about: "1 in N" surprise.
@@ -482,6 +685,12 @@ def _describe(m: dict) -> str:
         parts.append("exact %.0f%%" % (m["exact"] * 100))
     if m.get("json_valid") is not None:
         parts.append("valid JSON %.0f%%" % (m["json_valid"] * 100))
+    if m.get("schema_valid") is not None:
+        parts.append("fits the schema %.0f%%" % (m["schema_valid"] * 100))
+    if m.get("tool_name_ok") is not None:
+        parts.append("right tool %.0f%%" % (m["tool_name_ok"] * 100))
+    if m.get("judge_score") is not None:
+        parts.append("judge %.2f/5" % m["judge_score"])
     parts.append("%.0f tokens/s" % (m.get("tokens_per_sec") or 0))
     return ", ".join(parts)
 
@@ -499,6 +708,9 @@ RANKING = [
     ("expected_loss", "loss on the expected answers", True),
     ("chrf", "character overlap with the expected answers", False),
     ("f1", "token overlap with the expected answers", False),
+    # Last, and only when the prompts have no expected answers at all: a
+    # judge's opinion ranks free text that nothing else can measure.
+    ("judge_score", "the judge's score", False),
 ]
 
 
