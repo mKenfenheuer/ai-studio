@@ -1053,7 +1053,54 @@ function checkPanel(s) {
             }).join(""))}
           </tbody></table></div>
         </div>
+        ${raw((stats.media || []).map(mediaCard).join(""))}
       </div>
+    </div>`;
+}
+
+/** What the stored files in a column actually are.
+ *
+ *  Read off the file headers, not decoded -- see common/media.py. The three
+ *  things worth knowing before a run: files that have gone, files whose bytes
+ *  are not what their name says, and the spread of sizes. */
+function mediaCard(m) {
+  const img = m.images;
+  const aud = m.audio;
+  const kinds = Object.entries(m.kinds || {}).map(([k, n]) => `${fmtNum(n)} ${k}`).join(", ");
+  return html`
+    <div class="card">
+      <h3 style="margin:0 0 8px">Stored files in <span class="mono">${m.column}</span></h3>
+      <p class="muted tiny">${fmtNum(m.referenced)} rows point at ${fmtNum(m.files)}
+        distinct file${m.files === 1 ? "" : "s"}${kinds ? ` (${kinds})` : ""}.
+        ${raw(m.referenced > m.files
+          ? `Rows that share a picture share the file — it is stored once.` : "")}</p>
+      ${raw((m.missing_rows || m.missing_files) ? html`
+        <div class="callout callout-err">
+          <strong>${fmtNum(m.missing_rows + m.missing_files)} cannot be read</strong>
+          ${m.missing_files ? `${fmtNum(m.missing_files)} gone from disk. ` : ""}${
+            m.missing_rows ? `${fmtNum(m.missing_rows)} whose record is gone.` : ""}
+        </div>` : "")}
+      ${raw(m.mismatched ? html`
+        <div class="callout callout-warn">
+          <strong>${fmtNum(m.mismatched)} ${m.mismatched === 1 ? "is" : "are"} not what
+            ${m.mismatched === 1 ? "its" : "their"} name says</strong>
+          ${raw((m.examples || []).map((e) => `<div class="tiny mono">${esc(e)}</div>`).join(""))}
+        </div>` : "")}
+      ${raw(img ? html`
+        <table class="table" style="margin-top:8px"><tbody>
+          <tr><td class="muted tiny">Width</td><td class="tiny mono">${img.width.min} · ${img.width.median} · ${img.width.max} px</td></tr>
+          <tr><td class="muted tiny">Height</td><td class="tiny mono">${img.height.min} · ${img.height.median} · ${img.height.max} px</td></tr>
+          ${raw(img.tiny ? `<tr><td class="muted tiny">Under 64 px</td><td class="tiny">${fmtNum(img.tiny)} — nothing learns from a thumbnail</td></tr>` : "")}
+          ${raw(img.huge ? `<tr><td class="muted tiny">Over 2048 px</td><td class="tiny">${fmtNum(img.huge)} — resized on the way in, slowly</td></tr>` : "")}
+        </tbody></table>
+        <div class="hint">min · median · max, over ${fmtNum(img.measured)} measured</div>` : "")}
+      ${raw(aud ? html`
+        <table class="table" style="margin-top:8px"><tbody>
+          <tr><td class="muted tiny">Length</td><td class="tiny mono">${aud.seconds.min}s · ${aud.seconds.median}s · ${aud.seconds.max}s</td></tr>
+          <tr><td class="muted tiny">In total</td><td class="tiny">${fmtDuration ? fmtDuration(aud.seconds.total) : aud.seconds.total + "s"}</td></tr>
+          ${raw(aud.long ? `<tr><td class="muted tiny">Over 30 s</td><td class="tiny">${fmtNum(aud.long)} — most speech models want clips under that</td></tr>` : "")}
+        </tbody></table>
+        <div class="hint">WAV only; other formats need decoding to measure</div>` : "")}
     </div>`;
 }
 

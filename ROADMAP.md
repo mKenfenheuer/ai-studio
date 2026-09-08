@@ -608,12 +608,18 @@ a stored file, with the column named for what it is and the folder above it
 as the label (`cats/0001.jpg` → `label: cats`), which is how every
 hand-assembled classification set is laid out. The rows page says what each
 asset on it is, and the workbench draws a thumbnail or a player and opens the
-file in full on a click. *Still to do:* a manifest beside the files
-(`metadata.jsonl` with a `file_name` column, the Hub's imagefolder
-convention); Hub image/audio datasets fetched as assets rather than as dead
-viewer URLs; `inspect` reporting dimensions, duration, decode failures and
-files that have gone missing from disk; `drop_empty` and `format_example`
-learning that an asset is not nothing.
+file in full on a click. A `metadata.jsonl`/`.csv` beside the files (the
+Hub's imagefolder convention, `file_name` + whatever else) is joined onto the
+rows, and beats the folder-derived label. `inspect` reads every stored
+file's header -- pure Python, `common/media.py`, no Pillow -- and reports
+dimensions, WAV durations, files whose bytes are not what their name says
+(an HTML error page saved as `.png`, the classic), pictures under 64 px, and
+files gone from disk; each becomes a finding on the Check tab. A row that
+points at a stored file is not empty, to `inspect` and to `drop_empty`,
+which had declared a folder of photographs 100% empty. *Still to do:* Hub
+image/audio datasets fetched as assets rather than as dead viewer URLs;
+durations for formats other than WAV (needs decoding, so the runner's job);
+the text-length warnings still fire on a set with no text in it.
 
 **P3. Typed samples and metrics (M).** `job_meta.sample` becomes
 `{step, kind: text|image_grid|audio|table, asset_id?, text?}`; a

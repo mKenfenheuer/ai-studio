@@ -874,6 +874,53 @@ def _media_row(filename: str, blob: bytes, opts: dict,
     return row
 
 
+# The Hub's own convention for a folder of files with labels: a `metadata`
+# file beside them, one line per file, with a `file_name` column naming the
+# file relative to the manifest. Honoured here so a dataset laid out for
+# `load_dataset("imagefolder")` -- which is how every tutorial says to lay one
+# out -- uploads with its captions and labels attached rather than as a
+# folder of nameless pictures plus a JSONL nobody joined to them.
+_MANIFEST_NAMES = ("metadata.jsonl", "metadata.csv", "metadata.json")
+_MANIFEST_KEYS = ("file_name", "filename", "file", "path", "image", "audio")
+
+
+def _manifest_key(name: str) -> str:
+    return name.replace("\\", "/").lstrip("./").lower()
+
+
+def _manifest(z, members, failures: list[str]) -> tuple[dict, set[str]]:
+    """Every manifest in the archive, as file -> its other columns."""
+    found: dict[str, dict] = {}
+    names: set[str] = set()
+    for m in members:
+        base = Path(m.filename).name.lower()
+        if base not in _MANIFEST_NAMES:
+            continue
+        names.add(m.filename)
+        folder = str(Path(m.filename).parent)
+        folder = "" if folder in (".", "") else folder.rstrip("/") + "/"
+        try:
+            text = z.read(m).decode("utf-8-sig", errors="replace")
+            rows = list(_csv_rows(text, {}) if base.endswith(".csv")
+                        else _json_rows(text))
+        except Exception as e:  # noqa: BLE001 - one bad manifest, not the zip
+            failures.append("%s (manifest not readable: %s)" % (m.filename, e))
+            continue
+        key = next((k for k in _MANIFEST_KEYS if rows and k in rows[0]), None)
+        if not key:
+            failures.append("%s (a manifest needs a file_name column; it has: %s)"
+                            % (m.filename, ", ".join(rows[0].keys()) if rows
+                               else "nothing"))
+            continue
+        for r in rows:
+            target = str(r.get(key) or "").strip()
+            if not target:
+                continue
+            extra = {k: v for k, v in r.items() if k != key}
+            found[_manifest_key(folder + target)] = extra
+    return found, names
+
+
 def _zip_rows(blob: bytes, opts: dict,
               problems: list[str] | None = None) -> Iterator[dict]:
     """Every readable file in an archive, in name order, tagged with its name.
@@ -891,8 +938,11 @@ def _zip_rows(blob: bytes, opts: dict,
         if not members:
             raise ValueError("that archive has no files in it")
         failures: list[str] = problems if problems is not None else []
+        manifest, manifest_names = _manifest(z, members, failures)
         produced = 0
         for m in sorted(members, key=lambda x: x.filename):
+            if m.filename in manifest_names:
+                continue        # read already; it describes the others
             try:
                 inner = z.read(m)
             except (RuntimeError, zipfile.BadZipFile) as e:
@@ -901,6 +951,11 @@ def _zip_rows(blob: bytes, opts: dict,
             try:
                 for row in rows_from_upload(m.filename, inner, opts,
                                             source=m.filename):
+                    extra = manifest.get(_manifest_key(m.filename))
+                    if extra:
+                        # The manifest's columns win over what the folder
+                        # implied, because somebody wrote them down.
+                        row = {**row, **extra}
                     produced += 1
                     yield row
             except ValueError as e:
@@ -1047,9 +1102,15 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
     empty = 0
     seen: dict[str, int] = {}
     duplicates = 0
-    for text in texts:
+    for text, row in zip(texts, rows):
         if not text:
-            empty += 1
+            # A row that renders to no text is empty -- unless it points at a
+            # stored file. A picture with a label is a complete example for
+            # the trainer that reads pictures; the text renderer simply has
+            # nothing to say about it, and "100% of rows are empty" over a
+            # folder of photographs was the whole check crying wolf.
+            if not assets.ids_in_row(row):
+                empty += 1
             continue
         lengths.append(len(text))
         h = hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -1104,6 +1165,7 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
             [(formatting.format_example(r, fmt) or "") for r in held_rows])
         stats["leakage"]["split"] = held_name
 
+    stats["media"] = _media_report(rows, columns)
     stats["problems"] = _problems(stats, dataset)
 
     # Kept, so the library can say what was found without re-reading the file.
@@ -1288,6 +1350,8 @@ def _column_types(rows: list[dict], columns: list[str]) -> list[dict]:
     def kind(v: object) -> str:
         if v is None or v == "":
             return "empty"
+        if assets.id_in(v):
+            return "asset"
         if isinstance(v, bool):
             return "boolean"
         if isinstance(v, (int, float)):
@@ -1327,10 +1391,126 @@ def _column_types(rows: list[dict], columns: list[str]) -> list[dict]:
     return out
 
 
+def _media_report(rows: list[dict], columns: list[str]) -> list[dict]:
+    """What the stored files in this sample actually are.
+
+    Three things a training run would otherwise discover for itself, hours
+    in: a row whose file has gone from disk, a file whose bytes are not what
+    its name says (an HTML error page saved as a .png is the classic), and --
+    for pictures -- the spread of sizes, because a set that is mostly 224px
+    with a few 4000px scans in it trains slowly for no gain and a set that is
+    all 32px trains nothing. Read off the headers only: see common/media.py.
+    """
+    from common import media
+
+    out = []
+    for c in columns:
+        ids = [assets.id_in(r.get(c)) for r in rows]
+        ids = [i for i in ids if i]
+        if not ids:
+            continue
+        known = {a["id"]: a for a in db.get_assets(ids)}
+        report: dict[str, Any] = {
+            "column": c, "referenced": len(ids), "kinds": {},
+            "missing_rows": 0, "missing_files": 0, "mismatched": 0,
+            "examples": [],
+        }
+        widths: list[int] = []
+        heights: list[int] = []
+        seconds: list[float] = []
+        seen_sha: set[str] = set()
+        for aid in ids:
+            a = known.get(aid)
+            if not a:
+                report["missing_rows"] += 1
+                continue
+            report["kinds"][a["kind"]] = report["kinds"].get(a["kind"], 0) + 1
+            if a["sha256"] in seen_sha:
+                continue
+            seen_sha.add(a["sha256"])
+            path = assets.path_for(a["sha256"])
+            try:
+                with path.open("rb") as fh:
+                    head = fh.read(media.HEAD_BYTES)
+            except OSError:
+                report["missing_files"] += 1
+                if len(report["examples"]) < 5:
+                    report["examples"].append("%s: file missing from disk"
+                                              % a["filename"])
+                continue
+            facts = media.describe(head, a["size_bytes"], a["mime"])
+            if facts["mismatch"]:
+                report["mismatched"] += 1
+                if len(report["examples"]) < 5:
+                    report["examples"].append(
+                        "%s: named as %s, bytes are %s"
+                        % (a["filename"], a["mime"],
+                           facts["sniffed"] or "not a known format"))
+            if "width" in facts:
+                widths.append(facts["width"])
+                heights.append(facts["height"])
+            if "seconds" in facts:
+                seconds.append(facts["seconds"])
+        report["files"] = len(seen_sha)
+        if widths:
+            widths.sort(); heights.sort()
+            mid = len(widths) // 2
+            report["images"] = {
+                "measured": len(widths),
+                "width": {"min": widths[0], "median": widths[mid], "max": widths[-1]},
+                "height": {"min": heights[0], "median": heights[mid], "max": heights[-1]},
+                "tiny": sum(1 for w, h in zip(widths, heights) if max(w, h) < 64),
+                "huge": sum(1 for w, h in zip(widths, heights) if max(w, h) > 2048),
+            }
+        if seconds:
+            seconds.sort()
+            report["audio"] = {
+                "measured": len(seconds),
+                "seconds": {"min": seconds[0],
+                            "median": seconds[len(seconds) // 2],
+                            "max": seconds[-1], "total": round(sum(seconds), 1)},
+                "long": sum(1 for x in seconds if x > 30),
+            }
+        out.append(report)
+    return out
+
+
 def _problems(stats: dict, dataset: dict) -> list[dict]:
     """The things worth acting on, each with the fix that acts on it."""
     out = []
     n = max(stats["sampled"], 1)
+
+    for m in stats.get("media") or []:
+        gone = m["missing_rows"] + m["missing_files"]
+        if gone:
+            out.append({
+                "level": "error", "fix": None,
+                "message": "%d of %d rows in \"%s\" point at a file that is "
+                           "not there%s. A run would fail on the first one."
+                           % (gone, m["referenced"], m["column"],
+                              " -- the record is gone" if m["missing_rows"]
+                              and not m["missing_files"] else
+                              " on disk" if not m["missing_rows"] else ""),
+            })
+        if m["mismatched"]:
+            out.append({
+                "level": "warn", "fix": None,
+                "message": "%d file%s in \"%s\" %s not what %s name says: %s."
+                           % (m["mismatched"], "" if m["mismatched"] == 1 else "s",
+                              m["column"],
+                              "is" if m["mismatched"] == 1 else "are",
+                              "its" if m["mismatched"] == 1 else "their",
+                              "; ".join(m["examples"][:2])),
+            })
+        img = m.get("images") or {}
+        if img.get("tiny"):
+            out.append({
+                "level": "warn", "fix": None,
+                "message": "%d picture%s in \"%s\" %s under 64 pixels on the "
+                           "longest side. Nothing learns from a thumbnail."
+                           % (img["tiny"], "" if img["tiny"] == 1 else "s",
+                              m["column"], "is" if img["tiny"] == 1 else "are"),
+            })
 
     if stats["empty_rows"]:
         share = stats["empty_rows"] / n
@@ -1692,7 +1872,10 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
     if ops.get("drop_empty"):
         def says_something(r: dict) -> bool:
             if not (formatting.format_example(r, fmt) or "").strip():
-                return False
+                # Nothing to read -- but a stored file is not nothing. See
+                # the same rule in `inspect`: dropping "empty" rows from a
+                # folder of photographs would drop the photographs.
+                return bool(assets.ids_in_row(r))
             # A conversation whose every assistant turn is empty renders as
             # something -- the role label and a blank -- and is still a row
             # with no answer in it. On a reasoning set those are the rows
