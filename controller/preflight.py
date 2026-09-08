@@ -207,6 +207,16 @@ async def check(cfg: dict, fleet: Any) -> dict:
                     "%.0f%% of these rows are longer than %d tokens and would "
                     "be cut at that point." % (share * 100, max_len),
                     "Raise the context length, or filter the long rows out."))
+            elif over:
+                # A handful is not worth stopping for and is worth saying:
+                # claiming "every row fits" while reporting two that do not is
+                # the kind of small lie that makes a reader stop believing the
+                # rest of the page.
+                issues.append(_issue(
+                    "ok", "max_seq_len",
+                    "%d of %d rows measured are longer than %d tokens and "
+                    "would be cut. The rest fit; the longest is %d."
+                    % (len(over), len(lengths), max_len, facts["token_max"])))
             elif lengths:
                 issues.append(_issue(
                     "ok", "max_seq_len",
