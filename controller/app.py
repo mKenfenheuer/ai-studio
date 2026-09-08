@@ -2348,8 +2348,10 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
     # a tool result. The last two matter: continuing a conversation past a tool
     # call means sending back a result and nothing else, and requiring text
     # there made the second half of every tool exchange impossible.
+    # A picture with no words is a question -- "what is this?" is implied --
+    # so a turn that shows something counts as saying something.
     if not any((m.get("content") or "").strip() or m.get("tool_calls")
-               or m.get("role") in ("tool", "function")
+               or m.get("media") or m.get("role") in ("tool", "function")
                for m in messages if m.get("role") != "system"):
         raise HTTPException(400, "Type something first.")
 

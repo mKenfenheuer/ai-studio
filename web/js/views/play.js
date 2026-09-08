@@ -153,6 +153,10 @@ function chatView(mount, run, runs) {
   let requestId = null;
   let early = [];            // events that beat their own POST response
   let think = !!run.reasoning;
+  // Pictures and clips waiting to go with the next message. Uploaded the
+  // moment they are dropped, so sending is instant and a failed upload is
+  // known before anybody has typed a question around it.
+  let pending = [];            // [{kind, ref, url, name}]
 
   // The held-out example currently loaded, if any.
   let sample = null;         // {index, messages, tools, prompt, expected, ...}
@@ -219,6 +223,7 @@ function chatView(mount, run, runs) {
         <div class="chat-empty" id="chatEmpty">Nothing said yet. ${ui.title}.</div>
       </div>
       <div class="tiny muted" id="chatStatus"></div>
+      <div class="pending-media" id="pendingMedia" hidden></div>
       <div class="chat-input">
         <textarea id="chatBox" rows="2" placeholder="${ui.placeholder}"></textarea>
         <button class="btn-primary" id="sendBtn">Send</button>
@@ -230,7 +235,8 @@ function chatView(mount, run, runs) {
       <div class="row" style="margin-top:8px;flex-wrap:wrap">
         <span class="tiny muted" id="turnCount"></span>
         <span class="tiny muted" id="turnHint">· right-click a message to edit,
-          regenerate, remove or keep it as training data</span>
+          regenerate, remove or keep it as training data · drop or paste a
+          picture or a clip to send it with the next message</span>
       </div>
       ${raw(run.reasoning ? html`
         <p class="muted tiny" style="margin:8px 0 0">This model was trained to
@@ -606,10 +612,79 @@ function chatView(mount, run, runs) {
     // A model that never learned to follow a conversation is not given one:
     // each instruction stands alone, exactly as it did in training.
     if (!ui.multiturn) turns = [];
-    turns.push({ role: "user", content: text });
+    const turn = { role: "user", content: text };
+    if (pending.length) {
+      turn.media = pending.map(({ kind, ref }) => ({ kind, ref }));
+      pending = [];
+      paintPending();
+    }
+    turns.push(turn);
     box.value = "";
     await ask();
   };
+
+  // ------------------------------------------------- pictures and clips
+  //
+  // Dropped or pasted onto the chat, stored at once, sent with the next
+  // message. The model is told about them the way its format says -- a
+  // placeholder token in front of the words -- which is only worth anything
+  // to a model trained to look; the note below says so rather than letting
+  // the picture vanish into a token the model has never seen.
+  const seesPictures = !!(run.image_token || run.vision);
+
+  function paintPending() {
+    const strip = $("#pendingMedia", mount);
+    if (!strip) return;
+    strip.hidden = !pending.length;
+    strip.innerHTML = pending.map((p, i) => html`
+      <div class="pm">
+        ${raw(p.kind === "image"
+          ? `<img src="${esc(p.url)}" alt="${esc(p.name)}">`
+          : `<span class="badge">${esc(p.kind)} · ${esc(p.name)}</span>`)}
+        <button class="btn-sm btn-danger" data-drop-pending="${i}" title="Remove">✕</button>
+      </div>`).join("")
+      + (pending.length && !seesPictures ? html`
+        <span class="tiny muted" style="align-self:center">This model was not
+          trained to look at pictures; it will be told one is here and nothing
+          more.</span>` : "");
+  }
+
+  async function attach(files) {
+    const media = [...files].filter((f) => /^(image|audio|video)\//.test(f.type)
+                                          || /\.(png|jpe?g|webp|gif|wav|mp3|flac|ogg|m4a)$/i.test(f.name));
+    if (!media.length) return;
+    try {
+      const r = await api.uploadAssets(media);
+      for (const a of r.stored || []) {
+        pending.push({ kind: a.kind, ref: a.ref, url: a.url, name: a.filename });
+      }
+      for (const bad of r.refused || []) toast(`${bad.filename}: ${bad.why}`, "err");
+      paintPending();
+    } catch (e) { toast(e.message, "err"); }
+  }
+
+  const chatCard = $(".chat", mount);
+  chatCard.addEventListener("dragover", (e) => {
+    if ([...e.dataTransfer.types].includes("Files")) {
+      e.preventDefault();
+      chatCard.classList.add("dropping");
+    }
+  });
+  chatCard.addEventListener("dragleave", () => chatCard.classList.remove("dropping"));
+  chatCard.addEventListener("drop", (e) => {
+    chatCard.classList.remove("dropping");
+    if (!e.dataTransfer.files?.length) return;
+    e.preventDefault();
+    attach(e.dataTransfer.files);
+  });
+  box.addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) { e.preventDefault(); attach(files); }
+  });
+  on(mount, "click", "[data-drop-pending]", (_e, t) => {
+    pending.splice(+t.dataset.dropPending, 1);
+    paintPending();
+  });
 
   /** The result this row recorded for a call the model just made, if any. */
   function recordedResult(call) {
@@ -838,6 +913,7 @@ function chatView(mount, run, runs) {
       const split = ($("#keepSplit", dlg).value || "").trim() || KEEP_SPLIT;
       const row = { messages: rows.map((m) => ({
         role: m.role, content: m.content,
+        ...(m.media?.length ? { media: m.media } : {}),
         ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
         ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       })) };

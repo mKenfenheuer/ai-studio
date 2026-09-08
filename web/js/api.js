@@ -296,6 +296,20 @@ export const api = {
 
   playground:  () => req("/api/playground"),
 
+  // ---- stored files: pictures and clips a row or a turn can point at -----
+  // Multipart, not JSON: `req` would set a JSON content type and the browser
+  // has to write the boundary itself.
+  uploadAssets: async (files, datasetId = "") => {
+    const body = new FormData();
+    for (const f of files) body.append("file", f, f.name);
+    const r = await fetch(`/api/assets${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`,
+                          { method: "POST", body, credentials: "same-origin" });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `Upload failed (${r.status})`);
+    return data;
+  },
+  assetUsage: () => req("/api/assets"),
+
   // ---- served models: the names other software is pointed at ------------
   registeredModels: () => req("/api/models"),
   registerModel: (alias, body) =>

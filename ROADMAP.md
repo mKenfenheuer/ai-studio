@@ -654,8 +654,15 @@ hosted provider (`apimodels.chat_request` flattens to text); the playground's
 "keep it" drops media when writing a row; `generate` returning an asset
 waits for a model that produces one.
 
-**P5. Media capture in the playground (M).** Microphone, drop and paste for
-images and audio; an audio player and image viewer per turn.
+**P5. Media capture in the playground (M). Done, bar the microphone.** Drop
+or paste a picture or a clip onto the chat and it is stored at once and
+shown in a strip above the box; it goes with the next message as that turn's
+`media`, is drawn beside the words in the log, is kept when the exchange is
+written back to a dataset, and reaches the model as its format's placeholder.
+A turn that shows something and says nothing is a question, on both doors.
+The strip says plainly when the model was not trained to look. *Still to
+do:* recording from the microphone, and the `seesPictures` flag reads a
+capability the run does not yet carry (P6).
 
 **P6. Modality-aware capabilities and fit (M).** The probe reports installed
 libraries (`torchaudio`, `diffusers`, `torchvision`, `ffmpeg`), CPU cores and

@@ -228,6 +228,7 @@ def _messages(payload: dict) -> list[dict]:
     # is a legitimate request and refusing it would break the very loop tool
     # calling exists for.
     if not any(m.get("content", "").strip() or m.get("tool_calls")
+               or m.get("media")
                for m in out if m["role"] not in ("system", "developer")):
         raise HTTPException(400, "There is nothing to answer.")
     return out
