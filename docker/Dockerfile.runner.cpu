@@ -59,7 +59,13 @@ RUN pip install --no-cache-dir \
 # Only the quantiser is built -- not the server, not the CLI, not the tests --
 # which keeps this to a couple of minutes and a few tens of megabytes.
 ARG LLAMA_CPP_TAG=b4586
+# libgomp1 is not a build dependency: llama-quantize links against the OpenMP
+# runtime and needs it at run time. It arrives with build-essential, which is
+# purged below, and the first build of this image shipped a binary that could
+# not start -- "error while loading shared libraries: libgomp.so.1".
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+    && apt-get install -y --no-install-recommends \
         git build-essential cmake libcurl4-openssl-dev \
     && git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
          https://github.com/ggerganov/llama.cpp /opt/llama.cpp \

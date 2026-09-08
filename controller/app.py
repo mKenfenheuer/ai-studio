@@ -477,10 +477,19 @@ async def _create_job(request: Request, payload: dict) -> str:
         if not src_id:
             raise HTTPException(400, "Which run's model should be exported?")
         src = _job_or_404(request, src_id)
-        if not artifact_file(src["id"], "").exists():
+        # Not "is there a file" — a fine-tune that did not merge stores its
+        # adapter under the primary name, so the file exists and is the wrong
+        # thing. The recorded kind is read off the archive when it arrives and
+        # is the honest answer. Checked here so the refusal costs nothing,
+        # rather than after a runner has downloaded fourteen gigabytes.
+        kinds = {a["kind"] for a in db.list_artifacts(src["id"])}
+        if "model" not in kinds:
             raise HTTPException(
-                400, "That run has no model to export. A fine-tune has to have "
-                     "produced a merged model, not only an adapter.")
+                400, "That run left an adapter, not a standalone model, and "
+                     "there is no such thing as a GGUF of an adapter — it is a "
+                     "few megabytes that mean nothing without the exact weights "
+                     "they were fitted to. Run it again with \"also produce a "
+                     "standalone model\" turned on, and export that.")
         cfg["allow_cpu"] = True
         cfg.setdefault("name_hint", src["name"])
         cfg["source_run_name"] = src["name"]

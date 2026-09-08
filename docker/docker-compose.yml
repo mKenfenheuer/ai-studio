@@ -54,8 +54,10 @@ services:
   # written by a hosted model -- neither of which touches a GPU -- would
   # otherwise wait behind six hours of training for a card it never uses.
   # Uploading is the one that hurts: twenty minutes of sending a model to the
-  # Hub is twenty minutes the card is not training. Restricted by kind rather
-  # than trusted to behave: without
+  # Hub is twenty minutes the card is not training. Converting a model to GGUF
+  # is the same shape of work and belongs here for the same reason: it reads
+  # tensors and writes a smaller file, and does not touch a card. Restricted by
+  # kind rather than trusted to behave: without
   # AI_STUDIO_RUNNER_KINDS this would happily accept anything marked
   # `allow_cpu` and try to train on a CPU.
   runner-cpu:
@@ -71,7 +73,7 @@ services:
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
-      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset}
+      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset,export_gguf}
       HF_TOKEN: ${HF_TOKEN:-}
 
 volumes:
