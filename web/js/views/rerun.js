@@ -54,6 +54,15 @@ const FIELDS = [
     ],
   },
   {
+    group: "What it starts from",
+    items: [
+      { key: "base_model", label: "Base model", type: "text",
+        hint: "A Hugging Face id. Changing it is the difference between a "
+            + "copy of this run and a different experiment, which is "
+            + "occasionally what you want." },
+    ],
+  },
+  {
     group: "The adapter",
     items: [
       { key: "lora_r", label: "Rank", step: "1", min: "1",
@@ -71,6 +80,26 @@ const FLAGS = [
     label: "Stop when the held-out loss stops improving" },
   { key: "gradient_checkpointing",
     label: "Trade speed for memory (gradient checkpointing)" },
+  { key: "optim_8bit",
+    label: "Keep the optimiser state in 8 bits" },
+  { key: "merge_after",
+    label: "Also produce a standalone model, not just the adapter" },
+];
+
+// Not numbers, so they get a list each. These are the two settings the
+// out-of-memory advice names, and neither could be reached from this page --
+// which meant the most common failure was the one this page could not fix.
+const CHOICES = [
+  { key: "quantization", label: "Base model precision",
+    options: [["none", "16-bit — full quality"],
+              ["4bit", "4-bit — fits far more"]],
+    hint: "Only the frozen base is compressed; the adapter stays at full "
+        + "precision either way." },
+  { key: "dtype", label: "Arithmetic precision",
+    options: [["float16", "float16"], ["bfloat16", "bfloat16"],
+              ["float32", "float32"]],
+    hint: "The machine benchmarked all three when it joined; its own "
+        + "recommendation is on the Machines page." },
 ];
 
 // Shown in their own section rather than as numbers among the numbers: these
@@ -109,14 +138,28 @@ export async function rerunView(mount, [jobId]) {
   const runnerId = online.some((r) => r.id === cfg.required_runner)
     ? cfg.required_runner : (online[0]?.id || "");
 
+  // `?set={"learning_rate":2e-5}` — the correction the run's own report
+  // worked out, applied here so "fix it and run again" is one press rather
+  // than a paragraph, a form, and a number typed from memory.
+  let fixes = {};
+  try {
+    const at = location.hash.indexOf("?");
+    const raw = at < 0 ? null
+      : new URLSearchParams(location.hash.slice(at + 1)).get("set");
+    if (raw) fixes = JSON.parse(raw) || {};
+  } catch { fixes = {}; }
+  const applied = Object.keys(fixes);
+  Object.assign(cfg, fixes);
+
   const shown = new Set([...DATA_KEYS, ...DERIVED, "required_runner",
                          "system_prompt",
                          ...FIELDS.flatMap((g) => g.items.map((i) => i.key)),
+                         ...CHOICES.map((c) => c.key),
                          ...FLAGS.map((f) => f.key)]);
   const carried = Object.fromEntries(
     Object.entries(cfg).filter(([k]) => !shown.has(k)));
 
-  mount.innerHTML = layout(job, cfg, online, runnerId, datasets, carried);
+  mount.innerHTML = layout(job, cfg, online, runnerId, datasets, carried, applied);
 
   // The ribbon's Start is the same button as the form's, one screen higher.
   on(mount, "click", "[data-submit]", (_e, t) => {
@@ -142,7 +185,12 @@ export async function rerunView(mount, [jobId]) {
     for (const item of FIELDS.flatMap((g) => g.items)) {
       const el = $(`#rr_${item.key}`, mount);
       // Left blank means "leave it as it was", not "zero".
-      if (el && el.value.trim() !== "") next[item.key] = Number(el.value);
+      if (!el || el.value.trim() === "") continue;
+      next[item.key] = item.type === "text" ? el.value.trim() : Number(el.value);
+    }
+    for (const c of CHOICES) {
+      const el = $(`#rr_${c.key}`, mount);
+      if (el && el.value) next[c.key] = el.value === "none" ? null : el.value;
     }
     for (const f of FLAGS) {
       const el = $(`#rr_${f.key}`, mount);
@@ -177,7 +225,7 @@ function nextName(name) {
   return `${base} (again)`;
 }
 
-function layout(job, cfg, online, runnerId, datasets, carried) {
+function layout(job, cfg, online, runnerId, datasets, carried, applied = []) {
   const has = (k) => cfg[k] !== undefined && cfg[k] !== null;
   const studio = has("studio_dataset");
   const carriedKeys = Object.keys(carried);
@@ -200,6 +248,13 @@ function layout(job, cfg, online, runnerId, datasets, carried) {
           title: "Changing the model, the format or the shape of the data needs the full flow" }),
       ]),
     }))}
+
+    ${raw(applied.length ? html`
+      <div class="callout callout-ok" style="margin-bottom:14px">
+        <strong>The correction from that run's report is already filled in.</strong>
+        ${applied.map((k) => `${k.replace(/_/g, " ")} is now ${cfg[k]}`).join(", ")}.
+        Change anything else you like before starting.
+      </div>` : "")}
 
     <form id="rerunForm">
       <div class="card">
@@ -290,15 +345,34 @@ function layout(job, cfg, online, runnerId, datasets, carried) {
               ${raw(items.map((i) => `
                 <div class="field">
                   <label for="rr_${i.key}">${esc(i.label)}</label>
-                  <input id="rr_${i.key}" type="number" value="${esc(cfg[i.key])}"
+                  ${i.type === "text"
+                    ? `<input id="rr_${i.key}" class="mono" value="${esc(cfg[i.key])}">`
+                    : `<input id="rr_${i.key}" type="number" value="${esc(cfg[i.key])}"
                          step="${i.step}"${i.min !== undefined
                            ? ` min="${i.min}"` : ""}${i.max !== undefined
-                           ? ` max="${i.max}"` : ""}>
+                           ? ` max="${i.max}"` : ""}>`}
                   ${i.hint ? `<div class="hint">${esc(i.hint)}</div>` : ""}
                 </div>`).join(""))}
             </div>
           </div>`;
       }).join(""))}
+
+      ${raw(CHOICES.some((c) => has(c.key)) ? html`
+        <div class="card">
+          <h3>Precision</h3>
+          <div class="grid grid-2">
+            ${raw(CHOICES.filter((c) => has(c.key)).map((c) => `
+              <div class="field">
+                <label for="rr_${c.key}">${esc(c.label)}</label>
+                <select id="rr_${c.key}">
+                  ${c.options.map(([v, l]) => `<option value="${v}"${
+                    String(cfg[c.key] ?? "none") === v ? " selected" : ""}>${
+                    esc(l)}</option>`).join("")}
+                </select>
+                ${c.hint ? `<div class="hint">${esc(c.hint)}</div>` : ""}
+              </div>`).join(""))}
+          </div>
+        </div>` : "")}
 
       ${raw(FLAGS.some((f) => has(f.key)) ? html`
         <div class="card">

@@ -173,7 +173,7 @@ export async function jobView(mount, [jobId]) {
       box.innerHTML = "";
       return;
     }
-    try { box.innerHTML = reportCard(await api.jobReport(jobId)); }
+    try { box.innerHTML = reportCard(await api.jobReport(jobId), jobId); }
     catch { box.innerHTML = ""; }
   };
   paintReport();
@@ -1059,7 +1059,7 @@ const REPORT_ICON = { ok: "✓", warn: "!", error: "✕" };
 
 /** What the run says about itself. Findings first, numbers second: the
  *  numbers are only interesting once you know which of them to look at. */
-function reportCard(r) {
+function reportCard(r, jobId) {
   const findings = r.findings || [];
   if (!findings.length && !(r.facts || []).length) return "";
   const worst = findings.some((f) => f.level === "error") ? "error"
@@ -1092,6 +1092,16 @@ function reportCard(r) {
             <p class="saw">${f.saw}</p>
             <p class="means">${f.means}</p>
             <p class="do"><span class="lbl">What to do</span> ${f.do}</p>
+            ${raw(f.change ? html`
+              <p style="margin:8px 0 0">
+                <a class="btn btn-sm btn-primary"
+                   href="#/jobs/${jobId}/again?set=${
+                     encodeURIComponent(JSON.stringify(f.change))}"
+                >Fix it and run again</a>
+                <span class="muted tiny" style="margin-left:8px">${
+                  Object.entries(f.change).map(([k, v]) =>
+                    `${k.replace(/_/g, " ")} → ${v}`).join(" · ")}</span>
+              </p>` : "")}
           </div>
         </div>`).join(""))}
     </div>`;

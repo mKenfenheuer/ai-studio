@@ -32,8 +32,20 @@ def _series(metrics: list[dict], key: str) -> list[tuple[int, float]]:
             if m.get(key) is not None and isinstance(m[key], (int, float))]
 
 
-def _finding(level: str, title: str, saw: str, means: str, do: str) -> dict:
-    return {"level": level, "title": title, "saw": saw, "means": means, "do": do}
+def _finding(level: str, title: str, saw: str, means: str, do: str,
+             change: dict | None = None) -> dict:
+    """One thing this run says about itself.
+
+    `change` is the advice in `do`, as settings rather than as prose. It is
+    what lets the run page offer to start a corrected copy instead of leaving
+    somebody to read the paragraph, work out which field it means, find the
+    rerun form and type the number in -- which is the step at which most
+    people give up and run the same thing again.
+    """
+    out = {"level": level, "title": title, "saw": saw, "means": means, "do": do}
+    if change:
+        out["change"] = change
+    return out
 
 
 def report(job: dict, metrics: list[dict]) -> dict:
@@ -46,19 +58,14 @@ def report(job: dict, metrics: list[dict]) -> dict:
     findings: list[dict] = []
 
     if job.get("status") == "failed":
-        return {"status": "failed", "findings": [_finding(
-            "error", "This run failed",
-            str(job.get("error") or "It stopped with an error."),
-            "Nothing was produced, so there is nothing to diagnose in the "
-            "numbers.",
-            "The log below has the full error. If there is a checkpoint, "
-            "fixing the cause and starting it again carries on from there "
-            "rather than from the beginning.")], "facts": _facts(job, metrics)}
+        return {"status": "failed",
+                "findings": _failure(str(job.get("error") or ""), cfg),
+                "facts": _facts(job, metrics)}
 
     if len(loss) < 3:
         return {"status": job.get("status"), "findings": [], "facts": _facts(job, metrics)}
 
-    findings += _learning(loss, val, summary)
+    findings += _learning(loss, val, summary, cfg)
     findings += _overfitting(val, loss, summary, scratch)
     findings += _stability(loss, metrics)
     findings += _budget(summary, scratch, cfg)
@@ -81,7 +88,87 @@ def report(job: dict, metrics: list[dict]) -> dict:
             "facts": _facts(job, metrics)}
 
 
-def _learning(loss, val, summary) -> list[dict]:
+def _scaled_lr(cfg: dict | None, factor: float) -> dict | None:
+    """The same learning rate, times something. None when there is none to scale."""
+    try:
+        lr = float((cfg or {}).get("learning_rate") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {"learning_rate": float("%.2g" % (lr * factor))} if lr else None
+
+
+def _failure(error: str, cfg: dict) -> list[dict]:
+    """Why it stopped, and what to change so it does not stop again.
+
+    The log has the traceback. What was missing was the step after reading it:
+    the advice was a paragraph, and turning a paragraph into a corrected run
+    meant working out which field it meant, finding the rerun form, and typing
+    a number. Most people ran the same thing again instead.
+    """
+    low = error.lower()
+    said = error or "It stopped with an error."
+
+    # Out of memory, which is far and away the most common failure and the one
+    # with the most mechanical answer.
+    if "out of memory" in low or "cuda error" in low or "hip out of" in low \
+            or "alloc" in low and "fail" in low:
+        change: dict = {}
+        why = []
+        if cfg.get("quantization") != "4bit":
+            change["quantization"] = "4bit"
+            why.append("loading the frozen base in 4-bit")
+        seq = int(cfg.get("max_seq_len") or 0)
+        if seq > 512:
+            change["max_seq_len"] = max(512, seq // 2)
+            why.append("halving the context length")
+        batch = int(cfg.get("batch_size") or 1)
+        if batch > 1:
+            change["batch_size"] = max(1, batch // 2)
+            change["grad_accum"] = int(cfg.get("grad_accum") or 1) * 2
+            why.append("halving the batch and doubling the accumulation, "
+                       "which keeps the effective batch the same")
+        if not cfg.get("gradient_checkpointing"):
+            change["gradient_checkpointing"] = True
+            why.append("recomputing activations instead of storing them")
+        return [_finding(
+            "error", "It ran out of memory on the card", said,
+            "The model, its optimiser state and the activations for one batch "
+            "did not fit together. Nothing about the data or the settings was "
+            "wrong in itself -- there was simply not room.",
+            "Try " + ("; ".join(why) if why else "a smaller model") + ".",
+            change or None)]
+
+    if "no rows" in low or "has no rows in a split" in low:
+        return [_finding(
+            "error", "It could not find the rows to train on", said,
+            "The split named on the run does not exist in that dataset, or is "
+            "empty.",
+            "Choose a split the dataset actually has.")]
+
+    if "trust_remote_code" in low:
+        return [_finding(
+            "error", "That model needs code this studio will not run", said,
+            "The model ships custom Python that transformers would execute to "
+            "load it. This studio does not run model code it did not ship.",
+            "Choose a model with a standard architecture.")]
+
+    if "401" in low or "403" in low or "gated" in low or "authoriz" in low:
+        return [_finding(
+            "error", "It was not allowed to download that", said,
+            "Gated models -- Llama and Gemma among them -- need a Hugging Face "
+            "token belonging to an account that has accepted their licence.",
+            "Connect your Hugging Face account, and accept the model's terms "
+            "on its page.")]
+
+    return [_finding(
+        "error", "This run failed", said,
+        "Nothing was produced, so there is nothing to diagnose in the numbers.",
+        "The log below has the full error. If there is a checkpoint, fixing "
+        "the cause and starting it again carries on from there rather than "
+        "from the beginning.")]
+
+
+def _learning(loss, val, summary, cfg=None) -> list[dict]:
     first = summary.get("initial_loss") or loss[0][1]
     last = summary.get("final_loss") or loss[-1][1]
     if first <= 0:
@@ -100,7 +187,8 @@ def _learning(loss, val, summary) -> list[dict]:
             "enough to destroy the weights faster than training repairs them.",
             "Cut the learning rate by ten and run a short test. If the loss "
             "still rises, the data is being read wrongly rather than the "
-            "settings being wrong.")]
+            "settings being wrong.",
+            _scaled_lr(cfg, 0.1))]
 
     if drop < 0.02:
         return [_finding(
@@ -113,7 +201,8 @@ def _learning(loss, val, summary) -> list[dict]:
             "model with nothing trainable in it.",
             "Check the example training text on the run's settings: if it is "
             "blank or nonsense, the column mapping is wrong. If it looks "
-            "right, raise the learning rate tenfold and try a short run.")]
+            "right, raise the learning rate tenfold and try a short run.",
+            _scaled_lr(cfg, 10))]
     if drop < 0.15:
         return [_finding(
             "warn", "It learned very little",
