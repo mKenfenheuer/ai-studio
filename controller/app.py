@@ -702,6 +702,9 @@ async def get_job(request: Request, job_id: str) -> dict:
         positions = fleet.queue_positions()
         job["queue_position"] = positions.get(job_id)
         job["queue_length"] = len(positions)
+        # What each machine says about it. Only on the one job being looked
+        # at: it is a per-runner fit check and the list page shows a hundred.
+        job["waiting_on"] = fleet.why_waiting(job)
     job["resumable"] = _resumable(job)
     _hide_credentials(job)
     return job
@@ -1620,6 +1623,9 @@ async def plan(payload: dict = Body(...)) -> dict:
             # way to know that without being told to watch for it.
             "early_stop": True,
             "early_stop_patience": 4,
+            # Recorded on the run, so "the same settings" really is the same
+            # run: the held-out slice and the batch order both come from here.
+            "seed": 1234,
         },
         "fit": fit,
         # What each precision would actually cost, so the choice between them

@@ -518,6 +518,34 @@ class Fleet:
         shape of is indistinguishable from a queue that is stuck."""
         return {j["id"]: i + 1 for i, j in enumerate(self.fair_order(db.queued_jobs()))}
 
+    def why_waiting(self, job: dict) -> list[dict]:
+        """What each connected machine says about this job, in its own words.
+
+        The scheduler has always worked this out -- it is how a job is matched
+        to a machine -- and then thrown it away, so a run that no machine could
+        take said "no machine that can run this is connected yet". That one
+        sentence covers a card too small, a missing 4-bit build, a machine
+        restricted to other work, and a fleet that is merely busy, and they
+        are four different problems with four different answers.
+        """
+        out = []
+        for runner in db.list_runners():
+            if runner["status"] == "offline" or runner["id"] not in self.connections:
+                continue
+            caps = runner.get("capabilities") or {}
+            ok, reason = self.can_run(job, caps)
+            busy = self.busy.get(runner["id"])
+            out.append({
+                "runner": runner["name"], "runner_id": runner["id"],
+                "can": bool(ok),
+                # Busy is not the same as unable, and saying so is the
+                # difference between "wait" and "change something".
+                "reason": reason if not ok
+                          else ("training something else" if busy else "ready"),
+                "busy": bool(busy),
+            })
+        return out
+
     def in_flight(self) -> list[dict]:
         """Work that would be lost, or interrupted, by restarting right now."""
         out = []

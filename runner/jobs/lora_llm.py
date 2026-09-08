@@ -261,6 +261,24 @@ def _check_room_to_train(model, device: str, use_4bit: bool, ctx: Any) -> None:
         % (used / gb, total / gb, share * 100, advice))
 
 
+def _versions() -> dict:
+    """What this run was trained with.
+
+    "The same settings" is not the same run if the libraries underneath moved:
+    a transformers release that changes a chat template, or a torch release
+    that changes an attention kernel, changes the result while every number on
+    the page stays identical. Recorded so a comparison two months apart can be
+    told apart from a comparison of two models.
+    """
+    out: dict = {}
+    for name in ("torch", "transformers", "peft", "datasets", "accelerate"):
+        try:
+            out[name] = __import__(name).__version__
+        except Exception:  # noqa: BLE001 - absent is an answer
+            pass
+    return out
+
+
 def run(cfg: dict, ctx: Any) -> dict:
     """Execute a fine-tune. `ctx` supplies log/metric/progress/cancel hooks."""
     import torch
@@ -447,6 +465,22 @@ def run(cfg: dict, ctx: Any) -> dict:
     _check_room_to_train(model, device, use_4bit, ctx)
 
     # ---- dataset -------------------------------------------------------
+    # One seed, used by everything that draws a random number, so a run can be
+    # repeated. Fine-tuning had none at all: the held-out slice was cut with a
+    # hardcoded 1234 and the batch order was unseeded, so "the same run twice"
+    # was two different runs and comparing them measured the noise.
+    seed = int(cfg.get("seed") or 1234)
+    import random as _random
+    _random.seed(seed)
+    torch.manual_seed(seed)
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        import numpy as _np
+        _np.random.seed(seed)
+    except Exception:  # noqa: BLE001 - numpy is present in practice
+        pass
+
     ctx.progress(0, 0, stage="loading_dataset")
     ds_name = cfg["dataset"]
     ctx.log("Loading dataset: %s" % (cfg.get("dataset_label") or ds_name))
@@ -699,8 +733,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     if val_ds is not None:
         pass
     elif want_val >= VAL_ROWS_MIN and len(ds) - want_val >= 16:
-        parts = ds.train_test_split(test_size=want_val,
-                                    seed=int(cfg.get("seed") or 1234))
+        parts = ds.train_test_split(test_size=want_val, seed=seed)
         ds, val_ds = parts["train"], parts["test"]
         ctx.log("Holding back %d of the %d examples to measure on. The model "
                 "never trains on these, so their loss is the one that tells "
@@ -720,7 +753,11 @@ def run(cfg: dict, ctx: Any) -> dict:
     epochs = float(cfg.get("epochs", 1))
     lr = float(cfg.get("learning_rate", 2e-4))
 
-    loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=False)
+    # Seeded, so the batches come in the same order on a second run.
+    _gen = torch.Generator()
+    _gen.manual_seed(seed)
+    loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=False,
+                        generator=_gen)
     val_loader = DataLoader(val_ds, batch_size=bs) if val_ds is not None else None
     steps_per_epoch = max(1, math.ceil(len(loader) / accum))
     total_steps = int(cfg.get("max_steps") or max(1, int(steps_per_epoch * epochs)))
@@ -992,6 +1029,9 @@ def run(cfg: dict, ctx: Any) -> dict:
         # examples" means two quite different things: a split somebody
         # deliberately held back, or 5% of the training data taken at random.
         # Only the first is a fair test of anything.
+        # What it would take to run this again and get this back.
+        "seed": seed,
+        "versions": _versions(),
         "held_out_from": ("the %s split of the dataset" % held_split
                           if held_split else
                           "a slice taken from the training data"

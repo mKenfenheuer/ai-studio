@@ -1688,6 +1688,29 @@ function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
     </div>` : "";
 }
 
+/** Why this run is not running, machine by machine. */
+function waitingDetail(job) {
+  const rows = job.waiting_on || [];
+  if (!rows.length) return "";
+  const able = rows.filter((r) => r.can);
+  return html`
+    <details class="adv" style="margin-top:8px">
+      <summary>${able.length
+        ? `${able.length} of ${rows.length} connected machines could run this`
+        : `None of the ${rows.length} connected machines can run this`}</summary>
+      <table class="table" style="margin-top:8px"><tbody>
+        ${raw(rows.map((r) => html`
+          <tr>
+            <td class="tiny">${r.runner}</td>
+            <td class="tiny ${r.can ? "muted" : ""}">${raw(r.can
+              ? (r.busy ? `<span class="badge badge-accent">busy</span> ${esc(r.reason)}`
+                        : `<span class="badge badge-ok">ready</span>`)
+              : `<span class="badge badge-warn">cannot</span> ${esc(r.reason)}`)}</td>
+          </tr>`).join(""))}
+      </tbody></table>
+    </details>`;
+}
+
 function queueCard(job) {
   if (job.status !== "queued") return "";
   const pos = job.queue_position;
@@ -1702,6 +1725,7 @@ function queueCard(job) {
           queueing several long runs does not hold up everyone else.</p>`
         : html`<p class="muted tiny" style="margin:6px 0 0">
           No machine that can run this is connected yet.</p>`)}
+      ${raw(waitingDetail(job))}
     </div>`;
 }
 

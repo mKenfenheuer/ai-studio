@@ -14,7 +14,7 @@ import { api, events } from "../api.js";
 import { html, raw, esc, on, toast, fmtAgo, fmtDuration, fmtNum,
          statusBadge } from "../util.js";
 import { ribbon, rb, group } from "../ribbon.js";
-import { breadcrumb } from "../components.js";
+import { breadcrumb, pageHead, emptyState } from "../components.js";
 
 export async function sweepView(mount, [sweepId]) {
   const paint = async () => {
@@ -29,6 +29,77 @@ export async function sweepView(mount, [sweepId]) {
   return events.subscribe((m) => {
     if (["jobs_changed", "job_finished"].includes(m.type)) paint();
   });
+}
+
+/**
+ * Every sweep, which had no page at all.
+ *
+ * `GET /api/sweeps` has existed since sweeps did, and so has `api.sweeps()`.
+ * There was no route to reach either from, so the only way to a sweep was
+ * through one of its member runs -- and the way to find a member run was to
+ * recognise one of eight identically-named rows in the list of every run this
+ * studio has ever made. Close the tab and the sweep was gone.
+ */
+export async function sweepsView(mount) {
+  const paint = async () => {
+    const sweeps = await api.sweeps();
+    mount.innerHTML = html`
+      ${raw(pageHead({
+        title: "Sweeps",
+        sub: "The same run, several settings, so the comparison means something.",
+      }))}
+      ${raw(ribbon({
+        tabs: [{ key: "home", label: "Sweeps" }], active: "home",
+        body: group("New", [
+          rb(null, "✦", "Start one", { cls: "primary", href: "#/new",
+            title: "The review step of any run can vary one setting" }),
+        ]) + group("Elsewhere", [
+          rb(null, "≡", "All runs", { href: "#/jobs" }),
+          rb(null, "⚖", "Compare", { href: "#/compare" }),
+        ]),
+      }))}
+      ${raw(sweeps.length ? html`
+        <div class="card" style="padding:0">
+          <div class="table-wrap"><table>
+            <thead><tr>
+              <th>Sweep</th><th>Varying</th><th>Runs</th>
+              <th>Best held-out loss</th><th class="hide-sm">When</th><th></th>
+            </tr></thead>
+            <tbody>${raw(sweeps.map(sweepRow).join(""))}</tbody>
+          </table></div>
+        </div>` : emptyState({
+          icon: "⚖",
+          title: "No sweeps yet",
+          body: "A sweep is the same run started several times with one setting "
+              + "changed, so you can see which value was actually better instead "
+              + "of guessing. The review step of any run can start one.",
+          cta: { href: "#/new", label: "Start a training run" },
+        }))}`;
+  };
+  await paint();
+  return events.subscribe((m) => {
+    if (["jobs_changed", "job_finished"].includes(m.type)) paint();
+  });
+}
+
+function sweepRow(s) {
+  const runs = s.runs || [];
+  const scored = runs.filter((r) => heldOut(r) != null);
+  const best = scored.length ? Math.min(...scored.map(heldOut)) : null;
+  const running = runs.filter((r) =>
+    ["queued", "assigned", "running"].includes(r.status)).length;
+  const varied = [...new Set(runs.flatMap((r) => Object.keys(r.values || {})))];
+  return html`
+    <tr>
+      <td><a href="#/sweeps/${s.id}"><strong>${s.name}</strong></a></td>
+      <td class="mono tiny">${varied.join(", ") || "—"}</td>
+      <td class="tiny">${runs.length}${raw(running
+        ? ` <span class="badge badge-accent">${running} going</span>`
+        : ` <span class="badge badge-ok">done</span>`)}</td>
+      <td class="mono">${best != null ? best.toFixed(4) : "—"}</td>
+      <td class="tiny muted hide-sm">${fmtAgo(s.created_at)}</td>
+      <td><a class="btn btn-sm" href="#/sweeps/${s.id}">Open</a></td>
+    </tr>`;
 }
 
 const heldOut = (r) => r.summary?.best_val_loss ?? null;
@@ -49,7 +120,8 @@ function layout(s) {
 
   return html`
     <div class="page-head">
-      ${raw(breadcrumb({ href: "#/jobs", label: "Runs" }))}
+      ${raw(breadcrumb([{ href: "#/jobs", label: "Runs" },
+                        { href: "#/sweeps", label: "Sweeps" }]))}
       <h1 style="margin:6px 0 0">${s.name}</h1>
       <p class="sub">Varying ${(s.varied || []).join(", ") || "settings"} —
         everything else is identical, which is what makes the comparison mean

@@ -204,6 +204,8 @@ function ribbonFor(s) {
     ]) + group("Arrange", [
       rbSeg([{ label: "Flat", on: !bySweep, data: `data-sweepgroup="0"` },
              { label: "Group sweeps", on: bySweep, data: `data-sweepgroup="1"` }]),
+      rb(null, "⚖", "All sweeps", { href: "#/sweeps",
+        title: "Every sweep this studio has run" }),
     ]);
   }
   return ribbon({ tabs: TABS, active: tab, body });

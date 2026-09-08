@@ -2498,6 +2498,10 @@ function finetuneReview(state, runner, caps) {
              "Size of the trained adapter. Higher learns more and risks more."],
             ["max_steps", "Maximum steps", s.max_steps, "number",
              "Training stops here even if the data has not run out."],
+            ["seed", "Seed", s.seed ?? 1234, "number",
+             "The same seed with the same settings gives the same run, down to "
+             + "the order of the batches. Change it to find out how much of a "
+             + "difference between two runs was luck."],
           ]))}
           <div class="field">
             <label for="f_dtype">Number precision</label>

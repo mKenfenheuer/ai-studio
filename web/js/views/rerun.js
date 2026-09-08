@@ -35,6 +35,9 @@ const FIELDS = [
         min: "0",
         hint: "A hard cap, whatever the passes work out to. 0 removes it." },
       { key: "warmup_steps", label: "Warm-up steps", step: "1", min: "0" },
+      { key: "seed", label: "Seed", step: "1", min: "0",
+        hint: "The same seed with the same settings gives the same run. "
+            + "Change it to find out how much of a difference was luck." },
       { key: "learning_rate", label: "Learning rate", step: "any",
         hint: "The single most consequential number here. Halve it before "
             + "you change anything else." },
