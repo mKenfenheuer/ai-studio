@@ -83,6 +83,7 @@ app.include_router(data.router)
 app.include_router(evals.router)
 app.include_router(providers.router)
 app.include_router(serving_api.router)
+app.include_router(serving_api.registry)
 app.include_router(sharing.router)
 app.include_router(sso.router)
 

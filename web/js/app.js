@@ -21,6 +21,7 @@ import { evalsView } from "./views/evals.js";
 import { evalView } from "./views/evalview.js";
 import { compareView } from "./views/compare.js";
 import { sweepView, sweepsView } from "./views/sweep.js";
+import { servingView } from "./views/serving.js";
 
 const routes = [
   [/^\/$/,             dashboardView, "dashboard"],
@@ -45,6 +46,7 @@ const routes = [
   [/^\/evals$/,        evalsView,     "evals"],
   [/^\/evals\/(.+)$/,  evalView,      "evals"],
   [/^\/compare$/,      compareView,   "evals"],
+  [/^\/serving$/,      servingView,   "jobs"],
   [/^\/sweeps$/,       sweepsView,    "jobs"],
   [/^\/sweeps\/(.+)$/, sweepView,     "jobs"],
 ];

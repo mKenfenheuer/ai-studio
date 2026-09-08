@@ -59,9 +59,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from common import conversation
 
 from .. import config, db, serving as spec_for
-from .security import current_user
+from .security import current_user, require_view
 
 router = APIRouter(prefix="/v1")
+
+# The registry and the usage figures are the studio's own surface, not
+# OpenAI's, so they live behind /api with the rest of the app's routes -- but
+# in this file, next to the code that reads them, because a name that resolves
+# differently from the way it is registered is the bug this exists to prevent.
+registry = APIRouter(prefix="/api")
 
 # How long one reply may take before the request is abandoned. Generous: a
 # long answer from a large model on a busy card is slow, and a client that
@@ -111,15 +117,25 @@ def _servable(user: dict) -> list[dict]:
 def _resolve(user: dict, wanted: str) -> dict | None:
     """Find the run a client means by `model`.
 
-    Four ways, in order of how specific they are: the run's id, its exact
-    name, its name ignoring case, and a slug of its name. Clients put this in
-    a config file and type it by hand, and being strict about a capital letter
-    would buy nothing.
+    Five ways, in order of how specific they are: a registered alias, the
+    run's id, its exact name, its name ignoring case, and a slug of its name.
+    Clients put this in a config file and type it by hand, and being strict
+    about a capital letter would buy nothing.
+
+    The alias comes first on purpose. That is the whole point of registering
+    one: `assistant-prod` has to mean whatever it currently points at, even
+    when some run in the studio happens to be called the same thing. An alias
+    whose run this caller cannot use falls through to the other four rather
+    than saying so, because "that name exists but is not yours" is a fact
+    about somebody else's work.
     """
     jobs = _servable(user)
     wanted = (wanted or "").strip()
     if not wanted:
         return None
+    if alias := db.get_alias(wanted):
+        if job := next((j for j in jobs if j["id"] == alias["job_id"]), None):
+            return job
     for match in (lambda j: j["id"] == wanted,
                   lambda j: j["name"] == wanted,
                   lambda j: j["name"].lower() == wanted.lower(),
@@ -136,27 +152,52 @@ def _resolve(user: dict, wanted: str) -> dict | None:
     return None
 
 
+def _model_entry(job: dict, aliases: list[str]) -> dict:
+    summary = job.get("summary") or {}
+    return {
+        "id": job["id"],
+        "object": "model",
+        "created": int(job.get("finished_at") or job["created_at"]),
+        "owned_by": job.get("owner_username") or "ai-studio",
+        # Everything below is ours, not OpenAI's. Clients ignore unknown
+        # fields, and a person reading this by hand needs to know which
+        # run each id is.
+        "name": job["name"],
+        "alias": _slug(job["name"]),
+        "aliases": aliases,
+        "kind": job["kind"],
+        "base_model": (job.get("config") or {}).get("base_model"),
+        "held_out_loss": summary.get("best_val_loss"),
+    }
+
+
 @router.get("/models")
 async def list_models(request: Request) -> dict:
-    """Every run this key can serve, in OpenAI's model-list shape."""
+    """Every run this key can serve, in OpenAI's model-list shape.
+
+    Registered aliases are listed as models in their own right, ahead of the
+    runs, because an alias is the name a client should be configured with:
+    it survives a rename and it moves to next month's model without anything
+    outside this studio being edited.
+    """
     user = current_user(request)
+    jobs = _servable(user)
+    by_job: dict[str, list[str]] = {}
+    for row in db.list_aliases():
+        by_job.setdefault(row["job_id"], []).append(row["alias"])
+
     out = []
-    for job in _servable(user):
-        summary = job.get("summary") or {}
-        out.append({
-            "id": job["id"],
-            "object": "model",
-            "created": int(job.get("finished_at") or job["created_at"]),
-            "owned_by": job.get("owner_username") or "ai-studio",
-            # Everything below is ours, not OpenAI's. Clients ignore unknown
-            # fields, and a person reading this by hand needs to know which
-            # run each id is.
-            "name": job["name"],
-            "alias": _slug(job["name"]),
-            "kind": job["kind"],
-            "base_model": (job.get("config") or {}).get("base_model"),
-            "held_out_loss": summary.get("best_val_loss"),
-        })
+    for row in db.list_aliases():
+        job = next((j for j in jobs if j["id"] == row["job_id"]), None)
+        if not job:
+            continue
+        entry = _model_entry(job, by_job.get(job["id"]) or [])
+        out.append({**entry, "id": row["alias"], "run_id": job["id"],
+                    "is_alias": True,
+                    "stage": row.get("stage") or "",
+                    "created": int(row.get("updated_at") or entry["created"])})
+    for job in jobs:
+        out.append(_model_entry(job, by_job.get(job["id"]) or []))
     return {"object": "list", "data": out}
 
 
@@ -281,6 +322,16 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
         return _error(404, "No model called %r. GET /v1/models lists what this "
                            "key can use." % wanted, "model_not_found")
 
+    # Who to bill this reply to, and under which name it was asked for. The
+    # alias matters as much as the run: a name serving ten thousand calls a
+    # day is a fact about a deployment, and after it has been repointed twice
+    # the run ids underneath it tell you nothing.
+    named = wanted.strip().lower()
+    hit = db.get_alias(named)
+    who = {"user_id": user["id"],
+           "api_key_id": getattr(request.state, "api_key_id", "") or None,
+           "alias": named if hit and hit["job_id"] == job["id"] else None}
+
     try:
         messages = _messages(payload)
     except HTTPException as e:
@@ -303,10 +354,11 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
             # reply is therefore held until it is whole. Where they are not,
             # nothing can appear that needs parsing, and it streams token by
             # token as before.
-            _stream(rid, queue, job, created, buffer=bool(payload.get("tools"))),
+            _stream(rid, queue, job, created, who,
+                    buffer=bool(payload.get("tools"))),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return await _collect(rid, queue, job, created)
+    return await _collect(rid, queue, job, created, who)
 
 
 def _shell(job: dict, created: int, rid: str) -> dict:
@@ -332,9 +384,31 @@ def _tool_calls(msg: dict) -> list[dict]:
     return out
 
 
-async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
+def _record(job: dict, who: dict, msg: dict, started: float,
+            stream: bool) -> None:
+    """File what this reply cost.
+
+    Never raises. A ledger entry that fails must not turn a reply the model
+    has already produced into a 500 -- the numbers are worth having and they
+    are not worth that.
+    """
+    try:
+        db.record_usage(job["id"], msg.get("prompt_tokens") or 0,
+                        msg.get("tokens") or 0,
+                        user_id=who.get("user_id"),
+                        api_key_id=who.get("api_key_id"),
+                        alias=who.get("alias"),
+                        seconds=round(time.time() - started, 3),
+                        stream=stream)
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
+
+
+async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
+                   who: dict):
     """Wait for the whole reply and answer once."""
     text: list[str] = []
+    started = time.time()
     try:
         while True:
             msg = await asyncio.wait_for(queue.get(), GENERATE_TIMEOUT_S)
@@ -352,6 +426,7 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
                     msg.get("error") or "Generation failed.",
                     (" (%s)" % where) if where else ""), "upstream_error")
             elif kind == "generate_done":
+                _record(job, who, msg, started, stream=False)
                 calls = _tool_calls(msg)
                 # The runner's parsed text is authoritative when it sends one,
                 # *including when it is empty*. Falling back to the accumulated
@@ -401,8 +476,9 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int):
 
 
 async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
-                  buffer: bool = False):
+                  who: dict, buffer: bool = False):
     """Server-sent events, in the exact chunk shape OpenAI clients parse."""
+    started = time.time()
     def chunk(delta: dict, finish=None) -> str:
         body = {**_shell(job, created, rid), "object": "chat.completion.chunk",
                 "choices": [{"index": 0, "delta": delta,
@@ -427,6 +503,7 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 yield "data: [DONE]\n\n"
                 return
             elif kind == "generate_done":
+                _record(job, who, msg, started, stream=True)
                 # Reasoning and tool calls are only known once the reply is
                 # whole -- both are recognised by syntax that spans many
                 # tokens, so neither can honestly be streamed as it arrives.
@@ -450,3 +527,167 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
         yield "data: [DONE]\n\n"
     finally:
         FLEET.waiters.pop(rid, None)
+
+
+# --------------------------------------------------------------- registry
+
+# What an alias may be called. Lowercase because it is typed into config files
+# and compared exactly; no leading "job_" because that is what a run id looks
+# like and a name that could be either is a name nobody can reason about.
+ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+
+# Labels, not a workflow. Nothing here enforces an order or a promotion path:
+# a studio of four people does not need approval gates, and the useful part of
+# a stage is that a person reading /v1/models can see which name is the real
+# one.
+STAGES = ("production", "staging", "experiment")
+
+
+def _alias_or_404(alias: str) -> dict:
+    row = db.get_alias(alias)
+    if not row:
+        raise HTTPException(404, "No model is registered under that name.")
+    return row
+
+
+def _may_change(request: Request, row: dict | None) -> None:
+    """Who may repoint or remove a name.
+
+    Its owner, or an administrator. Not everyone who can see the run behind
+    it: an alias is what other software is pointed at, and repointing one is
+    changing what a running system answers with.
+    """
+    user = current_user(request)
+    if not row or not row.get("owner_id"):
+        return
+    if row["owner_id"] == user["id"] or user.get("role") == "admin":
+        return
+    raise HTTPException(
+        403, "That name belongs to somebody else. Ask them to repoint it, or "
+             "register one of your own.")
+
+
+@registry.get("/models")
+async def registered_models(request: Request) -> list[dict]:
+    """Every registered name, and what it currently points at."""
+    user = current_user(request)
+    out = []
+    for row in db.list_aliases():
+        job = db.get_job(row["job_id"])
+        visible = bool(job) and bool(
+            db.access_level("job", row["job_id"], job.get("owner_id"), user))
+        owner = db.get_user(row["owner_id"]) if row.get("owner_id") else None
+        out.append({
+            "alias": row["alias"],
+            "stage": row.get("stage") or "",
+            "notes": row.get("notes") or "",
+            "updated_at": row["updated_at"],
+            "created_at": row["created_at"],
+            "mine": row.get("owner_id") == user["id"],
+            "owner": db.public_user(owner) if owner else None,
+            # A name registered against a run this caller cannot see is still
+            # a name that is taken. What it points at is not theirs to know.
+            "job_id": row["job_id"] if visible else "",
+            "job_name": job["name"] if visible and job else "",
+            "job_status": job["status"] if visible and job else "",
+            "job_gone": job is None,
+            "visible": visible,
+            "history": [h for h in row.get("history") or []][:5] if visible else [],
+        })
+    return out
+
+
+@registry.put("/models/{alias}")
+async def register_model(request: Request, alias: str,
+                         payload: dict = Body(...)) -> dict:
+    """Point a name at a run, or move it to a different one."""
+    user = current_user(request)
+    alias = (alias or "").strip().lower()
+    if not ALIAS_RE.match(alias):
+        raise HTTPException(
+            400, "A name is 2 to 64 characters of lowercase letters, digits, "
+                 "dot, dash or underscore -- \"assistant-prod\", not \"My "
+                 "Model\". It is typed into other software's configuration, "
+                 "which is why it is strict.")
+    if alias.startswith("job_"):
+        raise HTTPException(400, "Names starting with \"job_\" look like run "
+                                 "ids. Choose something else.")
+    job_id = (payload.get("job_id") or "").strip()
+    job = db.get_job(job_id) if job_id else None
+    if not job:
+        raise HTTPException(404, "No such run.")
+    require_view(request, "job", job)
+    if job["kind"] not in spec_for.MODEL_KINDS:
+        raise HTTPException(400, "That run did not produce a model to serve.")
+    if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+        raise HTTPException(400, "That run has no saved model, so nothing "
+                                 "could be served under this name.")
+
+    existing = db.get_alias(alias)
+    _may_change(request, existing)
+    stage = (payload.get("stage") or "").strip().lower()
+    if stage and stage not in STAGES:
+        raise HTTPException(400, "A stage is one of: %s." % ", ".join(STAGES))
+    row = db.set_alias(alias, job_id,
+                       owner_id=(existing or {}).get("owner_id") or user["id"],
+                       stage=stage, notes=payload.get("notes"),
+                       by=user["id"])
+    moved = bool(existing) and existing["job_id"] != job_id
+    if moved:
+        # On the run, not only in the alias's own history: the run page is
+        # where somebody looks to find out why a model started being served.
+        db.add_log(job_id, "Serving as \"%s\" from now on." % alias)
+        db.add_log(existing["job_id"],
+                   "No longer served as \"%s\"; it now points at %s."
+                   % (alias, job["name"]))
+    return {**row, "moved": moved}
+
+
+@registry.delete("/models/{alias}")
+async def unregister_model(request: Request, alias: str) -> dict:
+    row = _alias_or_404(alias)
+    _may_change(request, row)
+    db.delete_alias(row["alias"])
+    return {"ok": True, "note": "Anything configured with that name will stop "
+                                "working; the run itself is untouched."}
+
+
+# ------------------------------------------------------------------ usage
+
+@registry.get("/usage")
+async def usage(request: Request, days: int = 30) -> dict:
+    """What has been served, and to whom.
+
+    Scoped to the caller unless they are an administrator, in which case it is
+    the whole studio -- there is no third answer that is useful, and a
+    per-user report somebody cannot see the total of is not a report.
+    """
+    user = current_user(request)
+    days = max(1, min(int(days or 30), db.USAGE_DAYS))
+    since = time.time() - days * 86400
+    whose = None if user.get("role") == "admin" else user["id"]
+
+    keys = {k["id"]: k for k in db.list_api_keys(user["id"])}
+    by_key = []
+    for row in db.usage_by("api_key_id", whose, since):
+        key = keys.get(row["key"])
+        by_key.append({**row,
+                       "name": key["name"] if key else
+                               ("the browser" if not row["key"] else "a key"),
+                       "prefix": key["prefix"] if key else ""})
+    by_model = []
+    for row in db.usage_by("job_id", whose, since):
+        job = db.get_job(row["key"] or "")
+        by_model.append({**row, "name": (job or {}).get("name") or row["key"],
+                         "job_id": row["key"],
+                         "gone": job is None})
+    return {
+        "days": days,
+        "scope": "studio" if whose is None else "you",
+        "totals": db.usage_totals(whose, since),
+        "by_key": by_key,
+        "by_model": by_model,
+        "by_alias": [r for r in db.usage_by("alias", whose, since) if r["key"]],
+        "daily": db.usage_daily(whose, days),
+        "kept_days": db.USAGE_DAYS,
+    }

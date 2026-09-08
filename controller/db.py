@@ -254,6 +254,51 @@ CREATE TABLE IF NOT EXISTS api_keys (
     calls       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+
+-- A name that outlives the run behind it.
+--
+-- Everything outside this studio addresses a model by a run id or a run name.
+-- The id is unreadable and unmemorable; the name changes the moment somebody
+-- renames a run, and every client pointed at it breaks silently. Neither is
+-- something to put in a config file, and both were the only options.
+--
+-- An alias is the stable half: `assistant-prod` names whichever run is
+-- currently the one, and promoting next week's model is repointing it rather
+-- than editing every client. `history` keeps what it pointed at before,
+-- because "when did the answers change, and to what" is the first question
+-- asked when something that was working stops.
+CREATE TABLE IF NOT EXISTS model_aliases (
+    alias       TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    owner_id    TEXT,
+    stage       TEXT,
+    notes       TEXT,
+    history     TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_job ON model_aliases(job_id);
+
+-- One row per reply served over the OpenAI-compatible API.
+--
+-- The tokens were measured on every call and thrown away, so nothing could
+-- answer "which key is doing all this" or "is anybody actually using the
+-- model I trained in March". The counts are the runner's real ones, not
+-- estimates from the text.
+CREATE TABLE IF NOT EXISTS usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                REAL NOT NULL,
+    user_id           TEXT,
+    api_key_id        TEXT,
+    job_id            TEXT NOT NULL,
+    alias             TEXT,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    seconds           REAL,
+    stream            INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, ts);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -1140,24 +1185,35 @@ def create_api_key(user_id: str, name: str, key_hash: str, prefix: str) -> str:
     return kid
 
 
-def api_key_owner(key_hash: str) -> dict | None:
-    """The account a key belongs to, and a note that it was used.
+def api_key_identity(key_hash: str) -> tuple[dict | None, str]:
+    """The account a key belongs to and the key's own id, plus a note that it
+    was used.
 
-    The usage counter is written at most once a minute per key. An API meant
-    to be called from a script can be called several times a second, and a
-    database write per call to record "yes, still being used" would be the
-    most expensive part of serving a short reply.
+    The `calls` counter is written at most once a minute per key, so it counts
+    minutes in which the key was busy rather than calls -- an API meant to be
+    called from a script can be called several times a second, and a database
+    write per call to record "yes, still being used" would be the most
+    expensive part of serving a short reply. The real per-call figures live in
+    the `usage` table, which is written once per reply and read as sums.
+
+    The key's id is returned because usage is recorded against it: "which of
+    my four keys is doing all this" is the first question anybody asks of a
+    number they did not expect.
     """
     row = q1("SELECT * FROM api_keys WHERE key_hash=?", (key_hash,))
     if not row:
-        return None
+        return None, ""
     user = get_user(row["user_id"])
     if not user or not user["active"]:
-        return None
+        return None, ""
     if now() - float(row["last_used"] or 0) > 60:
         ex("UPDATE api_keys SET last_used=?, calls=calls+1 WHERE id=?",
            (now(), row["id"]))
-    return user
+    return user, row["id"]
+
+
+def api_key_owner(key_hash: str) -> dict | None:
+    return api_key_identity(key_hash)[0]
 
 
 def list_api_keys(user_id: str) -> list[dict]:
@@ -1517,3 +1573,165 @@ def get_score(score_id: str) -> dict | None:
 
 def delete_score(score_id: str) -> None:
     ex("DELETE FROM eval_scores WHERE id=?", (score_id,))
+
+
+# ------------------------------------------------------------- the registry
+#
+# Aliases are the names clients use. See the table's comment for why they
+# exist; what matters here is that the alias is the primary key, so two
+# aliases cannot point at the same name and a repoint is one UPDATE rather
+# than a delete and an insert with a window in between where the name resolves
+# to nothing.
+
+# How many previous targets to keep. Enough to answer "what changed last
+# week"; not a permanent audit log, which is a different feature with
+# different retention rules.
+ALIAS_HISTORY = 20
+
+
+def _hydrate_alias(r: dict) -> dict:
+    try:
+        r["history"] = json.loads(r.get("history") or "[]")
+    except (TypeError, ValueError):
+        r["history"] = []
+    return r
+
+
+def get_alias(alias: str) -> dict | None:
+    r = q1("SELECT * FROM model_aliases WHERE alias=?", ((alias or "").lower(),))
+    return _hydrate_alias(r) if r else None
+
+
+def list_aliases() -> list[dict]:
+    """Every alias, with the run it points at, newest change first."""
+    rows = q("SELECT a.*, j.name AS job_name, j.kind AS job_kind,"
+             " j.status AS job_status, j.owner_id AS job_owner_id,"
+             " j.finished_at AS job_finished_at"
+             " FROM model_aliases a LEFT JOIN jobs j ON j.id = a.job_id"
+             " ORDER BY a.updated_at DESC")
+    return [_hydrate_alias(r) for r in rows]
+
+
+def aliases_for_job(job_id: str) -> list[str]:
+    return [r["alias"] for r in
+            q("SELECT alias FROM model_aliases WHERE job_id=? ORDER BY alias",
+              (job_id,))]
+
+
+def set_alias(alias: str, job_id: str, owner_id: str | None = None,
+              stage: str = "", notes: str | None = None,
+              by: str | None = None) -> dict:
+    """Point a name at a run, creating it if it is new.
+
+    The previous target is pushed onto the history before the update, not
+    after: a repoint that fails halfway must not leave a name whose history
+    claims it moved.
+    """
+    alias = (alias or "").lower()
+    ts = now()
+    existing = get_alias(alias)
+    if not existing:
+        ex("INSERT INTO model_aliases (alias,job_id,owner_id,stage,notes,"
+           "history,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+           (alias, job_id, owner_id, stage or None, notes or None,
+            json.dumps([]), ts, ts))
+        return get_alias(alias)
+
+    history = existing["history"]
+    if existing["job_id"] != job_id:
+        history = ([{"job_id": existing["job_id"], "until": ts, "by": by}]
+                   + history)[:ALIAS_HISTORY]
+    ex("UPDATE model_aliases SET job_id=?, stage=?, notes=?, history=?,"
+       " updated_at=? WHERE alias=?",
+       (job_id, stage or existing.get("stage") or None,
+        existing.get("notes") if notes is None else (notes or None),
+        json.dumps(history), ts, alias))
+    return get_alias(alias)
+
+
+def delete_alias(alias: str) -> bool:
+    c = connect()
+    cur = c.execute("DELETE FROM model_aliases WHERE alias=?",
+                    ((alias or "").lower(),))
+    c.commit()
+    return cur.rowcount > 0
+
+
+# ----------------------------------------------------------------- usage
+#
+# Written on every reply the OpenAI-compatible API serves. Read as sums, never
+# row by row, so the table is an append-only ledger and every question asked
+# of it is a GROUP BY.
+
+# How long a row is kept. Long enough to see a month-over-month change; short
+# enough that a studio serving a few requests a second does not grow a
+# database of nothing but this.
+USAGE_DAYS = 90
+
+# Trimming on every insert would double the cost of recording. Once in every
+# so many is enough for a table whose rows are a few dozen bytes.
+_TRIM_EVERY = 512
+_since_trim = 0
+
+
+def record_usage(job_id: str, prompt_tokens: int, completion_tokens: int,
+                 user_id: str | None = None, api_key_id: str | None = None,
+                 alias: str | None = None, seconds: float | None = None,
+                 stream: bool = False) -> None:
+    global _since_trim
+    ex("INSERT INTO usage (ts,user_id,api_key_id,job_id,alias,prompt_tokens,"
+       "completion_tokens,seconds,stream) VALUES (?,?,?,?,?,?,?,?,?)",
+       (now(), user_id, api_key_id, job_id, alias, int(prompt_tokens or 0),
+        int(completion_tokens or 0), seconds, 1 if stream else 0))
+    _since_trim += 1
+    if _since_trim >= _TRIM_EVERY:
+        _since_trim = 0
+        ex("DELETE FROM usage WHERE ts < ?", (now() - USAGE_DAYS * 86400,))
+
+
+def _usage_where(user_id: str | None, since: float | None) -> tuple[str, list]:
+    where, args = [], []
+    if user_id:
+        where.append("user_id=?")
+        args.append(user_id)
+    if since:
+        where.append("ts>=?")
+        args.append(since)
+    return (" WHERE " + " AND ".join(where) if where else ""), args
+
+
+def usage_by(column: str, user_id: str | None = None,
+             since: float | None = None, limit: int = 50) -> list[dict]:
+    """Token counts grouped by one column, biggest first."""
+    if column not in ("job_id", "api_key_id", "alias", "user_id"):
+        raise ValueError("refusing to group usage by %r" % column)
+    clause, args = _usage_where(user_id, since)
+    return q("SELECT %s AS key, COUNT(*) AS calls,"
+             " SUM(prompt_tokens) AS prompt_tokens,"
+             " SUM(completion_tokens) AS completion_tokens,"
+             " MAX(ts) AS last_used"
+             " FROM usage%s GROUP BY %s ORDER BY"
+             " SUM(prompt_tokens + completion_tokens) DESC LIMIT ?"
+             % (column, clause, column), args + [limit])
+
+
+def usage_totals(user_id: str | None = None,
+                 since: float | None = None) -> dict:
+    clause, args = _usage_where(user_id, since)
+    row = q1("SELECT COUNT(*) AS calls, SUM(prompt_tokens) AS prompt_tokens,"
+             " SUM(completion_tokens) AS completion_tokens,"
+             " MIN(ts) AS first_used, MAX(ts) AS last_used"
+             " FROM usage%s" % clause, args) or {}
+    return {k: (v or 0) for k, v in row.items()}
+
+
+def usage_daily(user_id: str | None = None, days: int = 30) -> list[dict]:
+    """Tokens per day, oldest first, for a sparkline that is not a lie.
+
+    Days with no calls are absent rather than zero: the caller draws them, and
+    filling them in here would mean guessing at the reader's time zone.
+    """
+    clause, args = _usage_where(user_id, now() - days * 86400)
+    return q("SELECT CAST(ts / 86400 AS INTEGER) AS day, COUNT(*) AS calls,"
+             " SUM(prompt_tokens + completion_tokens) AS tokens"
+             " FROM usage%s GROUP BY day ORDER BY day" % clause, args)

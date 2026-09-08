@@ -536,11 +536,16 @@ Remaining in this phase:
   that turns the playground into the source of the next training run.
 - **Batch inference**: run a model over a dataset split and save the answers
   as a new dataset (the eval job already does the loop).
-- **Registry**: named aliases (`assistant-prod`) pointing at a run, with
-  stages; `/v1/models` serves aliases; promotion from the sweep page and the
-  eval page.
-- **Usage**: per-key and per-model token counts from what `_collect` already
-  measures; expiry and scope on keys.
+- **Registry.** *Done:* `model_aliases` maps a name to a run, with a stage, a
+  note and the last twenty things it pointed at; `_resolve` checks aliases
+  before run ids and names; `/v1/models` lists them as models in their own
+  right; a Served models page registers and repoints them, and the run page
+  has "Serve as…". Still to do: promotion from the sweep page and the eval
+  page, which is where you learn which run deserves the name.
+- **Usage.** *Done:* every reply the OpenAI-compatible API serves writes one
+  row of the runner's real token counts, against the key, the run and the
+  alias it was asked for; summed on the Served models page, kept 90 days.
+  Still to do: expiry and scope on keys.
 - **A studio with no GPU cannot score anything.** `can_run` refuses an
   evaluation on a CPU machine unless every model in it is hosted, so a
   baseline off the Hub -- a 135M model that scores three prompts in three

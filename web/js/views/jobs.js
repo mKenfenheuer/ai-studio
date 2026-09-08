@@ -167,6 +167,8 @@ function ribbonFor(s) {
       rb(null, "✦", "Training run", { cls: "primary", href: "#/new" }),
       rb(null, "▤", "Write a dataset", { href: "#/generate" }),
       rb(null, "◎", "Score models", { href: "#/evals" }),
+      rb(null, "🏷", "Served models", { href: "#/serving",
+        title: "The names other software is pointed at, and what they cost" }),
     ]) + group(n ? `${n} selected` : "Selected", [
       rb(null, "▤", "Open", { disabled: !one, href: one ? `#/jobs/${one.id}` : "" }),
       rb(null, "▷", "Try it", { cls: "primary", disabled: !playable,

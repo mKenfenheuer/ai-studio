@@ -371,6 +371,48 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     });
   });
 
+  on(mount, "click", "#serveAs", async () => {
+    const job = getJob();
+    let names = [];
+    try { names = await api.registeredModels(); }
+    catch (e) { return toast(e.message, "err"); }
+    const here = names.filter((n) => n.job_id === job.id);
+    const dlg = modal({ title: `Serve "${job.name}" under a name`, width: 520,
+      body: html`
+      <p class="muted tiny">A name other software is configured with. It
+        survives a rename, and moving it to a better model later is one change
+        rather than one in every client.</p>
+      ${raw(here.length ? html`
+        <div class="callout callout-ok">
+          <strong>Already served as</strong>
+          ${raw(here.map((n) => `<code>${esc(n.alias)}</code>`).join(", "))}
+        </div>` : "")}
+      <div class="field">
+        <label for="serveName">Name</label>
+        <input id="serveName" type="text" class="mono" placeholder="assistant-prod"
+               value="${esc(suggestedAlias(job.name, names))}">
+        <div class="hint">Lowercase letters, digits, dot, dash or underscore.
+          Using a name that already exists points it here instead.</div>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <a class="btn" href="#/serving">All names</a>
+        <button type="button" class="btn btn-primary" id="serveGo">Serve it</button>
+      </div>` });
+    on(dlg, "click", "#serveGo", async (_e, btn) => {
+      const alias = ($("#serveName", dlg).value || "").trim().toLowerCase();
+      if (!alias) return toast("Give it a name.", "err");
+      btn.disabled = true;
+      try {
+        const r = await api.registerModel(alias, { job_id: job.id });
+        dlg.close();
+        toast(r.moved ? `"${alias}" now answers with this run.`
+                      : `Serving as "${alias}".`, "ok",
+              { href: "#/serving", label: "Served models" });
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  });
+
   // The publish form lives in the Model section, which may not be the tab you
   // are looking at.
   // A conversion, as a job: it reads every tensor and writes a new file, so
@@ -1718,6 +1760,11 @@ function runRibbon(job, tab) {
     rb(null, "▤", "Open the rows", { disabled: !madeRows,
       cls: "primary", href: madeRows ? `#/data/${esc(madeRows)}` : "" }),
   ]) + group("Share it", [
+    // Naming the run something other software can be pointed at. Without it
+    // a client is configured with a run id nobody can read or a run name that
+    // breaks the next time somebody renames it.
+    rb("serveAs", "🏷", "Serve as…", { disabled: !usable,
+      title: "Give it a name other software can be pointed at" }),
     rb(null, "↓", "Download", { disabled: !(done && job.artifacts?.length),
       href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
     rb("goPublish", "☁", "Publish", { disabled: !usable,
@@ -2039,4 +2086,20 @@ function appendLog(box, l) {
   div.innerHTML = `<span class="ts">${esc(time)}</span>${esc(l.line)}`;
   box.appendChild(div);
   while (box.childElementCount > 1200) box.removeChild(box.firstChild);
+}
+
+
+/** A name to offer, from the run's own, that is not taken already.
+ *
+ *  A suggestion rather than a default anybody has to accept: the useful name
+ *  is nearly always about what the model is *for* rather than what it was
+ *  called while it trained. */
+function suggestedAlias(name, taken) {
+  const base = String(name || "model").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40)
+    || "model";
+  const used = new Set((taken || []).map((n) => n.alias));
+  if (!used.has(base)) return base;
+  for (let i = 2; i < 50; i++) if (!used.has(`${base}-${i}`)) return `${base}-${i}`;
+  return base;
 }

@@ -67,6 +67,8 @@ async def authenticate(request: Request, call_next):
     """Attach the caller's account to the request, or refuse it."""
     path = request.url.path
     request.state.user = None
+    # Which API key this is, when it is one. Usage is recorded against it.
+    request.state.api_key_id = ""
 
     # The OpenAI-compatible surface. A different door with a different key,
     # because the caller is a script or a piece of home automation rather than
@@ -75,7 +77,8 @@ async def authenticate(request: Request, call_next):
     # errors, or the client library turns a clear refusal into a parse error.
     if path.startswith("/v1/"):
         raw = _bearer(request)
-        user = db.api_key_owner(auth.api_key_hash(raw)) if raw else None
+        user, request.state.api_key_id = (
+            db.api_key_identity(auth.api_key_hash(raw)) if raw else (None, ""))
         if not user:
             # Falls back to a session so the studio's own pages can call this
             # surface without minting a key to talk to itself.

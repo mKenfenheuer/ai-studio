@@ -388,8 +388,11 @@ function keysCard(keys, fresh) {
         <label>Base URL</label>
         <input type="text" class="mono" readonly value="${origin}/v1">
         <div class="hint">Model names come from
-          <code>GET ${origin}/v1/models</code> — each finished run is one,
-          by its id or its name.</div>
+          <code>GET ${origin}/v1/models</code> — each finished run is one, by
+          its id or its name, and so is every
+          <a href="#/serving">registered name</a>. Point a client at a
+          registered name rather than a run: it survives a rename, and you can
+          move it to a better model without editing anything out there.</div>
       </div>
 
       ${raw(fresh ? html`
@@ -417,7 +420,9 @@ function keysCard(keys, fresh) {
               <td>${k.name}
                 <div class="muted tiny mono">${k.prefix}…</div></td>
               <td class="tiny muted">${k.last_used
-                ? `used ${fmtAgo(k.last_used)}` : "never used"}</td>
+                ? `used ${fmtAgo(k.last_used)}` : "never used"}
+                ${raw(k.last_used
+                  ? `<div><a href="#/serving">what it served</a></div>` : "")}</td>
               <td><button class="btn-sm btn-danger" data-del-key="${k.id}"
                           title="Delete this key">✕</button></td>
             </tr>`).join(""))}

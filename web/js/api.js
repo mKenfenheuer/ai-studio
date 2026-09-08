@@ -291,6 +291,18 @@ export const api = {
     req("/api/scratch/plan", { method: "POST", body: JSON.stringify(body) }),
 
   playground:  () => req("/api/playground"),
+
+  // ---- served models: the names other software is pointed at ------------
+  registeredModels: () => req("/api/models"),
+  registerModel: (alias, body) =>
+    req(`/api/models/${encodeURIComponent(alias)}`,
+        { method: "PUT", body: JSON.stringify(body) }),
+  unregisterModel: (alias) =>
+    req(`/api/models/${encodeURIComponent(alias)}`, { method: "DELETE" }),
+  // The OpenAI-shaped list, which is also the one that knows which runs have
+  // a model behind them at all.
+  servableModels: () => req("/v1/models"),
+  usage: (days = 30) => req(`/api/usage?days=${encodeURIComponent(days)}`),
   chat:        (id, body) =>
     req(`/api/jobs/${encodeURIComponent(id)}/chat`,
         { method: "POST", body: JSON.stringify(body) }),
