@@ -390,6 +390,31 @@ move to `train`. The same view is the annotation tool for uploaded data
 
 ## 6. Phase 3: training as an iteration loop
 
+**In progress.** Done so far, deployed to the lab on 2026-09-08:
+
+- **6.1 the wizard remembers** — the step is in the address so Back and Forward
+  move between steps; everything else is a draft that survives a reload and
+  expires after eight hours; switching mode keeps the dataset; "train on this"
+  is a link. The file is not yet split per step.
+- **6.2 pre-flight instead of post-mortem** — the five checks that used to fail
+  an hour into a run, at the review step, gating the start. Includes real token
+  counts: a `tokenize` message asks whichever runner is free, so the controller
+  gets exact lengths without growing a tokenizer.
+- **6.3 failure has a next step** — findings carry the correction as settings,
+  the report offers "fix it and run again", and the rerun form can reach
+  quantization, dtype, the base model and the merge setting, which is to say it
+  can now fix the most common failure.
+- **6.4, in part** — sweeps get a list page; runs get notes.
+- **6.5 reproducibility** — one seed drives everything random in a fine-tune
+  and is a visible setting; library versions are recorded on the run.
+- **6.6, in part** — a queued run says what every connected machine made of it.
+
+Still to do: splitting wizard.js per step (6.1), compare filters and CSV
+export and run tags (6.4), the dataset hash on a run (6.5), loss masking as a
+setting, checkpoint browsing, sequence packing, full fine-tuning and preference
+tuning (6.6), and GGUF export (6.7).
+
+
 ### 6.1 The wizard remembers
 
 Step and every choice go in the URL (`#/new?step=3&model=…&dataset=…`) with
