@@ -864,9 +864,22 @@ def _verdict(scores: list[dict], ranked: dict | None) -> str:
         "Lowest" if lower else "Highest", ranked["label"], best["name"],
         fmt(best["metrics"][key]), fmt(worst["metrics"][key]), worst["name"])
     if key != "expected_loss":
-        head += (" Ranked on what the models wrote rather than on the loss, "
-                 "which a model reached over the network cannot be measured "
-                 "on -- no provider exposes the probabilities it needs.")
+        # Why the better measure was not available, in terms of what is
+        # actually true of this comparison. It used to blame the network in
+        # every case, including a set of prompts that simply has no expected
+        # answers -- an explanation that sends the reader to look for a
+        # problem that is not there.
+        hosted = any(s.get("source") == "api" for s in scores)
+        no_text = not any((s["metrics"].get("scored_on_text") or 0)
+                          for s in scores)
+        head += (" Ranked on what the models did rather than on the loss, "
+                 + ("because these prompts have no expected answers to "
+                    "measure a loss against."
+                    if no_text else
+                    "which a model reached over the network cannot be "
+                    "measured on -- no provider exposes the probabilities it "
+                    "needs." if hosted else
+                    "which was not available for every model here."))
     if ranked["excluded"]:
         # Never silently. A model on the page that took no part in the
         # ranking, with a winner announced above it, is the single most
