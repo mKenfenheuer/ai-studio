@@ -1,0 +1,192 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pending</title>
+<link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+<div id="gate" hidden></div>
+<div id="app"><aside class="sidebar">
+<div class="brand"><span class="brand-mark">&#9670;</span><div>
+  <div class="brand-name">AI Studio</div><div class="brand-sub">train &middot; tune &middot; evaluate</div></div></div>
+<nav class="nav">
+  <a href="#/" data-nav="dashboard"><span class="ico">&#8962;</span><span class="lbl">Dashboard</span></a>
+  <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">&#10022;</span><span class="lbl">New training run</span></a>
+  <a href="#/jobs" data-nav="jobs" class="active"><span class="ico">&#8801;</span><span class="lbl">Runs</span></a>
+  <a href="#/play" data-nav="play"><span class="ico">&#9655;</span><span class="lbl">Playground</span></a>
+  <a href="#/data" data-nav="data"><span class="ico">&#9636;</span><span class="lbl">Datasets</span></a>
+  <a href="#/evals" data-nav="evals" class="nav-spill"><span class="ico">&#9678;</span><span class="lbl">Evaluate</span></a>
+  <a href="#/runners" data-nav="runners" class="nav-spill"><span class="ico">&#9638;</span><span class="lbl">Machines</span></a>
+  <a href="#/settings" data-nav="settings" class="nav-spill"><span class="ico">&#9881;</span><span class="lbl">Settings</span></a>
+  <button type="button" class="nav-more" id="navMore"><span class="ico">&#8943;</span><span class="lbl">More</span></button>
+</nav><div class="sidebar-foot"><a class="who" href="#/account" id="whoami" hidden data-nav="account">
+  <span class="who-avatar" id="whoAvatar">?</span>
+  <span class="who-text"><span class="who-name" id="whoName"></span><span class="who-role" id="whoRole"></span></span>
+</a></div></aside>
+<main class="main" id="main"></main></div>
+<div class="drawer" id="helpDrawer" hidden><div class="drawer-inner">
+  <button class="drawer-close" id="helpClose">x</button></div></div>
+<button id="helpToggle" hidden></button>
+<button id="helpToggleMobile" hidden></button>
+<div id="toasts" class="toasts"></div>
+<pre id="results" style="white-space:pre-wrap;word-break:break-word"></pre>
+<script type="module">
+// ---------------------------------------------------------------------------
+// Every view, rendered against canned API answers, with anything that throws
+// or draws nothing reported.
+//
+// Driven by scripts/check-render.mjs. See that file for why this exists and
+// how to run it.
+//
+// The fixtures below are the shape of each endpoint, not its content: they are
+// here so a view can be drawn at all, and the assertions are only "it drew
+// something" and "its tabs switch". A fixture that drifts from the real
+// response shows up as a view that suddenly cannot draw, which is exactly the
+// signal wanted -- twice now it has been the code that was wrong rather than
+// the fixture.
+// ---------------------------------------------------------------------------
+
+const now = Math.floor(Date.now() / 1000);
+const job = (over = {}) => ({
+  id: "job_1", name: "SmolLM2 on alpaca", kind: "finetune_llm", status: "succeeded",
+  config: { base_model: "HuggingFaceTB/SmolLM2-135M", dataset: "tatsu-lab/alpaca",
+            dataset_label: "alpaca", studio_dataset: "ds_1", dataset_split: "train",
+            format: { mode: "chat" }, published: [] },
+  step: 100, total_steps: 100, created_at: now - 900, finished_at: now - 60,
+  started_at: now - 880, has_model: true, owner_id: "usr_1", mine: true,
+  summary: { best_val_loss: 1.23, final_loss: 1.1, steps: 100, duration_s: 800 },
+  access: "edit", shares: [], ...over,
+});
+const dataset = (over = {}) => ({
+  id: "ds_1", name: "alpaca", rows: 52002, bytes: 4e7, source: "hub",
+  origin: "tatsu-lab/alpaca", columns: ["instruction", "output", "split"],
+  splits: { train: 50000, validation: 2002 }, format: { mode: "instruction" },
+  owner_name: "max", mine: true, access: "edit", shares: [], notes: "",
+  created_at: now - 5000, updated_at: now - 100, parent_id: null, ...over,
+});
+
+const FIXTURES = [
+  [/\/api\/status/, { version: "0.1.0", join_token: "tok", hf_token_set: true,
+                      runners_online: 1, runners_total: 1, jobs_running: 0, jobs_queued: 0 }],
+  [/\/api\/runners$/, [{ id: "r1", name: "lab-box", status: "online", connected: true,
+      last_seen: now, current_job: null, checkpoints: [], disk: { free_gb: 120, total_gb: 500, models_gb: 40 },
+      capabilities: { device_name: "RX 6900 XT", arch: "gfx1030", vram_gb: 16, backend: "rocm",
+        dtypes: { float16: 31.6, bfloat16: 12.7 }, recommended_dtype: "float16",
+        quantization: { "4bit": true }, attention: { flash: false },
+        max_finetune_params_b: 7, warnings: ["bfloat16 is slow on this card"] } }]],
+  [/\/api\/jobs\/[^/]+\/metrics/, [{ step: 10, loss: 2.1, val_loss: 2.4, lr: 1e-4 },
+                                   { step: 20, loss: 1.8, val_loss: 2.0, lr: 9e-5 }]],
+  [/\/api\/jobs\/[^/]+\/logs/, [{ ts: now, level: "info", line: "training" }]],
+  [/\/api\/jobs\/[^/]+$/, job()],
+  [/\/api\/jobs/, [job(), job({ id: "job_2", kind: "pretrain_llm", name: "Nano from scratch",
+                                config: { dataset: "tinystories", arch: {} } }),
+                   job({ id: "job_3", kind: "generate_dataset", name: "Write me rows",
+                         status: "running", has_model: false,
+                         config: { model: { label: "gpt-4o" } } })]],
+  [/\/api\/datasets\/[^/]+\/rows/, { rows: [
+      { index: 0, split: "train", row: { instruction: "Say hi", output: "Hi" },
+        rendered: "### Instruction\nSay hi\n\n### Response\nHi" }],
+      offset: 0, total: 52002, columns: ["instruction", "output", "split"] }],
+  [/\/api\/datasets\/[^/]+$/, dataset()],
+  [/\/api\/datasets/, [dataset(), dataset({ id: "ds_2", name: "alpaca (cleaned)",
+                                            parent_id: "ds_1", source: "derived", rows: 48000 })]],
+  [/\/api\/evals\/[^/]+$/, { id: "ev_1", name: "Support questions", notes: "", items: [
+      { prompt: "Where is my order?", expected: "I will check.", note: "" }],
+      scores: [], access: "edit", mine: true, shares: [], created_at: now, updated_at: now }],
+  [/\/api\/evals/, [{ id: "ev_1", name: "Support questions", items: [{ prompt: "a", expected: "b" }],
+                     scores: [], mine: true, access: "edit", shares: [], updated_at: now }]],
+  [/\/api\/playground/, [
+      { id: "job_1", name: "SmolLM2 on alpaca", kind: "finetune_llm", style: "chat",
+        system_prompt: "You are helpful.", reasoning: false, base_model: "SmolLM2-135M",
+        dataset_id: "ds_1", held_out_split: "validation", finished_at: now },
+      { id: "job_2", name: "Nano from scratch", kind: "pretrain_llm", style: "continue",
+        finished_at: now }]],
+  [/\/api\/me\b/, { id: "usr_1", username: "max", display_name: "Max", role: "admin",
+                    sessions: [{ user_agent: "Mozilla/5.0 Chrome", last_used: now }],
+                    hf: { connected: false } }],
+  [/\/api\/sweeps/, []],
+  [/\/api\/hub\//, { models: [], datasets: [], configs: [] }],
+  [/\/api\/providers/, { connections: [], studio: [] }],
+  [/\/api\/me\/notify/, { url_hint: "", events: ["succeeded", "failed"] }],
+  [/\/api\/me\/api-keys/, []],
+  [/\/api\/plan/, { settings: {}, explanations: [], memory: {}, fit: {} }],
+];
+
+window.fetch = async (url) => {
+  const u = String(url);
+  const hit = FIXTURES.find(([re]) => re.test(u));
+  const body = hit ? hit[1] : {};
+  return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+};
+// The event stream must not actually open.
+window.WebSocket = class { constructor() { this.readyState = 0; } send() {} close() {} addEventListener() {} };
+
+const results = [];
+const errors = [];
+window.addEventListener("error", (e) => errors.push("window error: " + e.message));
+window.addEventListener("unhandledrejection", (e) => errors.push("unhandled: " + (e.reason?.stack || e.reason?.message || e.reason)));
+
+const VIEWS = [
+  ["dashboard", "./views/dashboard.js", "dashboardView", []],
+  ["data", "./views/data.js", "dataView", []],
+  ["dataset", "./views/dataset.js", "datasetView", ["ds_1"]],
+  ["jobs", "./views/jobs.js", "jobsView", []],
+  ["job", "./views/job.js", "jobView", ["job_1"]],
+  ["play-picker", "./views/play.js", "playView", []],
+  ["play-chat", "./views/play.js", "playView", ["job_1"]],
+  ["runners", "./views/runners.js", "runnersView", []],
+  ["evals", "./views/evals.js", "evalsView", []],
+  ["evalview", "./views/evalview.js", "evalView", ["ev_1"]],
+  ["compare", "./views/compare.js", "compareView", []],
+  ["settings", "./views/settings.js", "settingsView", []],
+  ["account", "./views/account.js", "accountView", []],
+  ["wizard", "./views/wizard.js", "wizardView", []],
+];
+
+const main = document.getElementById("main");
+// ?only=jobs mounts one view and leaves it there, for screenshots.
+const only = new URLSearchParams(location.search).get("only");
+if (only) document.getElementById("results").hidden = true;
+const RUN = only ? VIEWS.filter(([l]) => l === only) : VIEWS;
+for (const [label, path, fn, args] of RUN) {
+  try {
+    const mod = await import(`/static/js/${path.slice(2)}`);
+    main.innerHTML = "";
+    const stop = await mod[fn](main, args);
+    // A view that draws nothing is a view that failed quietly, which is the
+    // exact failure this is here to find.
+    const drew = main.innerHTML.trim().length;
+    const ribbons = main.querySelectorAll(".ribbon").length;
+    // Click every tab. A ribbon whose tabs throw, or draw nothing, is worse
+    // than no ribbon: the page looks fine until somebody presses the thing.
+    let tabNote = "";
+    const tabKeys = [...main.querySelectorAll("[data-tab]:not([disabled])")]
+      .map((b) => b.dataset.tab);
+    for (const key of (only ? [] : tabKeys)) {
+      const btn = main.querySelector(`[data-tab="${key}"]`);
+      if (!btn) { tabNote += ` !${key}-gone`; continue; }
+      btn.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const bodyLen = main.querySelector(".ribbon-body")?.innerHTML.trim().length || 0;
+      const active = main.querySelector(`[data-tab="${key}"]`)?.getAttribute("aria-selected");
+      if (bodyLen < 20) tabNote += ` !${key}-empty`;
+      if (active !== "true") tabNote += ` !${key}-notselected`;
+    }
+    results.push(`${drew > 200 ? "ok  " : "THIN"} ${label.padEnd(12)} ${
+      String(drew).padStart(6)} chars, ${tabKeys.length} tab(s)${
+      tabNote || (ribbons ? " all switch" : "")}`);
+    if (typeof stop === "function" && !only) stop();
+  } catch (e) {
+    results.push(`FAIL ${label.padEnd(12)} ${e.message}`);
+    errors.push(`${label}: ${e.stack || e.message}`);
+  }
+}
+
+// Let any late rejection land before reporting.
+await new Promise((r) => setTimeout(r, 300));
+const bad = results.filter((r) => !r.startsWith("ok")).length + errors.length;
+document.getElementById("results").textContent =
+  results.join("\n") + (errors.length ? "\n\nERRORS\n" + errors.join("\n") : "");
+document.title = bad ? `FAILURES ${bad}` : "ALL VIEWS RENDER";
+</script>
+</body></html>
