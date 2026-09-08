@@ -47,11 +47,7 @@ MANIFEST.json{models_note}.
 
 2. Put the files back into the studio's data directory -- the one mounted at
    /data in the container, or AI_STUDIO_DATA:
-       cp studio.db          <data>/studio.db
-       cp join_token         <data>/join_token
-       rm -rf <data>/datasets  && cp -r datasets  <data>/datasets
-       rm -rf <data>/assets    && cp -r assets    <data>/assets
-       {models_step}
+{steps}
    Remove any studio.db-wal and studio.db-shm beside the database first; they
    belong to the copy you are replacing.
 
@@ -174,13 +170,22 @@ def _copy_everything(staging: Path, dest: Path, root: Path, stamp: str,
         "users": (db.q1("SELECT COUNT(*) AS n FROM users") or {}).get("n"),
     }
     (staging / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # The steps name only what is actually in this directory. Instructions
+    # that tell you to copy a file that was never here are how somebody
+    # restoring at three in the morning decides the whole page is unreliable.
+    steps = ["       cp studio.db          <data>/studio.db"]
+    if "join_token" in parts:
+        steps.append("       cp join_token         <data>/join_token")
+    for name in ("datasets", "assets", "artifacts"):
+        if name in parts:
+            steps.append("       rm -rf <data>/%s && cp -r %s <data>/%s"
+                         % (name, name, name))
+    if "artifacts" not in parts:
+        steps.append("       (no artifacts/: the models were not in this backup)")
     (staging / "RESTORE.md").write_text(RESTORE_TEXT.format(
         models_note="" if include_models else
         " -- without the models, which were left out to keep it small",
-        models_step=("rm -rf <data>/artifacts && cp -r artifacts <data>/artifacts"
-                     if include_models else
-                     "(no artifacts/ directory: the models were not included)")),
-        encoding="utf-8")
+        steps="\n".join(steps)), encoding="utf-8")
     # Moved into place whole, so a half-written backup never looks like one.
     staging.rename(dest)
     db.set_setting(SETTING_KEY + "_last", json.dumps({**manifest, "path": str(dest)}))
