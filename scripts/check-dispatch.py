@@ -66,6 +66,12 @@ def main() -> int:
         check("and the estimate is left on the config the caller holds",
               j["config"].get("estimated_vram_gb"), 18.9)
 
+        j4 = job(base_model="openai/gpt-oss-20b", params_b=20.0,
+                 quantization="4bit", required_runner="run_gpu")
+        fleet.can_run(j4, GPU)
+        check("a 4-bit run is estimated in 4-bit, not in 16-bit",
+              j4["config"].get("estimated_vram_gb"), 13.5)
+
         print("\nPrecision")
         ok, why = fleet.can_run(
             job(base_model="openai/gpt-oss-20b", params_b=20.0), GPU)

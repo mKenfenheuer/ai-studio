@@ -216,7 +216,18 @@ class Fleet:
             # is the one worth checking, not one recomputed later under a
             # different calibration.
             if fit.get("needed_gb") and not job["config"].get("estimated_vram_gb"):
-                job["config"]["estimated_vram_gb"] = fit["needed_gb"]
+                # In the precision this run actually asked for. The verdict's
+                # figure is whichever precision made it fit, so a 7B that fits
+                # in 16-bit reported 18.9 GB even when the run was configured
+                # for 4-bit -- and the calibration that compares the measured
+                # peak against this estimate was being fed the wrong number
+                # for every quantised run.
+                needed = fit["needed_gb"]
+                if job["config"].get("quantization") == "4bit":
+                    mem = hub.estimate_memory(
+                        params_b, job["config"].get("method") or "lora") or {}
+                    needed = mem.get("int4_gb") or needed
+                job["config"]["estimated_vram_gb"] = needed
                 # There may be no run yet. This same check answers "will this
                 # run here" for a job that is being *created* -- the wizard
                 # pins a machine, so every fine-tune started from it came
