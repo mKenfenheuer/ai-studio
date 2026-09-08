@@ -1059,7 +1059,12 @@ def _artifact_kind(dest: Path, job: dict | None) -> str:
         names = set()
     if "adapter_config.json" in names:
         return "adapter"
-    if "config.json" in names:
+    # config.json is a transformers model; model_index.json a diffusers
+    # pipeline; a bare safetensors with neither is still weights.
+    if "config.json" in names or "model_index.json" in names:
+        return "model"
+    if any(n.endswith(".safetensors") for n in names) \
+            and not any(n.endswith(".jsonl") for n in names):
         return "model"
     if any(n.endswith(".jsonl") for n in names):
         return "dataset"
@@ -2111,7 +2116,11 @@ chat_spec = serving.chat_spec
 #: `kinds` is a whitelist of JOB kinds and chat is not a job, so a box
 #: configured for `upload,generate_dataset` cannot be tested for "serving" --
 #: it has to be read as "not meant for models" instead.
-_SERVING_KINDS = {"finetune_llm", "pretrain_llm", "evaluate"}
+# Read off the one list of kinds that leave a model, plus scoring, rather
+# than repeated here: the last time this was its own set it fell behind that
+# list and a machine restricted to a new kind of training read as "not for
+# models".
+_SERVING_KINDS = set(serving.MODEL_KINDS) | {"evaluate"}
 
 
 def _serves_models(r: dict) -> bool:

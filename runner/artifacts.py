@@ -48,9 +48,22 @@ def cached_dir(job_id: str, kind: str | None = None) -> Path:
     return CACHE_DIR / (job_id + _suffix(kind))
 
 
+# What makes a directory a model. A transformers model has config.json, an
+# adapter adapter_config.json, a diffusers pipeline model_index.json -- and
+# some things are a bare safetensors file with nothing beside it. Named in
+# one place so the two functions that ask cannot disagree.
+def _looks_like_model(d) -> bool:
+    if any((d / name).exists() for name in
+           ("config.json", "adapter_config.json", "model_index.json")):
+        return True
+    try:
+        return any(p.suffix == ".safetensors" for p in d.iterdir())
+    except OSError:
+        return False
+
+
 def is_present(job_id: str, kind: str | None = None) -> bool:
-    d = cached_dir(job_id, kind)
-    return (d / "config.json").exists() or (d / "adapter_config.json").exists()
+    return _looks_like_model(cached_dir(job_id, kind))
 
 
 def touch(job_id: str, kind: str | None = None) -> None:
@@ -73,8 +86,7 @@ def cached_ids() -> list[str]:
                 if d.is_dir() and not d.name.endswith(".partial")]
     except OSError:
         return []
-    dirs = [d for d in dirs
-            if (d / "config.json").exists() or (d / "adapter_config.json").exists()]
+    dirs = [d for d in dirs if _looks_like_model(d)]
     return [d.name for d in sorted(dirs, key=_used_at, reverse=True)]
 
 

@@ -82,7 +82,10 @@ const FIXTURES = [
       capabilities: { device_name: "RX 6900 XT", arch: "gfx1030", vram_gb: 16, backend: "rocm",
         dtypes: { float16: 31.6, bfloat16: 12.7 }, recommended_dtype: "float16",
         quantization: { "4bit": true }, attention: { flash: false },
-        max_finetune_params_b: 7, warnings: ["bfloat16 is slow on this card"] } }]],
+        max_finetune_params_b: 7, warnings: ["bfloat16 is slow on this card"],
+        cpu_cores: 16, ram_gb: 62.7, modalities: ["text", "vision"],
+        libraries: { torchvision: true, PIL: true, torchaudio: false, diffusers: false,
+                     ffmpeg: true, transformers: true, peft: true, datasets: true } } }]],
   [/\/api\/jobs\/[^/]+\/metrics/, [{ step: 10, loss: 2.1, val_loss: 2.4, lr: 1e-4 },
                                    { step: 20, loss: 1.8, val_loss: 2.0, lr: 9e-5 },
                                    // Samples of each kind the panel draws.

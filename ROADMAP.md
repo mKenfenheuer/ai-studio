@@ -664,13 +664,19 @@ The strip says plainly when the model was not trained to look. *Still to
 do:* recording from the microphone, and the `seesPictures` flag reads a
 capability the run does not yet carry (P6).
 
-**P6. Modality-aware capabilities and fit (M).** The probe reports installed
-libraries (`torchaudio`, `diffusers`, `torchvision`, `ffmpeg`), CPU cores and
-RAM, and the fit check becomes a strategy per kind rather than
-parameters-times-bytes. `artifacts.is_present` and `_artifact_kind` learn
-`model_index.json` and bare safetensors. Per-modality runner images selected
-by `AI_STUDIO_RUNNER_KINDS`, which already works; `_serves_models` stops
-hardcoding the text kinds.
+**P6. Modality-aware capabilities and fit (M). Done.** The probe reports
+the libraries on the machine (torchvision, torchaudio, diffusers, PIL,
+soundfile, librosa, ffmpeg, …), its cores and RAM, and a derived
+`modalities` list -- text, vision, audio, diffusion -- shown on the Machines
+page as "can work with". The scheduler refuses a job to a machine that cannot
+decode its data, by a per-kind table (`KIND_MODALITY`) or the run's own
+`config.modality`, before the download rather than at the first batch; a
+machine that predates the report is not refused for it. `artifacts` and
+`_artifact_kind` recognise a diffusers `model_index.json` and a bare
+safetensors as a model. `_serves_models` reads `serving.MODEL_KINDS`. *Still
+to do:* the memory estimate itself is still parameters-times-bytes and will
+need a per-kind strategy when a trainer whose cost is not its parameter count
+exists (diffusion's is its activations).
 
 ---
 

@@ -248,6 +248,17 @@ def probe(quick: bool = False) -> dict:
     if only := os.environ.get("AI_STUDIO_RUNNER_KINDS", "").strip():
         caps["kinds"] = [k.strip() for k in only.split(",") if k.strip()]
 
+    # What else is on this machine besides a card. A vision run needs an
+    # image library, a speech run an audio one, and a diffusion run the
+    # diffusers package; a machine without them can hold the model and still
+    # fail at the first batch. Reported so the scheduler can say "not on this
+    # machine" before the download rather than after it. Cores and RAM
+    # matter for the same reason on the CPU-bound stages -- decoding a
+    # thousand images a step is not GPU work.
+    caps["libraries"] = _libraries()
+    caps["cpu_cores"] = os.cpu_count()
+    caps["ram_gb"] = _ram_gb()
+
     try:
         import torch
     except ImportError:
@@ -314,7 +325,55 @@ def probe(quick: bool = False) -> dict:
             caps["quantization"]["error"] = sub["bnb_error"]
 
     _derive_recommendations(caps)
+    caps["modalities"] = _modalities(caps)
     return caps
+
+
+# The libraries each kind of work needs, by import name. Checked for presence
+# only -- versions are the job's problem -- and checked without importing
+# torch-heavy packages fully where a lighter probe exists.
+_LIBRARIES = ("torchvision", "torchaudio", "diffusers", "PIL", "soundfile",
+              "librosa", "timm", "transformers", "peft", "datasets")
+
+
+def _libraries() -> dict:
+    import importlib.util
+    import shutil
+    found = {name: importlib.util.find_spec(name) is not None
+             for name in _LIBRARIES}
+    found["ffmpeg"] = shutil.which("ffmpeg") is not None
+    return found
+
+
+def _ram_gb() -> float | None:
+    try:
+        if hasattr(os, "sysconf"):
+            pages = os.sysconf("SC_PHYS_PAGES")
+            size = os.sysconf("SC_PAGE_SIZE")
+            if pages > 0 and size > 0:
+                return round(pages * size / 1024 ** 3, 1)
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _modalities(caps: dict) -> list[str]:
+    """What kinds of data this machine can train on and serve, by name.
+
+    Derived from the libraries rather than declared, so a machine that gains
+    torchaudio gains audio on its next probe and nobody edits a config.
+    """
+    libs = caps.get("libraries") or {}
+    out = []
+    if caps.get("torch_version"):
+        out.append("text")
+        if libs.get("torchvision") or libs.get("PIL"):
+            out.append("vision")
+        if libs.get("torchaudio") or libs.get("soundfile") or libs.get("librosa"):
+            out.append("audio")
+        if libs.get("diffusers"):
+            out.append("diffusion")
+    return out
 
 
 def _rocm_marketing_name() -> str | None:

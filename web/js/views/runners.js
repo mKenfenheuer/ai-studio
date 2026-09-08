@@ -251,6 +251,18 @@ function card(r, admin, dense = false) {
           : c.cuda_version ? " " + c.cuda_version : ""}</dd>
         <dt>Biggest model</dt><dd>${c.max_finetune_params_b
           ? "about " + c.max_finetune_params_b + "B parameters" : "—"}</dd>
+        ${raw(c.cpu_cores || c.ram_gb ? html`
+          <dt>Processor</dt><dd>${c.cpu_cores ? c.cpu_cores + " cores" : ""}${
+            c.cpu_cores && c.ram_gb ? " · " : ""}${c.ram_gb ? c.ram_gb + " GB RAM" : ""}</dd>` : "")}
+        ${raw(Array.isArray(c.modalities) ? html`
+          <dt>Can work with</dt><dd>${c.modalities.length
+            ? c.modalities.map((m) => ({ text: "text", vision: "pictures",
+                                         audio: "audio", diffusion: "image generation" })[m] || m).join(" · ")
+            : "nothing yet — no PyTorch"}
+            ${raw(c.libraries && !c.libraries.torchvision && !c.libraries.PIL
+              ? `<div class="tiny muted">no image library: a vision run will not be sent here</div>` : "")}
+            ${raw(c.libraries && !c.libraries.torchaudio && !c.libraries.soundfile && !c.libraries.librosa
+              ? `<div class="tiny muted">no audio library: a speech run will not be sent here</div>` : "")}</dd>` : "")}
         <dt>Last seen</dt><dd>${fmtAgo(r.last_seen)}</dd>
         ${raw(r.current_job ? html`
           <dt>Working on</dt><dd><a href="#/jobs/${r.current_job}">open the run →</a></dd>` : "")}

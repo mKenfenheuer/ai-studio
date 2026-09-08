@@ -27,6 +27,18 @@ CHECKPOINT_WAIT_S = 600
 PERSISTED_STAGES = ("", "training", "writing", "uploading", "evaluating")
 
 
+# What each kind of job needs a machine to be able to decode. A kind not
+# listed is text. Filled in as the trainers arrive; a run may also say for
+# itself with `config.modality`.
+KIND_MODALITY: dict[str, str] = {
+    "finetune_vision_cls": "vision",
+    "finetune_vlm": "vision",
+    "finetune_asr": "audio",
+    "finetune_tts": "audio",
+    "finetune_diffusion": "diffusion",
+}
+
+
 class Fleet:
     def __init__(self) -> None:
         self.connections: dict[str, WebSocket] = {}
@@ -163,6 +175,20 @@ class Fleet:
                            % ", ".join(str(k) for k in kinds))
         if caps.get("backend") == "cpu" and not job["config"].get("allow_cpu"):
             return False, "runner has no GPU"
+        # What kind of data the job works on, against what the machine can
+        # decode. A vision run on a machine without an image library holds
+        # the model fine and fails at the first batch; said here instead.
+        # Text is assumed for every kind that does not say otherwise, which
+        # is every kind there is today, and a machine that reports no
+        # modalities at all predates the report and is not refused for it.
+        needs = job["config"].get("modality") or KIND_MODALITY.get(job["kind"])
+        have = caps.get("modalities")
+        if needs and needs != "text" and have is not None and needs not in have:
+            return False, ("this machine cannot work with %s (it has no %s "
+                           "library)" % (needs, {"vision": "image",
+                                                 "audio": "audio",
+                                                 "diffusion": "diffusers"}
+                                         .get(needs, needs)))
         if job["config"].get("quantization") == "4bit" \
                 and not caps.get("quantization", {}).get("4bit"):
             return False, "runner has no working 4-bit support"
