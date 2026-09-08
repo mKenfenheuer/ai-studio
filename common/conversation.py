@@ -855,6 +855,23 @@ def parse_reply(text: str, fmt: dict | None = None,
         take_json(_CHATML_CALL)
     if not calls:
         take(_BARE_CALL)
+    if not calls:
+        # The whole reply IS the call, as bare JSON. This is what a model
+        # trained on Mistral's own template produces once the reply has been
+        # decoded: the marker in front of it, `[TOOL_CALLS]`, is a special
+        # token, and decoding for display strips special tokens -- so what
+        # arrives here is an unannounced `[{"name": ..., "arguments": "..."}]`
+        # and every pattern above is looking for an announcement.
+        #
+        # Recognised only when the entire answer parses as a call: a reply
+        # that merely contains JSON is a reply, and a model asked to produce
+        # JSON must not have its answer turned into a phantom tool call.
+        whole = body.strip()
+        if whole[:1] in ("{", "["):
+            parsed = [c for c in _calls_from_json(whole) if c.get("arguments")]
+            if parsed:
+                calls.extend(parsed)
+                body = ""
 
     if calls:
         # Once the calls are structure, any call syntax still in the body is

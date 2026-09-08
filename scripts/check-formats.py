@@ -332,6 +332,32 @@ def test_reading_a_reply_back() -> None:
     check("an empty reply does not raise",
           C.parse_reply("", {"mode": "chat"})["content"] == "")
 
+    print("\nA call with its announcement stripped off")
+    # What a model trained on Mistral's own template actually hands back: the
+    # marker in front of the call, [TOOL_CALLS], is a special token, and
+    # decoding for display drops special tokens. What is left is a bare JSON
+    # array that no pattern is looking for -- and a fine-tune that had learned
+    # to call tools perfectly was scored as never having called one.
+    bare = C.parse_reply(
+        '[{"name": "execute_services", "arguments": '
+        '"{\\"list\\":[{\\"domain\\":\\"cover\\"}]}", "id": "abc"}]',
+        {"mode": "chat"})
+    check("a bare JSON call is recognised", len(bare["tool_calls"]) == 1, bare)
+    if bare["tool_calls"]:
+        one = bare["tool_calls"][0]
+        check("with its name", one["function"]["name"] == "execute_services",
+              one["function"]["name"])
+        check("its arguments parse", one["valid"], one["function"]["arguments"])
+        check("and nothing is left over as text", bare["content"] == "",
+              repr(bare["content"]))
+    # And the other half of the promise: JSON that is an answer stays an answer.
+    plain = C.parse_reply('{"answer": 42, "why": "because"}', {"mode": "chat"})
+    check("a reply that is merely JSON is not a call",
+          not plain["tool_calls"] and plain["content"].startswith("{"), plain)
+    names = C.parse_reply('[{"name": "Ann"}, {"name": "Bob"}]', {"mode": "chat"})
+    check("nor is a list of things that have names",
+          not names["tool_calls"], names)
+
 
 def test_shapes_in_the_wild() -> None:
     """The two layouts the widely used function-calling datasets actually use.
