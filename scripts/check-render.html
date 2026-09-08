@@ -286,7 +286,9 @@ const FIXTURES = [
     notes: "Tried lr 2e-4; worse.", archived: 0, owner_id: "usr_1", mine: true,
     access: "edit", shares: [], created_at: now - 90000, updated_at: now - 400,
     contents: {
-      datasets: [dataset()], runs: [job()], training: [job()], writing: [],
+      datasets: [dataset()], borrowed_datasets: [dataset({ id: "ds_9",
+        name: "shared corpus", borrowed_from: "Another project" })],
+      runs: [job()], training: [job()], writing: [],
       scorings: [], exports: [],
       prompt_sets: [{ id: "ev_1", name: "Support questions", items: [{ prompt: "a" }],
                       scorings: 2, is_benchmark: false }],

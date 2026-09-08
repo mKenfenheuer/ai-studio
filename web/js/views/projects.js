@@ -245,7 +245,7 @@ export async function projectView(mount, [projectId]) {
     } catch (e) { toast(e.message, "err"); }
   });
   on(mount, "click", "[data-file-into]", async (_e, t) => {
-    const target = $("#fileTarget", mount)?.value;
+    const target = $("#fileTarget", mount)?.value || p.id;
     if (!target) return toast("Choose a project first.", "err");
     try {
       await api.fileIntoProject(target, { kind: t.dataset.kind, id: t.dataset.fileInto });
@@ -380,7 +380,31 @@ function projectLayout(p) {
       </div>` : "")}
 
     ${raw(section("Data", c.datasets, datasetRow, "dataset",
-      "Nothing prepared yet.", p))}
+      "Nothing filed here yet.", p))}
+    ${raw((c.borrowed_datasets || []).length ? html`
+      <div class="card" style="margin-top:14px;padding:0">
+        <div class="row-between" style="padding:12px 16px">
+          <div>
+            <h3 style="margin:0">Data used from elsewhere</h3>
+            <p class="muted tiny" style="margin:2px 0 0">Trained on by this
+              project's runs, but filed in another project — or in none.
+              Nothing was moved.</p>
+          </div>
+          <span class="muted tiny">${c.borrowed_datasets.length}</span>
+        </div>
+        <div class="table-wrap"><table><tbody>
+          ${raw(c.borrowed_datasets.map((d) => html`
+            <tr>
+              <td><a href="#/data/${d.id}"><strong>${d.name}</strong></a>
+                <div class="muted tiny">${fmtNum(d.rows || 0)} rows${raw(
+                  d.borrowed_from ? ` · in <em>${esc(d.borrowed_from)}</em>`
+                                  : " · in no project")}</div></td>
+              <td style="text-align:right">
+                <button class="btn-sm" data-file-into="${esc(d.id)}"
+                  data-kind="dataset">Move it here</button></td>
+            </tr>`).join(""))}
+        </tbody></table></div>
+      </div>` : "")}
     ${raw(section("Runs", c.runs, runRow, "job",
       "No runs in this project yet.", p))}
     ${raw(section("Prompt sets and benchmarks",

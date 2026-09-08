@@ -78,6 +78,9 @@ def contents(user: dict, project_id: str | None) -> dict:
 
     datasets = mine(db.visible_datasets(user))
     runs = mine(db.visible_jobs(user, 1000))
+    for r in runs:
+        if not r.get("config"):
+            r["config"] = (db.get_job(r["id"]) or {}).get("config") or {}
     evals = mine(db.visible_evals(user))
     library = [r for r in db.library_rows(user)
                if (r.get("project_id") or None) == project_id]
@@ -89,8 +92,24 @@ def contents(user: dict, project_id: str | None) -> dict:
         e["latest"] = scores[0] if scores else None
     training = [r for r in runs if r["kind"] in ("finetune_llm", "pretrain_llm",
                                                  "finetune_vision_cls")]
+    # Data the project's runs actually trained on, even when it is filed
+    # somewhere else. Training on another project's dataset is allowed and
+    # moves nothing -- but a project with a finished model and "Data: none"
+    # on its map reads as a project missing its first stage.
+    used_ids = {(r.get("config") or {}).get("studio_dataset")
+                for r in runs} - {None, ""}
+    mine_ids = {d["id"] for d in datasets}
+    borrowed = []
+    for did in sorted(used_ids - mine_ids):
+        row = db.get_dataset(did)
+        if row and db.access_level("dataset", did, row.get("owner_id"), user):
+            row["borrowed_from"] = (db.get_project(row["project_id"]) or {}).get(
+                "name") if row.get("project_id") else None
+            borrowed.append(row)
+
     return {
         "datasets": datasets,
+        "borrowed_datasets": borrowed,
         "runs": runs,
         "training": training,
         "writing": [r for r in runs if r["kind"] == "generate_dataset"],
@@ -120,9 +139,11 @@ def _stage_map(c: dict) -> list[dict]:
     benched = [e for e in c["benchmarks"] if e["scorings"]]
     return [
         {"key": "data", "label": "Data",
-         "state": "done" if c["datasets"] else "todo",
-         "count": len(c["datasets"]),
-         "next": ("Upload or import a dataset" if not c["datasets"]
+         "state": "done" if c["datasets"] or c["borrowed_datasets"] else "todo",
+         "count": len(c["datasets"]) + len(c["borrowed_datasets"]),
+         "borrowed": len(c["borrowed_datasets"]),
+         "next": ("Upload or import a dataset" if not (c["datasets"]
+                                                       or c["borrowed_datasets"])
                   else "Check the data, hold back a split")},
         {"key": "train", "label": "Train",
          "state": "active" if any(r["kind"] != "evaluate" for r in active)
