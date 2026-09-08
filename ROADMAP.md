@@ -155,6 +155,18 @@ Each of these is a small change and each is actively misleading someone.
 
 ## 4. Phase 1: one shell, the ribbon everywhere
 
+**Done on 2026-09-08.** Every view has the bar; the shared layer underneath it
+exists; the shell work landed. What was added beyond the plan: a render check
+(`scripts/check-render.mjs`) that draws every view in a real browser and clicks
+every tab, because there was no way to find out that a view had stopped drawing
+short of opening nineteen routes by hand. It immediately found a grid item with
+the default `min-width: auto` dragging the whole page sideways on a phone.
+
+Deferred to Phase 2, where they belong with the work they depend on: the
+dataset editor's **Check** tab (needs the persistent quality report, 5.3) and
+its **Train** tab (needs the format written back to the dataset, 5.4).
+
+
 The dataset editor's ribbon (`dataset.js:664-711`, CSS at
 `styles.css:1264-1307`) is the right shape for every page that *does things to
 a thing*: tabs across the top, groups of labelled icon buttons underneath, the
@@ -249,6 +261,11 @@ Profile · Keys · Hugging Face · Hosted models · Notifications · Sessions.
 Settings: General · People · Sign-in (SSO) · Machines · About.
 
 ### 4.3 The shell work that the ribbon needs anyway
+
+All done, plus two things the audit listed under P2 that were cheap once the
+components existed: toasts carry an action link and are announced, and the
+active nav item carries `aria-current`.
+
 
 - **`components.js`**: `pageHead()` (sets `document.title`), `breadcrumb()`,
   `emptyState()`, `copyButton()`, `confirmDestructive()` on the existing
