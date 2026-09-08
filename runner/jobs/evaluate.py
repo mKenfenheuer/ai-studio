@@ -407,6 +407,14 @@ def run(cfg: dict, ctx: Any) -> dict:
                        "metrics": metrics, "items": results})
         ctx.log("  %s" % _describe(metrics))
 
+    # Every model failed. The run used to finish green with a summary full of
+    # error strings and nothing recorded, which reads as "scored, and the
+    # answer is nothing" rather than as "this did not run".
+    if scores and all(s["metrics"].get("error") for s in scores):
+        raise ValueError(
+            "Nothing could be scored. %s"
+            % "; ".join(dict.fromkeys(s["metrics"]["error"] for s in scores)))
+
     ranked = _rank(scores)
     verdict = _verdict(scores, ranked)
     ctx.log(verdict)

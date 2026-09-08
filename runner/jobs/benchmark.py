@@ -42,7 +42,17 @@ LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 # --------------------------------------------------------------- loading
 
 def _load_split(bench: dict, split: str, ctx: Any):
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        # Said in the words of the thing that is missing rather than as a bare
+        # ImportError. This machine can hold a model and score a prompt set;
+        # it cannot fetch a Hub dataset, which is a property of how it was
+        # built and not of the benchmark being asked for.
+        raise ValueError(
+            "This machine has no `datasets` library, so it cannot fetch a "
+            "benchmark from the Hub. The GPU runner images ship one; a "
+            "machine set up by hand needs `pip install datasets`.") from e
     config = bench.get("config") or None
     try:
         return load_dataset(bench["dataset"], config, split=split)

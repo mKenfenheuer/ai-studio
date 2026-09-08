@@ -44,8 +44,13 @@ RUN pip install --no-cache-dir \
 # does not rebuild it.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         "torch>=2.4"
+# `datasets` is here for the benchmarks: a published benchmark is a Hub
+# dataset, and the machine that scores it fetches it the way the tools that
+# publish those numbers do. Without it a benchmark run reaches the machine,
+# loads the model, and only then discovers it cannot read the questions.
 RUN pip install --no-cache-dir \
-        "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4"
+        "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
+        "datasets>=2.20"
 
 # llama.cpp, for turning a finished model into the one file everything outside
 # this studio wants. Two pieces: a Python converter that reads safetensors and
