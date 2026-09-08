@@ -27,11 +27,26 @@ export async function evalView(mount, [evalId]) {
   let ev = await api.eval(evalId);
   let candidates = [];
   let openScore = null;
+  let hosted = { providers: [], connected: [] };
+  // What is going to be scored, held here rather than read off the checkboxes
+  // at the end: adding a baseline redraws the panel, and a redraw that forgot
+  // which models were ticked would be worse than no baselines at all.
+  const picked = new Set();
+  let baselines = [];
   const tabs = tabState("evalview", TABS, "scores");
   let tab = tabs.get();
 
+  const addBaseline = (b) => {
+    const key = b.source === "api" ? `api:${b.provider}:${b.model}`
+                                   : `hub:${b.model}`;
+    if (baselines.some((x) => x.key === key)) return;
+    baselines.push({ ...b, key });
+    draw();
+  };
+
   const draw = () => {
-    mount.innerHTML = layout(ev, candidates, openScore, tab);
+    mount.innerHTML = layout(ev, candidates, openScore, tab,
+                             { picked, baselines, hosted });
     wire();
   };
 
@@ -60,15 +75,53 @@ export async function evalView(mount, [evalId]) {
       } catch (ex) { toast(ex.message, "err"); }
     });
 
+    on(mount, "change", "[data-model-pick]", (_e, t) => {
+      if (t.checked) picked.add(t.value); else picked.delete(t.value);
+      // Redrawn because the suggested baselines are the base models of
+      // whatever is ticked: tick a fine-tune and the model it came from is
+      // offered on the spot, which is the whole point.
+      draw();
+    });
+
+    on(mount, "click", "[data-add-base]", (_e, t) =>
+      addBaseline({ source: "hub", model: t.dataset.addBase,
+                    like_run: t.dataset.likeRun || "" }));
+
+    on(mount, "click", "#addHub", () => {
+      const box = $("#hubModel", mount);
+      const id = (box.value || "").trim();
+      if (!id) return toast("Name a model on the Hub.", "err");
+      if (!id.includes("/")) {
+        return toast("A Hub model looks like owner/name.", "err");
+      }
+      box.value = "";
+      addBaseline({ source: "hub", model: id });
+    });
+
+    on(mount, "click", "#addApi", () => {
+      const provider = $("#apiProvider", mount)?.value;
+      const model = ($("#apiModel", mount)?.value || "").trim();
+      if (!provider) return toast("Connect a provider first.", "err");
+      if (!model) return toast("Which model at that provider?", "err");
+      addBaseline({ source: "api", provider, model });
+    });
+
+    on(mount, "click", "[data-drop-base]", (_e, t) => {
+      baselines = baselines.filter((b) => b.key !== t.dataset.dropBase);
+      draw();
+    });
+
     on(mount, "click", "#runEval", async () => {
-      const picked = $$("[data-model-pick]:checked", mount).map((c) => c.value);
-      if (!picked.length) return toast("Choose at least one model.", "err");
+      if (!picked.size && !baselines.length) {
+        return toast("Choose at least one model.", "err");
+      }
       const btn = $("#runEval", mount);
       btn.disabled = true;
       btn.textContent = "Queueing…";
       try {
         const { id } = await api.runEval(evalId, {
-          model_job_ids: picked,
+          model_job_ids: [...picked],
+          baselines: baselines.map(({ key, ...b }) => b),
           max_new_tokens: +$("#evMaxTokens", mount).value || 200,
           temperature: +$("#evTemp", mount).value || 0,
           system_prompt: $("#evSystem", mount).value || "",
@@ -111,19 +164,20 @@ export async function evalView(mount, [evalId]) {
 
   draw();
   api.playground().then((p) => { candidates = p; draw(); }).catch(() => {});
+  api.providers().then((h) => { hosted = h; draw(); }).catch(() => {});
   const unsub = events.subscribe((m) => { if (m.type === "jobs_changed") refresh(); });
   return () => unsub();
 }
 
 // ---------------------------------------------------------------------------
 
-function layout(ev, candidates, openScore, tab) {
+function layout(ev, candidates, openScore, tab, state) {
   const scores = ev.scores || [];
   const items = ev.items || [];
   const answered = items.filter((i) => i.expected).length;
   document.title = `${ev.name} · Evaluate · AI Studio`;
 
-  const body = tab === "run" ? runPanel(ev, candidates)
+  const body = tab === "run" ? runPanel(ev, candidates, state)
     : tab === "prompts" ? promptsPanel(items, answered)
     : html`${raw(scoreTable(scores, answered, items.length))}
            ${raw(openScore ? scoreDetail(openScore) : "")}`;
@@ -142,9 +196,11 @@ function ribbonFor(ev, candidates, tab) {
   const items = ev.items || [];
   const scored = (ev.scores || []).length;
   const body = group("This set", [
-    rb("goScore", "◎", "Score models", { cls: "primary", disabled: !candidates.length,
-      title: candidates.length ? "Put these prompts to a model"
-                               : "Train a model first" }),
+    // Not disabled when there are no runs any more: these prompts can be put
+    // to a model off the Hub or one behind an API without this studio having
+    // trained anything at all.
+    rb("goScore", "◎", "Score models", { cls: "primary",
+      title: "Put these prompts to a model" }),
     rb("copyEval", "⧉", "Copy",
       { title: "An editable copy, so scores already taken keep their meaning" }),
     rb("deleteEval", "🗑", "Delete", { cls: "danger", disabled: !ev.mine }),
@@ -161,38 +217,50 @@ function ribbonFor(ev, candidates, tab) {
 }
 
 /** Choosing what to ask, and how. */
-function runPanel(ev, candidates) {
+function runPanel(ev, candidates, state) {
   const items = ev.items || [];
-  if (!candidates.length) {
-    return html`
-      <div class="card empty"><div class="big" aria-hidden="true">🌱</div>
-        <h3>No finished models to score yet</h3>
-        <p class="muted">Train something first — a run that produced a model,
-          or one you stopped and kept.</p>
-        <p><a class="btn btn-primary" href="#/new">Start a run</a></p></div>`;
-  }
+  const { picked, baselines, hosted } = state;
+  const none = !candidates.length;
+  const chosen = picked.size + baselines.length;
   return html`
+    ${raw(none ? html`
+      <div class="card empty"><div class="big" aria-hidden="true">🌱</div>
+        <h3>No finished models of your own yet</h3>
+        <p class="muted">Train something and it appears here. In the meantime
+          these prompts can still be put to models you have not trained —
+          anything on the Hub, or a model behind a connected API.</p>
+        <p><a class="btn" href="#/new">Start a run</a></p></div>` : html`
+      <div class="card">
+        <p class="muted tiny">Each model is loaded onto a machine in turn and
+          asked all ${items.length} prompts. That takes a while, so it runs as
+          a queued job you can watch and stop.</p>
+        <div class="picklist" style="margin-top:10px">
+          ${raw(candidates.map((c) => html`
+            <label class="check">
+              <input type="checkbox" data-model-pick value="${c.id}"${
+                raw(picked.has(c.id) ? " checked" : "")}>
+              <span>${c.name}
+                <span class="muted tiny">· ${c.kind === "pretrain_llm"
+                  ? "built from scratch" : (c.base_model || "fine-tune")}
+                  ${raw(c.stopped_early ? ' · <span class="badge">stopped early</span>' : "")}
+                </span></span>
+            </label>`).join(""))}
+        </div>
+      </div>`)}
+    ${raw(baselinePanel(candidates, picked, baselines, hosted))}
     <div class="card">
-      <p class="muted tiny">Each model is loaded onto a machine in turn and
-        asked all ${items.length} prompts. That takes a while, so it runs as a
-        queued job you can watch and stop.</p>
-      <div class="picklist" style="margin-top:10px">
-        ${raw(candidates.map((c) => html`
-          <label class="check">
-            <input type="checkbox" data-model-pick value="${c.id}">
-            <span>${c.name}
-              <span class="muted tiny">· ${c.kind === "pretrain_llm"
-                ? "built from scratch" : (c.base_model || "fine-tune")}
-                ${raw(c.stopped_early ? ' · <span class="badge">stopped early</span>' : "")}
-              </span></span>
-          </label>`).join(""))}
-      </div>
-      <details class="adv" style="margin-top:10px">
+      <details class="adv">
         <summary>How they are asked</summary>
         <div class="field">
-          <label for="evSystem">System prompt <span class="muted tiny">(optional)</span></label>
+          <label for="evSystem">System prompt for every model
+            <span class="muted tiny">(optional)</span></label>
           <input id="evSystem" type="text"
-                 placeholder="Left empty, each model gets only the prompt">
+                 placeholder="Left empty, each model gets the one it was trained with">
+          <div class="hint">Left empty, every run is asked with its own
+            recorded system prompt and every baseline with none — which is how
+            each model is actually meant to be used. Filling this in overrides
+            all of them, which is a fair test of a specific instruction and a
+            different measurement from the one above.</div>
         </div>
         <div class="row" style="gap:10px">
           <div class="field" style="flex:1">
@@ -208,7 +276,91 @@ function runPanel(ev, candidates) {
         </div>
       </details>
       <button class="btn-primary btn-sm" id="runEval" style="margin-top:10px">
-        Score these models</button>
+        ${chosen === 0 ? "Score models"
+          : chosen === 1 ? "Score 1 model" : `Score ${chosen} models`}</button>
+    </div>`;
+}
+
+/** Models with no run behind them: the thing to be better *than*. */
+function baselinePanel(candidates, picked, baselines, hosted) {
+  // The base models of whatever is ticked, offered by name. This is the
+  // comparison somebody actually wants and the one that was impossible: not
+  // "which of my two fine-tunes won" but "did fine-tuning help at all".
+  const suggested = [];
+  for (const c of candidates) {
+    if (!picked.has(c.id) || !c.base_model) continue;
+    if (suggested.some((s) => s.model === c.base_model)) continue;
+    if (baselines.some((b) => b.model === c.base_model)) continue;
+    suggested.push({ model: c.base_model, run: c.id, name: c.name });
+  }
+  const connected = hosted.connected || [];
+  const labelOf = Object.fromEntries(
+    (hosted.providers || []).map((p) => [p.id, p.label]));
+
+  return html`
+    <div class="card">
+      <div class="row-between" style="margin-bottom:6px">
+        <h3 style="margin:0">Compare against</h3>
+        <span class="tiny muted">optional</span>
+      </div>
+      <p class="muted tiny">A model that is not a run of this studio, asked the
+        same prompts. Without one, a comparison can only say which of your own
+        models won — never whether any of them beat what you started from.</p>
+
+      ${raw(suggested.length ? html`
+        <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">
+          ${raw(suggested.map((sg) => html`
+            <button class="btn-sm" data-add-base="${sg.model}"
+                    data-like-run="${sg.run}"
+                    title="The model ${esc(sg.name)} was trained from, asked in the same format that run was trained in">
+              + ${sg.model}</button>`).join(""))}
+        </div>` : "")}
+
+      ${raw(baselines.length ? html`
+        <div class="picklist" style="margin-top:10px">
+          ${raw(baselines.map((b) => html`
+            <div class="row-between" style="padding:4px 0">
+              <span>${b.source === "api" ? "◇" : "⌂"} ${b.model}
+                <span class="muted tiny">· ${b.source === "api"
+                  ? `${labelOf[b.provider] || b.provider} · scored on what it writes, not on loss`
+                  : "from the Hub"}</span></span>
+              <button class="btn-sm btn-danger" data-drop-base="${b.key}"
+                      title="Remove">✕</button>
+            </div>`).join(""))}
+        </div>` : "")}
+
+      <div class="row" style="gap:8px;margin-top:10px;align-items:flex-end">
+        <div class="field" style="flex:1;margin:0">
+          <label for="hubModel">A model on the Hub</label>
+          <input id="hubModel" type="text" placeholder="owner/name">
+        </div>
+        <button class="btn-sm" id="addHub">Add</button>
+      </div>
+
+      ${raw(connected.length ? html`
+        <div class="row" style="gap:8px;margin-top:8px;align-items:flex-end">
+          <div class="field" style="margin:0">
+            <label for="apiProvider">A hosted model</label>
+            <select id="apiProvider">
+              ${raw(connected.map((c) => html`
+                <option value="${c.provider}">${labelOf[c.provider] || c.provider}</option>`).join(""))}
+            </select>
+          </div>
+          <div class="field" style="flex:1;margin:0">
+            <label for="apiModel">Which model</label>
+            <input id="apiModel" type="text"
+                   value="${connected[0].model || ""}"
+                   placeholder="exactly as the provider names it">
+          </div>
+          <button class="btn-sm" id="addApi">Add</button>
+        </div>
+        <p class="muted tiny" style="margin-top:6px">A hosted model is billed to
+          the account you connected, and it cannot be scored on the loss — that
+          needs the model's own probabilities, which no provider hands out. It
+          is scored on what it writes.</p>`
+        : html`<p class="muted tiny" style="margin-top:8px">
+          <a href="#/account">Connect a provider</a> to compare against a
+          hosted model too.</p>`)}
     </div>`;
 }
 
@@ -237,6 +389,18 @@ function promptsPanel(items, answered) {
 // table has to stop drawing a winner's rosette on it.
 const ENOUGH_PROMPTS = 10;
 
+// What each measure is called, whether more is better, and how to print it.
+// One table, because the column heading, the bar, the winner's rosette and
+// the sentence underneath all have to agree about it.
+const MEASURES = {
+  expected_loss: { label: "Loss on expected", lower: true,
+                   fmt: (v) => v.toFixed(4) },
+  chrf: { label: "Character overlap", lower: false,
+          fmt: (v) => (v * 100).toFixed(0) + "%" },
+  f1: { label: "Token overlap", lower: false,
+        fmt: (v) => (v * 100).toFixed(0) + "%" },
+};
+
 function scoreTable(scores, answered, total) {
   if (!scores.length) {
     return html`
@@ -248,62 +412,93 @@ function scoreTable(scores, answered, total) {
       </div>`;
   }
 
-  const usable = scores.filter((s) => s.metrics.expected_loss != null);
-  const best = usable.length ? Math.min(...usable.map((s) => s.metrics.expected_loss)) : null;
-  const worst = usable.length ? Math.max(...usable.map((s) => s.metrics.expected_loss)) : null;
+  const latest = scores[0]?.metrics || {};
+  // The measure the runner ranked on. Older scores, taken before a scoring
+  // could fall back from the loss, recorded nothing here and were always
+  // ranked on the loss.
+  const key = latest.ranked_by || "expected_loss";
+  const measure = MEASURES[key] || MEASURES.expected_loss;
+  const usable = scores.filter((s) => s.metrics[key] != null);
+  const values = usable.map((s) => s.metrics[key]);
+  const best = values.length
+    ? (measure.lower ? Math.min(...values) : Math.max(...values)) : null;
+  const worst = values.length
+    ? (measure.lower ? Math.max(...values) : Math.min(...values)) : null;
   // The bar is a magnitude, so it gets one hue and a shared scale. Anchored at
   // zero would make every model look identical -- the differences that matter
   // between two trained models are small in absolute terms.
-  const span = (worst ?? 0) - (best ?? 0) || 1;
+  const span = Math.abs((worst ?? 0) - (best ?? 0)) || 1;
   // Two conditions, and both are the runner's own judgement rather than this
   // page's: enough prompts to be worth measuring, and a most-recent scoring
   // whose difference actually survived being measured against the spread
   // between prompts. Marking a winner the log has just called a coin toss
   // would be the table contradicting its own evidence.
-  const latest = scores[0]?.metrics || {};
   const decisive = total >= ENOUGH_PROMPTS && latest.ranking_decisive !== false;
   const verdict = latest.verdict;
+  const anyJson = scores.some((s) => s.metrics.json_valid != null);
 
   return html`
     <div class="card" style="margin-bottom:14px;padding:0">
       <div class="row-between" style="padding:14px 16px 0">
         <h3 style="margin:0">Results</h3>
-        <span class="tiny muted">newest first · lower loss is better</span>
+        <span class="tiny muted">newest first · ranked on
+          ${measure.label.toLowerCase()}</span>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Model</th>
           <th title="Teacher-forced loss on the answer you called correct">
             Loss on expected</th>
-          <th class="hide-sm" title="Same number as a 1-in-N surprise">Perplexity</th>
+          <th class="hide-sm" title="Character n-gram overlap: survives a right answer worded or inflected differently">
+            chrF</th>
           <th class="hide-sm" title="Token overlap with the expected answer">Overlap</th>
           <th class="hide-sm">Exact</th>
+          ${raw(anyJson ? `<th class="hide-sm" title="Answers that parsed as JSON, and answers that parsed to the expected value">JSON</th>` : "")}
           <th class="hide-sm">Speed</th>
           <th>When</th><th></th>
         </tr></thead>
         <tbody>
           ${raw(scores.map((s) => {
             const m = s.metrics || {};
-            const isBest = decisive && best !== null && m.expected_loss === best;
-            const width = m.expected_loss != null
-              ? 12 + 88 * (1 - (m.expected_loss - best) / span) : 0;
+            const isBest = decisive && best !== null && m[key] === best
+                           && usable.length > 1;
+            const width = m[key] != null
+              ? 12 + 88 * (1 - Math.abs(m[key] - best) / span) : 0;
             return html`
               <tr class="${isBest ? "row-best" : ""}">
                 <td>
-                  <a href="#/jobs/${s.model_job_id}">${s.model_name || s.model_job_id}</a>
+                  ${raw(s.is_run
+                    ? `<a href="#/jobs/${esc(s.model_job_id)}">${esc(s.model_name)}</a>`
+                    : `<span>${esc(s.model_name)}</span>`)}
                   ${raw(isBest ? ` <span class="badge badge-ok">best</span>` : "")}
-                  ${raw(!s.model_name
+                  ${raw(baselineBadge(s))}
+                  ${raw(s.model_gone
                     ? ` <span class="badge badge-warn">run deleted</span>` : "")}
+                  ${raw(settingsNote(s))}
                 </td>
                 <td style="min-width:150px">
                   ${raw(m.expected_loss != null ? html`
                     <strong>${m.expected_loss.toFixed(4)}</strong>
-                    <div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>`
-                    : `<span class="muted">—</span>`)}
+                    <div class="muted tiny">${m.expected_perplexity != null
+                      ? `1 in ${m.expected_perplexity} surprise` : ""}</div>
+                    ${raw(key === "expected_loss" ? html`
+                      <div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>` : "")}`
+                    : m.loss_unavailable
+                      ? `<span class="muted tiny" title="${esc(m.loss_unavailable)}">not measurable</span>`
+                      : `<span class="muted">—</span>`)}
                 </td>
-                <td class="hide-sm">${m.expected_perplexity ?? "—"}</td>
-                <td class="hide-sm">${m.f1 != null ? (m.f1 * 100).toFixed(0) + "%" : "—"}</td>
+                <td class="hide-sm">${m.chrf != null ? (m.chrf * 100).toFixed(0) + "%" : "—"}
+                  ${raw(key === "chrf" && m.chrf != null
+                    ? `<div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>` : "")}</td>
+                <td class="hide-sm">${m.f1 != null ? (m.f1 * 100).toFixed(0) + "%" : "—"}
+                  ${raw(key === "f1" && m.f1 != null
+                    ? `<div class="meter"><i style="width:${width.toFixed(1)}%"></i></div>` : "")}</td>
                 <td class="hide-sm">${m.exact != null ? (m.exact * 100).toFixed(0) + "%" : "—"}</td>
+                ${raw(anyJson ? html`
+                  <td class="hide-sm tiny">${m.json_valid != null
+                    ? `${(m.json_valid * 100).toFixed(0)}% valid`
+                    : "—"}${raw(m.json_match != null
+                      ? `<div class="muted">${(m.json_match * 100).toFixed(0)}% right</div>` : "")}</td>` : "")}
                 <td class="hide-sm tiny muted">${m.tokens_per_sec
                   ? m.tokens_per_sec.toFixed(0) + " tok/s" : "—"}
                   ${raw(m.seconds ? `<div>${esc(fmtDuration(m.seconds))}</div>` : "")}</td>
@@ -334,19 +529,53 @@ function scoreTable(scores, answered, total) {
           smaller than the gap between one prompt and the next, so with a set
           this small the lowest number is as likely to be luck as skill.</div>`
         : "")}
+      ${raw(scores.length === 1 && scores[0].is_run ? html`
+        <div class="callout" style="margin:0 16px 12px">
+          <strong>One model is not a comparison.</strong> Score it against the
+          model it was trained from — that is the number that says whether the
+          training helped.</div>` : "")}
       <p class="muted tiny" style="padding:10px 16px 14px;margin:0">
         ${raw(answered
           ? html`<strong>Loss on expected</strong> is how surprised the model was
               by the answer you called correct, scored on the answer only. It is
               the measure to trust: it does not care about wording, and it can
               separate two models that both scored zero exact matches.
-              <strong>Overlap</strong> credits a right answer worded differently,
-              and just as happily credits a wrong answer that reuses the right
-              words.`
+              <strong>chrF</strong> and <strong>Overlap</strong> credit a right
+              answer worded differently, and just as happily credit a wrong
+              answer that reuses the right words.`
           : html`None of these prompts has an expected answer, so there is
               nothing to score against — only the text each model produced.
               Add expected answers and score again to get numbers.`)}</p>
     </div>`;
+}
+
+/** Where a scored model came from, when it was not a run of this studio. */
+function baselineBadge(s) {
+  const ref = s.model_ref || "";
+  if (ref.startsWith("hub:")) {
+    return ` <span class="badge" title="A model off the Hub, scored as a baseline">baseline</span>`;
+  }
+  if (ref.startsWith("api:")) {
+    return ` <span class="badge" title="Reached over the network. No loss: a hosted model does not expose its probabilities">hosted</span>`;
+  }
+  return "";
+}
+
+/** The settings that produced a score, when they were not the ordinary ones.
+ *
+ *  Two scorings of one model under different settings are two different
+ *  measurements, and the table putting them in adjacent rows has to say so.
+ *  Only the differences are shown: a line reading "temperature 0" under every
+ *  row is noise. */
+function settingsNote(s) {
+  const st = s.settings;
+  if (!st) return "";
+  const bits = [];
+  if (st.system_prompt_override) bits.push("a system prompt set for the scoring");
+  else if (st.system_prompt) bits.push("its own system prompt");
+  if (st.temperature) bits.push(`temperature ${st.temperature}`);
+  if (!bits.length) return "";
+  return `<div class="muted tiny">${esc(bits.join(" · "))}</div>`;
 }
 
 function scoreDetail(score) {
@@ -367,8 +596,11 @@ function scoreDetail(score) {
               <td class="tiny mono">
                 ${raw(i.expected_loss != null
                   ? `${i.expected_loss.toFixed(3)}` : "—")}
+                ${raw(i.chrf != null ? ` ${(i.chrf * 100).toFixed(0)}%` : "")}
                 ${raw(i.exact ? ` <span class="badge badge-ok">exact</span>`
                   : i.contains ? ` <span class="badge">contains</span>` : "")}
+                ${raw(i.json_valid === false
+                  ? ` <span class="badge badge-warn">not JSON</span>` : "")}
               </td>
             </tr>`).join(""))}
         </tbody>

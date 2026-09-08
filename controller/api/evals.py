@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
-from common import conversation, formatting
+from common import apimodels, conversation, formatting
 
-from .. import config, datasets as dsets, db, serving
+from .. import config, datasets as dsets, db, hfaccount, serving
+from . import providers
 from .security import current_user, require_edit, require_owner, require_view
 
 router = APIRouter(prefix="/api")
@@ -257,8 +258,6 @@ async def get_score(request: Request, eval_id: str, score_id: str) -> dict:
     score = db.get_score(score_id)
     if not score or score["eval_id"] != eval_id:
         raise HTTPException(404, "No such scoring.")
-    job = db.get_job(score["model_job_id"])
-    score["model_name"] = (job or {}).get("name")
     return score
 
 
@@ -272,22 +271,11 @@ async def delete_score(request: Request, eval_id: str, score_id: str) -> dict:
     return {"ok": True}
 
 
-@router.post("/evals/{eval_id}/run")
-async def run_eval(request: Request, eval_id: str,
-                   payload: dict = Body(...)) -> dict:
-    """Queue a job that puts these prompts to each of the chosen models."""
-    row = _eval_or_404(request, eval_id)
-    user = current_user(request)
+MAX_MODELS = 8
 
-    wanted = payload.get("model_job_ids") or []
-    if not wanted:
-        raise HTTPException(400, "Choose at least one model to score.")
-    if len(wanted) > 8:
-        raise HTTPException(
-            400, "Score at most eight models at a time. Each one is loaded "
-                 "onto the card in turn, and a longer list is a job that runs "
-                 "for hours before it tells you anything.")
 
+def _runs_to_score(request: Request, user: dict, wanted: list) -> list[dict]:
+    """The studio's own runs, as things that can be put to a prompt set."""
     models = []
     for job_id in wanted:
         job = db.get_job(job_id)
@@ -301,8 +289,121 @@ async def run_eval(request: Request, eval_id: str,
             raise HTTPException(
                 400, "\"%s\" has no saved model, so there is nothing to "
                      "score." % job["name"])
-        models.append({"job_id": job_id, "name": job["name"],
-                       "spec": serving.chat_spec(job)})
+        cfg = serving.resolved_config(job)
+        models.append({
+            "ref": "job:" + job_id,
+            "source": "run",
+            "job_id": job_id,
+            "name": job["name"],
+            "spec": serving.chat_spec(job),
+            # Its OWN system prompt, not one borrowed from whichever model
+            # happened to be first in the list. A run trained with a system
+            # prompt and scored without it is being asked to do a job it was
+            # never told about, and it answers worse for a reason that has
+            # nothing to do with the training.
+            "system_prompt": cfg.get("system_prompt") or "",
+        })
+    return models
+
+
+def _baselines(request: Request, user: dict, wanted: list) -> list[dict]:
+    """Models with no run behind them, put to the same prompts.
+
+    Two kinds, and they behave differently enough to be worth knowing apart:
+
+    * **From the Hub.** Downloaded onto the machine and loaded like any other
+      model, so every measure works on it, the loss on the expected answer
+      included. This is the baseline that answers "did the training help".
+    * **Behind an API.** Reached over the network. It can be asked a question
+      and its answer scored for overlap, exactness and JSON validity -- but
+      not for loss, because that needs the model's own probabilities and no
+      hosted provider hands those out. Said plainly rather than left as an
+      empty cell, because an empty cell in the column everything else is
+      ranked by looks like a failure.
+    """
+    out = []
+    for entry in wanted:
+        if isinstance(entry, str):
+            entry = {"source": "hub", "model": entry}
+        if not isinstance(entry, dict):
+            continue
+        source = (entry.get("source") or "hub").strip()
+        name = (entry.get("model") or "").strip()
+        if not name:
+            raise HTTPException(400, "A baseline needs a model to name.")
+
+        if source == "hub":
+            # The format of the run this is a baseline *for*, when one was
+            # named: the base is then asked the question in the shape its
+            # descendant was trained to answer, which is the comparison that
+            # isolates what the training added rather than measuring two
+            # different prompt formats against each other.
+            fmt = None
+            if like := entry.get("like_run"):
+                job = db.get_job(like)
+                if job and db.access_level("job", like, job.get("owner_id"), user):
+                    fmt = (serving.resolved_config(job).get("format") or None)
+            spec = serving.hub_spec(name, fmt, hfaccount.token_for(user))
+            out.append({"ref": "hub:" + name, "source": "hub", "job_id": "",
+                        "name": name, "spec": spec, "system_prompt": ""})
+            continue
+
+        if source == "api":
+            conn = providers.connection(user, entry.get("provider"))
+            if not conn:
+                raise HTTPException(
+                    400, "That provider is not connected to your account. "
+                         "Connect it on your account page first.")
+            if problem := apimodels.problems(conn):
+                raise HTTPException(400, problem)
+            model = apimodels.model_name(conn, name)
+            if not model:
+                raise HTTPException(400, "Which model at %s should answer?"
+                                    % apimodels.describe(conn))
+            out.append({
+                "ref": "api:%s:%s" % (conn.get("provider") or "", model),
+                "source": "api", "job_id": "",
+                "name": "%s · %s" % (apimodels.describe(conn), model),
+                "model": model, "connection": conn,
+                "system_prompt": "",
+            })
+            continue
+
+        raise HTTPException(400, "A baseline is either a model on the Hub or "
+                                 "one behind a connected API.")
+    return out
+
+
+@router.post("/evals/{eval_id}/run")
+async def run_eval(request: Request, eval_id: str,
+                   payload: dict = Body(...)) -> dict:
+    """Queue a job that puts these prompts to each of the chosen models."""
+    row = _eval_or_404(request, eval_id)
+    user = current_user(request)
+
+    models = _runs_to_score(request, user, payload.get("model_job_ids") or []) \
+        + _baselines(request, user, payload.get("baselines") or [])
+    if not models:
+        raise HTTPException(400, "Choose at least one model to score.")
+    if len(models) > MAX_MODELS:
+        raise HTTPException(
+            400, "Score at most %d models at a time. Each one is loaded onto "
+                 "the card in turn, and a longer list is a job that runs for "
+                 "hours before it tells you anything." % MAX_MODELS)
+    seen = set()
+    for m in models:
+        if m["ref"] in seen:
+            raise HTTPException(400, "%s is in the list twice." % m["name"])
+        seen.add(m["ref"])
+
+    # One system prompt for everybody, or each model's own. The override is
+    # the exception and it is recorded as one: a score taken under a system
+    # prompt the model was not trained with is a different measurement, and
+    # six months later nothing else would say which had happened.
+    override = (payload.get("system_prompt") or "").strip()
+    if override:
+        for m in models:
+            m["system_prompt"] = override
 
     cfg = {
         "eval_id": eval_id,
@@ -311,10 +412,16 @@ async def run_eval(request: Request, eval_id: str,
         "models": models,
         "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
         "temperature": float(payload.get("temperature") or 0.0),
-        "system_prompt": payload.get("system_prompt") or "",
+        "system_prompt": override,
+        "system_prompt_override": bool(override),
     }
     if pinned := payload.get("runner_id"):
         cfg["required_runner"] = pinned
+    # Nothing here needs a graphics card if every model being scored is behind
+    # somebody else's. A comparison of two hosted models should not sit in the
+    # queue waiting for the one machine with a GPU in it.
+    if all(m["source"] == "api" for m in models):
+        cfg["allow_cpu"] = True
 
     name = "%s on %d model%s" % (row["name"], len(models),
                                  "" if len(models) == 1 else "s")
@@ -340,6 +447,7 @@ def record_scores(job: dict, summary: dict) -> int:
     if not eval_id or not db.get_eval(eval_id):
         return 0
     written = 0
+    cfg = job.get("config") or {}
     for score in summary.get("scores") or []:
         if score.get("metrics", {}).get("error"):
             continue
@@ -349,8 +457,28 @@ def record_scores(job: dict, summary: dict) -> int:
         # whether it may draw a winner.
         metrics = {**(score.get("metrics") or {}),
                    "verdict": summary.get("verdict"),
-                   "ranking_decisive": bool(summary.get("decisive"))}
-        db.record_score(eval_id, score.get("model_job_id") or "", job["id"],
-                        metrics, score.get("items") or [])
+                   "ranking_decisive": bool(summary.get("decisive")),
+                   # Which measure the verdict ranked on. A scoring that
+                   # included a hosted model may have had to fall back from
+                   # the loss, and the table must mark the winner in the
+                   # column the verdict is actually talking about.
+                   "ranked_by": summary.get("ranked_by")}
+        db.record_score(
+            eval_id, score.get("model_job_id") or "", job["id"], metrics,
+            score.get("items") or [],
+            model_ref=score.get("ref") or "",
+            model_label=score.get("name") or "",
+            # What produced these numbers. Two scorings of one model under
+            # different generation settings are two different measurements,
+            # and the table that puts them in adjacent rows has to be able to
+            # say so.
+            settings={
+                "max_new_tokens": cfg.get("max_new_tokens"),
+                "temperature": cfg.get("temperature"),
+                "system_prompt": score.get("system_prompt") or "",
+                "system_prompt_override": bool(cfg.get("system_prompt_override")),
+                "source": score.get("source") or "run",
+                "runner": job.get("runner_name") or job.get("runner_id"),
+            })
         written += 1
     return written

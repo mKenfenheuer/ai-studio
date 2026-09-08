@@ -496,17 +496,36 @@ card's "Use it" section.
 
 ## 7. Phase 4: evaluation closes the loop
 
-- **Baselines.** A scoring can name a Hub model, the run's own base, or a
-  hosted provider model beside studio runs. This is the single most important
-  missing feature in the product.
-- **Score it** on every run page and in the playground, with the run
-  preselected and its base model preselected as the baseline.
-- Each model is scored with its own recorded system prompt unless overridden;
-  the generation settings are stored with the score.
-- **Metrics**: BLEU / ROUGE / chrF / edit distance; JSON validity and schema
-  conformance; tool-call correctness (name, arguments); LLM-as-judge using the
-  hosted providers that already exist in `common/apimodels.py`; pass@k with
-  `n>1` sampling for code sets (sandboxed on a CPU runner).
+**Done (first pass).** Baselines, per-model system prompts, recorded settings
+and two more measures:
+
+- A scoring can now include a model that is not a run of this studio: one off
+  the Hub (loaded on the machine, so every measure works on it, the loss
+  included) or one behind a connected API (asked over the network, scored on
+  what it writes -- no provider exposes the probabilities a loss needs, and
+  the row says so instead of leaving the column blank).
+  `serving.hub_spec`, `inference.ensure_loaded`, `api/evals._baselines`.
+- The base model a run was trained from is offered by name the moment that run
+  is ticked, and on the run page's own "Score it" -- asked in the format its
+  descendant was trained in, which is the comparison that isolates what the
+  training added. `evalview.baselinePanel`, `job.js` Score it.
+- Each model is asked with **its own** recorded system prompt, unless the
+  scoring sets one for everybody, which is recorded as an override.
+- Every score keeps the settings that produced it (generation settings, system
+  prompt, where the model came from), so two rows taken under different
+  conditions can be told apart. `eval_scores.settings`.
+- **chrF** and **JSON validity** beside exact match and token overlap.
+- The verdict ranks on whichever measure covers *every* model scored, not the
+  best measure that covers some: announcing a winner chosen from two of three
+  models, with the third above it in the table, was the most misleading thing
+  the page could have done.
+
+Remaining in this phase:
+- **Score it** in the playground as well as on the run page.
+- **Metrics**: schema conformance beyond "it parses"; tool-call correctness
+  (name, arguments); LLM-as-judge using the hosted providers that already
+  exist in `common/apimodels.py`; pass@k with `n>1` sampling for code sets
+  (sandboxed on a CPU runner).
 - **Regression view**: one prompt set over time per model lineage, with a
   pinned champion.
 - **Playground**: side-by-side (the runner already holds several models,

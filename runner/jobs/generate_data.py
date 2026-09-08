@@ -89,7 +89,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     # about neither -- it asks for a reply and gets one.
     hosted = bool(spec.get("connection"))
     if hosted:
-        host: Any = _HostedModel(spec, ctx)
+        host: Any = HostedModel(spec, ctx)
     elif spec.get("job_id") or spec.get("base_model"):
         host = inference.ModelHost(ctx.controller_url, ctx.runner_token,
                                    ctx.capabilities)
@@ -247,13 +247,19 @@ _ATTEMPTS = 4
 _BACKOFF = (2, 8, 20)
 
 
-class _HostedModel:
+class HostedModel:
     """A model behind an API, wearing the two methods ModelHost has.
 
     The generation loop asks for a reply and gets one; whether that took a
     GPU or a POST is not its business. Everything about *which* API and what
     its request looks like lives in common/apimodels.py, so the preview in the
     browser and the run on the machine cannot disagree about it.
+
+    Also used by an evaluation, which is why the name is not private: scoring
+    a studio model against a hosted one is the same problem -- ask a model a
+    question, take what comes back -- and a second implementation of retries,
+    rate limits and per-provider parameter spellings would have drifted from
+    this one within a month.
     """
 
     def __init__(self, spec: dict, ctx: Any) -> None:

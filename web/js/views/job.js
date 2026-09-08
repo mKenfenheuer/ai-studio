@@ -329,6 +329,12 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
       toast("No prompt sets yet — write one first.", "", { href: "#/evals", label: "Prompt sets" });
       return;
     }
+    // The base it was trained from, offered in the same breath. "Is it better
+    // than what I started with" is the question this button raises, and until
+    // the baseline existed the answer took a second scoring, a second visit
+    // to Evaluate, and knowing that it was possible at all.
+    const base = !(job.config || {}).base_model_job
+      && (job.config || {}).base_model || "";
     const dlg = modal({ title: `Score "${job.name}"`, width: 480, body: html`
       <p class="muted tiny">Every model you put the same prompts to can be
         compared. Pick the set to ask.</p>
@@ -337,6 +343,14 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
         <select id="scoreSet">${raw(sets.map((e) => html`
           <option value="${e.id}">${e.name} · ${(e.items || []).length} prompts</option>`).join(""))}</select>
       </div>
+      ${raw(base ? html`
+        <label class="check">
+          <input type="checkbox" id="scoreBase" checked>
+          <span>Score ${base} beside it
+            <span class="muted tiny">· the model this was trained from, asked
+              in the same format. Without it the result can only say which of
+              your own models won.</span></span>
+        </label>` : "")}
       <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
         <button type="button" class="btn" data-modal-close>Cancel</button>
         <button type="button" class="btn btn-primary" id="scoreGo">Score it</button>
@@ -345,7 +359,11 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
       btn.disabled = true;
       const evalId = $("#scoreSet", dlg).value;
       try {
-        const r = await api.runEval(evalId, { model_job_ids: [job.id] });
+        const r = await api.runEval(evalId, {
+          model_job_ids: [job.id],
+          baselines: base && $("#scoreBase", dlg)?.checked
+            ? [{ source: "hub", model: base, like_run: job.id }] : [],
+        });
         dlg.close();
         toast("Scoring queued.", "ok",
               r.job_id ? { href: `#/jobs/${r.job_id}`, label: "Watch it" } : null);

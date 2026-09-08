@@ -405,7 +405,17 @@ class ModelHost:
             self._refresh_view()
             return
 
-        path = self._fetch(job_id, log)
+        # A model off the Hub rather than one this studio trained. There is no
+        # artifact to fetch: the id goes straight to `from_pretrained`, which
+        # downloads and caches it the same way training does. This is what
+        # makes a baseline possible -- "is my fine-tune better than the model
+        # I started from" cannot be answered while only runs can be loaded.
+        if hub_model := spec.get("hub_model"):
+            path: Path | str = hub_model
+            log("Loading %s from the Hub. Nothing here trained it; it is the "
+                "thing being compared against." % hub_model)
+        else:
+            path = self._fetch(job_id, log)
 
         # What this model wants at full precision. The eviction aims at that
         # rather than at the compressed size: quantizing costs answer quality
@@ -440,7 +450,7 @@ class ModelHost:
         self._refresh_view()
         log("Ready.")
 
-    def _load(self, spec: dict, path: Path, quantize: bool,
+    def _load(self, spec: dict, path: Path | str, quantize: bool,
               log: Callable[[str], None]) -> _Resident:
         """Put one model on the card, at the precision asked for."""
         import torch
@@ -479,12 +489,16 @@ class ModelHost:
         # fine-tune now saves its merged model beside its adapter, so the kind
         # of run no longer says which of the two is in this directory -- and an
         # adapter served as a whole model loads as nothing at all.
-        is_adapter = (path / "adapter_config.json").exists()
+        is_adapter = isinstance(path, Path) \
+            and (path / "adapter_config.json").exists()
 
         if not is_adapter:
-            log("Loading your model…")
-            tok = AutoTokenizer.from_pretrained(str(path))
-            model = AutoModelForCausalLM.from_pretrained(str(path), **extra)
+            log("Loading your model…" if isinstance(path, Path)
+                else "Downloading %s…" % path)
+            token = spec.get("hf_token")
+            tok = AutoTokenizer.from_pretrained(str(path), token=token)
+            model = AutoModelForCausalLM.from_pretrained(str(path), token=token,
+                                                         **extra)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):

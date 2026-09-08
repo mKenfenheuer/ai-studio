@@ -111,3 +111,52 @@ def chat_spec(job: dict) -> dict:
         # offers the toggle only where it means something.
         "reasoning": bool(fmt.get("reasoning")),
     }
+
+
+# ---------------------------------------------------------------- baselines
+#
+# "Is it better than what I started from?" is the question a finished run
+# raises, and until now nothing here could answer it: only a run in this
+# studio could be scored, so every comparison was between two of your own
+# models and never against the thing they were built out of. A baseline is a
+# model that has no run behind it -- one off the Hub, or one behind somebody
+# else's API -- put to exactly the same prompts.
+
+
+def hub_spec(model_id: str, fmt: dict | None = None,
+             hf_token: str | None = None) -> dict:
+    """What a runner needs to serve a model straight off the Hub.
+
+    `job_id` is a reference rather than a run id, because it is what the
+    runner keys its resident models by -- two baselines and three runs on one
+    card must not collide, and `hub:` cannot be mistaken for a job.
+
+    The format matters more here than it looks. Given none, the model's own
+    chat template is used, which is the right way to talk to an instruct model
+    and the only way to talk to one this studio has never seen. Given one --
+    the format of the fine-tune this is a baseline *for* -- the base is asked
+    the question in the same shape its descendant was trained to answer, which
+    is the comparison that actually isolates what the training added.
+    """
+    model_id = (model_id or "").strip()
+    return {
+        "job_id": "hub:" + model_id,
+        "hub_model": model_id,
+        "kind": "hub",
+        "base_model": model_id,
+        "params_b": hub.params_from_name(model_id),
+        "format": dict(fmt) if fmt else {"mode": "chat",
+                                         "use_model_template": True},
+        "system_prompt": "",
+        "hf_token": hf_token or None,
+    }
+
+
+def base_model_of(job: dict) -> str:
+    """The Hub model this run was built from, if it was built from one."""
+    cfg = resolved_config(job)
+    # A run fine-tuned from another run in this studio has no Hub base of its
+    # own worth offering: the baseline to compare it against is that run.
+    if cfg.get("base_model_job"):
+        return ""
+    return (cfg.get("base_model") or "").strip()

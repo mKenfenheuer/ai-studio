@@ -73,7 +73,7 @@ services:
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
-      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset,export_gguf}
+      AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset,export_gguf,evaluate}
       HF_TOKEN: ${HF_TOKEN:-}
 
 volumes:

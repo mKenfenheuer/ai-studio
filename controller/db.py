@@ -313,6 +313,15 @@ _ADDED_COLUMNS = [
     # be found, shared with and mentioned -- it simply has nothing of its own
     # yet. The flag clears on first sign-in.
     ("users", "pending", "INTEGER NOT NULL DEFAULT 0"),
+    # A scored model that is not a run in this studio: a model off the Hub, or
+    # one behind a hosted API, put to the same prompts as a baseline. The ref
+    # says which ("hub:...", "api:..."), the label is what to call it in a
+    # table months later, and `settings` is the generation settings and system
+    # prompt that produced these numbers -- without which two scorings of the
+    # same model are not necessarily comparable and nothing said so.
+    ("eval_scores", "model_ref", "TEXT"),
+    ("eval_scores", "model_label", "TEXT"),
+    ("eval_scores", "settings", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -1434,13 +1443,41 @@ def visible_evals(user: dict) -> list[dict]:
 
 
 def record_score(eval_id: str, model_job_id: str, run_job_id: str | None,
-                 metrics: dict, items: list[dict] | None) -> str:
+                 metrics: dict, items: list[dict] | None,
+                 model_ref: str = "", model_label: str = "",
+                 settings: dict | None = None) -> str:
     sid = new_id("scr")
     ex("INSERT INTO eval_scores (id,eval_id,model_job_id,run_job_id,created_at,"
-       "metrics,items) VALUES (?,?,?,?,?,?,?)",
+       "metrics,items,model_ref,model_label,settings) "
+       "VALUES (?,?,?,?,?,?,?,?,?,?)",
        (sid, eval_id, model_job_id, run_job_id, now(), json.dumps(metrics),
-        json.dumps(items or [])))
+        json.dumps(items or []), model_ref or None, model_label or None,
+        json.dumps(settings) if settings else None))
     return sid
+
+
+def _hydrate_score(r: dict) -> dict:
+    """One score row, with its JSON columns read and a name that survives.
+
+    A baseline has no run to join against, and a run that has been deleted no
+    longer has one either. Both used to come out of the table as a bare id
+    under the heading "Model", which is the one column of a comparison that
+    has to still mean something in six months -- so the label recorded at
+    scoring time stands in, and only a model that is genuinely a run and
+    genuinely gone is reported as gone.
+    """
+    r["metrics"] = json.loads(r.get("metrics") or "{}")
+    try:
+        r["settings"] = json.loads(r.get("settings") or "null")
+    except (TypeError, ValueError):
+        r["settings"] = None
+    r["model_ref"] = r.get("model_ref") or ("job:" + r["model_job_id"]
+                                            if r.get("model_job_id") else "")
+    r["is_run"] = bool(r.get("model_job_id"))
+    r["model_gone"] = bool(r["is_run"]) and not r.get("model_name")
+    r["model_name"] = r.get("model_name") or r.get("model_label") \
+        or r.get("model_job_id") or "a model"
+    return r
 
 
 def list_scores(eval_id: str, with_items: bool = False) -> list[dict]:
@@ -1456,7 +1493,7 @@ def list_scores(eval_id: str, with_items: bool = False) -> list[dict]:
              " WHERE sc.eval_id=? ORDER BY sc.created_at DESC", (eval_id,))
     out = []
     for r in rows:
-        r["metrics"] = json.loads(r["metrics"] or "{}")
+        _hydrate_score(r)
         r["items"] = json.loads(r["items"] or "[]") if with_items else []
         if r.get("model_summary"):
             try:
@@ -1468,10 +1505,12 @@ def list_scores(eval_id: str, with_items: bool = False) -> list[dict]:
 
 
 def get_score(score_id: str) -> dict | None:
-    r = q1("SELECT * FROM eval_scores WHERE id=?", (score_id,))
+    r = q1("SELECT sc.*, j.name AS model_name FROM eval_scores sc"
+           " LEFT JOIN jobs j ON j.id = sc.model_job_id WHERE sc.id=?",
+           (score_id,))
     if not r:
         return None
-    r["metrics"] = json.loads(r["metrics"] or "{}")
+    _hydrate_score(r)
     r["items"] = json.loads(r["items"] or "[]")
     return r
 

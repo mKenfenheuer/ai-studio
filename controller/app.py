@@ -295,6 +295,13 @@ def _hide_credentials(job: dict) -> None:
     job["config"].pop("hf_token", None)
     if isinstance(job["config"].get("model"), dict):
         job["config"]["model"].pop("connection", None)
+    # An evaluation carries one of these per model it scores, because a
+    # scoring can put a hosted model up against a studio run as a baseline.
+    for m in job["config"].get("models") or []:
+        if isinstance(m, dict):
+            m.pop("connection", None)
+            if isinstance(m.get("spec"), dict):
+                m["spec"].pop("hf_token", None)
 
 
 def _job_or_404(request: Request, job_id: str, need: str = "view") -> dict:
