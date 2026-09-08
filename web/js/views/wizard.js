@@ -1,5 +1,6 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast } from "../util.js";
+import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast, resource,
+         ensure } from "../util.js";
 
 // Two fundamentally different jobs behind one wizard. They share a machine
 // picker, a data step and a review; everything between differs, because the
@@ -7,13 +8,9 @@ import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast } from "../util.j
 // from scratch asks "how big, and how long are you prepared to wait" -- a
 // question fine-tuning never has to answer.
 //
-// RENDERING RULE, and the reason this file was rewritten: `draw()` renders
-// purely from state, and no render may start work that causes another render
-// synchronously. Every asynchronous load goes through `ensure()`, which marks
-// itself in-flight *before* awaiting, so the re-render it eventually triggers
-// finds the work already done rather than starting it again. The previous
-// version called draw() from inside the click handler that each step re-ran on
-// render, which recursed until the stack gave out.
+// This file follows the rendering rule, which now lives with `ensure()` in
+// util.js: draw() renders purely from state, and no render starts work that
+// causes another render synchronously.
 
 const MODES = [
   { id: "finetune", icon: "🎯", title: "Improve an existing model",
@@ -114,36 +111,6 @@ const ARCH_FIELDS = [
    + "feed-forward layer, normally about 2.7x the model width. Most of a "
    + "transformer's capacity lives here."],
 ];
-
-// ===========================================================================
-// A resource that loads once per key, never in a render loop.
-// ===========================================================================
-
-const resource = () => ({ status: "idle", key: null, data: null, error: null });
-
-function ensure(res, key, fetcher, draw) {
-  // Already loading or loaded for this exact key: do nothing. This is the
-  // guard that makes it safe for a render to call ensure() unconditionally.
-  if (res.key === key && res.status !== "idle") return res;
-  res.key = key;
-  res.status = "loading";
-  res.data = null;
-  res.error = null;
-  (async () => {
-    try {
-      const data = await fetcher();
-      if (res.key !== key) return;      // a newer request has superseded this
-      res.data = data;
-      res.status = "ready";
-    } catch (e) {
-      if (res.key !== key) return;
-      res.error = e.message || String(e);
-      res.status = "error";
-    }
-    draw();
-  })();
-  return res;
-}
 
 // The words say what is being waited for -- they are different every time and
 // worth reading -- and the bar under them holds the space the answer will

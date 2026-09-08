@@ -17,6 +17,8 @@ import { api } from "../api.js";
 import { conversationHtml, toolsHtml, isConversation } from "../conversation.js";
 import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo,
          debounce, inlineRename } from "../util.js";
+import { ribbon, rb, group, rbSelect, rbSeg, wireRibbon, tabState } from "../ribbon.js";
+import { confirmDestructive, breadcrumb } from "../components.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
 import { STEPS, TABS, stepsOnTab, stepFrom, describe } from "./dataset-steps.js";
@@ -44,7 +46,8 @@ export async function datasetView(mount, [id]) {
   let previewErr = null;
   let stages = null;               // per-step counts, for the whole pipeline
   let loading = false;
-  let tab = "home";
+  const tabs = tabState("dataset", TABS, "home");
+  let tab = tabs.get();
   let view = "table";
   let picked = new Set();
   let sample = +(localStorage.getItem("aistudio.previewSample") ?? 2000);
@@ -283,7 +286,7 @@ export async function datasetView(mount, [id]) {
   function wire() {
     wireShareBox(mount, "dataset", d, async () => { d = await api.dataset(id); draw(); });
 
-    on(mount, "click", "[data-tab]", (_e, t) => { tab = t.dataset.tab; draw(); });
+    wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
     on(mount, "click", "#toggleLeft", () => {
       leftOpen = !leftOpen; localStorage.setItem("aistudio.pqLeft", leftOpen ? "1" : "0"); draw();
     });
@@ -327,9 +330,12 @@ export async function datasetView(mount, [id]) {
     on(mount, "click", "#undo", undo);
     on(mount, "click", "#redo", redo);
     on(mount, "click", "#applySteps", applySteps);
-    on(mount, "click", "#discardSteps", () => {
+    on(mount, "click", "#discardSteps", async () => {
       if (!steps.length) return;
-      if (!confirm("Remove every step? The file is untouched either way.")) return;
+      if (!await confirmDestructive({
+        title: "Remove every step?",
+        body: "The file is untouched either way — nothing has been applied yet.",
+        confirmLabel: "Remove them", tone: "danger" })) return;
       commit([], -1);
       if (!rows) showRows(0);
     });
@@ -401,8 +407,13 @@ export async function datasetView(mount, [id]) {
 
     on(mount, "click", "#deleteRows", async () => {
       const n = picked.size;
-      if (!confirm(`Delete ${n} row${n === 1 ? "" : "s"} from "${d.name}"?\n\n`
-                   + "This changes the file itself. Anything already trained on it is unaffected.")) return;
+      if (!await confirmDestructive({
+        title: `Delete ${n} row${n === 1 ? "" : "s"}?`,
+        body: `From "${d.name}".`,
+        consequences: ["This changes the file itself — it is not a step, and Undo does not reach it.",
+                       "Anything already trained on this data is unaffected."],
+        confirmLabel: `Delete ${n} row${n === 1 ? "" : "s"}`,
+      })) return;
       try {
         const r = await api.editRows(id, { delete: [...picked] });
         picked = new Set();
@@ -559,7 +570,15 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "click", "#deleteDs", async () => {
-      if (!confirm(`Delete "${d.name}"?\n\nThe rows are removed from this studio permanently. Anything made from it is kept.`)) return;
+      if (!await confirmDestructive({
+        title: `Delete "${d.name}"?`,
+        consequences: [
+          `All ${fmtNum(d.rows)} rows are removed from this studio permanently.`,
+          "Datasets made from this one are kept, and keep working.",
+          "Runs that trained on it keep their models and their history.",
+        ],
+        confirmLabel: "Delete the dataset",
+        confirmWord: d.rows > 5000 ? d.name : null })) return;
       try {
         const r = await api.deleteDataset(id);
         sessionStorage.removeItem(draftKey(id));
@@ -619,7 +638,7 @@ function layout(s) {
   const { d, steps, selected, leftOpen } = s;
   return html`
     ${raw(header(d))}
-    ${raw(ribbon(s))}
+    ${raw(ribbonFor(s))}
     <div class="pq ${leftOpen ? "" : "no-left"}">
       ${raw(leftOpen ? leftPane(s) : "")}
       <div class="pq-pane pq-mid">
@@ -634,9 +653,10 @@ function layout(s) {
 }
 
 function header(d) {
+  document.title = `${d.name} · Datasets · AI Studio`;
   return html`
     <div class="pq-head">
-      <a href="#/data" class="tiny">← Datasets</a>
+      ${raw(breadcrumb({ href: "#/data", label: "Datasets" }))}
       <div class="row" style="gap:8px;min-width:0;flex-wrap:wrap">
         <div class="title-row row" style="gap:4px;min-width:0">
           <h1 id="dsTitle" style="margin:0;font-size:1.3rem">${d.name}</h1>
@@ -654,14 +674,7 @@ function header(d) {
 
 // ---- the ribbon ------------------------------------------------------------
 
-const rb = (id, icon, label, { cls = "", title = "", disabled = false, data = "" } = {}) =>
-  `<button class="rb-btn ${cls}" ${id ? `id="${id}"` : ""} ${data} title="${esc(title)}"${
-    disabled ? " disabled" : ""}><span class="ico">${icon}</span><span>${esc(label)}</span></button>`;
-
-const group = (label, items) =>
-  `<div class="rb-group"><div class="rb-items">${items.join("")}</div><div class="rb-label">${esc(label)}</div></div>`;
-
-function ribbon(s) {
+function ribbonFor(s) {
   const { d, tab, steps, history, future, view, sample, leftOpen } = s;
   const canEdit = d.access === "edit";
   let body = "";
@@ -678,18 +691,20 @@ function ribbon(s) {
       rb("holdBack", "◫", "Hold back a split"),
     ]) + group("Use", [
       rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
-      `<a class="rb-btn" href="/api/datasets/${esc(d.id)}/dataset-file"><span class="ico">↓</span><span>Download</span></a>`,
+      rb(null, "↓", "Download", { href: `/api/datasets/${esc(d.id)}/dataset-file`,
+                                  title: "The whole file, as JSONL" }),
       rb("publishBtn", "☁", "Publish"),
       d.mine ? rb("deleteDs", "🗑", "Delete", { cls: "danger" }) : "",
     ]);
   } else if (tab === "view") {
     body = group("Rows", [
-      `<div class="seg"><button class="btn-sm ${view === "table" ? "on" : ""}" data-view="table">Table</button>
-       <button class="btn-sm ${view === "text" ? "on" : ""}" data-view="text">As trained</button></div>`,
+      rbSeg([{ label: "Table", on: view === "table", data: `data-view="table"` },
+             { label: "As trained", on: view === "text", data: `data-view="text"` }]),
     ]) + group("Preview on", [
-      `<select id="previewSample" class="rb-select" title="How many rows the preview rehearses on">
-        ${SAMPLES.map((n) => `<option value="${n}"${n === sample ? " selected" : ""}>${
-          n ? `first ${fmtNum(n)} rows` : "the whole file"}</option>`).join("")}</select>`,
+      rbSelect("previewSample", {
+        title: "How many rows the preview rehearses on", value: sample,
+        options: SAMPLES.map((n) =>
+          [n, n ? `first ${fmtNum(n)} rows` : "the whole file"]) }),
     ]) + group("Panes", [
       rb("toggleLeft", "▤", leftOpen ? "Hide library" : "Show library"),
     ]);
@@ -699,15 +714,8 @@ function ribbon(s) {
     const label = tab === "transform" ? "Columns and shape" : tab === "columns" ? "New column" : "Filter, order, size";
     body = group(label, items);
   }
-  return html`
-    <div class="ribbon">
-      <div class="ribbon-tabs">
-        ${raw(TABS.map((t) => `<button data-tab="${t.key}" class="${t.key === tab ? "on" : ""}">${t.label}</button>`).join(""))}
-        <span class="spacer"></span>
-        <span class="ribbon-share">${raw(shareButton("dataset", d))}</span>
-      </div>
-      <div class="ribbon-body">${raw(body)}</div>
-    </div>`;
+  return ribbon({ tabs: TABS, active: tab, body,
+                  right: shareButton("dataset", d) });
 }
 
 // ---- left: the library -----------------------------------------------------
@@ -1158,7 +1166,8 @@ function rowEditor(row, rendered, canEdit) {
 function columnsOf(d, data) {
   const seen = [];
   (d.columns || []).forEach((c) => seen.push(c));
-  (data?.rows || []).forEach((r) => Object.keys(r.row).forEach((k) => { if (!seen.includes(k)) seen.push(k); }));
+  (data?.rows || []).forEach((r) => Object.keys(r.row || {}).forEach(
+    (k) => { if (!seen.includes(k)) seen.push(k); }));
   return seen.filter((c) => c !== "split").concat(seen.includes("split") ? ["split"] : []);
 }
 

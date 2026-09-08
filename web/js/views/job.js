@@ -1,38 +1,12 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtNum, fmtDuration, fmtAgo, statusBadge,
-         toast, skeletonValue, inlineRename } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtNum, fmtDuration, fmtAgo, statusBadge,
+         toast, modal, skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
-
-const STAGES = {
-  evaluating: "Putting the prompts to each model…",
-  loading_model: "Downloading and loading the model…",
-  // Writing a dataset is not training, and a hosted writer is not downloaded.
-  // These runs used to borrow the training vocabulary and report that they
-  // were loading a model and then training, while they were opening an HTTPS
-  // connection and then writing rows.
-  connecting: "Reaching the model that will write it…",
-  writing: "Writing rows",
-  collecting: "Collecting the files to send…",
-  uploading: "Uploading to Hugging Face",
-  loading_dataset: "Downloading and preparing your data…",
-  training_tokenizer: "Building a vocabulary from your text…",
-  tokenizing: "Reading and tokenizing the text…",
-  building_model: "Creating the model from random weights…",
-  training: "Training",
-  saving: "Saving the result…",
-};
-
-// The same stage word means something different depending on what is running.
-// "Downloading and loading the model" is right for training and wrong for a
-// merge, which is loading two sets of weights in order to add them together.
-const KIND_STAGES = {
-  merge_adapter: {
-    loading_model: "Loading the adapter and the weights it was trained on…",
-    saving: "Writing the merged model…",
-  },
-};
+import { kindOf, subjectOf, stagesFor } from "../kinds.js";
+import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
+import { breadcrumb, confirmDestructive } from "../components.js";
 
 export async function jobView(mount, [jobId]) {
   let job = await api.job(jobId);
@@ -131,8 +105,11 @@ export async function jobView(mount, [jobId]) {
   // The stage the runner last reported. paintStats runs on every metric and
   // must not claim "training" while the tokenizer is still being built.
   let stage = job.status === "running" ? "" : "training";
-  const stats = () =>
+  const getTab = wireRunTabs(mount, job, () => stats());
+  const stats = () => {
+    paintHeader(mount, job, getTab());
     paintStats(mount, job, latest, scratch, stage, checkpointStep, lastEval);
+  };
   stats();
 
   const unsub = events.subscribe(async (msg) => {
@@ -167,7 +144,7 @@ export async function jobView(mount, [jobId]) {
       paintProgress(mount, job, stage, msg.step, msg.total);
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
-      paintHeader(mount, job);
+      paintHeader(mount, job, getTab());
       stats();
       // A run that just finished has a model to build on, and one that just
       // failed has a checkpoint to carry on from. Both change this panel.
@@ -181,7 +158,7 @@ export async function jobView(mount, [jobId]) {
 
   const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
     job = await api.job(jobId);
-    paintHeader(mount, job);
+    paintHeader(mount, job, getTab());
   });
   paintOwnerRow();
 
@@ -263,11 +240,23 @@ export async function jobView(mount, [jobId]) {
  *  callers redraw on every metric and a captured `job` would go stale within
  *  seconds of the page opening.
  */
+/** The ribbon's tabs, wired to whatever the page repaints with.
+ *
+ *  Remembered per kind of run rather than per run: which tab you want on a
+ *  training run is a habit, and it is a different habit from the one you want
+ *  on a scoring run. */
+function wireRunTabs(mount, job, repaint) {
+  const tabs = tabState(`run.${kindOf(job).page}`, RUN_TABS(job), "home");
+  let tab = tabs.get();
+  wireRibbon(mount, (key) => { tab = key; tabs.set(key); repaint(); });
+  return () => tab;
+}
+
 function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   // A run is named when it is created, from the model and the dataset -- a
   // decent guess and a poor label once there are six of them. Both layouts on
   // this page draw the same heading, so it is wired once here.
-  on(mount, "click", "#renameRun", () => {
+  on(mount, "click", "[data-rename]", () => {
     inlineRename($("#runTitle", mount), async (name) => {
       await api.renameJob(jobId, name);
       const job = getJob?.();
@@ -310,17 +299,68 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     } catch (e) { toast(e.message, "err"); }
   });
 
+  // "Score it" had no home on this page at all: the question a finished run
+  // raises is whether it is better than what you started with, and answering
+  // it meant navigating to Evaluate and finding the run again in a list of
+  // every model in the studio.
+  on(mount, "click", "#scoreRun", async () => {
+    const job = getJob();
+    let sets = [];
+    try { sets = await api.evals(); }
+    catch (e) { return toast(e.message, "err"); }
+    if (!sets.length) {
+      toast("No prompt sets yet — write one first.", "", { href: "#/evals", label: "Prompt sets" });
+      return;
+    }
+    const dlg = modal({ title: `Score "${job.name}"`, width: 480, body: html`
+      <p class="muted tiny">Every model you put the same prompts to can be
+        compared. Pick the set to ask.</p>
+      <div class="field">
+        <label for="scoreSet">Prompt set</label>
+        <select id="scoreSet">${raw(sets.map((e) => html`
+          <option value="${e.id}">${e.name} · ${(e.items || []).length} prompts</option>`).join(""))}</select>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="scoreGo">Score it</button>
+      </div>` });
+    on(dlg, "click", "#scoreGo", async (_e, btn) => {
+      btn.disabled = true;
+      const evalId = $("#scoreSet", dlg).value;
+      try {
+        const r = await api.runEval(evalId, { model_job_ids: [job.id] });
+        dlg.close();
+        toast("Scoring queued.", "ok",
+              r.job_id ? { href: `#/jobs/${r.job_id}`, label: "Watch it" } : null);
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  });
+
+  // The publish form lives in the Model section, which may not be the tab you
+  // are looking at.
+  on(mount, "click", "#goPublish", () => {
+    const tab = $('[data-tab="model"]', mount);
+    if (tab) tab.click();
+    requestAnimationFrame(() =>
+      $("#ownerRow", mount)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  });
+
   on(mount, "click", "#deleteBtn", async () => {
     const job = getJob();
     const hasModel = job.artifacts?.length;
-    if (!confirm(`Delete "${job.name}"?
-
-` + (
-      job.kind === "generate_dataset"
-        ? "Its log and measurements go. Any dataset it already produced stays."
-        : hasModel
-          ? "Its trained model file will be deleted too, and cannot be recovered."
-          : "Its logs and measurements will be deleted."))) return;
+    if (!await confirmDestructive({
+      title: `Delete "${job.name}"?`,
+      consequences: [
+        job.kind === "generate_dataset"
+          ? "Its log and measurements go. Any dataset it already produced stays."
+          : hasModel
+            ? "Its trained model file goes with it, and cannot be recovered."
+            : "Its logs and measurements go.",
+        "Cached copies on the machines that ran it are removed too.",
+        "Scores already recorded against a prompt set are kept.",
+      ],
+      confirmLabel: "Delete the run",
+      confirmWord: hasModel ? job.name : null })) return;
     try {
       await api.deleteJob(jobId);
       toast("Run deleted.", "ok");
@@ -356,23 +396,7 @@ function writingLayout(job) {
   const what = WRITING_MODES[cfg.mode] || "writing rows";
   const extending = cfg.mode === "extend_conversations";
   return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${job.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub tiny" style="margin-top:4px">
-        <span class="badge badge-accent">writing a dataset</span>
-        ${what} with <span class="mono">${who}</span>${
-          cfg.source_label ? `, from ${cfg.source_label}` : ""}</p>
-    </div>
-
-    <div id="errorCard"></div>
+    ${raw(runHead(job))}
     <div id="queueCard"></div>
     <div id="stopPanel"></div>
     <div id="progressCard"></div>
@@ -411,7 +435,7 @@ function writingLayout(job) {
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" data-sec="log">
       <div class="row-between" style="align-items:center">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">what the run said as it went</span>
@@ -447,8 +471,9 @@ function writingView(mount, job, jobId, metrics, logs) {
   let stage = job.status === "running" ? "writing" : "";
   wireRunControls(mount, jobId, () => job, () => latest, () => stage);
 
+  const getTab = wireRunTabs(mount, job, () => paint());
   const paint = () => {
-    paintHeader(mount, job);
+    paintHeader(mount, job, getTab());
     paintProgress(mount, job, stage, null, null, 0);
     const q = $("#queueCard", mount);
     if (q) q.innerHTML = queueCard(job);
@@ -559,23 +584,7 @@ function uploadLayout(job) {
   const cfg = job.config || {};
   const dataset = cfg.target === "dataset";
   return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${job.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub tiny" style="margin-top:4px">
-        <span class="badge badge-accent">publishing</span>
-        ${dataset ? "a dataset" : "a model"} to
-        <span class="mono">${cfg.repo_id || "Hugging Face"}</span></p>
-    </div>
-
-    <div id="errorCard"></div>
+    ${raw(runHead(job))}
     <div id="queueCard"></div>
     <div id="stopPanel"></div>
     <div id="progressCard"></div>
@@ -604,7 +613,7 @@ function uploadLayout(job) {
       <div id="uploadResult" style="margin-top:10px"></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-sec="log">
       <div class="row-between" style="align-items:center">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">file by file</span>
@@ -621,8 +630,9 @@ function uploadView(mount, job, jobId, logs) {
   let stage = job.status === "running" ? "uploading" : "";
   wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
 
+  const getTab = wireRunTabs(mount, job, () => paint());
   const paint = () => {
-    paintHeader(mount, job);
+    paintHeader(mount, job, getTab());
     paintProgress(mount, job, stage, job.step, job.total_steps);
     const q = $("#queueCard", mount);
     if (q) q.innerHTML = queueCard(job);
@@ -699,22 +709,7 @@ function mergeLayout(job) {
   const cfg = job.config || {};
   const into = cfg.base_model_label || cfg.base_model || "its base model";
   return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${job.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub tiny" style="margin-top:4px">
-        <span class="badge badge-accent">merging</span>
-        an adapter into <span class="mono">${into}</span></p>
-    </div>
-
-    <div id="errorCard"></div>
+    ${raw(runHead(job))}
     <div id="queueCard"></div>
     <div id="stopPanel"></div>
     <div id="progressCard"></div>
@@ -744,11 +739,11 @@ function mergeLayout(job) {
       <div id="mergeResult" style="margin-top:10px"></div>
     </div>
 
-    <div id="cardRow"></div>
+    <div id="cardRow" data-sec="model"></div>
 
-    <div class="grid grid-2" style="margin-bottom:14px" id="ownerRow"></div>
+    <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
 
-    <div class="card">
+    <div class="card" data-sec="log">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">Newest at the bottom</span>
@@ -768,11 +763,12 @@ function mergeView(mount, job, jobId, logs) {
   const paintCard = wireModelCard(mount, jobId, () => job);
   const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
     job = await api.job(jobId);
-    paintHeader(mount, job);
+    paint();
   });
 
+  const getTab = wireRunTabs(mount, job, () => paint());
   const paint = () => {
-    paintHeader(mount, job);
+    paintHeader(mount, job, getTab());
     paintProgress(mount, job, stage, step, total);
     $("#queueCard", mount).innerHTML = queueCard(job);
     $("#mergeResult", mount).innerHTML = mergeResult(job);
@@ -868,29 +864,13 @@ function evalLayout(job) {
   const cfg = job.config || {};
   const models = (cfg.models || []).length;
   return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${job.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub tiny" style="margin-top:4px">
-        <span class="badge badge-accent">scoring</span>
-        ${models ? `${models} model${models === 1 ? "" : "s"}` : "models"}
-        against ${esc(cfg.eval_name || "a saved prompt set")}</p>
-    </div>
-
-    <div id="errorCard"></div>
+    ${raw(runHead(job))}
     <div id="queueCard"></div>
     <div id="stopPanel"></div>
     <div id="progressCard"></div>
     <div id="evalResult"></div>
 
-    <div class="card">
+    <div class="card" data-sec="log">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">One line per model, as each finishes</span>
@@ -907,8 +887,9 @@ function evalView(mount, job, jobId, logs) {
   let stage = job.status === "running" ? "evaluating" : "";
   let step = job.step, total = job.total_steps;
 
+  const getTab = wireRunTabs(mount, job, () => paint());
   const paint = () => {
-    paintHeader(mount, job);
+    paintHeader(mount, job, getTab());
     paintProgress(mount, job, stage, step, total);
     $("#queueCard", mount).innerHTML = queueCard(job);
     $("#evalResult", mount).innerHTML = evalResult(job);
@@ -1012,24 +993,7 @@ function layout(job, scratch, experts = 0) {
     : scratch ? `from scratch · ${source}`
               : `${job.config.base_model} → ${source}`;
   return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${job.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub mono tiny" style="margin-top:4px">${subtitle}</p>
-      ${raw(job.config.sweep_id ? html`
-        <p class="tiny" style="margin:4px 0 0">One of several variants —
-          <a href="#/sweeps/${job.config.sweep_id}">see them side by
-          side</a>.</p>` : "")}
-    </div>
-
-    <div id="errorCard"></div>
+    ${raw(runHead(job))}
     <div id="reportCard"></div>
     <div id="resumeCard"></div>
     <div id="queueCard"></div>
@@ -1037,10 +1001,10 @@ function layout(job, scratch, experts = 0) {
     <div id="progressCard"></div>
     <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
 
-    <div class="card" style="margin-bottom:14px"><div id="lossChart"></div></div>
+    <div class="card" data-sec="home charts" style="margin-bottom:14px"><div id="lossChart"></div></div>
 
     ${raw(experts > 1 ? html`
-      <div class="card" style="margin-bottom:14px">
+      <div class="card" data-sec="charts" style="margin-bottom:14px">
         <div id="expertChart"></div>
         <p class="muted tiny" style="margin:8px 0 0">
           The share of tokens going to the single busiest of the
@@ -1053,9 +1017,9 @@ function layout(job, scratch, experts = 0) {
       </div>` : "")}
 
     ${raw(scratch ? html`
-      <div class="card" id="samplesCard" style="margin-bottom:14px"></div>` : "")}
+      <div class="card" id="samplesCard" data-sec="home charts" style="margin-bottom:14px"></div>` : "")}
 
-    <div class="grid grid-2" style="margin-bottom:14px">
+    <div class="grid grid-2" data-sec="charts" style="margin-bottom:14px">
       <div class="card"><div id="lrChart"></div></div>
       <div class="card">
         <h3>What am I looking at?</h3>
@@ -1076,13 +1040,13 @@ function layout(job, scratch, experts = 0) {
       </div>
     </div>
 
-    <div id="furtherRow"></div>
+    <div id="furtherRow" data-sec="model"></div>
 
-    <div id="cardRow"></div>
+    <div id="cardRow" data-sec="model"></div>
 
-    <div class="grid grid-2" style="margin-bottom:14px" id="ownerRow"></div>
+    <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
 
-    <div class="card">
+    <div class="card" data-sec="log">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">Newest at the bottom</span>
@@ -1547,66 +1511,130 @@ function stopPanel(job, latest, stage) {
     </div>`;
 }
 
-function paintHeader(mount, job) {
-  const box = $("#headerActions", mount);
+/**
+ * The run's own ribbon.
+ *
+ * This page had an action row of up to eight buttons, five separate layouts
+ * that each re-emitted their own back link, and one very long scroll holding
+ * charts, a log, an artifact explainer, a model card editor, a publish form
+ * and a "train this further" form. Which of those you wanted depended entirely
+ * on whether the run was still going.
+ *
+ * So: verbs on the ribbon, and the page in sections the tabs switch between.
+ * The sections are hidden rather than removed, because every live paint on
+ * this page writes into an element by id — a tab that removed the log box
+ * would silently stop the log.
+ */
+const RUN_TABS = (job) => {
+  const k = kindOf(job);
+  const tabs = [{ key: "home", label: "Overview" }];
+  if (k.page === "training") tabs.push({ key: "charts", label: "Charts" });
+  tabs.push({ key: "log", label: "Log" });
+  if (k.leavesModel) tabs.push({ key: "model", label: "Model" });
+  return tabs;
+};
+
+function runRibbon(job, tab) {
+  const k = kindOf(job);
   const done = ["succeeded", "failed", "cancelled"].includes(job.status);
-  // A stopped run that kept its model is as usable as a finished one. The
-  // artifact is what decides that, not how the run ended.
-  // A generation run leaves a dataset, not a model. Offering "Try it out"
-  // pointed the playground at a job it cannot serve, and "Compare" offered to
-  // rank a held-out loss that does not exist.
-  const writing = job.kind === "generate_dataset";
-  // An upload produces nothing here at all -- what it produces is on the Hub.
-  const sending = job.kind === "upload";
-  // Neither does a scoring run: what it leaves is rows against a prompt set.
-  const scoring = job.kind === "evaluate";
+  const usable = job.artifacts?.length && k.leavesModel
+    && ["succeeded", "cancelled"].includes(job.status);
   // "Run again with changes" opens the form the run was started from, and two
   // kinds have no such form: a scoring run comes from the prompt set it
   // scores, and a merge -- which can no longer be created at all, merging
   // being part of training now -- came from the fine-tune it folded.
-  const repeatable = !scoring && job.kind !== "merge_adapter";
-  const usable = job.artifacts?.length && !writing
-    && ["succeeded", "cancelled"].includes(job.status);
-  const kept = job.status === "cancelled" && job.artifacts?.length;
-  box.innerHTML = html`
-    ${statusBadge(job.status, job.kind)}
-    ${raw(sending && job.summary?.url
-      ? `<a class="btn btn-primary btn-sm" target="_blank" rel="noopener"
-            href="${esc(job.summary.url)}">↗ Open on Hugging Face</a>` : "")}
-    ${raw(kept ? `<span class="badge badge-ok">${
-      writing ? "rows kept" : "model kept"}</span>` : "")}
-    ${raw(usable
-      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>`
-        // A merge has no held-out loss of its own -- it did not train. What
-        // there is to compare belongs to the fine-tune it was folded from.
-        + (repeatable
-          ? `<a class="btn btn-sm" href="#/compare"
-                title="Compare its held-out loss with other runs">⇄ Compare</a>`
-          : "") : "")}
-    ${raw(done && job.artifacts?.length
-      ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
-           ↓ Download${writing ? " the JSONL" : ""}</a>` : "")}
-    ${raw(done && !sending && repeatable
-      // Offered for a run that failed or was stopped as much as for one that
-      // finished: those are the ones somebody most wants to start again with
-      // one thing different. A generation run has a whole page that can edit
-      // its brief, so it goes there instead. An upload has nothing to vary --
-      // it is started again from whatever it was publishing.
-      ? `<a class="btn btn-sm" href="${writing
-             ? `#/generate/from/${esc(job.id)}`
-             : `#/jobs/${esc(job.id)}/again`}"
-            title="Start a new run from this one's settings">
-           ⟳ Run again with changes</a>` : "")}
-    ${raw(shareButton("job", job))}
-    ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>`
-                : `<button class="btn-danger btn-sm" id="deleteBtn">Delete</button>`)}`;
+  const repeatable = job.kind !== "evaluate" && job.kind !== "merge_adapter"
+    && job.kind !== "upload";
+  const writing = job.kind === "generate_dataset";
+  const madeRows = writing && (job.summary?.dataset_id || job.dataset_id);
 
-  // Assigned, not prepended: paintHeader runs on every metric tick, and
-  // prepending would stack a fresh copy of the error on each one.
-  $("#errorCard", mount).innerHTML = job.error
-    ? html`<div class="callout callout-err">
-        <strong>This run failed</strong>${job.error}</div>`
-    : "";
+  const body = group("This run", [
+    !done ? rb("cancelBtn", "■", "Stop", { cls: "danger" })
+          : rb("deleteBtn", "🗑", "Delete", { cls: "danger" }),
+    rb(null, "⟳", "Run again", { disabled: !done || !repeatable,
+      href: done && repeatable
+        ? (writing ? `#/generate/from/${esc(job.id)}` : `#/jobs/${esc(job.id)}/again`) : "",
+      title: "Start a new run from this one's settings" }),
+    rb(null, "✎", "Rename", { data: 'data-rename="1"' }),
+  ]) + group("Use it", [
+    rb(null, "▷", "Try it out", { cls: "primary", disabled: !usable,
+      href: usable ? `#/play/${esc(job.id)}` : "" }),
+    // The question a finished run actually raises -- is this better than what
+    // I started with -- had no button anywhere on this page. It does now.
+    rb("scoreRun", "◎", "Score it", { disabled: !usable,
+      title: "Put a saved set of prompts to it" }),
+    rb(null, "⚖", "Compare", { disabled: !usable, href: "#/compare",
+      title: "Held-out loss beside other runs" }),
+    // A fine-tune writing the next dataset is the loop this studio is built
+    // around, and it was reachable only by going to the generator and finding
+    // the run in a dropdown.
+    rb(null, "✦", "Write data with it", { disabled: !usable, href: "#/generate",
+      title: "Have this model write a dataset" }),
+    rb(null, "▤", "Open the rows", { disabled: !madeRows,
+      cls: "primary", href: madeRows ? `#/data/${esc(madeRows)}` : "" }),
+  ]) + group("Share it", [
+    rb(null, "↓", "Download", { disabled: !(done && job.artifacts?.length),
+      href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
+    rb("goPublish", "☁", "Publish", { disabled: !usable,
+      title: "Send it to Hugging Face" }),
+    job.summary?.url
+      ? rb(null, "↗", "On the Hub", { href: job.summary.url }) : "",
+  ]);
+
+  return ribbon({
+    tabs: RUN_TABS(job), active: tab, body,
+    right: `${statusBadge(job.status, job.kind).value || ""}
+            ${job.status === "cancelled" && job.artifacts?.length
+              ? `<span class="badge badge-ok">${writing ? "rows kept" : "model kept"}</span>` : ""}
+            ${shareButton("job", job)}`,
+  });
+}
+
+/** Draw the ribbon and show only the section it selects. */
+function paintHeader(mount, job, tab = "home") {
+  const box = $("#runRibbon", mount);
+  if (box) box.innerHTML = runRibbon(job, tab);
+  // Sections are marked in the layouts. Anything unmarked belongs to the
+  // overview, which keeps the four smaller layouts working without each of
+  // them having to label every card.
+  const tabs = RUN_TABS(job).map((t) => t.key);
+  $$("[data-sec]", mount).forEach((el) => {
+    const wanted = el.dataset.sec.split(" ");
+    // A section belonging to a tab this kind does not have is always shown,
+    // rather than being unreachable.
+    el.hidden = wanted.some((w) => tabs.includes(w)) && !wanted.includes(tab);
+  });
+
+  // Assigned, not prepended: this runs on every metric tick, and prepending
+  // would stack a fresh copy of the error on each one.
+  const err = $("#errorCard", mount);
+  if (err) {
+    err.innerHTML = job.error
+      ? html`<div class="callout callout-err">
+          <strong>This run failed</strong>${job.error}</div>`
+      : "";
+  }
+}
+
+/** The head of every run page, whatever kind it is. */
+function runHead(job) {
+  document.title = `${job.name} · Runs · AI Studio`;
+  return html`
+    <div class="page-head">
+      ${raw(breadcrumb({ href: "#/jobs", label: "Runs" }))}
+      <div class="row title-row" style="gap:4px;min-width:0;margin-top:6px">
+        <h1 style="margin:0" id="runTitle">${job.name}</h1>
+        <button class="btn-sm btn-quiet" data-rename="1" title="Rename this run"
+          aria-label="Rename this run">&#9998;</button>
+      </div>
+      <p class="sub mono tiny" style="margin-top:4px">${subjectOf(job)}</p>
+      ${raw(job.config.sweep_id ? html`
+        <p class="tiny" style="margin:4px 0 0">One of several variants —
+          <a href="#/sweeps/${job.config.sweep_id}">see them side by
+          side</a>.</p>` : "")}
+    </div>
+    <div id="runRibbon"></div>
+    <div id="errorCard"></div>`;
 }
 
 function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
@@ -1629,8 +1657,7 @@ function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
   const total = training ? job.total_steps : (rawTotal ?? 0);
   const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
-  const stageText = KIND_STAGES[job.kind]?.[stage] || STAGES[stage]
-    || (running ? "Working…" : "");
+  const stageText = stagesFor(job)[stage] || (running ? "Working…" : "");
   const counted = total > 0 && (training || writing || uploading || scoring);
   const count = writing ? `row ${step} of ${total}`
     : uploading ? `${fmtNum(step)} MB of ${fmtNum(total)}`
@@ -1694,7 +1721,6 @@ function resumeCard(job) {
 
 function paintStats(mount, job, m, scratch, stage = "training",
                    checkpointStep = 0, lastEval = null) {
-  paintHeader(mount, job);
   paintProgress(mount, job, stage, null, null,
                 checkpointStep || job.checkpoint_step || 0);
   const q = $("#queueCard", mount);

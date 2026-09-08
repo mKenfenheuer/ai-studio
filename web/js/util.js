@@ -154,10 +154,24 @@ export function statusBadge(status, kind = "") {
   return raw(`<span class="${cls}">${esc(label)}</span>`);
 }
 
-export function toast(message, kind = "") {
+/** A short message in the corner.
+ *
+ *  `action` is `{href, label}`: "the run started" is worth saying, and worth
+ *  being able to act on without hunting for where it went. The container is a
+ *  live region, so a screen reader hears these at all — they were silent.
+ */
+export function toast(message, kind = "", action = null) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
-  el.textContent = message;
+  el.setAttribute("role", kind === "err" ? "alert" : "status");
+  el.appendChild(document.createTextNode(message));
+  if (action?.href) {
+    const a = document.createElement("a");
+    a.href = action.href;
+    a.textContent = action.label || "Open";
+    a.addEventListener("click", () => el.remove());
+    el.appendChild(a);
+  }
   document.getElementById("toasts").appendChild(el);
   setTimeout(() => el.remove(), kind === "err" ? 7000 : 4000);
 }
@@ -197,6 +211,53 @@ export function modal({ title, body = "", width = 580, onClose } = {}) {
   dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
   dlg.showModal();
   return dlg;
+}
+
+// ===========================================================================
+// A resource that loads once per key, never in a render loop.
+// ===========================================================================
+//
+// THE RENDERING RULE, and it is the only architectural rule this UI has:
+// `draw()` renders purely from state, and no render may start work that causes
+// another render synchronously. Every asynchronous load goes through
+// `ensure()`, which marks itself in-flight *before* awaiting, so the re-render
+// it eventually triggers finds the work already done rather than starting it
+// again.
+//
+// Written down because breaking it is neither obvious nor survivable: an
+// earlier wizard called draw() from inside a click handler that each step
+// re-ran on render, which recursed until the stack gave out and filled the
+// console with `too much recursion`.
+//
+// It lived in wizard.js, unexported, which meant the one rule the project
+// writes down was available to one of eighteen views. The other seventeen
+// each invented something: a `paint()` that refetches everything on every
+// event, top-level `let`s reassigned from handlers, or nothing at all.
+
+export const resource = () => ({ status: "idle", key: null, data: null, error: null });
+
+export function ensure(res, key, fetcher, draw) {
+  // Already loading or loaded for this exact key: do nothing. This is the
+  // guard that makes it safe for a render to call ensure() unconditionally.
+  if (res.key === key && res.status !== "idle") return res;
+  res.key = key;
+  res.status = "loading";
+  res.data = null;
+  res.error = null;
+  (async () => {
+    try {
+      const data = await fetcher();
+      if (res.key !== key) return;      // a newer request has superseded this
+      res.data = data;
+      res.status = "ready";
+    } catch (e) {
+      if (res.key !== key) return;
+      res.error = e.message || String(e);
+      res.status = "error";
+    }
+    draw();
+  })();
+  return res;
 }
 
 /** Run `fn` only once the typing stops. Used by every search-as-you-type box:
