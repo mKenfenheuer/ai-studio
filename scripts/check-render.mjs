@@ -99,6 +99,7 @@ function run(bin, args) {
 
 const args = process.argv.slice(2);
 const shot = args.includes("--shot") ? args[args.indexOf("--shot") + 1] : null;
+const tab = args.includes("--tab") ? args[args.indexOf("--tab") + 1] : "";
 const width = args.includes("--width") ? args[args.indexOf("--width") + 1] : "1440";
 const height = args.includes("--height") ? args[args.indexOf("--height") + 1] : "950";
 
@@ -117,7 +118,8 @@ if (shot) {
     "--headless", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
     `--window-size=${width},${height}`, "--virtual-time-budget=8000",
     `--screenshot=${out}`,
-    `http://localhost:${PORT}/check-render.html?only=${encodeURIComponent(shot)}`,
+    `http://localhost:${PORT}/check-render.html?only=${encodeURIComponent(shot)}`
+      + (tab ? `&tab=${encodeURIComponent(tab)}` : ""),
   ]);
   console.log(out);
   server.close();

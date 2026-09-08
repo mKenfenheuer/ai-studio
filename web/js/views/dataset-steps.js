@@ -536,6 +536,10 @@ export const TABS = [
   { key: "columns", label: "Add Column" },
   { key: "rows", label: "Rows" },
   { key: "view", label: "View" },
+  // Not a step: what the trainer will read out of these rows, and whether it
+  // can. It lived only inside the wizard, three screens from the editor where
+  // the mapping it depends on is decided.
+  { key: "train", label: "Training" },
 ];
 
 export const stepsOnTab = (tab) => Object.entries(STEPS)

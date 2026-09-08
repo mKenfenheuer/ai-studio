@@ -90,6 +90,20 @@ const FIXTURES = [
                    job({ id: "job_3", kind: "generate_dataset", name: "Write me rows",
                          status: "running", has_model: false,
                          config: { model: { label: "gpt-4o" } } })]],
+  [/\/api\/datasets\/[^/]+\/inspect/, { sampled: 500, total_rows: 52002,
+      columns: [{ name: "instruction", filled: 500, fill_rate: 1 }],
+      empty_rows: 0, duplicate_rows: 3, unique_rows: 497,
+      chars: { min: 20, p50: 340, p90: 1200, p99: 4000, max: 9000, mean: 500 },
+      est_tokens: 62500, histogram: [], preview: [], format: { mode: "instruction" },
+      problems: [] }],
+  [/\/api\/datasets\/[^/]+\/conversation-report/, { sampled: 500, canonical: 200,
+      problems: [] }],
+  [/\/api\/hub\/training-preview/, { available: true, columns: ["instruction", "output"],
+      split: "train", counts: { ok: 38, empty: 1, unreadable: 1, sampled: 40 },
+      readable: 38, template_source: "builtin", system_prompts: ["You are helpful."],
+      resolved: { instruction_field: "instruction", response_field: "output" },
+      format: { mode: "instruction", confidence: "high" },
+      rendered: [{ status: "ok", ok: true, text: "### Instruction\nSay hi\n\n### Response\nHi", length: 42 }] }],
   [/\/api\/datasets\/[^/]+\/rows/, { rows: [
       { index: 0, split: "train", row: { instruction: "Say hi", output: "Hi" },
         rendered: "### Instruction\nSay hi\n\n### Response\nHi" }],
@@ -201,6 +215,12 @@ for (const [label, path, fn, args] of RUN) {
     results.push(`${drew > 200 ? "ok  " : "THIN"} ${label.padEnd(12)} ${
       String(drew).padStart(6)} chars, ${tabKeys.length} tab(s)${
       tabNote || (ribbons ? " all switch" : "")}`);
+    // ?tab=... opens one tab before the screenshot is taken.
+    const wantTab = new URLSearchParams(location.search).get("tab");
+    if (only && wantTab) {
+      main.querySelector(`[data-tab="${wantTab}"]`)?.click();
+      await new Promise((r) => setTimeout(r, 400));
+    }
     if (typeof stop === "function" && !only) stop();
   } catch (e) {
     results.push(`FAIL ${label.padEnd(12)} ${e.message}`);

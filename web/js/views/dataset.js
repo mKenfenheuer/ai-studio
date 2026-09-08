@@ -16,7 +16,7 @@
 import { api } from "../api.js";
 import { conversationHtml, toolsHtml, isConversation } from "../conversation.js";
 import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo,
-         debounce, inlineRename } from "../util.js";
+         debounce, inlineRename, resource, ensure } from "../util.js";
 import { ribbon, rb, group, rbSelect, rbSeg, wireRibbon, tabState } from "../ribbon.js";
 import { confirmDestructive, breadcrumb } from "../components.js";
 import { shareButton, wireShareBox } from "./share.js";
@@ -47,6 +47,10 @@ export async function datasetView(mount, [id]) {
   let library = [];
   let rows = null;                 // a page of the file itself
   let stats = null;                // the quality report, once asked for
+  const training = resource();     // what the trainer will read, once asked
+  const convReport = resource();   // whether it reads as conversations
+  let trainSplit = "";             // which split the training tab is showing
+  let contextLen = +(localStorage.getItem("aistudio.ctxLen") || 2048);
   let steps = loadDraft(id);       // [{type, ops}]
   let selected = steps.length - 1; // -1 is the source
   let history = [], future = [];   // undo and redo, as whole step lists
@@ -71,8 +75,19 @@ export async function datasetView(mount, [id]) {
   const draw = () => {
     mount.innerHTML = layout({ d, library, rows, steps, selected, preview, previewErr,
                                stages, loading, tab, view, picked, sample, leftOpen,
-                               history, future, colMenu });
+                               history, future, colMenu, stats,
+                               training, convReport, trainSplit, contextLen });
     wire();
+    // Everything the training tab shows is fetched the first time it is
+    // opened, and again when the split changes -- never on the way past.
+    if (tab === "train") {
+      ensure(training, `${id}:${trainSplit}`,
+             () => api.trainingPreview({ studio_dataset: id, split: trainSplit }),
+             draw);
+      if ((d.format || {}).mode === "chat") {
+        ensure(convReport, id, () => api.conversationReport(id), draw);
+      }
+    }
   };
 
   // ---- the file itself ---------------------------------------------------
@@ -526,6 +541,103 @@ export async function datasetView(mount, [id]) {
       catch (ex) { toast(ex.message, "err"); }
     });
 
+    // ---- the training tab --------------------------------------------------
+    on(mount, "change", "#trainSplit", (_e, t) => { trainSplit = t.value; draw(); });
+    on(mount, "click", "#recheckTraining", () => {
+      training.key = null;          // force the next ensure() to fetch again
+      convReport.key = null;
+      draw();
+    });
+    on(mount, "click", "#measureLengths", async () => {
+      try { stats = await api.datasetInspect(id); draw(); }
+      catch (ex) { toast(ex.message, "err"); }
+    });
+    on(mount, "change", "#ctxLen", (_e, t) => {
+      contextLen = Math.max(128, +t.value || 2048);
+      localStorage.setItem("aistudio.ctxLen", String(contextLen));
+      draw();
+    });
+
+    on(mount, "click", "#editMapping", () => {
+      const cols = (d.columns || []).filter((c) => c !== "split");
+      const fmt = d.format || {};
+      const pick = (id_, label, value, hint) => html`
+        <div class="field">
+          <label for="${id_}">${label}</label>
+          <select id="${id_}">
+            <option value="">— none —</option>
+            ${raw(cols.map((c) => `<option value="${esc(c)}"${
+              c === value ? " selected" : ""}>${esc(c)}</option>`).join(""))}
+          </select>
+          ${raw(hint ? `<div class="hint">${esc(hint)}</div>` : "")}
+        </div>`;
+      const dlg = modal({ title: "How to read these rows", width: 560, body: html`
+        <p class="muted tiny">Saved on the dataset, so every run started from
+          it reads the rows the same way. This was worked out inside the wizard
+          and thrown away afterwards, which meant doing it again every time.</p>
+        <div class="field">
+          <label for="fmMode">Each row is</label>
+          <select id="fmMode">
+            ${raw([["auto", "Work it out from the columns"],
+                   ["chat", "A conversation"],
+                   ["instruction", "An instruction and a response"],
+                   ["text", "One column of text"]].map(([v, l]) =>
+              `<option value="${v}"${v === (fmt.mode || "auto") ? " selected" : ""}>${l}</option>`).join(""))}
+          </select>
+        </div>
+        <div id="fmFields"></div>
+        <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+          <button type="button" class="btn" data-modal-close>Cancel</button>
+          <button type="button" class="btn btn-primary" id="fmSave">Save the mapping</button>
+        </div>` });
+
+      const fields = () => {
+        const mode = $("#fmMode", dlg).value;
+        $("#fmFields", dlg).innerHTML =
+          mode === "chat" ? pick("fmMessages", "The conversation is in", fmt.messages_field,
+                                 "A list of messages, each with a role and content.")
+                            + pick("fmTools", "Tool definitions are in", fmt.tools_field, "")
+          : mode === "instruction"
+            ? pick("fmInstruction", "The instruction is in", fmt.instruction_field, "")
+              + pick("fmInput", "Extra input is in", fmt.input_field,
+                     "Optional. Appended to the instruction when a row has one.")
+              + pick("fmResponse", "The answer is in", fmt.response_field, "")
+          : mode === "text"
+            ? pick("fmText", "The text is in", fmt.text_field,
+                   "The whole row, trained on as-is.")
+          : `<p class="muted tiny">The column names are matched against the shapes
+               this app knows. Pick one of the others to say so yourself.</p>`;
+      };
+      fields();
+      on(dlg, "change", "#fmMode", fields);
+      on(dlg, "click", "#fmSave", async () => {
+        const mode = $("#fmMode", dlg).value;
+        const val = (sel) => $(sel, dlg)?.value || undefined;
+        const next = mode === "auto" ? {} : { mode };
+        if (mode === "chat") {
+          next.messages_field = val("#fmMessages");
+          next.tools_field = val("#fmTools");
+        } else if (mode === "instruction") {
+          next.instruction_field = val("#fmInstruction");
+          next.input_field = val("#fmInput");
+          next.response_field = val("#fmResponse");
+        } else if (mode === "text") {
+          next.text_field = val("#fmText");
+        }
+        // Said by a person rather than guessed, so nothing downstream should
+        // hedge about it.
+        if (mode !== "auto") next.confidence = "high";
+        try {
+          d = await api.renameDataset(id, { format: next });
+          dlg.close();
+          training.key = null;
+          convReport.key = null;
+          toast("Saved. Runs started from this dataset will read it this way.", "ok");
+          draw();
+        } catch (ex) { toast(ex.message, "err"); }
+      });
+    });
+
     // ---- home actions ------------------------------------------------------
     on(mount, "click", "#inspect", async () => {
       const dlg = modal({ title: "What is in it", width: 720,
@@ -670,7 +782,13 @@ function saveDraft(id, steps) {
 // Layout
 
 function layout(s) {
-  const { d, steps, selected, leftOpen } = s;
+  const { d, steps, selected, leftOpen, tab } = s;
+  if (tab === "train") {
+    return html`
+      ${raw(header(d))}
+      ${raw(ribbonFor(s))}
+      ${raw(trainPanel(s))}`;
+  }
   return html`
     ${raw(header(d))}
     ${raw(ribbonFor(s))}
@@ -743,6 +861,21 @@ function ribbonFor(s) {
     ]) + group("Panes", [
       rb("toggleLeft", "▤", leftOpen ? "Hide library" : "Show library"),
     ]);
+  } else if (tab === "train") {
+    body = group("Check it", [
+      rb("recheckTraining", "↻", "Read it again",
+        { title: "Render these rows the way the trainer will" }),
+      rbSelect("trainSplit", { title: "Which split to look at", value: s.trainSplit,
+        options: [["", "Every split"]].concat(
+          Object.keys(d.splits || {}).map((n) => [n, n])) }),
+    ]) + group("How to read it", [
+      rb("editMapping", "⚙", "Change the mapping",
+        { disabled: d.access !== "edit",
+          title: "Which columns hold the question, the answer, the conversation" }),
+    ]) + group("Then", [
+      rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
+      rb("holdBack", "◫", "Hold back a split"),
+    ]);
   } else {
     const items = stepsOnTab(tab).map((def) =>
       rb(null, def.icon, def.label, { data: `data-add="${def.key}"`, title: def.blurb }));
@@ -751,6 +884,207 @@ function ribbonFor(s) {
   }
   return ribbon({ tabs: TABS, active: tab, body,
                   right: shareButton("dataset", d) });
+}
+
+// ---- the training tab --------------------------------------------------------
+//
+// The one question this page could not answer: what will the trainer actually
+// read out of these rows, and can it? The renderer that answers it existed and
+// was reachable only from step three of the wizard -- so the mapping worked out
+// there was never written back here, and had to be worked out again on every
+// future run. The preview also has no way back to the editor, so a problem it
+// reveals is a problem you go and fix somewhere else.
+
+function trainPanel(s) {
+  const { d, training, convReport, trainSplit } = s;
+  const t = training.data;
+  const chat = (d.format || {}).mode === "chat";
+
+  return html`
+    <div class="grid grid-2" style="align-items:start;gap:14px">
+      <div>
+        ${raw(formatCard(d, t))}
+        ${raw(lengthCard(s))}
+        ${raw(chat ? conversationCard(convReport) : "")}
+      </div>
+      <div>${raw(renderedCard(training, trainSplit))}</div>
+    </div>`;
+}
+
+/** How these rows are read, and how sure anybody is about that. */
+function formatCard(d, t) {
+  const fmt = d.format || {};
+  const mode = fmt.mode || "auto";
+  const conf = fmt.confidence || (t?.format || {}).confidence;
+  const resolved = t?.resolved || {};
+  const MODE_WORDS = {
+    chat: "A conversation per row",
+    instruction: "An instruction and a response per row",
+    text: "One column of text per row",
+    auto: "Not worked out yet",
+  };
+  const level = conf === "high" ? "ok" : conf === "low" ? "warn" : "";
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin:0 0 8px">How the trainer reads these rows</h3>
+      <div class="callout ${level ? "callout-" + level : ""}">
+        <strong>${MODE_WORDS[mode] || mode}</strong>
+        ${raw(conf === "high"
+          ? "Read from the column names, which match a shape this app knows."
+          : conf === "low"
+          ? "Guessed. Check the rendered text on the right before training on it — "
+            + "a wrong guess trains the model on the wrong half of every row."
+          : "Worked out from the rows themselves.")}
+      </div>
+      ${raw(Object.keys(resolved).length ? html`
+        <dl class="kv" style="margin-top:10px">
+          ${raw(Object.entries(resolved).map(([k, v]) => html`
+            <dt>${k.replace(/_/g, " ")}</dt>
+            <dd class="mono">${v == null || v === "" ? "—" : String(v)}</dd>`).join(""))}
+        </dl>` : "")}
+      ${raw((fmt.roles || []).length ? html`
+        <p class="muted tiny" style="margin:8px 0 0">Roles in the data:
+          ${(fmt.roles || []).join(", ")}${fmt.has_tool_calls ? " · with tool calls" : ""}${
+          fmt.has_reasoning ? " · with reasoning" : ""}</p>` : "")}
+    </div>`;
+}
+
+/** How long the rows are, and how much of them a context window would keep. */
+function lengthCard(s) {
+  const { stats, contextLen } = s;
+  if (!stats) {
+    return html`
+      <div class="card" style="margin-bottom:14px">
+        <h3 style="margin:0 0 6px">How long are these rows?</h3>
+        <p class="muted tiny">A row longer than the context length is cut, and
+          nothing says so at training time — the end of every long example is
+          simply not learned.</p>
+        <button class="btn-sm" id="measureLengths">Measure them</button>
+      </div>`;
+  }
+  const chars = stats.chars || {};
+  // Four characters to a token is the usual rule for English. Said out loud
+  // rather than presented as a count, because it is wrong by a third on code
+  // and much worse on languages that do not space their words.
+  const est = (n) => Math.round((n || 0) / 4);
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin:0 0 8px">How long are these rows?</h3>
+      <dl class="kv">
+        <dt>Typical</dt><dd>${fmtNum(chars.p50 || 0)} characters
+          <span class="muted tiny">≈ ${fmtNum(est(chars.p50))} tokens</span></dd>
+        <dt>Long ones</dt><dd>${fmtNum(chars.p90 || 0)} characters
+          <span class="muted tiny">≈ ${fmtNum(est(chars.p90))} tokens</span></dd>
+        <dt>Longest seen</dt><dd>${fmtNum(chars.max || 0)} characters
+          <span class="muted tiny">≈ ${fmtNum(est(chars.max))} tokens</span></dd>
+      </dl>
+      <div class="row row-top" style="margin-top:10px;align-items:flex-end">
+        <div class="field" style="max-width:170px;margin:0">
+          <label for="ctxLen">Against a context of</label>
+          <input id="ctxLen" type="number" value="${contextLen}" min="128" step="128">
+        </div>
+      </div>
+      ${raw(est(chars.p90) > contextLen ? html`
+        <div class="callout callout-warn" style="margin-top:10px">
+          <strong>More than a tenth of these rows will be cut</strong>
+          At ${fmtNum(contextLen)} tokens, everything past the cut is not
+          learned — and for an instruction dataset that is usually the answer.
+          Either raise the context length on the run, or filter the long rows
+          out on the Rows tab.</div>`
+        : est(chars.max) > contextLen ? html`
+        <div class="callout" style="margin-top:10px">
+          The longest rows here will be cut at ${fmtNum(contextLen)} tokens.
+          Typical ones fit comfortably.</div>`
+        : html`
+        <div class="callout callout-ok" style="margin-top:10px">
+          Every row measured fits in ${fmtNum(contextLen)} tokens.</div>`)}
+      <p class="muted tiny" style="margin:8px 0 0">Character counts are exact;
+        the token figures are the usual four-characters-a-token rule and are
+        wrong by a third on code. Measured on ${fmtNum(stats.sampled || 0)} rows.</p>
+    </div>`;
+}
+
+/** Whether it reads as conversations, from the validator the conversion uses. */
+function conversationCard(res) {
+  if (res.status === "loading") {
+    return `<div class="card muted tiny" aria-busy="true">Reading the conversations…</div>`;
+  }
+  if (res.status === "error") {
+    return `<div class="callout callout-err">${esc(res.error)}</div>`;
+  }
+  const r = res.data;
+  if (!r) return "";
+  const problems = r.problems || [];
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin:0 0 8px">Do they read as conversations?</h3>
+      <p class="muted tiny">${fmtNum(r.sampled || 0)} checked${
+        r.canonical != null ? ` · ${r.canonical} of the first 200 already in the standard shape` : ""}.</p>
+      ${raw(!problems.length
+        ? `<div class="callout callout-ok" style="margin-top:8px">
+             Nothing wrong found.</div>`
+        : problems.map((p) => `<div class="callout callout-${
+            p.level === "error" ? "err" : "warn"} tiny" style="margin-top:8px">${
+            esc(p.message)}${p.rows ? ` <span class="muted">(${p.rows} rows)</span>` : ""}</div>`).join(""))}
+    </div>`;
+}
+
+/** The exact text the model will be trained on. */
+function renderedCard(res, split) {
+  if (res.status === "idle" || res.status === "loading") {
+    return html`<div class="card muted tiny" aria-busy="true">
+      Rendering these rows the way the trainer will…
+      <div class="sk-line shimmer" style="margin-top:10px;width:80%"></div>
+      <div class="sk-line shimmer" style="margin-top:6px;width:60%"></div></div>`;
+  }
+  if (res.status === "error") {
+    return `<div class="callout callout-err"><strong>Could not render these rows</strong>${esc(res.error)}</div>`;
+  }
+  const t = res.data || {};
+  if (!t.available) {
+    return `<div class="callout callout-warn"><strong>Nothing to render</strong>${
+      esc(t.reason || "That split has no rows in it.")}</div>`;
+  }
+  const c = t.counts || {};
+  return html`
+    <div class="card">
+      <div class="row-between" style="align-items:baseline;margin-bottom:8px">
+        <h3 style="margin:0">What the model will read</h3>
+        <span class="muted tiny">${split ? split + " split" : "every split"}</span>
+      </div>
+      <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:10px">
+        <span class="badge badge-ok">${c.ok || 0} readable</span>
+        ${raw(c.empty ? `<span class="badge">${c.empty} blank</span>` : "")}
+        ${raw(c.unreadable
+          ? `<span class="badge badge-err">${c.unreadable} unreadable</span>` : "")}
+        <span class="badge">via ${esc(t.template_source || "the builtin format")}</span>
+      </div>
+      ${raw(c.unreadable ? `<div class="callout callout-err" style="margin-bottom:10px">
+        <strong>${c.unreadable} of ${c.sampled} rows have content the chosen columns
+        cannot reach</strong> Those rows are skipped at training time. Change the
+        mapping, or look at one on the table.</div>` : "")}
+      ${raw(t.template_error ? `<div class="callout callout-err" style="margin-bottom:10px">
+        <strong>The template did not render</strong>${esc(t.template_error)}</div>` : "")}
+      ${raw((t.rendered || []).map((r) => html`
+        <div class="sample ${r.status !== "ok" ? "bad" : ""}">
+          <div class="row-between tiny muted" style="margin-bottom:4px">
+            <span>${r.status === "ok" ? "row as the model sees it"
+              : r.status === "empty" ? "blank in the source — skipped"
+              : "has content the mapping cannot reach"}</span>
+            <span>${fmtNum(r.length || 0)} characters</span>
+          </div>
+          <p class="txt mono tiny" style="white-space:pre-wrap;margin:0">${
+            r.text || "(nothing)"}</p>
+        </div>`).join(""))}
+      ${raw((t.system_prompts || []).length ? html`
+        <details class="adv" style="margin-top:10px">
+          <summary>The system prompt in this data</summary>
+          <p class="mono tiny" style="white-space:pre-wrap">${t.system_prompts[0]}</p>
+          <p class="muted tiny">Recorded with any run started from here, and
+            offered back in the playground — a model fine-tuned with one behaves
+            noticeably worse without it.</p>
+        </details>` : "")}
+    </div>`;
 }
 
 // ---- left: the library -----------------------------------------------------
