@@ -532,17 +532,25 @@ async def _create_job(request: Request, payload: dict) -> str:
     user = security.current_user(request)
     kind = payload.get("kind", "finetune_llm")
     cfg = payload.get("config") or {}
-    # Which project this run belongs to: said outright, or inherited from the
-    # dataset it trains on. A run has to be somebody's project's, or it is a
-    # thing on a list nobody will find again.
+    # Which project this run belongs to. Every run belongs to one: a run
+    # without a project is a row on a list that nobody will find again, and
+    # this studio has six months of proof of that.
+    #
+    # Said outright, or inherited from what the run is made of -- the dataset
+    # it trains on, or the run it continues, exports, or uploads. Inheritance
+    # covers every path that starts from something that is already filed,
+    # which is nearly all of them; only a run started from nothing has to be
+    # asked, and the pages that start one ask before they get here.
     project_id = (payload.get("project_id") or cfg.get("project_id") or "").strip() or None
+    cfg.pop("project_id", None)
     if project_id:
         prj = db.get_project(project_id)
         if not prj or not db.access_level("project", project_id, prj.get("owner_id"), user):
             raise HTTPException(404, "No such project.")
-    elif cfg.get("studio_dataset"):
-        project_id = db.project_of_dataset(cfg["studio_dataset"])
-    cfg.pop("project_id", None)
+    else:
+        project_id = _inherited_project(cfg)
+    if not project_id:
+        raise HTTPException(400, _no_project_message(cfg))
     # A dataset from the studio's own library travels as a URL the runner can
     # fetch with its join token, so a private dataset never has to be public
     # to be trained on.
@@ -949,6 +957,46 @@ async def get_sweep(request: Request, sweep_id: str) -> dict:
         row["best"] = None
         row["ranked_by"] = None
     return row
+
+
+def _inherited_project(cfg: dict) -> str | None:
+    """The project of whatever this run is made of.
+
+    A run is nearly always started from something that is already filed: the
+    dataset it trains on, the run it continues, the run it exports or
+    uploads. Asking again for a fact the run already implies is the kind of
+    question that makes people stop filing things at all.
+    """
+    if did := cfg.get("studio_dataset"):
+        if found := db.project_of_dataset(did):
+            return found
+    for key in ("base_model_job", "source_job", "trained_by", "from_job",
+                "resume_from_job", "parent_job"):
+        if jid := cfg.get(key):
+            job = db.get_job(jid)
+            if job and job.get("project_id"):
+                return job["project_id"]
+    return None
+
+
+def _no_project_message(cfg: dict) -> str:
+    """Why this run has nowhere to go, in terms of what the caller sent.
+
+    A studio that predates projects is full of runs and datasets in no
+    project, and "every run belongs to a project" is unhelpful when the thing
+    you started from is the unfiled one. Name it instead.
+    """
+    if (did := cfg.get("studio_dataset")) and db.get_dataset(did):
+        return ("The dataset this would train on is not in a project yet. "
+                "Open it and file it, or start this run from a project's own "
+                "page -- every run belongs to a project.")
+    for key in ("base_model_job", "source_job", "trained_by"):
+        if (jid := cfg.get(key)) and (job := db.get_job(jid)):
+            return ("The run this one is built on (\"%s\") is not in a "
+                    "project yet. File that run and this one follows it."
+                    % job["name"])
+    return ("Every run belongs to a project. Open the project this is for and "
+            "start it from there, or make a new one.")
 
 
 def _default_job_name(cfg: dict, kind: str = "finetune_llm") -> str:

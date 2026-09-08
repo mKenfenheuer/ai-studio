@@ -11,7 +11,7 @@
   <div class="brand-name">AI Studio</div><div class="brand-sub">train &middot; tune &middot; evaluate</div></div></div>
 <nav class="nav">
   <a href="#/" data-nav="projects" class="active"><span class="ico">&#9671;</span><span class="lbl">Projects</span></a>
-  <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">&#10022;</span><span class="lbl">New training run</span></a>
+  <a href="#/projects?new=1" data-nav="projects" class="nav-cta"><span class="ico">&#10022;</span><span class="lbl">New project</span></a>
   <a href="#/play" data-nav="play"><span class="ico">&#9655;</span><span class="lbl">Playground</span></a>
   <a href="#/data" data-nav="data"><span class="ico">&#9636;</span><span class="lbl">Datasets</span></a>
   <a href="#/models" data-nav="models"><span class="ico">&#11042;</span><span class="lbl">Models</span></a>
@@ -359,11 +359,13 @@ const VIEWS = [
   ["evalview", "./views/evalview.js", "evalView", ["ev_1"]],
   ["compare", "./views/compare.js", "compareView", []],
   ["serving", "./views/serving.js", "servingView", []],
-  ["vision", "./views/vision.js", "visionView", []],
+  ["vision", "./views/vision.js", "visionView", [], "#/new/vision?project=prj_1"],
   ["settings", "./views/settings.js", "settingsView", []],
   ["account", "./views/account.js", "accountView", []],
-  ["wizard", "./views/wizard.js", "wizardView", []],
-  ["generate", "./views/generate.js", "generateView", []],
+  // Once without a project, where it must ask; once with, where it must work.
+  ["wizard-gate", "./views/wizard.js", "wizardView", [], "#/new"],
+  ["wizard", "./views/wizard.js", "wizardView", [], "#/new?project=prj_1"],
+  ["generate", "./views/generate.js", "generateView", [], "#/generate?project=prj_1"],
   ["sweep", "./views/sweep.js", "sweepView", ["sw_1"]],
   ["sweeps", "./views/sweep.js", "sweepsView", []],
   ["rerun", "./views/rerun.js", "rerunView", ["job_1"]],
@@ -383,9 +385,13 @@ const main = document.getElementById("main");
 const only = new URLSearchParams(location.search).get("only");
 if (only) document.getElementById("results").hidden = true;
 const RUN = only ? VIEWS.filter(([l]) => l === only) : VIEWS;
-for (const [label, path, fn, args] of RUN) {
+for (const [label, path, fn, args, hash] of RUN) {
   try {
     const mod = await import(`/static/js/${path.slice(2)}`);
+    // Some pages read the address: the wizard, the generator and the vision
+    // page all ask which project they are working in and stop if they are not
+    // told, which is the point of them -- so the harness has to say.
+    location.hash = hash || "#/";
     main.innerHTML = "";
     const stop = await mod[fn](main, args);
     // A view that draws nothing is a view that failed quietly, which is the
@@ -440,7 +446,7 @@ if (!only) {
   try {
     localStorage.removeItem("aistudio.wizard");
     const { wizardView } = await import("/static/js/views/wizard.js");
-    location.hash = "#/new";
+    location.hash = "#/new?project=prj_1";
     main.innerHTML = "";
     await wizardView(main, []);
 
@@ -458,7 +464,7 @@ if (!only) {
         back ? back.className : "no mode button");
 
     // The step comes from the address, so Back and Forward move between steps.
-    location.hash = "#/new?step=1";
+    location.hash = "#/new?project=prj_1&step=1";
     main.innerHTML = "";
     await wizardView(main, []);
     await new Promise((r) => setTimeout(r, 120));
@@ -472,7 +478,7 @@ if (!only) {
     // opened directly, which is every step change, because the step is in
     // the address. The page then waited on a request nobody had sent.
     localStorage.removeItem("aistudio.wizard");
-    location.hash = "#/new?step=3&dataset=ds_1";
+    location.hash = "#/new?project=prj_1&step=3&dataset=ds_1";
     main.innerHTML = "";
     await wizardView(main, []);
     await new Promise((r) => setTimeout(r, 400));
@@ -482,10 +488,24 @@ if (!only) {
         `${tiles} layout(s) offered`);
     localStorage.removeItem("aistudio.wizard");
 
+    // A run without a project cannot be started at all: the wizard asks
+    // first, because a run nobody can find later is the thing projects exist
+    // to prevent.
+    localStorage.removeItem("aistudio.wizard");
+    location.hash = "#/new";
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 120));
+    say("project asked first",
+        !!main.querySelector("[data-pick-project]")
+          && !main.querySelector("[data-mode]"),
+        main.querySelector("h1")?.textContent || "no heading");
+    location.hash = "#/new?project=prj_1";
+
     // An expired draft is not resumed.
     localStorage.setItem("aistudio.wizard",
       JSON.stringify({ at: Date.now() - 9 * 3600 * 1000, mode: "scratch" }));
-    location.hash = "#/new";
+    location.hash = "#/new?project=prj_1";
     main.innerHTML = "";
     await wizardView(main, []);
     await new Promise((r) => setTimeout(r, 120));

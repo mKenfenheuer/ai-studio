@@ -31,6 +31,9 @@ export async function evalView(mount, [evalId]) {
   let candidates = [];
   let openScore = null;
   let hosted = { providers: [], connected: [] };
+  // Only needed when this set is in no project: a scoring run has to be filed
+  // somewhere, and this is the last page that can ask before it starts one.
+  let projects = [];
   // What is going to be scored, held here rather than read off the checkboxes
   // at the end: adding a baseline redraws the panel, and a redraw that forgot
   // which models were ticked would be worse than no baselines at all.
@@ -49,9 +52,18 @@ export async function evalView(mount, [evalId]) {
 
   const draw = () => {
     mount.innerHTML = layout(ev, candidates, openScore, tab,
-                             { picked, baselines, hosted });
+                             { picked, baselines, hosted, projects });
     wire();
   };
+
+  // Fetched only when the answer is missing, and drawn again when it lands
+  // rather than holding the page up for a list most visits do not need.
+  if (!ev.project_id) {
+    api.projects().then((d) => {
+      projects = (d.projects || []).filter((p) => !p.archived);
+      draw();
+    }).catch(() => {});
+  }
 
   const refresh = async () => { ev = await api.eval(evalId); draw(); };
 
@@ -125,6 +137,9 @@ export async function evalView(mount, [evalId]) {
       try {
         const { id } = await api.runEval(evalId, {
           model_job_ids: [...picked],
+          // Where the scoring run goes. The set's own project when it has
+          // one; otherwise whatever was chosen here, which files the set too.
+          project_id: ev.project_id || $("#evProject", mount)?.value || null,
           baselines: baselines.map(({ key, ...b }) => b),
           max_new_tokens: +$("#evMaxTokens", mount).value || 200,
           temperature: +$("#evTemp", mount).value || 0,
@@ -281,7 +296,7 @@ function ribbonFor(ev, candidates, tab) {
 /** Choosing what to ask, and how. */
 function runPanel(ev, candidates, state) {
   const items = ev.items || [];
-  const { picked, baselines, hosted } = state;
+  const { picked, baselines, hosted, projects } = state;
   const none = !candidates.length;
   const chosen = picked.size + baselines.length;
   return html`
@@ -358,7 +373,22 @@ function runPanel(ev, candidates, state) {
           </div>
         </div>
       </details>
-      <button class="btn-primary btn-sm" id="runEval" style="margin-top:10px">
+      ${raw(ev.project_id ? "" : html`
+        <div class="field" style="margin-top:10px">
+          <label for="evProject">Which project is this scoring for?</label>
+          <select id="evProject">
+            ${raw((projects || []).map((p) =>
+              `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join(""))}
+          </select>
+          <div class="hint">This prompt set is not in a project yet. Scoring
+            from here files it into the one you choose, so the question and
+            its answers end up in the same place.
+            ${raw((projects || []).length ? ""
+              : `You have no projects — <a href="#/projects?new=1">make one</a>
+                 and this set goes into it.`)}</div>
+        </div>`)}
+      <button class="btn-primary btn-sm" id="runEval" style="margin-top:10px"
+        ${raw(!ev.project_id && !(projects || []).length ? "disabled" : "")}>
         ${chosen === 0 ? "Score models"
           : chosen === 1 ? "Score 1 model" : `Score ${chosen} models`}</button>
     </div>`;

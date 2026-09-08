@@ -7,6 +7,7 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtNum } from "../util.js";
+import { requireProject } from "./projects.js";
 import { ribbon, rb, group, rbSelect } from "../ribbon.js";
 import { breadcrumb } from "../components.js";
 
@@ -64,6 +65,15 @@ const MODES = [
 ];
 
 export async function generateView(mount, [fromJob] = []) {
+  // Writing a dataset is a run like any other, and lands in a project like
+  // any other -- which is also where the rows it writes end up.
+  const projectId = await requireProject(mount, {
+    title: "Which project is this data for?",
+    blurb: "The rows a model writes are filed with the project that asked "
+         + "for them, so the run that trains on them is beside the run that "
+         + "wrote them.",
+  });
+  if (!projectId) return () => {};
   const [runners, playable, hosted, datasets, jobs] = await Promise.all([
     api.runners(), api.playground(),
     // A studio with no keys connected simply has no hosted options; it must
@@ -218,7 +228,7 @@ export async function generateView(mount, [fromJob] = []) {
       try {
         const r = await api.createJob({
           name: f.dataset_name || "Generating a dataset",
-          kind: "generate_dataset", config: cfg });
+          kind: "generate_dataset", config: cfg, project_id: projectId });
         toast("Started. Watch it write.", "ok");
         location.hash = `#/jobs/${r.id}`;
       } catch (ex) {

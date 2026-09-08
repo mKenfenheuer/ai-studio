@@ -19,6 +19,7 @@ import { html, raw, esc, on, toast, fmtAgo, fmtNum, fmtBytes, modal, $,
          statusBadge } from "../util.js";
 import { ribbon, rb, group } from "../ribbon.js";
 import { pageHead, emptyState, breadcrumb, confirmDestructive } from "../components.js";
+import { hashParam } from "../util.js";
 import { primaryMetric } from "../kinds.js";
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,9 @@ export async function projectsView(mount) {
     mount.innerHTML = index(data);
   };
   await paint();
+  // The sidebar's primary action lands here with ?new=1 rather than opening a
+  // dialog on a page nobody can see behind it.
+  if (hashParam("new")) newProjectDialog();
 
   on(mount, "click", "#newProject", () => newProjectDialog());
   on(mount, "click", "#showArchived", () => {
@@ -45,7 +49,7 @@ export async function projectsView(mount) {
 }
 
 /** Start a project. Two fields, because a third would be answered with "…". */
-export function newProjectDialog(prefill = {}) {
+export function newProjectDialog({ onCreated = null, ...prefill } = {}) {
   const dlg = modal({
     title: "New project",
     body: html`
@@ -78,7 +82,10 @@ export function newProjectDialog(prefill = {}) {
     try {
       const p = await api.createProject(f);
       dlg.close();
-      location.hash = `#/projects/${p.id}`;
+      // Straight into the project by default; a page that asked for one --
+      // the wizard, the generator -- says what to do instead, and stays.
+      if (onCreated) onCreated(p.id);
+      else location.hash = `#/projects/${p.id}`;
     } catch (ex) { toast(ex.message, "err"); }
   });
   return dlg;
@@ -520,4 +527,132 @@ function libraryPanel(rows) {
             published from this project yet. Publishing is what turns a run
             into something other people can find and use.</p>`)}
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// "Which project is this for?" -- asked once, by every page that starts a run
+// ---------------------------------------------------------------------------
+
+/** The project this page is working in, asking for one if it does not know.
+ *
+ *  Every run belongs to a project. Nearly every run is started from inside
+ *  one -- from a project's own map -- and carries it in the address; the rest
+ *  come from a bookmark, a link in the help drawer, or the button somebody
+ *  pressed six months ago out of habit. Those are asked, once, here.
+ *
+ *  Returns the project id, or `null` after drawing the question into `mount`,
+ *  in which case the caller should return and let the answer remount it: the
+ *  answer goes into the address, so the page comes back knowing it, Back
+ *  works, and a reload does not ask again.
+ */
+export async function requireProject(mount, { title, blurb } = {}) {
+  const named = hashParam("project");
+  if (named) return named;
+  let data = { projects: [] };
+  try { data = await api.projects(); } catch { /* offer to make one anyway */ }
+  const live = (data.projects || []).filter((p) => !p.archived);
+  rememberProjects(live);
+
+  mount.innerHTML = html`
+    ${raw(pageHead({
+      title: title || "Which project is this for?",
+      sub: blurb || "Everything a model needs -- the data, the runs, the "
+         + "scores, the published version -- is kept together in a project. "
+         + "Pick the one this belongs to, or start a new one.",
+      back: [{ href: "#/projects", label: "Projects" }],
+    }))}
+    ${raw(live.length ? html`
+      <div class="grid grid-2">
+        ${raw(live.map((p) => html`
+          <button class="card card-link" data-pick-project="${esc(p.id)}"
+                  style="text-align:left;cursor:pointer;width:100%">
+            <h3 style="margin:0">${p.name}</h3>
+            ${raw(p.goal ? `<p class="muted tiny" style="margin:4px 0 0">${esc(p.goal)}</p>` : "")}
+            <p class="muted tiny" style="margin:8px 0 0">
+              ${p.runs || 0} run${p.runs === 1 ? "" : "s"} ·
+              ${p.datasets || 0} dataset${p.datasets === 1 ? "" : "s"} ·
+              touched ${fmtAgo(p.updated_at)}</p>
+          </button>`).join(""))}
+      </div>
+      <p style="margin-top:14px">
+        <button class="btn" id="newProjectHere">Start a new project instead</button></p>`
+      : emptyState({
+          icon: "◇",
+          title: "You have no projects yet",
+          body: "A project keeps one model's data, runs, scores and published "
+              + "versions together. Make one and this run goes straight into it.",
+        }) + html`
+        <p style="text-align:center;margin-top:-6px">
+          <button class="btn btn-primary" id="newProjectHere">Start a project</button></p>`)}`;
+
+  const go = (id) => {
+    const at = location.hash.indexOf("?");
+    const params = new URLSearchParams(at < 0 ? "" : location.hash.slice(at + 1));
+    params.set("project", id);
+    location.hash = `${at < 0 ? location.hash : location.hash.slice(0, at)}?${params}`;
+  };
+  on(mount, "click", "[data-pick-project]", (_e, t) => go(t.dataset.pickProject));
+  // Made here and used here. Sending somebody to the projects page to make
+  // one, and leaving them to find their way back to what they were starting,
+  // is how a two-click detour loses the thing they came to do.
+  on(mount, "click", "#newProjectHere", () => newProjectDialog({ onCreated: go }));
+  return null;
+}
+
+/** "File this into…" -- from a run page, a dataset page, anywhere.
+ *
+ *  The other half of the rule that every run belongs to a project: a studio
+ *  with six months of history has runs and datasets that predate projects
+ *  entirely, and the first thing anybody wants to do with one is publish,
+ *  export or repeat it. That needs a project, so it has to be possible to
+ *  give it one from where you are standing.
+ */
+export function fileIntoDialog({ kind, id, name, current = null, onDone = null }) {
+  const what = { job: "run", dataset: "dataset", eval: "prompt set" }[kind] || kind;
+  const dlg = modal({
+    title: `Which project is this ${what} part of?`,
+    body: html`
+      <p class="muted tiny" style="margin-top:0">Filing moves nothing and
+        copies nothing: <strong>${esc(name || "it")}</strong> stays exactly
+        where it is, and the project gains a way to find it.</p>
+      <div id="fileList" class="muted tiny">Looking for your projects…</div>`,
+  });
+  api.projects().then((d) => {
+    const live = (d.projects || []).filter((p) => !p.archived);
+    const box = $("#fileList", dlg);
+    if (!box) return;
+    box.innerHTML = live.length ? html`
+      <div class="picklist">
+        ${raw(live.map((p) => html`
+          <button class="btn" style="width:100%;text-align:left;margin-bottom:6px"
+                  data-file-here="${esc(p.id)}">
+            ${p.name}${raw(p.id === current
+              ? ` <span class="badge badge-ok">already here</span>` : "")}
+            ${raw(p.goal ? `<div class="muted tiny">${esc(p.goal)}</div>` : "")}
+          </button>`).join(""))}
+      </div>
+      ${raw(current ? `<button class="btn-sm" data-file-here="">Take it out of
+        its project</button>` : "")}
+      <p style="margin:10px 0 0"><button class="btn-sm" id="fileNewProject">New
+        project instead</button></p>`
+      : html`<p class="muted tiny">You have no projects yet.</p>
+        <p><button class="btn btn-primary" id="fileNewProject">Make one</button></p>`;
+  }).catch((e) => {
+    const box = $("#fileList", dlg);
+    if (box) box.innerHTML = `<p class="muted tiny">${esc(e.message)}</p>`;
+  });
+
+  const done = async (projectId) => {
+    try {
+      if (projectId) await api.fileIntoProject(projectId, { kind, id });
+      else await api.unfile({ kind, id });
+      dlg.close();
+      toast(projectId ? "Filed." : "Taken out of its project.", "ok");
+      if (onDone) await onDone(projectId || null);
+    } catch (e) { toast(e.message, "err"); }
+  };
+  on(dlg, "click", "[data-file-here]", (_e, t) => done(t.dataset.fileHere));
+  on(dlg, "click", "#fileNewProject", () =>
+    newProjectDialog({ onCreated: (pid) => done(pid) }));
+  return dlg;
 }

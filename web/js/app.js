@@ -39,8 +39,8 @@ const routes = [
   [/^\/admin$/,        adminView,     "admin"],
   [/^\/admin\/(\w+)$/,  adminView,     "admin"],
   [/^\/dashboard$/,    dashboardView, "projects"],
-  [/^\/new$/,          wizardView,    "new"],
-  [/^\/new\/vision$/,   visionView,    "new"],
+  [/^\/new$/,          wizardView,    "projects"],
+  [/^\/new\/vision$/,   visionView,    "projects"],
   [/^\/jobs$/,         jobsView,      "projects"],
   // Before the catch-all below, which would otherwise swallow it and open the
   // run's own page with "<id>/again" as the id.

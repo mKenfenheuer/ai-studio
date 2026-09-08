@@ -24,7 +24,10 @@
            sweeps and comparisons are not gone -- they are inside a project,
            which is where the question "which run was that?" is answerable. -->
       <a href="#/" data-nav="projects"><span class="ico">◇</span><span class="lbl">Projects</span></a>
-      <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">✦</span><span class="lbl">New training run</span></a>
+      <!-- A run is not a thing you start from a menu any more: it belongs to
+           a project, along with the data it trained on and the scores it is
+           judged by, so the way in is a project. -->
+      <a href="#/projects?new=1" data-nav="projects" class="nav-cta"><span class="ico">✦</span><span class="lbl">New project</span></a>
       <!-- U+25B7, not U+25B6: the filled triangle has an emoji presentation and
            renders as a colour glyph on most phones, which is out of place in a
            row of monochrome marks. This one has no emoji variant. -->

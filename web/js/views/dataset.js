@@ -22,6 +22,7 @@ import { confirmDestructive, breadcrumb } from "../components.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
 import { qualityBadge } from "./data.js";
+import { fileIntoDialog } from "./projects.js";
 import { STEPS, TABS, stepsOnTab, stepFrom, describe } from "./dataset-steps.js";
 
 const PAGE = 25;
@@ -792,6 +793,9 @@ export async function datasetView(mount, [id]) {
       wirePublish(dlg, "dataset", (body) => api.publishDataset(id, body));
     });
 
+    on(mount, "click", "#fileDataset", () => fileIntoDialog({
+      kind: "dataset", id: d.id, name: d.name, current: d.project_id || null,
+      onDone: async () => { d = await api.dataset(id); draw(); } }));
     on(mount, "click", "#useForTraining", () => {
       // A link, not a stashed value: it survives a reload, it can be sent to
       // somebody, and it is what the wizard reads on the way in.
@@ -934,6 +938,11 @@ function ribbonFor(s) {
         title: "Go through the rows waiting in the review split" }) : "",
     ]) + group("Use", [
       rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
+      // Which project this data is part of. A run is filed by the dataset it
+      // trains on, so this is also the answer to "why will it not let me
+      // start a run from here".
+      rb("fileDataset", "◇", d.project_id ? "Move to another project"
+                                          : "File into a project"),
       // The other thing to do with a set of questions: have a model answer
       // them. Reachable only from the generator until now, where you had to
       // remember the dataset's name.

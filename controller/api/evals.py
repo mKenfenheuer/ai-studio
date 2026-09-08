@@ -546,12 +546,23 @@ async def run_eval(request: Request, eval_id: str,
 
     name = "%s on %d model%s" % (row["name"], len(models),
                                  "" if len(models) == 1 else "s")
-    # A scoring run belongs to the same project as the prompt set it runs, or
-    # to the project of the model it is scoring. Either is better than the
-    # unfiled pile, and the prompt set is the more specific of the two.
+    # Every run belongs to a project, this one included. Said by the page, or
+    # the prompt set's own, or the project of the model being scored -- the
+    # prompt set is the more specific of the two, and a score is filed with
+    # the question rather than with the answer.
+    asked = _project_of(request, payload)
+    project_id = asked or row.get("project_id") or _project_of_first_model(models)
+    if not project_id:
+        raise HTTPException(
+            400, "This prompt set is not in a project, and neither is anything "
+                 "being scored. Say which project this scoring is for.")
+    # Scoring an unfiled set from inside a project files the set as well. The
+    # alternative is a project whose scores point at a prompt set that is not
+    # in it, which is the same lost thread projects exist to prevent.
+    if asked and not row.get("project_id"):
+        db.assign_project("eval", row["id"], asked)
     jid = db.create_job(name, "evaluate", cfg, owner_id=user["id"],
-                        project_id=row.get("project_id")
-                                   or _project_of_first_model(models))
+                        project_id=project_id)
     db.add_log(jid, "Queued: %d prompt%s against %s."
                % (len(row["items"]), "" if len(row["items"]) == 1 else "s",
                   ", ".join(m["name"] for m in models)))

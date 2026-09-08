@@ -212,6 +212,11 @@ export async function rerunView(mount, [jobId]) {
         name: $("#rr_name", mount).value || undefined,
         kind: job.kind,
         config: next,
+        // The same project as the run this one repeats. Kept explicit rather
+        // than left to the config: a rerun that changes the dataset would
+        // otherwise be filed by the new dataset and leave the comparison it
+        // exists for in another project.
+        project_id: job.project_id || undefined,
       });
       toast("Training run created.", "ok");
       location.hash = `#/jobs/${id}`;

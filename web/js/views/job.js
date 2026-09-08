@@ -5,7 +5,7 @@ import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { openScoreDialog } from "../scoring.js";
 import { publishCard, wirePublish } from "./publish.js";
-import { publishDialog } from "./projects.js";
+import { publishDialog, fileIntoDialog } from "./projects.js";
 import { kindOf, subjectOf, stagesFor } from "../kinds.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive } from "../components.js";
@@ -473,6 +473,14 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     });
   });
 
+  on(mount, "click", "#fileRun", () => {
+    fileIntoDialog({ kind: "job", id: jobId, name: job?.name,
+      current: job?.project?.id || null,
+      onDone: async () => {
+        job = await api.job(jobId);
+        paintHeader(mount, job, getTab());
+      } });
+  });
   on(mount, "click", "#publishHere", () => {
     publishDialog(jobId, job?.name, job?.project_id || null, async () => {
       job = await api.job(jobId);
@@ -1820,6 +1828,14 @@ function runRibbon(job, tab) {
         ? (writing ? `#/generate/from/${esc(job.id)}` : `#/jobs/${esc(job.id)}/again`) : "",
       title: "Start a new run from this one's settings" }),
     rb(null, "✎", "Rename", { data: 'data-rename="1"' }),
+    // A run made before projects existed has nowhere to go, and everything
+    // worth doing with it -- publishing, exporting, running it again -- now
+    // needs one. This is where it gets one.
+    rb("fileRun", "◇", job.project ? "Move to another project"
+                                   : "File into a project",
+      { cls: job.project ? "" : "primary",
+        title: job.project ? `Currently in ${job.project.name}`
+                           : "This run is in no project" }),
   ]) + group("Use it", [
     // A classifier is tried on this page -- drop a picture, read the labels
     // -- rather than in a playground built around a conversation.

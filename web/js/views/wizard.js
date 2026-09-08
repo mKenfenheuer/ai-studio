@@ -1,6 +1,7 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast, resource,
          ensure } from "../util.js";
+import { requireProject } from "./projects.js";
 import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
 import { pageHead, emptyState } from "../components.js";
 
@@ -256,6 +257,17 @@ export async function wizardView(mount) {
     overrides: {}, archOverrides: {},
     starting: false,
   };
+
+  // Which project this run is for. Asked before anything else, because it is
+  // the one answer that cannot be inferred from the settings below and the
+  // one that decides where the result can be found afterwards.
+  const projectId = await requireProject(mount, {
+    title: "Which project is this run for?",
+    blurb: "A run belongs with the data it was trained on and the scores it "
+         + "is judged by. Pick the project this one is part of, or start a "
+         + "new one -- nothing you choose next is lost by doing it now.",
+  });
+  if (!projectId) return () => {};
 
   // What was being worked on before, if it was recent.
   const draft = loadDraft();

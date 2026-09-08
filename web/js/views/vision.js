@@ -8,6 +8,7 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, on, toast, fmtNum } from "../util.js";
+import { requireProject } from "./projects.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState } from "../components.js";
 
@@ -23,6 +24,10 @@ const MODELS = [
 ];
 
 export async function visionView(mount) {
+  const projectId = await requireProject(mount, {
+    title: "Which project is this classifier for?",
+  });
+  if (!projectId) return () => {};
   const datasets = await api.datasets().catch(() => []);
   // A dataset qualifies when its column types say a column holds pictures.
   // The list page does not carry types, so every dataset with an "image"
@@ -70,6 +75,7 @@ export async function visionView(mount) {
             early_stop_patience: 3,
             base_model_label: $("#vsModel", mount).value.split("/").pop(),
           },
+          project_id: projectId,
         });
         toast("Started.", "ok");
         location.hash = `#/jobs/${r.id}`;
