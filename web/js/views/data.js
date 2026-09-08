@@ -421,9 +421,7 @@ export async function dataView(mount) {
     on(mount, "click", "#trainOnPicked", () => {
       const d = chosen()[0];
       if (!d) return;
-      sessionStorage.setItem("aistudio.dataset", JSON.stringify(
-        { id: d.id, name: d.name, splits: d.splits || {}, rows: d.rows }));
-      location.hash = "#/new";
+      location.hash = `#/new?dataset=${encodeURIComponent(d.id)}`;
     });
 
     on(mount, "click", "#deletePicked", async () => {

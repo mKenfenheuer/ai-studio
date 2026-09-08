@@ -721,8 +721,9 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "click", "#useForTraining", () => {
-      sessionStorage.setItem("aistudio.dataset", JSON.stringify({ id: d.id, name: d.name, splits: d.splits || {}, rows: d.rows }));
-      location.hash = "#/new";
+      // A link, not a stashed value: it survives a reload, it can be sent to
+      // somebody, and it is what the wizard reads on the way in.
+      location.hash = `#/new?dataset=${encodeURIComponent(d.id)}`;
     });
 
     on(mount, "click", "#deleteDs", async () => {

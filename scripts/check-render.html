@@ -254,6 +254,59 @@ for (const [label, path, fn, args] of RUN) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Behaviours worth asserting, rather than just "it drew something".
+// ---------------------------------------------------------------------------
+if (!only) {
+  const say = (name, ok, detail = "") =>
+    results.push(`${ok ? "ok  " : "FAIL"} ${name.padEnd(12)} ${detail}`);
+
+  try {
+    localStorage.removeItem("aistudio.wizard");
+    const { wizardView } = await import("/static/js/views/wizard.js");
+    location.hash = "#/new";
+    main.innerHTML = "";
+    await wizardView(main, []);
+
+    // Choosing from-scratch is a state change; it must survive a remount.
+    main.querySelector('[data-mode="scratch"]')?.click();
+    await new Promise((r) => setTimeout(r, 120));
+    const saved = JSON.parse(localStorage.getItem("aistudio.wizard") || "null");
+    say("draft saved", saved?.mode === "scratch", `mode=${saved?.mode}`);
+
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 120));
+    const back = main.querySelector('[data-mode="scratch"]');
+    say("draft restored", back?.classList.contains("selected"),
+        back ? back.className : "no mode button");
+
+    // The step comes from the address, so Back and Forward move between steps.
+    location.hash = "#/new?step=1";
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 120));
+    const active = main.querySelector('[data-tab][aria-selected="true"]');
+    say("step from url", active?.dataset.tab === "1",
+        `landed on step ${active?.dataset.tab}`);
+
+    // An expired draft is not resumed.
+    localStorage.setItem("aistudio.wizard",
+      JSON.stringify({ at: Date.now() - 9 * 3600 * 1000, mode: "scratch" }));
+    location.hash = "#/new";
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 120));
+    const fresh = main.querySelector('[data-mode="finetune"]');
+    say("stale draft dropped", fresh?.classList.contains("selected"),
+        fresh ? fresh.className : "no mode button");
+    localStorage.removeItem("aistudio.wizard");
+  } catch (e) {
+    results.push(`FAIL wizard-draft  ${e.message}`);
+    errors.push("wizard-draft: " + (e.stack || e.message));
+  }
+}
+
 // Let any late rejection land before reporting.
 await new Promise((r) => setTimeout(r, 300));
 const bad = results.filter((r) => !r.startsWith("ok")).length + errors.length;

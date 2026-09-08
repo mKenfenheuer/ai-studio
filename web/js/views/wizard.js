@@ -125,6 +125,75 @@ const loading = (what) => html`<div class="card muted tiny" aria-busy="true">
 const failed = (msg) => html`<div class="callout callout-err">${msg}</div>`;
 
 // ===========================================================================
+// The draft, and the step in the address bar
+// ===========================================================================
+//
+// All of this lived in a closure. Six steps, a mandatory format decision, and
+// a browser Back that left the wizard entirely and took every choice with it;
+// so did a reload, and so did going to look at the dataset you were about to
+// train on. The way to answer "which split was that again" was to start over.
+//
+// Two mechanisms, deliberately:
+//
+//   The STEP is in the address bar, so Back and Forward move between steps
+//   rather than out of the wizard, and a step can be linked to.
+//
+//   Everything else is a DRAFT in localStorage, restored on mount. The step
+//   in the URL then decides where you land. Resources -- the previews, the
+//   plans, the model lists -- are not saved: they are caches keyed on the
+//   choices, and they refill from the choices.
+//
+// The draft expires, because resuming a half-made run from last Tuesday
+// without being told is worse than starting fresh.
+
+const DRAFT_KEY = "aistudio.wizard";
+const DRAFT_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+
+// The decisions. Everything here is plain data that came from a person; the
+// resources are left out on purpose.
+const DRAFT_FIELDS = [
+  "mode", "goal", "runnerId", "model", "sourceRun", "dataset", "config",
+  "split", "studioDataset", "textField", "formatMode", "templateSource",
+  "customTemplate", "chatFormat", "teachReasoning", "selectors", "roleMap",
+  "minutes", "size", "vocab", "custom", "moe", "overrides", "archOverrides",
+  "sweepKey", "sweepValues",
+];
+
+/** Whatever follows the `?` in `#/new?step=2&dataset=ds_x`.
+ *
+ *  Read from the hash rather than from location.search, because the router
+ *  puts everything after the `#`. */
+function wizardParams() {
+  const at = location.hash.indexOf("?");
+  return new URLSearchParams(at < 0 ? "" : location.hash.slice(at + 1));
+}
+
+function saveDraft(state) {
+  try {
+    const keep = { at: Date.now() };
+    for (const k of DRAFT_FIELDS) keep[k] = state[k];
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(keep));
+  } catch { /* private browsing; the wizard still works, it just forgets */ }
+}
+
+function loadDraft() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DRAFT_KEY) || "null");
+    if (!raw || !raw.at || Date.now() - raw.at > DRAFT_MAX_AGE_MS) return null;
+    return raw;
+  } catch { return null; }
+}
+
+export function clearWizardDraft() {
+  try { localStorage.removeItem(DRAFT_KEY); } catch { /* nothing to forget */ }
+}
+
+/** Move to a step by changing the address, so the browser records it. */
+function goToStep(n) {
+  const params = wizardParams();
+  params.set("step", String(n));
+  location.hash = `#/new?${params}`;
+}
 
 export async function wizardView(mount) {
   const state = {
@@ -178,16 +247,52 @@ export async function wizardView(mount) {
     starting: false,
   };
 
+  // What was being worked on before, if it was recent.
+  const draft = loadDraft();
+  let resumed = false;
+  if (draft) {
+    for (const k of DRAFT_FIELDS) {
+      if (draft[k] !== undefined) state[k] = draft[k];
+    }
+    resumed = true;
+  }
+
+  const params = wizardParams();
+
+  // A dataset named in the address wins over the draft: following "train on
+  // this" from a dataset page is a new intention, not a continuation. It is a
+  // link rather than a stashed value so that it survives a reload and can be
+  // sent to somebody.
   try {
     const handed = sessionStorage.getItem("aistudio.dataset");
     if (handed) {
-      const d = JSON.parse(handed);
       sessionStorage.removeItem("aistudio.dataset");
+      const d = JSON.parse(handed);
       state.studioDataset = d;
       state.dataset = d.name;
       state.split = defaultSplit(d.splits);
+      state.formatMode = null;
+      resumed = false;
     }
   } catch { /* nothing was handed over */ }
+
+  const wantDataset = params.get("dataset");
+  if (wantDataset && state.studioDataset?.id !== wantDataset) {
+    try {
+      const d = await api.dataset(wantDataset);
+      state.studioDataset = { id: d.id, name: d.name, splits: d.splits || {},
+                              rows: d.rows };
+      state.dataset = d.name;
+      state.split = defaultSplit(d.splits);
+      state.textField = (d.format || {}).text_field || null;
+      state.formatMode = null;
+      resumed = false;
+    } catch { /* it may have been deleted; the picker still works */ }
+  }
+
+  const wantStep = parseInt(params.get("step") || "", 10);
+  if (Number.isFinite(wantStep)) state.step = wantStep;
+  state.resumed = resumed && (state.step > 0 || !!state.dataset || !!state.model);
 
   // In parallel: neither needs the other, and doing them in turn doubled the
   // wait before anything at all appeared.
@@ -208,6 +313,9 @@ export async function wizardView(mount) {
     // throw "steps[state.step] is not a function" and blank the page.
     const names = STEP_NAMES[state.mode] || STEP_NAMES.finetune;
     state.step = Math.max(0, Math.min(state.step | 0, names.length - 1));
+    // Every choice, kept, so a reload or a trip to look at the dataset does
+    // not start the whole thing again.
+    saveDraft(state);
     mount.innerHTML = shell(state, ctx.runners, names, ctx.known);
     const body = $("#stepBody", mount);
     if (body) STEPS[state.mode][state.step](body, ctx);
@@ -318,6 +426,14 @@ function shell(state, runners, names, known = []) {
         rb(null, "≡", "Runs", { href: "#/jobs" }),
       ]),
     }))}
+    ${raw(state.resumed ? html`
+      <div class="callout" style="margin-bottom:14px">
+        <div class="row-between" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <span><strong>Carrying on where you left off.</strong> Every choice
+            you had made is still here.</span>
+          <button class="btn-sm" id="startOver">Start fresh</button>
+        </div>
+      </div>` : "")}
     <div id="stepBody"></div>
     <div class="wizard-actions">
       <button data-back="1" ${state.step === 0 ? "disabled" : ""}>← Back</button>
@@ -396,11 +512,12 @@ function stepGoal(body, { state, runners, draw }) {
   on(body, "click", "[data-mode]", (_e, t) => {
     if (state.mode === t.dataset.mode) return;
     state.mode = t.dataset.mode;
-    // The two paths share nothing past this point. A half-made choice from the
-    // other one must not survive and end up in the job config.
+    // What differs between the two paths is thrown away; what does not, is
+    // kept. Which dataset you mean to train on is the same question either
+    // way, and clearing it meant somebody who picked a dataset and then
+    // wondered what from-scratch would look like had to go and find it again.
     Object.assign(state, {
-      model: null, modelDetail: resource(), dataset: null, configs: resource(),
-      config: null, split: "train", preview: resource(), textField: null,
+      model: null, modelDetail: resource(), preview: resource(),
       formatMode: null, size: null, custom: null, sizes: resource(),
       // The format is asked again as well: "the model's own" means nothing
       // once there is no model, and a from-scratch run reserves its tokens
@@ -2707,7 +2824,7 @@ function wireNav(mount, ctx) {
   // it decided.
   wireRibbon(mount, (key) => {
     const want = Number(key);
-    if (Number.isFinite(want) && want <= state.step) { state.step = want; draw(); }
+    if (Number.isFinite(want) && want <= state.step) goToStep(want);
   });
 
   const names = STEP_NAMES[state.mode];
@@ -2738,12 +2855,22 @@ function wireNav(mount, ctx) {
   $$("[data-next]", mount).forEach((b) => { b.disabled = !!blocker; });
   hint.textContent = blocker || "";
 
+  on(mount, "click", "#startOver", () => {
+    clearWizardDraft();
+    // Replaced rather than pushed: "start fresh" should not leave the draft
+    // one press of Back away.
+    history.replaceState(null, "", "#/new");
+    location.reload();
+  });
+
   on(mount, "click", "[data-back]", () => {
-    if (state.step > 0) { state.step--; draw(); }
+    // Through the address bar, so the browser's own Back does the same thing
+    // this button does rather than leaving the wizard and losing everything.
+    if (state.step > 0) goToStep(state.step - 1);
   });
   on(mount, "click", "[data-next]", async () => {
     if (state.starting) return;
-    if (state.step < last) { state.step++; draw(); return; }
+    if (state.step < last) { goToStep(state.step + 1); return; }
 
     const job = buildJob(mount, state);
     if (!job) { toast("The plan is not ready yet.", "err"); return; }
@@ -2759,10 +2886,12 @@ function wireNav(mount, ctx) {
           name: `${job.name || "Run"} · trying ${varied.key}`,
           base: job, vary: { [varied.key]: varied.values } });
         toast(`${r.jobs.length} runs queued.`, "ok");
+        clearWizardDraft();
         location.hash = `#/sweeps/${r.sweep_id}`;
       } else {
         const { id } = await api.createJob(job);
         toast("Training run created.", "ok");
+        clearWizardDraft();
         location.hash = `#/jobs/${id}`;
       }
     } catch (e) {
