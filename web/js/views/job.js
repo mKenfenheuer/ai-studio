@@ -1768,7 +1768,12 @@ function paintStats(mount, job, m, scratch, stage = "training",
  *  due is more use than a placeholder that pulses in the meantime.
  */
 function heldOutCard(job, m, lastEval) {
-  const sub = job.kind === "pretrain_llm" ? "on unseen text" : "on unseen examples";
+  // Where the rows came from, when the run said. "On unseen examples" covers
+  // both a split somebody deliberately held back and 5% of the training data
+  // taken at random, and only the first is a fair test of anything.
+  const from = job.summary?.held_out_from;
+  const sub = from ? `on ${from}`
+    : job.kind === "pretrain_llm" ? "on unseen text" : "on unseen examples";
   const value = m.val_loss ?? lastEval?.val_loss;
   const at = m.val_loss != null ? m.step : lastEval?.step;
   if (value != null) {

@@ -24,6 +24,14 @@ import { publishCard, wirePublish } from "./publish.js";
 import { STEPS, TABS, stepsOnTab, stepFrom, describe } from "./dataset-steps.js";
 
 const PAGE = 25;
+// The reserved column holding a row's own name. A row is referred to by that
+// name rather than by where it happens to sit, because deleting one row used
+// to renumber every row after it -- so a second click, built from a list read
+// before the first, acted on somebody else's data.
+const ROW_ID = "_id";
+/** How to refer to this row: its name, or its position on a dataset written
+ *  before names existed. */
+const handleOf = (r) => r.row?.[ROW_ID] ?? r.index;
 // How much of a cell is shown before it is cut. Long enough to recognise the
 // value, short enough that fifty rows still look like a table.
 const CELL = 140;
@@ -395,12 +403,15 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "change", "[data-row]", (_e, t) => {
-      const i = +t.dataset.row;
-      if (t.checked) picked.add(i); else picked.delete(i);
+      const h = t.dataset.row;
+      if (t.checked) picked.add(h); else picked.delete(h);
       draw();
     });
     on(mount, "change", "#selectAll", (_e, t) => {
-      (rows?.rows || []).forEach((r) => { if (t.checked) picked.add(r.index); else picked.delete(r.index); });
+      (rows?.rows || []).forEach((r) => {
+        const h = String(handleOf(r));
+        if (t.checked) picked.add(h); else picked.delete(h);
+      });
       draw();
     });
     on(mount, "click", "#clearPick", () => { picked = new Set(); draw(); });
@@ -425,7 +436,7 @@ export async function datasetView(mount, [id]) {
       const to = t.value;
       if (!to) return;
       try {
-        const r = await api.editRows(id, { move: { indices: [...picked], to } });
+        const r = await api.editRows(id, { move: { ids: [...picked], to } });
         picked = new Set();
         toast(r.changed || "Done.", "ok");
         await reload();
@@ -434,11 +445,12 @@ export async function datasetView(mount, [id]) {
 
     on(mount, "click", "[data-open-row]", (e, t) => {
       e.preventDefault();
-      const i = +t.dataset.openRow;
-      const found = (rows?.rows || []).find((r) => r.index === i);
+      const h = t.dataset.openRow;
+      const found = (rows?.rows || []).find((r) => String(handleOf(r)) === h);
       if (!found) return;
       const canEdit = d.access === "edit";
-      const dlg = modal({ title: `Row ${i}`, width: isConversation(found.row) ? 860 : 720,
+      const dlg = modal({ title: `Row ${found.index}`,
+                          width: isConversation(found.row) ? 860 : 720,
                           body: rowEditor(found.row, found.rendered, canEdit) });
       on(dlg, "click", "#saveRow", async () => {
         const next = {};
@@ -451,7 +463,7 @@ export async function datasetView(mount, [id]) {
         });
         if (bad) { $("#rowEditError", dlg).innerHTML = `<div class="callout callout-err">${esc(bad)}</div>`; return; }
         try {
-          await api.editRows(id, { update: { [i]: next } });
+          await api.editRows(id, { update: { [h]: next } });
           dlg.close();
           toast("Row saved.", "ok");
           await reload();
@@ -534,25 +546,48 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "click", "#holdBack", () => {
-      const dlg = modal({ title: "Hold some back", width: 480, body: html`
-        <p class="muted tiny">Splits into a training set and a validation set.
-          Without one there is no way to tell a model that has learned from one
-          that has memorised — the training loss looks identical either way.</p>
-        <form id="splitForm" class="row row-top" style="margin-top:10px">
-          <div class="field" style="max-width:130px">
-            <label for="sFrac">Hold back %</label>
-            <input id="sFrac" name="fraction" type="number" value="10" min="1" max="50">
+      const cols = (d.columns || []).filter((c) => c !== "split");
+      const dlg = modal({ title: "Hold some back", width: 520, body: html`
+        <p class="muted tiny">Makes one new dataset with a
+          <strong>validation</strong> split in it. Without one there is no way
+          to tell a model that has learned from one that has memorised — the
+          training loss looks identical either way.</p>
+        <form id="splitForm" style="margin-top:10px">
+          <div class="row row-top">
+            <div class="field" style="max-width:140px">
+              <label for="sFrac">Hold back %</label>
+              <input id="sFrac" name="fraction" type="number" value="10" min="1" max="50">
+            </div>
+            <div class="field" style="flex:1">
+              <label for="sStrat">Keep the mix of</label>
+              <select id="sStrat" name="stratify">
+                <option value="">Nothing — cut at random</option>
+                ${raw(cols.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join(""))}
+              </select>
+              <div class="hint">Pick the column holding a label or a source, and
+                each of its values is represented on both sides in proportion.
+                A category held by 3% of the rows otherwise lands entirely on
+                one side often enough to matter — and a held-out score that
+                contains none of the rare case cannot see the thing most likely
+                to be wrong.</div>
+            </div>
           </div>
-          <button class="btn-sm btn-primary" type="submit" style="margin-top:24px">Split</button>
+          <div class="row" style="justify-content:flex-end;gap:8px">
+            <button type="button" class="btn" data-modal-close>Cancel</button>
+            <button class="btn btn-primary" type="submit">Hold it back</button>
+          </div>
         </form>` });
       on(dlg, "submit", "#splitForm", async (e) => {
         e.preventDefault();
         const f = Object.fromEntries(new FormData(e.target).entries());
         try {
-          const made = await api.splitDataset(id, { fraction: +f.fraction / 100 });
+          const made = await api.splitDataset(id, {
+            fraction: +f.fraction / 100, stratify: f.stratify || "" });
           dlg.close();
-          toast(`Split into ${made.map((m) => fmtNum(m.rows)).join(" and ")} rows.`, "ok");
-          location.hash = `#/data/${made[0].id}`;
+          const s = made.splits || {};
+          toast(`Made "${made.name}" — ${fmtNum(s.train || 0)} to train on, `
+                + `${fmtNum(s.validation || 0)} held back.`, "ok");
+          location.hash = `#/data/${made.id}`;
         } catch (ex) { toast(ex.message, "err"); }
       });
     });
@@ -846,9 +881,12 @@ function table(columns, items, picked) {
       </tr></thead>
       <tbody>
         ${raw(items.map((r) => html`
-          <tr class="${picked?.has(r.index) ? "picked" : ""}">
-            ${raw(picked ? `<td class="sel"><input type="checkbox" data-row="${r.index}"${picked.has(r.index) ? " checked" : ""}></td>` : "")}
-            <td class="idx">${raw(picked ? `<a href="#" data-open-row="${r.index}" title="Open this row">${r.index}</a>` : String(r.label ?? r.index))}</td>
+          <tr class="${picked?.has(String(handleOf(r))) ? "picked" : ""}">
+            ${raw(picked ? `<td class="sel"><input type="checkbox" data-row="${esc(String(handleOf(r)))}"${
+              picked.has(String(handleOf(r))) ? " checked" : ""}></td>` : "")}
+            <td class="idx">${raw(picked
+              ? `<a href="#" data-open-row="${esc(String(handleOf(r)))}" title="Open this row">${r.index}</a>`
+              : String(r.label ?? r.index))}</td>
             ${raw(columns.map((c) => {
               const v = r.row[c];
               return html`<td data-cell="${r.index}" data-col="${c}"
@@ -1128,7 +1166,9 @@ function bars(hist) {
  *  The fields are still there, underneath, because they are how it is edited.
  */
 function rowEditor(row, rendered, canEdit) {
-  const fields = Object.entries(row);
+  // The row's own name is not a field to edit. It survives whatever is saved
+  // here -- a corrected row is still the row it was.
+  const fields = Object.entries(row).filter(([k]) => k !== ROW_ID);
   const chat = isConversation(row);
   const editors = html`
     ${raw(fields.map(([k, v]) => {
@@ -1168,7 +1208,10 @@ function columnsOf(d, data) {
   (d.columns || []).forEach((c) => seen.push(c));
   (data?.rows || []).forEach((r) => Object.keys(r.row || {}).forEach(
     (k) => { if (!seen.includes(k)) seen.push(k); }));
-  return seen.filter((c) => c !== "split").concat(seen.includes("split") ? ["split"] : []);
+  // `_id` is the row's own name and `split` is bookkeeping. Neither is
+  // content: the first is never shown, the second goes last.
+  const kept = seen.filter((c) => c !== "split" && c !== ROW_ID);
+  return kept.concat(seen.includes("split") ? ["split"] : []);
 }
 
 const scalar = (v) => v === null || v === undefined || ["string", "number", "boolean"].includes(typeof v);

@@ -481,12 +481,21 @@ async def edit_rows(request: Request, dataset_id: str,
 
 @router.post("/{dataset_id}/split")
 async def split_dataset(request: Request, dataset_id: str,
-                        payload: dict = Body(...)) -> list[dict]:
+                        payload: dict = Body(...)) -> dict:
+    """Hold part of a dataset back, as a validation split of one new dataset.
+
+    Returns the one dataset it makes. It used to return a list of two, which
+    is why this is worth a note: a caller written against the old shape gets
+    an object where it expected an array, which is a visible failure rather
+    than a silent one.
+    """
     d = _get(request, dataset_id)
     user = current_user(request)
     try:
         return ds.split(d, float(payload.get("fraction") or 0.1), user["id"],
-                        int(payload.get("seed") or 1234))
+                        int(payload.get("seed") or 1234),
+                        stratify=(payload.get("stratify") or "").strip() or None,
+                        name=(payload.get("name") or "").strip() or None)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 

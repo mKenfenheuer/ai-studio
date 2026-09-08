@@ -492,9 +492,10 @@ runner/       capability probe, websocket agent, trainers, inference host
 web/          zero-build UI (ES modules, no dependencies)
 docker/       controller + rocm/cuda runner images, compose
 scripts/      host provisioning, bare-metal runner install, and the checks:
-              check-formats.py (conversation round-trips), check-web.mjs
-              (every browser script parses), check-render.mjs (every view
-              still draws, in a real browser, with its tabs clicked)
+              check-formats.py (conversation round-trips), check-datasets.py
+              (row names, editing, splits, transforms), check-web.mjs (every
+              browser script parses), check-render.mjs (every view still
+              draws, in a real browser, with its tabs clicked)
 ```
 
 ### One rule in the web UI

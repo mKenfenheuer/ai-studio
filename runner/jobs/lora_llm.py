@@ -29,6 +29,11 @@ VAL_FRACTION = 0.05
 VAL_ROWS_MAX = 256
 VAL_ROWS_MIN = 8
 
+# Split names that mean "nothing trains on this". Checked in this order, so a
+# dataset with both a validation and a test split measures on the validation
+# one and keeps the test set for later.
+HELD_OUT_SPLITS = ("validation", "test", "eval", "dev", "val", "holdout")
+
 # LoRA adapts attention (and often MLP) projections. Names differ per
 # architecture, so we match against what the model actually contains rather
 # than hardcoding one family's naming.
@@ -445,6 +450,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.progress(0, 0, stage="loading_dataset")
     ds_name = cfg["dataset"]
     ctx.log("Loading dataset: %s" % (cfg.get("dataset_label") or ds_name))
+    held_raw = None
+    held_split = ""
     if cfg.get("dataset_is_local"):
         ds = load_dataset("json", data_files=source.local_copy(cfg, ctx),
                           split="train")
@@ -453,7 +460,28 @@ def run(cfg: dict, ctx: Any) -> dict:
         # no splits, so the filter only bites where splits actually exist.
         want = (cfg.get("dataset_split") or "").strip()
         if want and "split" in (ds.column_names or []):
+            names = {(r or "train") for r in ds["split"]}
+            # The held-out split, if the dataset has one. Somebody who cuts a
+            # validation set in the dataset editor has said exactly what they
+            # want measured on; this run used to ignore that entirely, train on
+            # the training split, and then carve a *second* validation set out
+            # of it -- so the rows deliberately held back were neither trained
+            # on nor measured on, which is the worst of both.
+            #
+            # An explicit empty string means "carve your own"; an absent key
+            # means "work it out", so runs created before this existed get the
+            # right behaviour too.
+            evs = cfg.get("dataset_eval_split")
+            if evs is None:
+                evs = next((n for n in HELD_OUT_SPLITS
+                            if n in names and n != want), "")
+            evs = (evs or "").strip()
             before = len(ds)
+            if evs and evs in names:
+                held_split = evs
+                held_raw = ds.filter(lambda r: (r.get("split") or "train") == evs)
+                ctx.log("Measuring on the %s split of your dataset: %s rows "
+                        "the model never sees." % (evs, f"{len(held_raw):,}"))
             ds = ds.filter(lambda r: (r.get("split") or "train") == want)
             ctx.log("Training on the %s split: %s of %s rows."
                     % (want, f"{len(ds):,}", f"{before:,}"))
@@ -632,6 +660,13 @@ def run(cfg: dict, ctx: Any) -> dict:
         enc["labels"] = labels
         return enc
 
+    held_ds = None
+    if held_raw is not None and len(held_raw):
+        held_ds = held_raw.map(tokenize, batched=True, batch_size=64,
+                               remove_columns=held_raw.column_names,
+                               desc="Tokenizing the held-out split")
+        held_ds.set_format(type="torch",
+                           columns=["input_ids", "attention_mask", "labels"])
     ds = ds.map(tokenize, batched=True, batch_size=64,
                 remove_columns=ds.column_names, desc="Tokenizing")
     if inexact:
@@ -645,10 +680,27 @@ def run(cfg: dict, ctx: Any) -> dict:
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     val_ds = None
+    if held_ds is None:
+        held_split = ""
+    if held_ds is not None:
+        # The split the dataset already holds back. Nothing is carved out of
+        # the training data, because the person who made this dataset already
+        # said which rows are the honest ones to measure on.
+        val_ds = held_ds
+        if len(val_ds) > VAL_ROWS_MAX:
+            # Every evaluation costs a forward pass over all of these, several
+            # times a run. Beyond a couple of hundred rows the number stops
+            # moving and the run just gets slower.
+            val_ds = val_ds.select(range(VAL_ROWS_MAX))
+            ctx.log("Measuring on the first %d rows of that split; the rest "
+                    "are left for a proper scoring afterwards." % VAL_ROWS_MAX)
     want_val = min(VAL_ROWS_MAX,
                    int(len(ds) * float(cfg.get("val_fraction", VAL_FRACTION))))
-    if want_val >= VAL_ROWS_MIN and len(ds) - want_val >= 16:
-        parts = ds.train_test_split(test_size=want_val, seed=1234)
+    if val_ds is not None:
+        pass
+    elif want_val >= VAL_ROWS_MIN and len(ds) - want_val >= 16:
+        parts = ds.train_test_split(test_size=want_val,
+                                    seed=int(cfg.get("seed") or 1234))
         ds, val_ds = parts["train"], parts["test"]
         ctx.log("Holding back %d of the %d examples to measure on. The model "
                 "never trains on these, so their loss is the one that tells "
@@ -936,6 +988,14 @@ def run(cfg: dict, ctx: Any) -> dict:
         # is memorising the examples it is being scored on.
         "best_val_loss": round(best_val, 5) if best_val is not None else None,
         "held_out_rows": len(val_ds) if val_ds is not None else 0,
+        # Which rows the held-out loss was measured on, because "on unseen
+        # examples" means two quite different things: a split somebody
+        # deliberately held back, or 5% of the training data taken at random.
+        # Only the first is a fair test of anything.
+        "held_out_from": ("the %s split of the dataset" % held_split
+                          if held_split else
+                          "a slice taken from the training data"
+                          if val_ds is not None else None),
         "steps": step,
         "planned_steps": total_steps,
         "stopped_early": stopped_early,

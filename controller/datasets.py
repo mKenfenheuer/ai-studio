@@ -67,6 +67,48 @@ PREVIEW_ROWS = 8
 SPLIT_FIELD = "split"
 DEFAULT_SPLIT = "train"
 
+# Every row gets a name of its own.
+#
+# Rows were addressed by their position in the file, which is fine until
+# anything changes: one delete renumbers every row after it, so an annotation,
+# a review decision, a comment, or a reference from anywhere else in the studio
+# pointed at whatever moved into that slot. It is the reason this tool could
+# show you a bad row and not let you mark it, and the reason two versions of a
+# dataset could not be diffed -- there was nothing to match rows *by*.
+#
+# Twelve characters of base36 is 4.7e18 names; at the two-million-row ceiling
+# the chance of a collision within one dataset is about one in two million.
+# The cost is roughly 21 bytes a row, which is less than the `split` column
+# already costs and buys considerably more.
+#
+# Ids are assigned when a dataset is written and preserved by everything that
+# rewrites one, so a row keeps its name through a filter, a rename, a merge and
+# a conversion to chat. A dataset written before this existed has no ids until
+# something rewrites it; everything that takes an id also takes a position, so
+# those keep working in the meantime.
+ROW_ID_FIELD = "_id"
+RESERVED_FIELDS = (SPLIT_FIELD, ROW_ID_FIELD)
+
+_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def new_row_id() -> str:
+    n = random.getrandbits(64)
+    out = []
+    for _ in range(12):
+        out.append(_ID_ALPHABET[n % 36])
+        n //= 36
+    return "".join(out)
+
+
+def stamp_ids(rows: Iterator[dict]) -> Iterator[dict]:
+    """Give every row a name, keeping the one it already has."""
+    for row in rows:
+        if row.get(ROW_ID_FIELD):
+            yield row
+        else:
+            yield {**row, ROW_ID_FIELD: new_row_id()}
+
 
 def stamp_split(rows: Iterator[dict], split: str | None) -> Iterator[dict]:
     """Put rows into a named split, unless they already name their own."""
@@ -149,7 +191,7 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
     n = 0
     dropped = 0
     with p.open("w", encoding="utf-8") as fh:
-        for row in rows:
+        for row in stamp_ids(rows):
             if n >= MAX_ROWS:
                 # Count what did not fit rather than stopping quietly: a merge
                 # of three large datasets used to lose rows with no sign of it
@@ -157,7 +199,9 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
                 dropped += 1
                 continue
             for k in row:
-                if k not in seen:
+                # The row's own name is bookkeeping, not content: it is not
+                # offered as a column to template from, drop, or train on.
+                if k not in seen and k != ROW_ID_FIELD:
                     seen.add(k)
                     columns.append(k)
             name = str(row.get(SPLIT_FIELD) or DEFAULT_SPLIT)
@@ -217,9 +261,9 @@ def append_rows(dataset: dict, rows: list[dict], split: str) -> dict:
     splits = dict(dataset.get("splits") or {})
     added = 0
     with path.open("a", encoding="utf-8") as fh:
-        for row in stamp_split(iter(rows), split or DEFAULT_SPLIT):
+        for row in stamp_ids(stamp_split(iter(rows), split or DEFAULT_SPLIT)):
             for k in row:
-                if k not in columns:
+                if k not in columns and k != ROW_ID_FIELD:
                     columns.append(k)
             name = str(row.get(SPLIT_FIELD) or DEFAULT_SPLIT)
             splits[name] = splits.get(name, 0) + 1
@@ -232,7 +276,7 @@ def append_rows(dataset: dict, rows: list[dict], split: str) -> dict:
     return db.get_dataset(dataset["id"])
 
 
-def edit_rows(dataset: dict, *, delete: list[int] | None = None,
+def edit_rows(dataset: dict, *, delete: list | None = None,
               move: dict | None = None, update: dict | None = None) -> dict:
     """Delete rows, move them between splits, or rewrite one.
 
@@ -245,11 +289,30 @@ def edit_rows(dataset: dict, *, delete: list[int] | None = None,
     What it is not is silent. Every edit is appended to the dataset's own
     history, which the page shows, and the file is rewritten atomically -- a
     half-written dataset is worse than any edit is useful.
+
+    Rows are named by `_id` and, for datasets written before names existed, by
+    position. Both are accepted, and a rewrite gives every row a name on the
+    way out -- so a dataset addressed by position once is addressed by name
+    from then on. Position was never safe to hold on to: deleting row 3 made
+    row 4 into row 3, so a second request built from the same list deleted
+    somebody else's row.
     """
-    drop = set(int(i) for i in (delete or []))
+    def refs(values) -> tuple[set, set]:
+        """Split a caller's list into names and positions."""
+        names, spots = set(), set()
+        for v in values or []:
+            if isinstance(v, str) and not v.lstrip("-").isdigit():
+                names.add(v)
+            else:
+                try: spots.add(int(v))
+                except (TypeError, ValueError): pass
+        return names, spots
+
+    drop_names, drop_at = refs(delete)
     move_to = (move or {}).get("to")
-    move_set = set(int(i) for i in (move or {}).get("indices") or [])
-    updates = {int(k): v for k, v in (update or {}).items()
+    move_names, move_at = refs((move or {}).get("ids")
+                               or (move or {}).get("indices"))
+    updates = {str(k): v for k, v in (update or {}).items()
                if isinstance(v, dict)}
 
     path = path_for(dataset["id"])
@@ -261,18 +324,21 @@ def edit_rows(dataset: dict, *, delete: list[int] | None = None,
     splits: dict[str, int] = {}
     kept = removed = moved = changed = 0
     with tmp.open("w", encoding="utf-8") as out:
-        for i, row in enumerate(iter_rows(dataset["id"])):
-            if i in drop:
+        for i, row in enumerate(stamp_ids(iter_rows(dataset["id"]))):
+            rid = row.get(ROW_ID_FIELD)
+            if rid in drop_names or i in drop_at:
                 removed += 1
                 continue
-            if i in updates:
-                row = updates[i]
+            if (edit := updates.get(rid) or updates.get(str(i))) is not None:
+                # The name survives the edit whatever the caller sent, so a
+                # row corrected by hand is still the row it was.
+                row = {**edit, ROW_ID_FIELD: rid}
                 changed += 1
-            if move_to and i in move_set:
+            if move_to and (rid in move_names or i in move_at):
                 row = {**row, SPLIT_FIELD: move_to}
                 moved += 1
             for k in row:
-                if k not in columns:
+                if k not in columns and k != ROW_ID_FIELD:
                     columns.append(k)
             name = str(row.get(SPLIT_FIELD) or DEFAULT_SPLIT)
             splits[name] = splits.get(name, 0) + 1
@@ -891,7 +957,8 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
         return {"sampled": 0, "problems": [
             {"level": "error", "message": "This dataset has no readable rows."}]}
 
-    columns = dataset.get("columns") or sorted({k for r in rows for k in r})
+    columns = dataset.get("columns") or sorted(
+        {k for r in rows for k in r} - set(RESERVED_FIELDS))
     fmt = formatting.resolve_format(dataset.get("format") or {})
 
     fill: dict[str, int] = {c: 0 for c in columns}
@@ -1272,7 +1339,7 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
     # reads from is a reasonable thing to ask for -- build the text, throw the
     # parts away -- and doing it first left every row reading "{question}".
     if dropped := [c for c in (ops.get("drop_columns") or [])
-                   if c and c != SPLIT_FIELD]:
+                   if c and c not in RESERVED_FIELDS]:
         rows = [{k: v for k, v in r.items() if k not in dropped} for r in rows]
         steps.append("Dropped the columns %s" % ", ".join(dropped))
 
@@ -1397,9 +1464,13 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
             raise ValueError("That exclusion pattern is not valid: %s" % e) from e
 
     if keep := ops.get("keep_columns"):
-        keep = list(keep) + ([SPLIT_FIELD] if SPLIT_FIELD not in keep else [])
+        # The reserved columns are kept whatever the caller asked for: a row
+        # that loses its name stops being the row it was, and one that loses
+        # its split quietly rejoins the training data.
+        wanted = list(keep)
+        keep = wanted + [f for f in RESERVED_FIELDS if f not in wanted]
         rows = [{k: r.get(k) for k in keep if k in r} for r in rows]
-        steps.append("Kept only the columns %s" % ", ".join(keep))
+        steps.append("Kept only the columns %s" % ", ".join(wanted))
 
     if ops.get("shuffle"):
         random.Random(int(ops.get("seed") or 1234)).shuffle(rows)
@@ -1422,7 +1493,10 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
     # the endpoint. It means the same thing it always did, which is now this.
     report: dict = {}
     convs_made: list[dict] = []
-    if ops.get("to_conversations") or ops.get("to_chat"):
+    # `is not None`, not truthiness: `{"to_conversations": {}}` means "convert
+    # these, with the defaults", and an empty options dict is falsy -- so the
+    # step ran, reported success, and changed nothing.
+    if _asked_to_convert(ops):
         rows, report, convs_made = _to_conversations(rows, fmt, ops)
         steps.append("Converted %d rows to the standard conversation format"
                      % report["converted"])
@@ -1436,7 +1510,7 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
             steps.append("Marked every assistant turn but the last one "
                          "weight 0, so they are context and not lessons")
 
-    if ops.get("to_conversations") or ops.get("to_chat"):
+    if _asked_to_convert(ops):
         # What was produced, not merely how to read it. "mode: chat" is a
         # complete description of how to read these rows and says nothing about
         # what is in them -- and the wizard decides whether to offer "teach it
@@ -1650,6 +1724,19 @@ def _fill_template(template: str, row: dict) -> str:
     return _PLACEHOLDER.sub(one, template)
 
 
+def _asked_to_convert(ops: dict) -> bool:
+    """Whether this step is a conversion to the conversation format.
+
+    `to_chat` is what the first version of this called it, kept working
+    because it is in saved recipes and in whatever anybody scripted against
+    the endpoint. It means the same thing it always did.
+    """
+    for key in ("to_conversations", "to_chat"):
+        if ops.get(key) is not None and ops.get(key) is not False:
+            return True
+    return False
+
+
 def _to_conversations(rows: list[dict], fmt: dict,
                       ops: dict) -> tuple[list[dict], dict, list[dict]]:
     """Rewrite rows into the canonical conversation format.
@@ -1711,7 +1798,9 @@ def _to_conversations(rows: list[dict], fmt: dict,
         convs.append(conv)
         # The split survives being rewritten. Losing it here would quietly
         # merge somebody's held-out rows back into training.
-        out.append(conversation.to_row(conv, split=r.get(SPLIT_FIELD)))
+        out.append(conversation.to_row(
+            conv, split=r.get(SPLIT_FIELD),
+            extra={ROW_ID_FIELD: r[ROW_ID_FIELD]} if r.get(ROW_ID_FIELD) else None))
 
     report = conversation.validate_many(convs)
     report["converted"] = len(out)
@@ -1721,33 +1810,65 @@ def _to_conversations(rows: list[dict], fmt: dict,
 
 
 def split(dataset: dict, fraction: float, owner_id: str | None,
-          seed: int = 1234) -> list[dict]:
-    """Cut a dataset into a training part and a held-out part.
+          seed: int = 1234, stratify: str | None = None,
+          name: str | None = None) -> dict:
+    """Hold part of a dataset back, as a split of one dataset.
 
     The single most useful thing this module does. Without a held-out slice
     there is no way to tell a model that has learned from one that has
     memorised, and the loss curve looks identical in both cases.
+
+    ONE dataset with two splits, not two datasets. It used to make two, named
+    "X (train)" and "X (validation)", which contradicted the whole design --
+    a dataset holds all of its splits together, in one file, with each row
+    naming the split it belongs to -- and left the trainer pointed at a
+    dataset containing nothing but training rows. It then carved its own
+    validation slice out of that, so the held-out set somebody deliberately
+    made was never measured on. Two datasets also meant two things to keep in
+    step: rename one, edit one, share one, and the pair has quietly diverged.
+
+    `stratify` names a column whose mix should survive the cut. Without it a
+    label held by 3% of the rows lands entirely on one side often enough to
+    matter, and a held-out score that contains none of the rare case is a
+    score that cannot see the thing most likely to be wrong.
     """
     fraction = min(max(float(fraction or 0.1), 0.001), 0.5)
     rows = list(iter_rows(dataset["id"]))
     if len(rows) < 20:
         raise ValueError("There are too few rows here to split meaningfully.")
-    random.Random(seed).shuffle(rows)
-    cut = max(1, int(len(rows) * fraction))
-    held, train = rows[:cut], rows[cut:]
 
-    made = []
-    for label, part in (("train", train), ("validation", held)):
-        made.append(register(
-            owner_id, "%s (%s)" % (dataset["name"], label), "derived",
-            iter(part), split=label,
-            origin=dataset["id"], parent_id=dataset["id"],
-            columns=dataset.get("columns"), format=dataset.get("format"),
-            recipe={"from": dataset["id"], "from_name": dataset["name"],
-                    "steps": ["Split %s: %d%% held out, shuffled with seed %d"
-                              % (label, round(fraction * 100), seed)],
-                    "rows_before": len(rows), "rows_after": len(part)}))
-    return made
+    rng = random.Random(seed)
+    held_ids: set[int] = set()
+    if stratify:
+        # Cut within each group, so every group is represented on both sides
+        # in the proportion it holds overall.
+        groups: dict[str, list[int]] = {}
+        for i, r in enumerate(rows):
+            groups.setdefault(str(r.get(stratify)), []).append(i)
+        for _, members in sorted(groups.items()):
+            rng.shuffle(members)
+            take = max(1, round(len(members) * fraction)) if len(members) > 1 else 0
+            held_ids.update(members[:take])
+        note = ("Held back %d%% for validation, keeping the mix of \"%s\" "
+                "(seed %d)" % (round(fraction * 100), stratify, seed))
+    else:
+        order = list(range(len(rows)))
+        rng.shuffle(order)
+        held_ids = set(order[:max(1, int(len(rows) * fraction))])
+        note = ("Held back %d%% for validation, shuffled with seed %d"
+                % (round(fraction * 100), seed))
+
+    out = [{**r, SPLIT_FIELD: "validation" if i in held_ids else "train"}
+           for i, r in enumerate(rows)]
+
+    return register(
+        owner_id, name or "%s (split)" % dataset["name"], "derived",
+        iter(out),
+        origin=dataset["id"], parent_id=dataset["id"],
+        columns=dataset.get("columns"), format=dataset.get("format"),
+        recipe={"from": dataset["id"], "from_name": dataset["name"],
+                "steps": [note], "rows_before": len(rows),
+                "rows_after": len(out)})
 
 
 # Weakest wins, so a merge of a confidently-read file and a doubtfully-read one
