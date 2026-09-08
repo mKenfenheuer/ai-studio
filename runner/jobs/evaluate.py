@@ -653,10 +653,18 @@ def _rate(rows: list[dict], key: str) -> float | None:
 
 def _aggregate(rows: list[dict], seconds: float) -> dict:
     scored = [r for r in rows if r.get("expected")]
+    # A prompt can be measurable without an expected sentence: a tool-calling
+    # set says which tool should have been called, a schema set says what
+    # shape the answer must have. Counting only the ones with text made a
+    # perfectly measurable comparison report "nothing to rank on".
+    measurable = [r for r in rows
+                  if r.get("expected") or r.get("tool_name_ok") is not None
+                  or r.get("schema_valid") is not None]
     losses = [r["expected_loss"] for r in scored if r.get("expected_loss") is not None]
     return {
         "items": len(rows),
-        "scored": len(scored),
+        "scored": len(measurable),
+        "scored_on_text": len(scored),
         "exact": _rate(scored, "exact"),
         "contains": _rate(scored, "contains"),
         "f1": _mean(scored, "f1"),
@@ -717,6 +725,13 @@ RANKING = [
     ("expected_loss", "loss on the expected answers", True),
     ("chrf", "character overlap with the expected answers", False),
     ("f1", "token overlap with the expected answers", False),
+    # Calling the right tool. For a tool-calling set this IS the task -- the
+    # expected answer is a call, not a sentence -- and without it here such a
+    # comparison had no rankable measure at all and said so, beside a table
+    # that plainly showed one model calling the right tool four times as
+    # often as the other.
+    ("tool_name_ok", "calling the right tool", False),
+    ("schema_valid", "answers that fit the schema", False),
     # Last, and only when the prompts have no expected answers at all: a
     # judge's opinion ranks free text that nothing else can measure.
     ("judge_score", "the judge's score", False),
@@ -837,9 +852,10 @@ def _verdict(scores: list[dict], ranked: dict | None) -> str:
                     "get a comparison -- a single set of numbers has nothing "
                     "to be better or worse than. The model this one was "
                     "trained from is the usual answer.")
-        return ("Scored. Without expected answers there is no measure that can "
-                "rank these, only the text each one produced. Add expected "
-                "answers to the prompt set to get a number.")
+        return ("Scored. Nothing here can rank these: the prompts carry no "
+                "expected answer, no expected tool call and no schema, so "
+                "there is only the text each model produced. Add any one of "
+                "those to the prompt set to get a number.")
 
     key, lower = ranked["key"], ranked["lower"]
     best, worst = ranked["best"], ranked["worst"]
