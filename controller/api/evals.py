@@ -46,6 +46,9 @@ def _eval_or_404(request: Request, eval_id: str, need: str = "view") -> dict:
     return row
 
 
+MAX_SYSTEM_CHARS = 8000
+
+
 def _clean_items(raw: object) -> list[dict]:
     """Prompts, as a list of usable rows, or a refusal that says what is wrong."""
     if not isinstance(raw, list):
@@ -62,6 +65,13 @@ def _clean_items(raw: object) -> list[dict]:
         item = {"prompt": prompt,
                 "expected": str(entry.get("expected") or "").strip(),
                 "note": str(entry.get("note") or "").strip()}
+        # The context this prompt is asked in, when it is the prompt's own
+        # rather than the set's. A home-automation row carries the list of
+        # devices in the house at that moment; asking "close the awning"
+        # without it is asking a different question from the one the data
+        # holds, and every model would fail it.
+        if system := str(entry.get("system") or "").strip():
+            item["system"] = system[:MAX_SYSTEM_CHARS]
         # What else a prompt may ask to be scored on: the shape the answer
         # must have, and the tool it should call. Kept only when given, so an
         # ordinary set does not grow two empty fields per row.
@@ -198,22 +208,48 @@ async def eval_from_dataset(request: Request, payload: dict = Body(...)) -> dict
                             % (" in the %s split" % split if split else ""))
 
     fmt = formatting.resolve_format(ds.get("format") or {})
+    tools: list[dict] = []
     if not prompt_field and (fmt.get("mode") == "chat" or "messages" in rows[0]):
         # A conversation dataset: the prompt is the last thing the user said
         # and the answer is what the data says came next. The flat-column
         # guess below would have found no prompt column and refused.
         pairs = []
+        calls = 0
         for r in rows:
             conv, _ = conversation.repair(conversation.from_row(r, fmt))
             prompt, expected = conversation.split_for_trial(conv)
             asked = next((m.get("content") for m in reversed(prompt)
                           if m.get("role") == "user"), None)
-            answer = next((m.get("content") for m in expected
-                           if m.get("role") == "assistant"), "")
-            if asked:
-                pairs.append({"prompt": asked, "expected": answer or ""})
+            if not asked:
+                continue
+            # The context the question was asked in travels with it. Without
+            # it these rows are unanswerable by anything.
+            system = next((m.get("content") for m in prompt
+                           if m.get("role") == "system"), "")
+            reply = next((m for m in expected
+                          if m.get("role") == "assistant"), {})
+            pair = {"prompt": asked, "system": system or "",
+                    "expected": reply.get("content") or ""}
+            # What the data says should happen next is often not text at all:
+            # in a tool-calling set the assistant's turn is a call, and the
+            # sentence a couple of messages later depends on what the tool
+            # returned -- which the model being scored never sees. Scoring
+            # that sentence would be marking it down for not guessing a
+            # result. The call itself is the answer, so that is what is kept.
+            wanted = (reply.get("tool_calls") or [])
+            if wanted:
+                fn = (wanted[0].get("function") or wanted[0])
+                if fn.get("name"):
+                    pair["expected_tool"] = {"name": fn["name"],
+                                             "arguments": fn.get("arguments")}
+                    pair["expected"] = ""
+                    calls += 1
+            if not tools:
+                tools = conversation.flat_tools(conv)
+            pairs.append(pair)
         items = _clean_items(pairs)
-        how = "last user turn -> first assistant reply"
+        how = ("last user turn -> the tool it should call" if calls
+               else "last user turn -> first assistant reply")
     else:
         if not prompt_field:
             prompt_field = next((f for f in ("instruction", "prompt", "question",
@@ -244,6 +280,10 @@ async def eval_from_dataset(request: Request, payload: dict = Body(...)) -> dict
                 "not trained on these rows."))
     source = {"dataset_id": ds["id"], "dataset_name": ds["name"],
               "split": split or None, "held_out": held_out}
+    # The same tools the data declared, so a model is asked to choose from the
+    # list it would really be given rather than invent one.
+    if declared := _clean_tools(tools):
+        source["tools"] = declared
     eid = db.create_eval(user["id"], name, items, notes, source,
                          project_id=_project_of(request, payload)
                                     or ds.get("project_id"))

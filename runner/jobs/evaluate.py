@@ -550,7 +550,16 @@ def run(cfg: dict, ctx: Any) -> dict:
 
             prompt = str(item.get("prompt") or "")
             expected = str(item.get("expected") or "")
-            messages = ([{"role": "system", "content": system}] if system else []) \
+            # The prompt's own context, when it has one. A set taken from a
+            # dataset carries the system message each row was written under --
+            # for a home-automation set that is the list of devices in the
+            # house, and the question means nothing without it. A system
+            # prompt typed for this scoring still wins: that is somebody
+            # deliberately asking what happens under a different instruction.
+            asked_under = (override or str(item.get("system") or "").strip()
+                           or system)
+            messages = ([{"role": "system", "content": asked_under}]
+                        if asked_under else []) \
                 + [{"role": "user", "content": prompt}]
 
             t0 = time.time()
