@@ -355,6 +355,40 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
 
   // The publish form lives in the Model section, which may not be the tab you
   // are looking at.
+  // A conversion, as a job: it reads every tensor and writes a new file, so
+  // it wants a progress bar and a stop button like everything else here.
+  on(mount, "click", "#exportGguf", () => {
+    const job = getJob();
+    const dlg = modal({ title: "Export as GGUF", width: 520, body: html`
+      <p class="muted tiny">One file, quantised, that loads in Ollama,
+        llama.cpp and LM Studio with no Python at all. It runs as a job on
+        whichever machine is free — no graphics card needed.</p>
+      <div class="field">
+        <label for="ggufQ">How much to shrink it</label>
+        <select id="ggufQ">
+          ${raw(Object.entries(GGUF_TYPES).map(([k, why], i) =>
+            `<option value="${k}"${i === 0 ? " selected" : ""}>${k} — ${
+              esc(why)}</option>`).join(""))}
+        </select>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="ggufGo">Export it</button>
+      </div>` });
+    on(dlg, "click", "#ggufGo", async (_e, btn) => {
+      btn.disabled = true;
+      try {
+        const { id } = await api.createJob({
+          name: `${job.name} → GGUF`,
+          kind: "export_gguf",
+          config: { source_job: job.id, quantize: $("#ggufQ", dlg).value },
+        });
+        dlg.close();
+        toast("Export queued.", "ok", { href: `#/jobs/${id}`, label: "Watch it" });
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  });
+
   on(mount, "click", "#goPublish", () => {
     const tab = $('[data-tab="model"]', mount);
     if (tab) tab.click();
@@ -600,6 +634,9 @@ function writingStopPanel(job, latest) {
 function uploadLayout(job) {
   const cfg = job.config || {};
   const dataset = cfg.target === "dataset";
+  // An export shares this page shape -- a job that produces one file and
+  // hands it over -- and shares none of its facts.
+  if (job.kind === "export_gguf") return exportLayout(job);
   return html`
     ${raw(runHead(job))}
     <div id="queueCard"></div>
@@ -981,6 +1018,57 @@ function evalResult(job) {
     </div>`;
 }
 
+/** A model on its way to being one file. */
+function exportLayout(job) {
+  const cfg = job.config || {};
+  const s = job.summary || {};
+  const done = job.status === "succeeded" && job.artifacts?.length;
+  return html`
+    ${raw(runHead(job))}
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin:0 0 8px">One file, for everything outside this studio</h3>
+      <dl class="kv">
+        <dt>From</dt>
+        <dd>${raw(cfg.source_job
+          ? `<a href="#/jobs/${esc(cfg.source_job)}">${
+               esc(cfg.source_run_name || "the run")}</a>`
+          : esc(cfg.source_run_name || "a run"))}</dd>
+        <dt>Quantised to</dt><dd class="mono">${cfg.quantize || "Q4_K_M"}</dd>
+        ${raw(s.filename ? html`
+          <dt>File</dt><dd class="mono">${s.filename}${
+            s.bytes ? ` · ${fmtBytes(s.bytes)}` : ""}</dd>` : "")}
+      </dl>
+      ${raw(done ? html`
+        <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">
+          <a class="btn btn-primary" href="/api/jobs/${esc(job.id)}/download?kind=gguf"
+            >↓ Download it</a>
+        </div>
+        <p class="muted tiny" style="margin:10px 0 0">The zip holds the model,
+          a <code>Modelfile</code> for Ollama and a note saying what to do with
+          both — because a file downloaded in six weeks will not have this page
+          open beside it.</p>
+        <pre class="mono tiny" style="white-space:pre-wrap;background:var(--surface-2);
+             padding:10px;border-radius:8px;margin-top:10px">ollama create ${
+          esc((s.filename || "model").split(".")[0])} -f Modelfile
+ollama run ${esc((s.filename || "model").split(".")[0])}</pre>`
+        : html`<p class="muted tiny" style="margin:10px 0 0">Reading every
+          tensor and writing a new file. No graphics card is involved, so this
+          runs on whichever machine is free.</p>`)}
+    </div>
+
+    <div class="card" data-sec="log">
+      <div class="row-between" style="align-items:center">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">from the converter itself</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
 /** Where the rows went, once there are any. */
 function writtenDatasetCard(job) {
   const made = job.summary?.dataset_id || job.dataset_id;
@@ -1073,6 +1161,16 @@ function layout(job, scratch, experts = 0) {
       <div class="logbox" id="logBox"></div>
     </div>`;
 }
+
+// The quantisations worth offering, and what each is for. Mirrors the list
+// the runner accepts; the runner is the authority and refuses anything else.
+const GGUF_TYPES = {
+  Q4_K_M: "about a quarter of the size, and what nearly everybody means",
+  Q5_K_M: "a little bigger, a little better",
+  Q6_K: "close to the original, at about half the size",
+  Q8_0: "barely distinguishable, at half the size",
+  F16: "no quantisation at all",
+};
 
 const REPORT_ICON = { ok: "✓", warn: "!", error: "✕" };
 
@@ -1606,6 +1704,10 @@ function runRibbon(job, tab) {
       href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
     rb("goPublish", "☁", "Publish", { disabled: !usable,
       title: "Send it to Hugging Face" }),
+    // The page has said for a long time that merging produces "what Ollama
+    // wants". Ollama wants GGUF, and until now this could not make one.
+    rb("exportGguf", "⬓", "Export as GGUF", { disabled: !usable,
+      title: "One quantised file for Ollama, llama.cpp and LM Studio" }),
     job.summary?.url
       ? rb(null, "↗", "On the Hub", { href: job.summary.url }) : "",
   ]);

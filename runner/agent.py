@@ -25,7 +25,8 @@ import httpx
 import websockets
 
 from . import artifacts, capabilities, checkpoints, inference
-from .jobs import evaluate, generate_data, lora_llm, scratch_llm, upload
+from .jobs import (evaluate, export_gguf, generate_data, lora_llm,
+                   scratch_llm, upload)
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -65,6 +66,10 @@ JOB_HANDLERS = {
     # Sending a model to Hugging Face: no GPU, but twenty minutes of network
     # and every bit as much in need of a progress bar and a stop button.
     "upload": upload.run,
+    # Turning a finished model into the one file everything outside this
+    # studio wants. No GPU: it reads tensors and writes a smaller file, so it
+    # belongs on whichever machine is free.
+    "export_gguf": export_gguf.run,
 }
 
 

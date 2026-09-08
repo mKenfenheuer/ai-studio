@@ -74,6 +74,17 @@ export const KINDS = {
     family: null,
     subject: (c) => "scoring against " + (c.eval_name || "a prompt set"),
   },
+  export_gguf: {
+    label: "GGUF export",
+    icon: "⬓",
+    running: "Converting",
+    unit: "stages",
+    page: "upload",
+    leavesModel: false,
+    family: null,
+    subject: (c) => "converting " + (c.source_run_name || "a model")
+                    + " to " + (c.quantize || "GGUF"),
+  },
   // Kept because runs of this kind exist in databases that predate the merge
   // moving into the fine-tune that produces it. Nothing creates one now.
   merge_adapter: {
@@ -138,4 +149,6 @@ export const STAGES = {
   building_model: "Creating the model from random weights…",
   training: "Training",
   saving: "Saving the result…",
+  converting: "Reading the weights and writing one file…",
+  quantizing: "Shrinking it to the size you asked for…",
 };

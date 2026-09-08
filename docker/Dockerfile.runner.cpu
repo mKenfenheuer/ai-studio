@@ -47,6 +47,31 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 RUN pip install --no-cache-dir \
         "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4"
 
+# llama.cpp, for turning a finished model into the one file everything outside
+# this studio wants. Two pieces: a Python converter that reads safetensors and
+# writes GGUF, and a compiled `llama-quantize` that shrinks it.
+#
+# Pinned to a tag rather than to main. The converter is the part that knows
+# about model architectures and it changes weekly; a model that converted last
+# month and does not this month, because an image was rebuilt, is the worst
+# kind of surprise. Move the pin deliberately.
+#
+# Only the quantiser is built -- not the server, not the CLI, not the tests --
+# which keeps this to a couple of minutes and a few tens of megabytes.
+ARG LLAMA_CPP_TAG=b4586
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential cmake libcurl4-openssl-dev \
+    && git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+         https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
+    && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
+         -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
+    && cmake --build /opt/llama.cpp/build --target llama-quantize -j "$(nproc)" \
+    && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/llama-quantize \
+    && pip install --no-cache-dir -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \
+    && rm -rf /opt/llama.cpp/build /opt/llama.cpp/.git /opt/llama.cpp/tests \
+    && apt-get purge -y git build-essential cmake \
+    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
 COPY runner /app/runner
 COPY common /app/common
 COPY pyproject.toml /app/

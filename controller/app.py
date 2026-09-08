@@ -469,6 +469,21 @@ async def _create_job(request: Request, payload: dict) -> str:
             _attach_provider(user, cfg)
         else:
             _check_generation_source(request, cfg)
+    elif kind == "export_gguf":
+        # Turning a finished model into the one file everything outside this
+        # studio wants. No GPU, so it goes to whichever machine is free --
+        # which on most fleets is the CPU box beside the controller.
+        src_id = (cfg.get("source_job") or "").strip()
+        if not src_id:
+            raise HTTPException(400, "Which run's model should be exported?")
+        src = _job_or_404(request, src_id)
+        if not artifact_file(src["id"], "").exists():
+            raise HTTPException(
+                400, "That run has no model to export. A fine-tune has to have "
+                     "produced a merged model, not only an adapter.")
+        cfg["allow_cpu"] = True
+        cfg.setdefault("name_hint", src["name"])
+        cfg["source_run_name"] = src["name"]
     elif kind == "upload":
         # Sending something to Hugging Face. No GPU, no model to load: this
         # one is network and patience, and it comes through the same door as
@@ -966,8 +981,14 @@ def _artifact_kind(dest: Path, job: dict | None) -> str:
         return "model"
     if any(n.endswith(".jsonl") for n in names):
         return "dataset"
+    if any(n.endswith(".gguf") for n in names):
+        # Not a model in the sense the rest of this app means: nothing here
+        # can load one, and the playground and the fit checks must not be
+        # offered it. It is a file to download and take elsewhere.
+        return "gguf"
     # An archive that says nothing about itself: fall back to what the run was.
     return {"pretrain_llm": "model", "generate_dataset": "dataset",
+            "export_gguf": "gguf",
             "merge_adapter": "model"}.get((job or {}).get("kind"), "adapter")
 
 
