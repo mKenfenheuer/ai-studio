@@ -2,8 +2,18 @@
  *  your Hugging Face connection, and the hosted models you can write data
  *  with. */
 import { api } from "../api.js";
+import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
+import { pageHead } from "../components.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo,
          askForNotifications } from "../util.js";
+
+const TABS = [
+  { key: "profile", label: "Profile" },
+  { key: "keys", label: "API keys" },
+  { key: "hf", label: "Hugging Face" },
+  { key: "hosted", label: "Hosted models" },
+  { key: "alerts", label: "Notifications" },
+];
 
 export async function accountView(mount) {
   let me = await api.me();
@@ -18,12 +28,16 @@ export async function accountView(mount) {
   // secret in them, not a list to browse.
   let opening = null;
 
+  const tabs = tabState("account", TABS, "profile");
+  let tab = tabs.get();
+
   const draw = () => {
-    mount.innerHTML = layout(me, alerts, keys, freshKey, hosted, opening);
+    mount.innerHTML = layout(me, alerts, keys, freshKey, hosted, opening, tab);
     wire();
   };
 
   function wire() {
+    wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
     on(mount, "submit", "#keyForm", async (e) => {
       e.preventDefault();
       const name = new FormData(e.target).get("name");
@@ -280,15 +294,33 @@ export async function accountView(mount) {
 
 // ---------------------------------------------------------------------------
 
-function layout(me, alerts, keys, freshKey, hosted, opening) {
+function layout(me, alerts, keys, freshKey, hosted, opening, tab) {
   const hf = me.hf || {};
-  return html`
-    <div class="page-head">
-      <h1>Your account</h1>
-      <p class="sub">Signed in as <strong>${me.username}</strong>${
-        me.role === "admin" ? " · administrator" : ""}</p>
-    </div>
+  const panel = tab === "keys" ? keysCard(keys, freshKey)
+    : tab === "hf" ? hfCard(hf)
+    : tab === "hosted" ? hostedCard(hosted, opening)
+    : tab === "alerts" ? alertCard(alerts)
+    : profilePanel(me);
 
+  return html`
+    ${raw(pageHead({
+      title: "Your account",
+      sub: `Signed in as ${me.username}${me.role === "admin" ? " · administrator" : ""}`,
+    }))}
+    ${raw(ribbon({
+      tabs: TABS, active: tab,
+      body: group("Elsewhere", [
+        rb(null, "⚙", "Settings", { href: "#/settings" }),
+        me.role === "admin" ? rb(null, "◍", "People", { href: "#/users" }) : "",
+        me.role === "admin" ? rb(null, "🔑", "Single sign-on", { href: "#/sso" }) : "",
+      ]),
+    }))}
+    <div class="acct-panel">${raw(panel)}</div>`;
+}
+
+/** Name, password, and the sessions you are signed in on. */
+function profilePanel(me) {
+  return html`
     <div class="grid grid-2" style="align-items:start">
       <div>
         <div class="card" style="margin-bottom:14px">
@@ -327,10 +359,10 @@ function layout(me, alerts, keys, freshKey, hosted, opening) {
 
         <div class="card">
           <h3>Where you are signed in</h3>
-          <p class="muted tiny">${me.sessions.length} active session${
-            me.sessions.length === 1 ? "" : "s"}.</p>
+          <p class="muted tiny">${(me.sessions || []).length} active session${
+            (me.sessions || []).length === 1 ? "" : "s"}.</p>
           <ul class="muted tiny" style="margin:8px 0;padding-left:18px;line-height:1.7">
-            ${raw(me.sessions.slice(0, 6).map((s) => html`
+            ${raw((me.sessions || []).slice(0, 6).map((s) => html`
               <li>${shortAgent(s.user_agent)} — last used ${
                 fmtAgo(s.last_used)}</li>`).join(""))}
           </ul>
@@ -338,12 +370,6 @@ function layout(me, alerts, keys, freshKey, hosted, opening) {
         </div>
       </div>
 
-      <div>
-        ${raw(keysCard(keys, freshKey))}
-        ${raw(alertCard(alerts))}
-        ${raw(hfCard(hf))}
-        ${raw(hostedCard(hosted, opening))}
-      </div>
     </div>`;
 }
 

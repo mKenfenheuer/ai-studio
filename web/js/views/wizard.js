@@ -1,6 +1,8 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast, resource,
          ensure } from "../util.js";
+import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
+import { pageHead, emptyState } from "../components.js";
 
 // Two fundamentally different jobs behind one wizard. They share a machine
 // picker, a data step and a review; everything between differs, because the
@@ -257,7 +259,7 @@ function shell(state, runners, names, known = []) {
     // they already own, while it is in the middle of reconnecting, is the
     // wrong instruction as well as the wrong diagnosis.
     return html`
-      <div class="page-head"><h1>New training run</h1></div>
+      ${raw(pageHead({ title: "New training run" }))}
       <div class="card">
         <div class="row" style="gap:12px;align-items:flex-start">
           <div class="sk-value shimmer" style="min-width:34px;height:34px;
@@ -277,33 +279,52 @@ function shell(state, runners, names, known = []) {
   }
   if (!runners.length) {
     return html`
-      <div class="page-head"><h1>New training run</h1></div>
-      <div class="card empty">
-        <div class="big">🔌</div>
-        <h2>No machines are connected</h2>
-        <p class="muted">A training run needs a machine with a GPU. Connect one
-          from the <a href="#/runners">Machines</a> page — it takes one command.</p>
-        <p><a class="btn btn-primary" href="#/runners">Connect a machine</a></p>
-      </div>`;
+      ${raw(pageHead({ title: "New training run" }))}
+      ${raw(emptyState({
+        icon: "🔌",
+        title: "No machines are connected",
+        body: "A training run needs a machine with a graphics card. Connecting "
+            + "one takes a single command.",
+        cta: { href: "#/runners", label: "Connect a machine" },
+      }))}`;
   }
-  const chips = names.map((s, i) => html`
-    <div class="step-chip ${i === state.step ? "current" : i < state.step ? "done" : ""}">
-      <span class="n">${i < state.step ? "✓" : String(i + 1)}</span>${s}
-    </div>`).join("");
+  // The steps are the tabs. A step you have not reached is not a tab you can
+  // press: this is a sequence, and every step reads what the one before it
+  // decided. Going back is free.
+  const tabs = names.map((label, i) => ({
+    key: String(i),
+    label: `${i < state.step ? "✓" : i + 1}. ${label}`,
+    disabled: i > state.step,
+    hint: i > state.step ? "Finish the steps before this one first" : "",
+  }));
+  const last = names.length - 1;
   return html`
-    <div class="page-head">
-      <h1>New training run</h1>
-      <p class="sub">${names.length} steps. Everything technical is chosen for
-        you, and every choice is explained — and every one can be changed.</p>
-    </div>
-    <div class="steps">${raw(chips)}</div>
+    ${raw(pageHead({
+      title: "New training run",
+      tab: `${names[state.step]} · New run`,
+      sub: `${names.length} steps. Everything technical is chosen for you, and `
+         + `every choice is explained — and every one can be changed.`,
+    }))}
+    ${raw(ribbon({
+      tabs, active: String(state.step),
+      body: group("This run", [
+        rb(null, "←", "Back", { disabled: state.step === 0, data: 'data-back="1"' }),
+        rb(null, state.step === last ? "▶" : "→",
+           state.step === last ? "Start training" : "Continue",
+           { cls: "primary", data: 'data-next="1"' }),
+      ]) + group("Look at", [
+        rb(null, "▤", "Datasets", { href: "#/data" }),
+        rb(null, "▦", "Machines", { href: "#/runners" }),
+        rb(null, "≡", "Runs", { href: "#/jobs" }),
+      ]),
+    }))}
     <div id="stepBody"></div>
     <div class="wizard-actions">
-      <button id="backBtn" ${state.step === 0 ? "disabled" : ""}>← Back</button>
+      <button data-back="1" ${state.step === 0 ? "disabled" : ""}>← Back</button>
       <div class="spacer"></div>
       <span id="navHint" class="tiny muted"></span>
-      <button id="nextBtn" class="btn-primary btn-lg">
-        ${state.step === names.length - 1 ? "Start training" : "Continue →"}
+      <button id="nextBtn" data-next="1" class="btn-primary btn-lg">
+        ${state.step === last ? "Start training" : "Continue →"}
       </button>
     </div>`;
 }
@@ -2622,10 +2643,15 @@ function sweepPanel(state) {
     </details>`;
 }
 
+/** Whether the run can move on, said in both places it is asked.
+ *
+ *  Continue exists twice — on the ribbon, where it is always in view, and at
+ *  the end of the step, where the reading order puts it. They are one control
+ *  wearing two coats, so they are gated together. */
 function gateNext(blocked, hintText) {
-  const nextBtn = document.getElementById("nextBtn");
-  if (!nextBtn) return;
-  nextBtn.disabled = !!blocked;
+  const buttons = document.querySelectorAll("[data-next]");
+  if (!buttons.length) return;
+  buttons.forEach((b) => { b.disabled = !!blocked; });
   const hint = document.getElementById("navHint");
   if (hint) hint.textContent = blocked ? hintText : "";
 }
@@ -2673,9 +2699,16 @@ const STEPS = {
 function wireNav(mount, ctx) {
   const { state, draw } = ctx;
   const next = $("#nextBtn", mount);
-  const back = $("#backBtn", mount);
   const hint = $("#navHint", mount);
   if (!next) return;
+
+  // A step you have already been through can be reopened from the ribbon; one
+  // you have not reached cannot, because each step reads what the one before
+  // it decided.
+  wireRibbon(mount, (key) => {
+    const want = Number(key);
+    if (Number.isFinite(want) && want <= state.step) { state.step = want; draw(); }
+  });
 
   const names = STEP_NAMES[state.mode];
   const last = names.length - 1;
@@ -2702,13 +2735,13 @@ function wireNav(mount, ctx) {
   ];
   const blocker = blockers[state.step]();
 
-  next.disabled = !!blocker;
+  $$("[data-next]", mount).forEach((b) => { b.disabled = !!blocker; });
   hint.textContent = blocker || "";
 
-  back?.addEventListener("click", () => {
+  on(mount, "click", "[data-back]", () => {
     if (state.step > 0) { state.step--; draw(); }
   });
-  next.addEventListener("click", async () => {
+  on(mount, "click", "[data-next]", async () => {
     if (state.starting) return;
     if (state.step < last) { state.step++; draw(); return; }
 
@@ -2717,7 +2750,8 @@ function wireNav(mount, ctx) {
     const varied = parseSweep(state);
     if (varied && varied.error) { toast(varied.error, "err"); return; }
     state.starting = true;
-    next.disabled = true;
+    const buttons = $$("[data-next]", mount);
+    buttons.forEach((b) => { b.disabled = true; });
     next.textContent = varied ? "Launching variants…" : "Starting…";
     try {
       if (varied) {
@@ -2734,7 +2768,7 @@ function wireNav(mount, ctx) {
     } catch (e) {
       toast(e.message, "err");
       state.starting = false;
-      next.disabled = false;
+      buttons.forEach((b) => { b.disabled = false; });
       next.textContent = "Start training";
     }
 

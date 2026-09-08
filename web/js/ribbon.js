@@ -70,8 +70,11 @@ export function ribbon({ tabs, active, body = "", right = "" }) {
   const strip = tabs.map((t) => `
     <button type="button" role="tab" data-tab="${esc(t.key)}"
       id="rbtab-${esc(t.key)}" aria-selected="${t.key === active}"
+      ${t.disabled ? 'aria-disabled="true" disabled' : ""}
+      ${t.hint ? `title="${esc(t.hint)}"` : ""}
       tabindex="${t.key === active ? 0 : -1}"
-      class="${t.key === active ? "on" : ""}">${esc(t.label)}</button>`).join("");
+      class="${t.key === active ? "on" : ""}${t.disabled ? " off" : ""}"
+      >${esc(t.label)}</button>`).join("");
   return html`
     <div class="ribbon">
       <div class="ribbon-tabs" role="tablist">
@@ -123,7 +126,7 @@ export function wireRibbon(mount, onTab) {
   on(mount, "keydown", ".ribbon-tabs", (e) => {
     const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
     if (!keys.includes(e.key)) return;
-    const tabs = $$("[data-tab]", e.currentTarget || mount);
+    const tabs = $$("[data-tab]:not([disabled])", e.currentTarget || mount);
     const at = tabs.findIndex((b) => b.getAttribute("aria-selected") === "true");
     if (at < 0) return;
     e.preventDefault();

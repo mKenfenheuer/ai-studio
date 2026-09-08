@@ -1314,6 +1314,10 @@ textarea.turn-edit {
   padding: 6px 13px; font-weight: 550; color: var(--text-2); font-size: 13px;
 }
 .ribbon-tabs > button:hover { background: var(--surface-2); color: var(--text); }
+.ribbon-tabs > button.off, .ribbon-tabs > button:disabled {
+  opacity: .45; cursor: not-allowed;
+}
+.ribbon-tabs > button.off:hover { background: transparent; color: var(--text-2); }
 .ribbon-tabs > button.on {
   background: var(--accent-bg); color: var(--accent);
   box-shadow: inset 0 -2px 0 var(--accent);

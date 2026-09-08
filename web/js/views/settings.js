@@ -1,13 +1,27 @@
 import { api } from "../api.js";
-import { html, raw, $, on, toast } from "../util.js";
+import { html, raw, $, on } from "../util.js";
 import { session } from "../app.js";
+import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
+import { pageHead, copyButton } from "../components.js";
 
 export async function settingsView(mount) {
   const status = await api.status();
   const admin = session.user?.role === "admin";
   mount.innerHTML = html`
-    <div class="page-head"><h1>Settings</h1>
-      <p class="sub">Studio-wide configuration.</p></div>
+    ${raw(pageHead({ title: "Settings", sub: "Studio-wide configuration." }))}
+    ${raw(ribbon({
+      tabs: [{ key: "general", label: "General" }], active: "general",
+      body: group("Your things", [
+        rb(null, "◉", "Your account", { href: "#/account",
+          title: "Name, password, keys, Hugging Face, notifications" }),
+      ]) + (admin ? group("Administration", [
+        rb(null, "◍", "People", { href: "#/users" }),
+        rb(null, "🔑", "Single sign-on", { href: "#/sso" }),
+        rb(null, "▦", "Machines", { href: "#/runners" }),
+      ]) : "") + group("Session", [
+        rb("signOut", "→", "Sign out", { cls: "danger" }),
+      ]),
+    }))}
 
     <div class="card" style="margin-bottom:14px">
       <h3>Hugging Face</h3>
@@ -32,26 +46,13 @@ export async function settingsView(mount) {
 
     ${raw(!admin ? "" : html`
     <div class="card" style="margin-bottom:14px">
-      <div class="row-between" style="gap:10px;flex-wrap:wrap;align-items:flex-start">
-        <div style="min-width:0">
-          <h3 style="margin-bottom:2px">Single sign-on</h3>
-          <p class="muted tiny" style="margin:0">Let people in with the account
-            they already have — Entra ID, Google, Okta, Keycloak — and find
-            colleagues by name when sharing, without keeping a second list of
-            who works here.</p>
-        </div>
-        <a class="btn btn-sm" href="#/sso">Set up</a>
-      </div>
-    </div>
-
-    <div class="card" style="margin-bottom:14px">
       <h3>Join token</h3>
       <p class="muted tiny">Machines present this to join the studio. Anyone with
         it can attach a machine and read job data, so share it carefully.</p>
       <div class="row row-top">
         <input type="password" id="tok" value="${status.join_token}" readonly>
         <button class="btn-sm" id="reveal">Show</button>
-        <button class="btn-sm" data-copy="${status.join_token}">Copy</button>
+        ${raw(copyButton(status.join_token || ""))}
       </div>
       <div class="hint">To rotate it, delete <code class="mono">data/join_token</code>
         on the controller and restart. Every machine must then rejoin.</div>
@@ -66,26 +67,17 @@ export async function settingsView(mount) {
         <dt>Signed in as</dt><dd>${session.user?.display_name || "?"}
           ${raw(admin ? `<span class="badge badge-accent">administrator</span>` : "")}</dd>
       </dl>
-      ${raw(admin ? `<a class="btn btn-sm" href="#/users"
-        style="margin-top:10px">Manage people</a>` : "")}
-      <button class="btn-sm btn-danger" id="signOut"
-              style="margin-top:10px">Sign out</button>
     </div>`;
 
-  $("#signOut", mount).addEventListener("click", async () => {
+  wireRibbon(mount, () => {});
+  on(mount, "click", "#signOut", async () => {
     await api.logout().catch(() => {});
     location.reload();
   });
-
-  $("#reveal", mount)?.addEventListener("click", (e) => {
+  on(mount, "click", "#reveal", (_e, t) => {
     const i = $("#tok", mount);
     const show = i.type === "password";
     i.type = show ? "text" : "password";
-    e.target.textContent = show ? "Hide" : "Show";
-  });
-  on(mount, "click", "[data-copy]", (_e, t) => {
-    navigator.clipboard.writeText(t.dataset.copy)
-      .then(() => toast("Copied.", "ok"))
-      .catch(() => toast("Could not copy.", "err"));
+    t.textContent = show ? "Hide" : "Show";
   });
 }
