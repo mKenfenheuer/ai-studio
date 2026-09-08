@@ -244,6 +244,7 @@ export function conversationHtml(messages, opts = {}) {
         </div>
         ${raw(reasoning
           ? reasoningBlock(reasoning, { open: !!opts.openReasoning }) : "")}
+        ${raw(mediaStrip(m.media))}
         ${raw(body(content, calls, reasoning, per, role))}
         ${raw(opts.footer ? opts.footer(m, i) : "")}
         ${raw(opts.actions ? opts.actions(m, i) : "")}
@@ -293,4 +294,31 @@ export function toolsHtml(tools) {
 export function isConversation(row) {
   return Array.isArray(row?.messages) && row.messages.length > 0
     && row.messages.every((m) => m && typeof m === "object" && m.role);
+}
+
+
+/** The pictures and clips a turn carries, beside its words.
+ *
+ *  A message's text is its `content`; anything that is not text rides in
+ *  `media` as `{kind, ref}` for a file in the studio's store or `{kind, url}`
+ *  for one elsewhere. Drawn as what it is -- never as the string "[image]"
+ *  in the middle of a sentence, which is what a flattened part used to
+ *  become. */
+export function mediaStrip(media) {
+  if (!Array.isArray(media) || !media.length) return "";
+  const src = (p) => {
+    const m = /^asset:(ast_[0-9a-f]{12})$/.exec(p.ref || "");
+    return m ? `/api/assets/${m[1]}` : (p.url || "");
+  };
+  return `<div class="media-strip">${media.map((p) => {
+    const u = src(p);
+    if (!u) return `<span class="badge">${esc(p.kind || "file")}</span>`;
+    if (p.kind === "image") {
+      return `<a href="${esc(u)}" target="_blank" rel="noopener"><img class="turn-img" src="${esc(u)}" alt="" loading="lazy"></a>`;
+    }
+    if (p.kind === "audio") {
+      return `<audio controls preload="none" src="${esc(u)}" class="turn-clip"></audio>`;
+    }
+    return `<a class="badge" href="${esc(u)}" target="_blank" rel="noopener">${esc(p.kind || "file")}</a>`;
+  }).join("")}</div>`;
 }

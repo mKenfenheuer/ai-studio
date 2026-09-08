@@ -235,6 +235,9 @@ img.thumb { display: block; max-width: 96px; max-height: 64px; border-radius: 4p
             object-fit: cover; background: var(--border); }
 audio.clip { width: 180px; height: 28px; }
 .sample-img { max-width: 100%; max-height: 360px; border-radius: 6px; display: block; }
+.media-strip { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 6px; }
+.turn-img { max-width: 240px; max-height: 180px; border-radius: 6px; display: block; object-fit: cover; }
+.turn-clip { height: 30px; max-width: 280px; }
 
 .badge {
   display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;

@@ -88,7 +88,7 @@ ROLES = ("system", "developer", "user", "assistant", "tool")
 # Keys a canonical message may carry, in the order they are written out. Order
 # matters only because a person reads these files, and a message whose `role`
 # is the fourth key is harder to skim than one where it is the first.
-MESSAGE_KEYS = ("role", "name", "content", "reasoning", "tool_calls",
+MESSAGE_KEYS = ("role", "name", "content", "media", "reasoning", "tool_calls",
                 "tool_call_id", "weight")
 
 # Where a conversation lives in a row. `messages` is the name every consumer of
@@ -200,6 +200,17 @@ def _message(m: dict) -> dict:
         # <tool_response> for every result in the file.
         content = _INLINE_RESULT.sub("", content).strip()
     out["content"] = content
+    # What the turn shows rather than says: pictures and clips, each
+    # `{"kind", "ref"|"url"}`. `content` stays the words -- every consumer of
+    # a message, from the validator to the loss mask to the browser, reads it
+    # as text, and making it sometimes a list would have broken each of them
+    # in a different place. The media rides beside it, and the template puts
+    # the model's placeholder where each piece goes.
+    media = [{k: v for k, v in mm.items() if k in ("kind", "ref", "url")}
+             for mm in (m.get("media") or []) if isinstance(mm, dict)
+             and mm.get("kind") and (mm.get("ref") or mm.get("url"))]
+    if media:
+        out["media"] = media
     if reasoning := (m.get("reasoning") or "").strip():
         out["reasoning"] = reasoning
 
@@ -974,7 +985,39 @@ def arguments_form(template: str | None) -> str:
     return "object" if template and _TOJSON_ARGS.search(template) else "string"
 
 
-def for_template(conv: dict, template: str | None = None) -> list[dict]:
+# Where a picture goes in the text the model reads. Every vision-language
+# model has a token for "an image is here" and they all spell it differently;
+# a format names its own, and this is the fallback that at least marks the
+# place rather than dropping it. Audio the same.
+DEFAULT_PLACEHOLDERS = {"image": "<image>", "audio": "<audio>", "video": "<video>"}
+
+
+def placeholders_for(fmt: dict | None) -> dict:
+    fmt = fmt or {}
+    return {"image": fmt.get("image_token") or DEFAULT_PLACEHOLDERS["image"],
+            "audio": fmt.get("audio_token") or DEFAULT_PLACEHOLDERS["audio"],
+            "video": fmt.get("video_token") or DEFAULT_PLACEHOLDERS["video"]}
+
+
+def with_placeholders(content: str, media: list | None, tokens: dict) -> str:
+    """The text of a turn with a token in front for each thing it shows.
+
+    In front rather than behind, which is the convention the published
+    vision templates follow (LLaVA, Qwen-VL, Idefics all put the image before
+    the question). One token per item, in order, separated by newlines from
+    the words so a placeholder is never glued to a word.
+    """
+    if not media:
+        return content
+    marks = [tokens.get(mm.get("kind"), "") for mm in media]
+    marks = [t for t in marks if t]
+    if not marks:
+        return content
+    return "\n".join(marks) + ("\n" + content if content else "")
+
+
+def for_template(conv: dict, template: str | None = None,
+                 placeholders: dict | None = None) -> list[dict]:
     """The messages as a template should see them, aliases and all.
 
     Three things happen here that do not belong in the stored record:
@@ -999,7 +1042,10 @@ def for_template(conv: dict, template: str | None = None) -> list[dict]:
         called = m.get("tool_call_id")
         item = {
             "role": m.get("role", "user"),
-            "content": m.get("content") or "",
+            "content": with_placeholders(m.get("content") or "", m.get("media"),
+                                         placeholders or DEFAULT_PLACEHOLDERS),
+            # Offered to a template that wants to place them itself.
+            "media": list(m.get("media") or []),
             "name": m.get("name"),
             "reasoning": reasoning,
             "reasoning_content": reasoning,
@@ -1145,7 +1191,7 @@ def render(conv: dict, fmt: dict | None = None, *,
     text = formatting.render_template(
         template,
         row=conv.get(META_KEY) or {},
-        messages=for_template(conv, template),
+        messages=for_template(conv, template, placeholders_for(fmt)),
         tools=tools or None,
         specials=fmt.get("specials"),
         add_generation_prompt=add_generation_prompt,

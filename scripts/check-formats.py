@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from common import chat_formats, conversation as C  # noqa: E402
+from common import chat_formats, conversation as C, formatting as F  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -116,6 +116,31 @@ def test_import() -> None:
 
 
 def test_repair() -> None:
+    print("\nPictures and clips in a turn")
+    parts = [{"type": "text", "text": "What is this?"},
+             {"type": "image_url", "image_url": {"url": "https://x/cat.png"}},
+             {"type": "image", "image": "asset:ast_0123456789ab"}]
+    conv = C.from_messages([{"role": "user", "content": parts},
+                            {"role": "assistant", "content": "A cat."}])
+    user = conv["messages"][0]
+    check("the words are the content", user["content"], "What is this?")
+    check("no [image] in the text", "[image]" not in user["content"])
+    check("both pictures kept, in order",
+          [m.get("ref") or m.get("url") for m in user.get("media", [])],
+          ["https://x/cat.png", "asset:ast_0123456789ab"])
+    check("media round-trips through a row",
+          C.from_row(json.loads(json.dumps(C.to_row(conv))))["messages"][0].get("media"),
+          user["media"])
+    rendered = F.render_prompt(conv["messages"], {"mode": "chat"})
+    check("a placeholder marks each picture", rendered.count("<image>"), 2)
+    check("placed before the words", rendered.index("<image>") < rendered.index("What is this?"))
+    named = F.render_prompt(conv["messages"], {"mode": "chat", "image_token": "<|vision_start|>"})
+    check("a format names its own token", named.count("<|vision_start|>"), 2)
+    plain = C.from_messages([{"role": "user", "content": "just words"}])
+    check("a turn with no media is untouched",
+          "media" not in plain["messages"][0] and
+          "<image>" not in F.render_prompt(plain["messages"], {"mode": "chat"}))
+
     print("\nRepairing what data leaves implicit")
     bare = {"messages": [
         {"role": "user", "content": "x"},

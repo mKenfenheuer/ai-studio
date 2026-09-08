@@ -120,13 +120,56 @@ def _part_text(part: Any) -> str:
     if isinstance(part, str):
         return part
     if isinstance(part, dict):
+        if _media_part(part):
+            # Not text. It used to become the string "[image]" in the middle
+            # of the sentence, which a model then learned to say. It rides
+            # beside the text now, in `media`, and the template puts the
+            # model's own placeholder token where it goes.
+            return ""
         for key in ("text", "content", "value", "data"):
             if isinstance(part.get(key), str):
                 return part[key]
-        # A non-text part (an image, say). Name it rather than dumping it.
         kind = part.get("type")
         return "[%s]" % kind if kind else ""
     return str(part) if part is not None else ""
+
+
+# The shapes a picture or a clip arrives in: OpenAI's chat parts, the Hub's
+# multimodal datasets, and this studio's own store. Each becomes one
+# `{"kind": image|audio, "ref"|"url": ...}` so nothing downstream has to know
+# which it came from.
+_MEDIA_KINDS = {"image": "image", "image_url": "image", "input_image": "image",
+                "audio": "audio", "input_audio": "audio", "audio_url": "audio",
+                "video": "video", "video_url": "video"}
+
+
+def _media_part(part: dict) -> dict | None:
+    kind = _MEDIA_KINDS.get(str(part.get("type") or "").lower())
+    if not kind:
+        return None
+    out: dict = {"kind": kind}
+    nested = part.get(kind) or part.get(kind + "_url") or part.get("image_url") \
+        or part.get("input_audio") or {}
+    url = None
+    if isinstance(nested, dict):
+        url = nested.get("url") or nested.get("data")
+    elif isinstance(nested, str):
+        url = nested
+    url = url or part.get("url") or part.get("ref") or part.get("asset")
+    if isinstance(url, str) and url.startswith("asset:"):
+        out["ref"] = url
+    elif isinstance(url, str) and url:
+        out["url"] = url
+    else:
+        return None                  # a part that points at nothing
+    return out
+
+
+def media_in(content: Any) -> list[dict]:
+    """The non-text parts of a content value, canonical."""
+    if not isinstance(content, list):
+        return []
+    return [m for m in (_media_part(p) for p in content if isinstance(p, dict)) if m]
 
 
 def _content_text(content: Any) -> str:
@@ -205,6 +248,11 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
             content = m.get("content")
         if content is None:
             content = m.get("value")
+        # Pictures and clips, kept whole. Read off the parts before they are
+        # flattened to text, and off an explicit `media` field a canonical
+        # row already carries.
+        media = media_in(content) + [
+            mm for mm in (m.get("media") or []) if isinstance(mm, dict)]
 
         reasoning = ""
         chosen = select_in_message(m, sel.get("reasoning"))
@@ -269,6 +317,7 @@ def normalize_messages(value: Any, selectors: dict | None = None) -> list[dict]:
         out.append({
             "role": role,
             "content": content,
+            "media": media,
             "reasoning": reasoning,
             "tool_calls": calls,
             # Which call this result answers. Carried through rather than
@@ -790,7 +839,7 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
 
     if style == "instruct":
         tmpl = fmt.get("template") or DEFAULT_INSTRUCTION_TEMPLATE
-        instruction = _last_user(messages)
+        instruction = _last_user(messages, fmt)
         # System text is prepended rather than dropped: an instruction-tuned
         # model has no system turn, but the words still steer it.
         system = " ".join(m["content"] for m in messages if m["role"] == "system")
@@ -798,14 +847,25 @@ def render_prompt(messages: list[dict], fmt: dict | None = None,
             instruction = system.strip() + "\n\n" + instruction
         return tmpl.format(instruction=instruction, response="")
 
-    return _last_user(messages)
+    return _last_user(messages, fmt)
 
 
-def _last_user(messages: list[dict]) -> str:
+def _last_user(messages: list[dict], fmt: dict | None = None) -> str:
+    """The last thing the user said, with a mark for anything it showed.
+
+    The chat path puts placeholders in through the template; the two plainer
+    styles build the prompt by hand and would otherwise drop the picture on
+    the floor with no sign it had been there.
+    """
+    from . import conversation
+    marks = conversation.placeholders_for(fmt)
     for m in reversed(messages):
-        if m["role"] == "user" and m["content"]:
-            return m["content"]
-    return messages[-1]["content"] if messages else ""
+        if m["role"] == "user" and (m["content"] or m.get("media")):
+            return conversation.with_placeholders(m["content"], m.get("media"), marks)
+    if not messages:
+        return ""
+    last = messages[-1]
+    return conversation.with_placeholders(last["content"], last.get("media"), marks)
 
 
 def stop_sequences(fmt: dict | None, specials: dict | None = None) -> list[str]:

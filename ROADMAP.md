@@ -635,10 +635,24 @@ it, in the metric's own direction, with its own label as the column heading.
 *Still to do:* early stopping in the trainers reads `val_loss` directly and
 will need the same treatment when a trainer with a different metric exists.
 
-**P4. Typed content end to end (L).** `content` in `common/conversation.py`
-becomes `str | list[Part]`; `_part_text` stops turning images into the string
-`"[image]"`; templates emit the model's placeholder tokens; `generate` and
-`/v1/chat/completions` accept content parts and can return an asset.
+**P4. Typed content end to end (L). Done, with one deliberate deviation.**
+`content` stays the words; a message's pictures and clips ride beside it in
+`media` as `{kind, ref|url}`. Every consumer of a message -- the validator,
+the loss mask, the trial splitter, the browser -- reads `content` as text,
+and making it sometimes a list would have broken each of them in a different
+place; a sibling field breaks none and reaches the same end. OpenAI content
+parts (`image_url`, `input_audio`), the Hub's part lists and the studio's own
+`asset:` references all normalise to it, so `/v1/chat/completions` and a
+dataset row arrive identical. `_part_text` no longer turns a picture into
+the string `"[image]"` in the middle of a sentence (which a model then
+learned to say). Rendering puts a placeholder in front of the words, one per
+item, in the format's own token (`image_token`, `audio_token`) or `<image>`
+by default -- through the chat template and on the two plainer paths alike.
+`media` is written to rows in key order and round-trips. The browser draws a
+turn's media beside its words. *Still to do:* sending an image part on to a
+hosted provider (`apimodels.chat_request` flattens to text); the playground's
+"keep it" drops media when writing a row; `generate` returning an asset
+waits for a model that produces one.
 
 **P5. Media capture in the playground (M).** Microphone, drop and paste for
 images and audio; an audio player and image viewer per turn.
