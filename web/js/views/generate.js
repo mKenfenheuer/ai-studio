@@ -7,6 +7,8 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtNum } from "../util.js";
+import { ribbon, rb, group, rbSelect } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 
 const MODES = [
   {
@@ -118,6 +120,11 @@ export async function generateView(mount, [fromJob] = []) {
       draw();
     });
     on(mount, "input", "#genApiModel", (_e, t) => { state.apiModel = t.value; });
+
+    // The ribbon's Start is the form's submit, one screen higher.
+    on(mount, "click", "[data-submit]", (_e, t) => {
+      $(`#${t.dataset.submit}`, mount)?.requestSubmit();
+    });
 
     on(mount, "submit", "#genForm", async (e) => {
       e.preventDefault();
@@ -370,27 +377,35 @@ function layout(state, online, playable, connected = [], labelOf = {},
   const hostedSource = state.source.startsWith("api:");
   return html`
     <div class="page-head">
-      <a href="#/data" class="tiny">← Datasets</a>
-      <h1 style="margin-top:6px">Write a dataset with a model</h1>
+      ${raw(breadcrumb({ href: "#/data", label: "Datasets" }))}
+      <h1 style="margin:6px 0 0">Write a dataset with a model</h1>
       <p class="sub">It runs as a job: progress, a log, and a stop button that
         keeps whatever it has written so far.</p>
     </div>
 
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "The brief" }], active: "home",
+      body: group("This run", [
+        rb(null, "▶", "Start writing", { cls: "primary", data: 'data-submit="genForm"' }),
+      ]) + (state.earlier?.length ? group("Start from", [
+        rbSelect("genFrom", {
+          title: "Load an earlier run's brief into this page",
+          value: state.from || "",
+          options: [["", "A blank brief"]].concat(state.earlier.slice(0, 40)
+            .map((j) => [j.id, j.name + (j.status === "succeeded" ? "" : ` — ${j.status}`)])),
+        }),
+      ]) : "") + group("Elsewhere", [
+        rb(null, "▤", "Datasets", { href: "#/data" }),
+        rb(null, "◉", "Model keys", { href: "#/account",
+          title: "Connect OpenAI, Anthropic, Azure or anything OpenAI-shaped" }),
+      ]),
+    }))}
+
     ${raw(state.earlier?.length ? html`
-      <div class="card" style="margin-bottom:14px">
-        <div class="field" style="margin:0">
-          <label for="genFrom">Start from an earlier run</label>
-          <select id="genFrom">
-            <option value="">Start from scratch</option>
-            ${raw(state.earlier.slice(0, 40).map((j) => `<option value="${
-              esc(j.id)}"${sel(j.id, state.from)}>${esc(j.name)}${
-              j.status === "succeeded" ? "" : ` — ${esc(j.status)}`}</option>`).join(""))}
-          </select>
-          <div class="hint">Its brief, situations, languages, tools and
-            settings are loaded into this page. Change what you want and start
-            a second run — the earlier one and its dataset are untouched.</div>
-        </div>
-      </div>` : "")}
+      <p class="muted tiny" style="margin:-4px 0 14px">Loading an earlier run
+        brings its brief, situations, languages, tools and settings into this
+        page. Change what you want and start a second run — the earlier one
+        and its dataset are untouched.</p>` : "")}
 
     ${raw(state.preName ? html`
       <div class="callout" style="margin-bottom:14px">

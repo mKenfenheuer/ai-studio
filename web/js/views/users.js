@@ -2,6 +2,8 @@
 import { api } from "../api.js";
 import { html, raw, esc, $, on, toast, fmtAgo, debounce,
          avatar } from "../util.js";
+import { ribbon, rb, group } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 import { session } from "../app.js";
 
 export async function usersView(mount) {
@@ -46,6 +48,13 @@ export async function usersView(mount) {
       view.pending = t.checked;
       view.focus = false;
       await refresh();
+    });
+
+    // The form it opens is at the foot of a page that can be long.
+    on(mount, "click", "#newUserBtn", () => {
+      const form = $("#newUser", mount);
+      form?.scrollIntoView({ behavior: "smooth", block: "center" });
+      $("#nu", mount)?.focus({ preventScroll: true });
     });
 
     on(mount, "submit", "#newUser", async (e) => {
@@ -114,12 +123,24 @@ function layout(page, view) {
   const admins = users.filter((u) => u.role === "admin" && u.active).length;
   return html`
     <div class="page-head">
-      <h1>People</h1>
+      ${raw(breadcrumb({ href: "#/settings", label: "Settings" }))}
+      <h1 style="margin:6px 0 0">People</h1>
       <p class="sub">${page.total} account${page.total === 1 ? "" : "s"} ·
         ${admins} administrator${admins === 1 ? "" : "s"}${
         page.pending_total ? ` · ${page.pending_total} imported from a `
           + `directory who have never signed in` : ""}</p>
     </div>
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "People" }], active: "home",
+      body: group("Accounts", [
+        rb("newUserBtn", "＋", "Add someone", { cls: "primary",
+          title: "The form is at the foot of this page" }),
+      ]) + group("Elsewhere", [
+        rb(null, "🔑", "Single sign-on", { href: "#/sso",
+          title: "Let people in with an account they already have" }),
+        rb(null, "⚙", "Settings", { href: "#/settings" }),
+      ]),
+    }))}
 
     <div class="card" style="margin-bottom:14px">
       <div class="row row-top" style="gap:10px;flex-wrap:wrap">

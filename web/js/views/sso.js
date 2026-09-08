@@ -15,6 +15,8 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, modal, fmtAgo } from "../util.js";
+import { ribbon, rb, group } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 
 export async function ssoView(mount) {
   let idps = [];
@@ -84,15 +86,21 @@ export async function ssoView(mount) {
 function layout(idps, presets) {
   return html`
     <div class="page-head">
-      <a href="#/settings" class="tiny">← Settings</a>
-      <div class="row-between" style="margin-top:6px;gap:10px;flex-wrap:wrap">
-        <h1 style="margin:0">Single sign-on</h1>
-        <button class="btn-primary btn-sm" id="addIdp">Add a sign-in method</button>
-      </div>
+      ${raw(breadcrumb({ href: "#/settings", label: "Settings" }))}
+      <h1 style="margin:6px 0 0">Single sign-on</h1>
       <p class="sub">Let people in with the account they already have, and
         find colleagues by name when sharing — without keeping a second list
         of who works here.</p>
     </div>
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "Sign-in methods" }], active: "home",
+      body: group("Methods", [
+        rb("addIdp", "＋", "Add a method", { cls: "primary" }),
+      ]) + group("Elsewhere", [
+        rb(null, "◍", "People", { href: "#/users" }),
+        rb(null, "⚙", "Settings", { href: "#/settings" }),
+      ]),
+    }))}
 
     ${raw(!idps.length ? empty() : idps.map(card).join(""))}
 

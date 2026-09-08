@@ -55,7 +55,8 @@ const job = (over = {}) => ({
   step: 100, total_steps: 100, created_at: now - 900, finished_at: now - 60,
   started_at: now - 880, has_model: true, owner_id: "usr_1", mine: true,
   summary: { best_val_loss: 1.23, final_loss: 1.1, steps: 100, duration_s: 800 },
-  access: "edit", shares: [], ...over,
+  access: "edit", shares: [], artifacts: [{ kind: "model", size_bytes: 2.7e8 }],
+  ...over,
 });
 const dataset = (over = {}) => ({
   id: "ds_1", name: "alpaca", rows: 52002, bytes: 4e7, source: "hub",
@@ -66,6 +67,12 @@ const dataset = (over = {}) => ({
 });
 
 const FIXTURES = [
+  // app.js runs its own boot when it is imported -- several views import
+  // `session` from it -- and an unanswered auth check puts the sign-in gate up
+  // over everything, which reads as "the view drew nothing".
+  [/\/api\/auth\/state/, { authenticated: true, setup_required: false,
+      must_change: false,
+      user: { id: "usr_1", username: "max", display_name: "Max", role: "admin" } }],
   [/\/api\/status/, { version: "0.1.0", join_token: "tok", hf_token_set: true,
                       runners_online: 1, runners_total: 1, jobs_running: 0, jobs_queued: 0 }],
   [/\/api\/runners$/, [{ id: "r1", name: "lab-box", status: "online", connected: true,
@@ -104,7 +111,21 @@ const FIXTURES = [
   [/\/api\/me\b/, { id: "usr_1", username: "max", display_name: "Max", role: "admin",
                     sessions: [{ user_agent: "Mozilla/5.0 Chrome", last_used: now }],
                     hf: { connected: false } }],
+  [/\/api\/sweeps\/[^/]+$/, { id: "sw_1", name: "SmolLM2 · trying lora_r",
+      varied: ["lora_r"], runs: [
+        { id: "job_1", name: "lora_r=8", status: "succeeded", kind: "finetune_llm",
+          config: { sweep_values: { lora_r: 8 } }, summary: { best_val_loss: 1.2, steps: 100 },
+          finished_at: now, created_at: now - 900 },
+        { id: "job_2", name: "lora_r=16", status: "succeeded", kind: "finetune_llm",
+          config: { sweep_values: { lora_r: 16 } }, summary: { best_val_loss: 1.1, steps: 100 },
+          finished_at: now, created_at: now - 900 }] }],
   [/\/api\/sweeps/, []],
+  [/\/api\/users/, { users: [{ id: "usr_1", username: "max", display_name: "Max",
+      role: "admin", active: true, created_at: now, last_login: now }],
+      total: 1, shown: 1, pending_total: 0 }],
+  [/\/api\/sso\/providers/, []],
+  [/\/api\/idp\/presets/, []],
+  [/\/api\/idp/, []],
   [/\/api\/hub\//, { models: [], datasets: [], configs: [] }],
   [/\/api\/providers/, { connections: [], studio: [] }],
   [/\/api\/me\/notify/, { url_hint: "", events: ["succeeded", "failed"] }],
@@ -141,6 +162,11 @@ const VIEWS = [
   ["settings", "./views/settings.js", "settingsView", []],
   ["account", "./views/account.js", "accountView", []],
   ["wizard", "./views/wizard.js", "wizardView", []],
+  ["generate", "./views/generate.js", "generateView", []],
+  ["sweep", "./views/sweep.js", "sweepView", ["sw_1"]],
+  ["rerun", "./views/rerun.js", "rerunView", ["job_1"]],
+  ["users", "./views/users.js", "usersView", []],
+  ["sso", "./views/sso.js", "ssoView", []],
 ];
 
 const main = document.getElementById("main");

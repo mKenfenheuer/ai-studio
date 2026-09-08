@@ -17,6 +17,8 @@
  */
 import { api } from "../api.js";
 import { html, raw, esc, $, on, toast } from "../util.js";
+import { ribbon, rb, group } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 
 // The settings people actually change between two runs, in the order they
 // tend to think about them. Only the ones the original run had are drawn --
@@ -116,6 +118,11 @@ export async function rerunView(mount, [jobId]) {
 
   mount.innerHTML = layout(job, cfg, online, runnerId, datasets, carried);
 
+  // The ribbon's Start is the same button as the form's, one screen higher.
+  on(mount, "click", "[data-submit]", (_e, t) => {
+    $(`#${t.dataset.submit}`, mount)?.requestSubmit();
+  });
+
   on(mount, "submit", "#rerunForm", async (e) => {
     e.preventDefault();
     const btn = $("#rerunGo", mount);
@@ -177,11 +184,22 @@ function layout(job, cfg, online, runnerId, datasets, carried) {
 
   return html`
     <div class="page-head">
-      <h1>Run again</h1>
-      <p class="sub">A copy of <a href="#/jobs/${job.id}">${job.name}</a>'s
-        settings. Change what you like and start a new run &mdash; the
-        original is left exactly as it is.</p>
+      ${raw(breadcrumb([{ href: "#/jobs", label: "Runs" },
+                        { href: `#/jobs/${job.id}`, label: job.name }]))}
+      <h1 style="margin:6px 0 0">Run again</h1>
+      <p class="sub">A copy of that run's settings. Change what you like and
+        start a new one &mdash; the original is left exactly as it is.</p>
     </div>
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "Settings" }], active: "home",
+      body: group("This copy", [
+        rb(null, "▶", "Start it", { cls: "primary", data: 'data-submit="rerunForm"' }),
+        rb(null, "≡", "The original", { href: `#/jobs/${esc(job.id)}` }),
+      ]) + group("Change more", [
+        rb(null, "✦", "Open the wizard", { href: "#/new",
+          title: "Changing the model, the format or the shape of the data needs the full flow" }),
+      ]),
+    }))}
 
     <form id="rerunForm">
       <div class="card">

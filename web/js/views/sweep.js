@@ -13,6 +13,8 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, on, toast, fmtAgo, fmtDuration, fmtNum,
          statusBadge } from "../util.js";
+import { ribbon, rb, group } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 
 export async function sweepView(mount, [sweepId]) {
   const paint = async () => {
@@ -39,23 +41,41 @@ function layout(s) {
   const span = (worst ?? 0) - (best ?? 0) || 1;
   const running = runs.filter((r) =>
     ["queued", "assigned", "running"].includes(r.status));
+  // The variant that actually won, as a run rather than as a number. It was
+  // computed to draw a bar next to and then nothing was offered to do with it:
+  // the point of a sweep is the winner, and the page stopped at naming it.
+  const winner = scored.length
+    ? scored.reduce((a, b) => (heldOut(a) <= heldOut(b) ? a : b)) : null;
 
   return html`
     <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${s.name}</h1>
-        <div class="row" style="gap:6px">
-          <span class="badge">${runs.length} runs</span>
-          ${raw(running.length
-            ? `<span class="badge badge-accent">${running.length} still going</span>`
-            : `<span class="badge badge-ok">all finished</span>`)}
-        </div>
-      </div>
+      ${raw(breadcrumb({ href: "#/jobs", label: "Runs" }))}
+      <h1 style="margin:6px 0 0">${s.name}</h1>
       <p class="sub">Varying ${(s.varied || []).join(", ") || "settings"} —
         everything else is identical, which is what makes the comparison mean
         something.</p>
     </div>
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "Variants" }], active: "home",
+      body: group("The winner", [
+        rb(null, "▷", "Try it", { cls: winner ? "primary" : "", disabled: !winner,
+          href: winner ? `#/play/${esc(winner.id)}` : "",
+          title: "Talk to the variant with the lowest held-out loss" }),
+        rb(null, "⟳", "Run it again", { disabled: !winner,
+          href: winner ? `#/jobs/${esc(winner.id)}/again` : "",
+          title: "Start from the winner's settings — for longer, or on more data" }),
+        rb(null, "≡", "Open it", { disabled: !winner,
+          href: winner ? `#/jobs/${esc(winner.id)}` : "" }),
+      ]) + group("All of them", [
+        rb(null, "⚖", "Compare", { href: "#/compare" }),
+        rb(null, "◎", "Score them", { href: "#/evals" }),
+        rb(null, "✦", "Another sweep", { href: "#/new" }),
+      ]),
+      right: `<span class="badge">${runs.length} runs</span>
+              ${running.length
+                ? `<span class="badge badge-accent">${running.length} still going</span>`
+                : `<span class="badge badge-ok">all finished</span>`}`,
+    }))}
 
     ${raw(running.length && scored.length < 2 ? html`
       <div class="callout" style="margin-bottom:14px">
