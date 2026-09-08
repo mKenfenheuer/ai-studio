@@ -476,12 +476,20 @@ function runRow(r, kind, p) {
     </tr>`;
 }
 
+/** "· 40 prompts", or nothing at all for a benchmark, whose questions are
+ *  fetched by recipe and never stored here. */
+function prompts(e) {
+  const n = (e.items || []).length || e.item_count || 0;
+  if (!n) return e.is_benchmark ? "" : " · no prompts yet";
+  return ` · ${fmtNum(n)} prompt${n === 1 ? "" : "s"}`;
+}
+
 function evalRow(e, kind, p) {
   return html`
     <tr>
       <td><a href="#/evals/${e.id}"><strong>${e.name}</strong></a>
         <div class="muted tiny">${e.is_benchmark ? "benchmark" : "prompt set"}
-          · ${fmtNum((e.items || []).length || e.item_count || 0)} prompts</div></td>
+          ${raw(prompts(e))}</div></td>
       <td class="tiny">${e.scorings
         ? `${e.scorings} scoring${e.scorings > 1 ? "s" : ""}`
         : `<span class="muted">not run yet</span>`}</td>
