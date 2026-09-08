@@ -154,7 +154,7 @@ const FIXTURES = [
                                     bytes: 4000, url: "/api/assets/ast_000000000002" } },
       offset: 0, total: 52002, columns: ["instruction", "output", "image", "clip", "split"] }],
   [/\/api\/datasets\/[^/]+$/, dataset()],
-  [/\/api\/datasets/, [dataset(), dataset({ id: "ds_2", name: "alpaca (cleaned)",
+  [/\/api\/datasets/, [dataset({ project_id: "prj_1" }), dataset({ id: "ds_2", name: "alpaca (cleaned)",
                                             parent_id: "ds_1", source: "derived", rows: 48000 }),
                        dataset({ id: "ds_3", name: "pets", rows: 1200, source: "upload",
                                  columns: ["image", "filename", "label", "split"],
@@ -486,6 +486,21 @@ if (!only) {
     const tiles = main.querySelectorAll("[data-tmpl]").length;
     say("format step draws", tiles > 0 && !text.includes("Reading a few real rows"),
         `${tiles} layout(s) offered`);
+    localStorage.removeItem("aistudio.wizard");
+
+    // The data step shows the project's own datasets, and folds the rest of
+    // the library away: choosing between two relevant ones and choosing
+    // between forty are different tasks.
+    localStorage.removeItem("aistudio.wizard");
+    location.hash = "#/new?project=prj_1&step=2";
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 300));
+    const heads = [...main.querySelectorAll("h3")].map((h) => h.textContent.trim());
+    const folded = [...main.querySelectorAll("details summary")]
+      .some((x) => /outside this project/i.test(x.textContent));
+    say("library scoped", heads.includes("In this project") && folded,
+        folded ? "the rest is folded away" : "no fold for the rest");
     localStorage.removeItem("aistudio.wizard");
 
     // A run without a project cannot be started at all: the wizard asks

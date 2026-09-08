@@ -166,6 +166,23 @@ const DRAFT_FIELDS = [
   "sweepKey", "sweepValues",
 ];
 
+/** Machines in the order somebody would choose them: the ones that can train
+ *  the most, first, and a machine with no graphics card last whatever else it
+ *  reports. Idle before busy at equal capability -- a run that can start now
+ *  beats a slightly larger card with a queue in front of it. */
+function byCapability(runners) {
+  const rank = (r) => {
+    const c = r.capabilities || {};
+    const gpu = c.backend && c.backend !== "cpu" ? 1 : 0;
+    return [gpu, c.vram_gb || 0, r.status === "busy" ? 0 : 1];
+  };
+  return [...runners].sort((a, b) => {
+    const [ga, va, fa] = rank(a);
+    const [gb, vb, fb] = rank(b);
+    return gb - ga || vb - va || fb - fa;
+  });
+}
+
 /** Whatever follows the `?` in `#/new?step=2&dataset=ds_x`.
  *
  *  Read from the hash rather than from location.search, because the router
@@ -322,7 +339,13 @@ export async function wizardView(mount) {
     api.runners(), api.starters(),
   ]);
   let known = allRunners;
-  let runners = allRunners.filter((r) => r.status !== "offline");
+  // Best first, so the tiles read as a recommendation and the default is the
+  // machine that can actually do the work. The first row used to win, which
+  // on a studio whose CPU-only controller answers first meant every run was
+  // planned for a machine with no graphics card -- silently, because a
+  // machine with no VRAM cannot say whether a model fits, and a machine with
+  // no 4-bit support offers no 4-bit. A 20B model then looked impossible.
+  let runners = byCapability(allRunners.filter((r) => r.status !== "offline"));
   state.runnerId = runners[0]?.id ?? null;
   state.vocab = starters.default_vocab || 8192;
 
@@ -354,7 +377,7 @@ export async function wizardView(mount) {
   const recheck = async () => {
     const fresh = await api.runners().catch(() => null);
     if (!fresh) return;
-    const live = fresh.filter((r) => r.status !== "offline");
+    const live = byCapability(fresh.filter((r) => r.status !== "offline"));
     const changed = live.length !== runners.length
       || live.some((r, i) => r.id !== runners[i]?.id);
     known = fresh;
@@ -523,6 +546,13 @@ function stepGoal(body, { state, runners, draw }) {
               <span class="row" style="gap:6px;flex-wrap:wrap">
                 ${raw(c.vram_gb ? `<span class="badge">${c.vram_gb} GB memory</span>` : "")}
                 ${raw(c.backend ? `<span class="badge">${esc(c.backend.toUpperCase())}</span>` : "")}
+                ${raw(!c.vram_gb ? `<span class="badge badge-warn"
+                  title="No graphics card: fine for trying the app out, far too slow for real training"
+                  >no GPU</span>` : "")}
+                ${raw(c.vram_gb && !((c.quantization || {})["4bit"])
+                  ? `<span class="badge badge-warn"
+                       title="Without 4-bit, a model has to fit in 16-bit — about four times the memory"
+                       >no 4-bit</span>` : "")}
                 ${raw(ceiling ? `<span class="badge badge-accent">${esc(ceiling)}</span>` : "")}
                 ${raw(r.status === "busy" ? `<span class="badge badge-warn">busy</span>` : "")}
               </span>
@@ -767,17 +797,42 @@ function ownModelPanel(state) {
   }
   if (r.status === "loading") return "";
   if (!rows.length) return "";
+  // This project's own models first, and by default the only ones offered.
+  // "Improve what we made last week" is the commonest second run, and it is
+  // the project's models that are meant, not the studio's forty.
+  const project = wizardParams().get("project");
+  const ours = rows.filter((m) => (m.project_id || null) === project);
+  const others = rows.filter((m) => (m.project_id || null) !== project);
+  const tile = (m) => html`
+    <button class="pick" data-own-model="${m.id}">
+      <span class="t">${m.name}
+        <span class="badge">${m.kind === "pretrain_llm"
+          ? "from scratch" : "adapter"}</span>
+        ${raw(m.stopped_early
+          ? `<span class="badge badge-warn">stopped early</span>` : "")}
+      </span>
+      <span class="d">${m.kind === "pretrain_llm"
+        ? (m.size || "built here") : (m.base_model || "")}</span>
+    </button>`;
   return html`
+    ${raw(ours.length ? html`
+      <div class="card" style="margin-top:14px">
+        <h3 style="margin:0 0 4px">Or carry on from this project's own models</h3>
+        <p class="muted tiny" style="margin:0 0 10px">A model this studio
+          produced can be a base like any other. For a model built from scratch
+          this teaches it your task; for a fine-tune it carries the same
+          adapter on with new data instead of starting a second one.</p>
+        <div class="grid grid-2">${raw(ours.map(tile).join(""))}</div>
+      </div>` : "")}
+    ${raw(others.length ? html`
     <details class="adv" style="margin-top:14px">
-      <summary>Or start from one of your own models
-        <span class="muted tiny">(${rows.length})</span></summary>
+      <summary>Models from the rest of the studio
+        <span class="muted tiny">(${others.length})</span></summary>
       <p class="muted tiny" style="margin:10px 0 0">
-        A model this studio produced can be a base like any other. For a model
-        built from scratch this teaches it your task; for a fine-tune it
-        carries the same adapter on with new data instead of starting a
-        second one.</p>
+        Anything finished here can be a base. Starting from one does not move
+        it out of its own project; this run stays in this one.</p>
       <div class="grid grid-2" style="margin-top:10px">
-        ${raw(rows.map((m) => html`
+        ${raw(others.map((m) => html`
           <button class="pick" data-own-model="${m.id}">
             <span class="t">${m.name}
               <span class="badge">${m.kind === "pretrain_llm"
@@ -789,7 +844,7 @@ function ownModelPanel(state) {
               ? (m.size || "built here") : (m.base_model || "")}</span>
           </button>`).join(""))}
       </div>
-    </details>`;
+    </details>` : "")}`;
 }
 
 function modelInfo(state) {
@@ -1001,8 +1056,8 @@ function libraryPicker(state, scratch) {
     return loading("Looking at your dataset library…");
   }
   if (r.status === "error") return "";
-  const mine = r.data || [];
-  if (!mine.length) {
+  const all = r.data || [];
+  if (!all.length) {
     return html`
       <div class="callout" style="margin-bottom:14px">
         <strong>Your library is empty</strong>
@@ -1011,29 +1066,54 @@ function libraryPicker(state, scratch) {
         it.
       </div>`;
   }
+  // What this project holds, and then everything else. A studio's library is
+  // every dataset anybody ever made; the two or three this project is about
+  // are the ones being chosen between, and burying them in forty rows is how
+  // the wrong one gets picked.
+  const project = wizardParams().get("project");
+  const mine = all.filter((d) => (d.project_id || null) === project);
+  const outside = all.filter((d) => (d.project_id || null) !== project);
+
+  const tile = (d) => {
+    const splits = Object.entries(d.splits || {});
+    return html`
+      <button class="pick ${state.studioDataset?.id === d.id ? "selected" : ""}"
+              data-studio-ds="${d.id}">
+        <span class="t">${d.name}
+          <span class="badge">${fmtNum(d.rows)} rows</span>
+          ${raw(d.mine ? "" : `<span class="badge badge-accent">shared</span>`)}
+        </span>
+        <span class="d">
+          ${raw(splits.length > 1
+            ? splits.map(([n, c]) =>
+                `<span class="badge">${esc(n)} ${fmtNum(c)}</span>`).join(" ")
+            : "")}
+          ${raw(d.origin ? `<span class="mono tiny">${esc(d.origin)}</span>` : "")}
+        </span>
+      </button>`;
+  };
 
   return html`
-    <h3 style="margin:0 0 8px">From your library</h3>
-    <div class="grid grid-2">
-      ${raw(mine.map((d) => {
-        const splits = Object.entries(d.splits || {});
-        return html`
-          <button class="pick ${state.studioDataset?.id === d.id ? "selected" : ""}"
-                  data-studio-ds="${d.id}">
-            <span class="t">${d.name}
-              <span class="badge">${fmtNum(d.rows)} rows</span>
-              ${raw(d.mine ? "" : `<span class="badge badge-accent">shared</span>`)}
-            </span>
-            <span class="d">
-              ${raw(splits.length > 1
-                ? splits.map(([n, c]) =>
-                    `<span class="badge">${esc(n)} ${fmtNum(c)}</span>`).join(" ")
-                : "")}
-              ${raw(d.origin ? `<span class="mono tiny">${esc(d.origin)}</span>` : "")}
-            </span>
-          </button>`;
-      }).join(""))}
-    </div>`;
+    <h3 style="margin:0 0 8px">In this project</h3>
+    ${raw(mine.length ? html`
+      <div class="grid grid-2">${raw(mine.map(tile).join(""))}</div>`
+      : html`
+      <div class="callout" style="margin-bottom:14px">
+        <strong>This project has no data in it yet</strong>
+        <a href="#/data?project=${esc(project || "")}">Upload or import
+        something</a> and it lands here. Anything below can be trained on too —
+        the run stays in this project either way.
+      </div>`)}
+    ${raw(outside.length ? html`
+      <details class="adv" style="margin-top:12px">
+        <summary>Datasets outside this project
+          <span class="muted tiny">(${outside.length})</span></summary>
+        <p class="muted tiny" style="margin:10px 0 0">Training on one of these
+          does not move it: it stays where it is, and this run stays in this
+          project.</p>
+        <div class="grid grid-2" style="margin-top:10px">
+          ${raw(outside.map(tile).join(""))}</div>
+      </details>` : "")}`;
 }
 
 function dataDetail(state, scratch) {
@@ -2426,7 +2506,7 @@ function stepReview(body, ctx) {
       // of a 2,000-row one and a 200,000-row set got it too.
       dataset_rows: datasetRows(state),
     }), draw);
-    body.innerHTML = finetuneReview(state, runner, caps);
+    body.innerHTML = finetuneReview(state, runner, caps, runners);
     if (state.ftPlan.status === "ready") {
       wireOverrides(body, ctx);
       askPreflight(state, ctx);
@@ -2455,8 +2535,13 @@ function stepReview(body, ctx) {
  *  precision either way, which is why the quality cost is small and why this
  *  is not the same choice as `dtype` above.
  */
-function quantField(s, plan, caps) {
+function quantField(s, plan, caps, runners = [], runner = null) {
   const has4bit = !!((caps.quantization || {})["4bit"]);
+  // Where it could be done instead. Being told "not available on this
+  // machine" and nothing else, on a studio that has a machine which can, is
+  // a dead end with the answer one tab away.
+  const elsewhere = has4bit ? null
+    : runners.find((r) => (r.capabilities || {}).quantization?.["4bit"]);
   const mem = plan.memory || {};
   const fits16 = plan.fit?.verdict === "fits";
   const only4 = plan.fit?.verdict === "fits_quantized";
@@ -2473,7 +2558,12 @@ function quantField(s, plan, caps) {
             mem.int4_gb ? ` · about ${mem.int4_gb} GB` : ""}${
             has4bit ? "" : " · not available on this machine"}</option>
       </select>
-      <div class="hint">${raw(only4
+      <div class="hint">${raw(!has4bit && elsewhere
+        ? `This machine (${esc(runner?.name || "the one chosen")}) has no
+           working 4-bit support, so a model has to fit in 16-bit here.
+           <strong>${esc(elsewhere.name)}</strong> can do 4-bit — go back to
+           the first step and choose it. `
+        : "")}${raw(only4
         ? "This model only fits on this card in 4-bit, so that is what the "
           + "plan chose. Quality drops slightly; not running at all drops it "
           + "further."
@@ -2486,7 +2576,7 @@ function quantField(s, plan, caps) {
     </div>`;
 }
 
-function finetuneReview(state, runner, caps) {
+function finetuneReview(state, runner, caps, ctxRunners = []) {
   const r = state.ftPlan;
   if (r.status === "loading") return loading("Working out the best settings for your machine…");
   if (r.status === "error") return failed(r.error);
@@ -2581,7 +2671,7 @@ function finetuneReview(state, runner, caps) {
             </select>
             <div class="hint">Recommended here: ${caps.recommended_dtype}</div>
           </div>
-          ${raw(quantField(s, plan, caps))}
+          ${raw(quantField(s, plan, caps, ctxRunners, runner))}
           ${raw(state.preview.data?.style === "chat" ? html`
             <div class="field">
               <label for="f_train_on">Learn from</label>

@@ -2479,6 +2479,10 @@ async def playground(request: Request) -> list[dict]:
             "system_prompt": spec["system_prompt"],
             "reasoning": spec["reasoning"],
             "stopped_early": job["status"] == "cancelled",
+            # Which project produced it. The wizard shows the project's own
+            # models first, because "start from what we already made here" is
+            # the normal next step and the rest of the studio is noise.
+            "project_id": job.get("project_id"),
         }
         # Which dataset this run learned from, so the playground can offer its
         # held-out rows to try. The held-out split is the one that matters --
