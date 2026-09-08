@@ -600,7 +600,8 @@ class Fleet:
         # SQLite would turn a chat into a few hundred transactions a minute.
         # A counted answer to "how long are these rows, really". Always to a
         # waiting caller, never broadcast: nobody's browser wants it.
-        if kind in ("tokenize_done", "tokenize_error"):
+        if kind in ("tokenize_done", "tokenize_error",
+                    "classify_done", "classify_error"):
             if waiter := self.waiters.get(msg.get("request_id")):
                 waiter.put_nowait(msg)
             return

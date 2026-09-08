@@ -30,15 +30,19 @@ export async function visionView(mount) {
   const usable = datasets.filter((d) => (d.columns || []).some((c) => /image|picture|photo/i.test(c)));
   let picked = usable[0]?.id || "";
   let inspect = null;
+  let peek = null;                 // a page of rows, for the thumbnail grid
   const tabs = tabState("vision", TABS, "setup");
 
   const draw = () => {
-    mount.innerHTML = layout({ usable, picked, inspect, datasets });
+    mount.innerHTML = layout({ usable, picked, inspect, datasets, peek });
     wire();
   };
 
   async function loadInspect() {
-    if (!picked) { inspect = null; return draw(); }
+    if (!picked) { inspect = null; peek = null; return draw(); }
+    // The pictures themselves, a page of them, so the choice is made looking
+    // at what is there rather than at a row count.
+    api.datasetRows(picked, 0, 48).then((r) => { peek = r; draw(); }).catch(() => {});
     try { inspect = await api.datasetInspect(picked); } catch { inspect = null; }
     draw();
   }
@@ -77,7 +81,42 @@ export async function visionView(mount) {
   loadInspect();
 }
 
-function layout({ usable, picked, inspect, datasets }) {
+/** A few of the pictures, grouped by label, with how many of each there are.
+ *
+ *  The label distribution is the thing to look at before training a
+ *  classifier: a category with nine pictures beside one with nine hundred
+ *  is a model that will call everything the big one. */
+function thumbGrid(peek, imageCol, labelCol, labelType) {
+  if (!peek?.rows?.length) return "";
+  const assets = peek.assets || {};
+  const byLabel = new Map();
+  for (const r of peek.rows) {
+    const a = /^asset:(ast_[0-9a-f]{12})$/.exec(String(r.row[imageCol] || ""));
+    const label = String(r.row[labelCol] ?? "—");
+    if (!byLabel.has(label)) byLabel.set(label, []);
+    if (a && assets[a[1]]?.kind === "image") byLabel.get(label).push(assets[a[1]].url);
+  }
+  const groups = [...byLabel.entries()].slice(0, 12);
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin:0 0 4px">What is in it</h3>
+      <p class="muted tiny">The first ${peek.rows.length} rows, by label${
+        labelType?.distinct ? ` · ${labelType.distinct} categories in the sample` : ""}.
+        A category with far fewer pictures than the others is one the model
+        will barely learn.</p>
+      ${raw(groups.map(([label, urls]) => html`
+        <div style="margin-top:8px">
+          <div class="tiny"><strong>${label}</strong>
+            <span class="muted">· ${urls.length} of the ${peek.rows.length} shown</span></div>
+          <div class="row" style="gap:4px;flex-wrap:wrap;margin-top:4px">
+            ${raw(urls.slice(0, 8).map((u) =>
+              `<img class="thumb" src="${esc(u)}" alt="" loading="lazy" style="max-width:64px;max-height:48px">`).join(""))}
+          </div>
+        </div>`).join(""))}
+    </div>`;
+}
+
+function layout({ usable, picked, inspect, datasets, peek }) {
   const d = usable.find((x) => x.id === picked);
   const cols = d?.columns || [];
   const imageCol = cols.find((c) => /image|picture|photo/i.test(c)) || "image";
@@ -126,6 +165,7 @@ function layout({ usable, picked, inspect, datasets }) {
               media.missing_files ? ` · <span class="badge badge-err">${media.missing_files} missing</span>` : "")}.
               <a href="#/data/${esc(picked)}">Check the data</a> first if anything is flagged.</p>` : "")}
         </div>
+        ${raw(thumbGrid(peek, imageCol, labelCol, labelType))}
         <div class="card">
           <h3 style="margin:0 0 8px">Which model</h3>
           <div class="field">

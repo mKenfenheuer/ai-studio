@@ -169,10 +169,19 @@ def usage(max_age_s: float = 60.0) -> dict:
 
 
 def _protected(keep: Iterable[str]) -> set[str]:
+    """Directories eviction must not touch, for the models named in `keep`.
+
+    The staging directory of a download in progress is one of them. It ends
+    in `.partial`, and leftover partials are the first thing eviction reaches
+    for -- which, on a disk near its floor, meant a fetch made room for
+    itself by deleting the directory it was about to write into, and failed
+    with "no such file" on a path it had just created.
+    """
     names = set()
     for job_id in keep or ():
-        names.add(job_id)
-        names.add(job_id + "-adapter")
+        for name in (job_id, job_id + "-adapter"):
+            names.add(name)
+            names.add(name + ".partial")
     return names
 
 

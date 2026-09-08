@@ -381,10 +381,18 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
     if not rows:
         raise HTTPException(400, "That dataset returned no rows.")
 
+    # Pictures and clips in a Hub dataset arrive as links into Hugging Face's
+    # viewer, which expire. Fetched now and stored, so the rows point at
+    # files this studio holds rather than at URLs that will be dead by the
+    # time anybody trains on them.
+    fetched = await _materialise_media(rows, user["id"])
+
     created = await run_in_threadpool(
         ds.register,
         user["id"], payload.get("name") or hub_id.split("/")[-1], "hub",
         iter(rows), origin=hub_id)
+    if fetched["stored"] or fetched["failed"]:
+        created["media"] = fetched
     # The note describes what arrived, not what was asked for. Those are the
     # same thing right up until Hugging Face stops serving rows halfway.
     got = created.get("splits") or {}
@@ -395,6 +403,13 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
     if incomplete:
         note += (" Hugging Face stopped serving rows partway through %s, so "
                  "that split is incomplete." % ", ".join(incomplete))
+    if fetched["stored"]:
+        note += (" %s picture%s and clip%s were fetched into this studio's "
+                 "store%s." % (f"{fetched['stored']:,}",
+                               "" if fetched["stored"] == 1 else "s",
+                               "" if fetched["stored"] == 1 else "s",
+                               (" (%d could not be fetched and were left as "
+                                "links)" % fetched["failed"]) if fetched["failed"] else ""))
     db.update_dataset(created["id"], notes=note)
     created["notes"] = note
     created["incomplete"] = incomplete
@@ -709,3 +724,63 @@ def dataset_runs(request: Request, dataset_id: str) -> list[dict]:
                         if isinstance(summary, dict) and summary.get("best_val_loss") is not None
                         else None)})
     return out
+
+
+# A cell the datasets-server gives for an image column: a link into its own
+# viewer plus the size. Audio is a list of them, one per encoding.
+def _viewer_link(value: object) -> str:
+    if isinstance(value, dict) and isinstance(value.get("src"), str):
+        return value["src"]
+    if isinstance(value, list) and value and isinstance(value[0], dict) \
+            and isinstance(value[0].get("src"), str):
+        return value[0]["src"]
+    return ""
+
+
+async def _materialise_media(rows: list[dict], owner_id: str) -> dict:
+    """Fetch every viewer link in these rows into the store, in place.
+
+    Eight at a time, with a ceiling on how many are tried: an import of
+    ten thousand rows of pictures is a real download and is capped rather
+    than allowed to run for an hour inside one request. Rows past the cap
+    keep their links, and the note says so.
+    """
+    import asyncio
+    import httpx
+
+    targets = []
+    for r in rows:
+        for col, value in list(r.items()):
+            if url := _viewer_link(value):
+                targets.append((r, col, url))
+    if not targets:
+        return {"stored": 0, "failed": 0, "skipped": 0}
+    cap = 4000
+    tried, rest = targets[:cap], targets[cap:]
+    stored = failed = 0
+    sem = asyncio.Semaphore(8)
+
+    async def one(client, r, col, url):
+        nonlocal stored, failed
+        async with sem:
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                name = url.split("?")[0].rsplit("/", 1)[-1] or "file"
+                mime = assets.guess_mime(name, resp.headers.get("content-type", ""))
+                if not mime:
+                    raise ValueError("not a kind of file the store holds")
+                row = await run_in_threadpool(
+                    assets.store, [resp.content], name, mime, owner_id)
+                r[col] = assets.ref(row["id"])
+                stored += 1
+            except Exception:  # noqa: BLE001 - the link is kept as it was
+                failed += 1
+
+    try:
+        assets.check_quota(owner_id)
+    except ValueError:
+        return {"stored": 0, "failed": 0, "skipped": len(targets)}
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        await asyncio.gather(*(one(client, r, c, u) for r, c, u in tried))
+    return {"stored": stored, "failed": failed, "skipped": len(rest)}

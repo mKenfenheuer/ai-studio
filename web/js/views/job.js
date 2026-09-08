@@ -337,6 +337,43 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   // which raises the same question three messages into a conversation.
   on(mount, "click", "#scoreRun", () => openScoreDialog(getJob()));
 
+  // ---- asking a classifier about a picture
+  async function tryPicture(file) {
+    const status = $("#tryStatus", mount);
+    const out = $("#tryResult", mount);
+    if (!file || !status || !out) return;
+    status.textContent = "Asking…";
+    out.innerHTML = `<img src="${URL.createObjectURL(file)}" alt="" style="max-width:200px;max-height:160px;border-radius:6px;display:block">`;
+    try {
+      const r = await api.classify(jobId, file);
+      status.textContent = `${r.runner ? `on ${r.runner} · ` : ""}${r.seconds}s`;
+      const top = r.labels?.[0];
+      out.innerHTML += html`
+        <p style="margin:8px 0 4px"><strong>${top?.label || "—"}</strong>
+          <span class="muted tiny">${top ? `${(top.probability * 100).toFixed(1)}% sure` : ""}</span></p>
+        <table class="table" style="max-width:420px"><tbody>
+          ${raw((r.labels || []).map((l) => html`
+            <tr><td class="tiny">${l.label}</td>
+              <td style="min-width:160px"><div class="meter"><i style="width:${(l.probability * 100).toFixed(1)}%"></i></div></td>
+              <td class="tiny muted">${(l.probability * 100).toFixed(1)}%</td></tr>`).join(""))}
+        </tbody></table>`;
+    } catch (e) { status.textContent = ""; toast(e.message, "err"); }
+  }
+  on(mount, "change", "#tryFile", (_e, t) => tryPicture(t.files?.[0]));
+  on(mount, "click", "#tryClassifier", () => {
+    const card = $("#tryCard", mount);
+    if (card) { card.hidden = false; card.scrollIntoView({ behavior: "smooth" }); $("#tryFile", mount)?.click(); }
+  });
+  const tryCardEl = $("#tryCard", mount);
+  if (tryCardEl) {
+    tryCardEl.addEventListener("dragover", (e) => { e.preventDefault(); tryCardEl.classList.add("dropping"); });
+    tryCardEl.addEventListener("dragleave", () => tryCardEl.classList.remove("dropping"));
+    tryCardEl.addEventListener("drop", (e) => {
+      e.preventDefault(); tryCardEl.classList.remove("dropping");
+      tryPicture(e.dataTransfer.files?.[0]);
+    });
+  }
+
   on(mount, "click", "#serveAs", async () => {
     const job = getJob();
     let names = [];
@@ -819,6 +856,18 @@ function mergeLayout(job) {
       <div id="mergeResult" style="margin-top:10px"></div>
     </div>
 
+    ${raw(job.kind === "finetune_vision_cls" ? html`
+      <div class="card" id="tryCard" data-sec="home model" style="margin-bottom:14px">
+        <h3 style="margin:0 0 6px">Try it on a picture</h3>
+        <p class="muted tiny">Drop a picture here, or choose one. It is sent to a
+          machine that has the model and comes back with every category and how
+          sure it was.</p>
+        <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="file" id="tryFile" accept="image/*">
+          <span class="tiny muted" id="tryStatus"></span>
+        </div>
+        <div id="tryResult" style="margin-top:10px"></div>
+      </div>` : "")}
     <div id="cardRow" data-sec="model"></div>
 
     <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
@@ -1175,6 +1224,18 @@ function layout(job, scratch, experts = 0) {
 
     <div id="furtherRow" data-sec="model"></div>
 
+    ${raw(job.kind === "finetune_vision_cls" ? html`
+      <div class="card" id="tryCard" data-sec="home model" style="margin-bottom:14px">
+        <h3 style="margin:0 0 6px">Try it on a picture</h3>
+        <p class="muted tiny">Drop a picture here, or choose one. It is sent to a
+          machine that has the model and comes back with every category and how
+          sure it was.</p>
+        <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="file" id="tryFile" accept="image/*">
+          <span class="tiny muted" id="tryStatus"></span>
+        </div>
+        <div id="tryResult" style="margin-top:10px"></div>
+      </div>` : "")}
     <div id="cardRow" data-sec="model"></div>
 
     <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
@@ -1710,8 +1771,13 @@ function runRibbon(job, tab) {
       title: "Start a new run from this one's settings" }),
     rb(null, "✎", "Rename", { data: 'data-rename="1"' }),
   ]) + group("Use it", [
-    rb(null, "▷", "Try it out", { cls: "primary", disabled: !usable,
-      href: usable ? `#/play/${esc(job.id)}` : "" }),
+    // A classifier is tried on this page -- drop a picture, read the labels
+    // -- rather than in a playground built around a conversation.
+    job.kind === "finetune_vision_cls"
+      ? rb("tryClassifier", "▷", "Try it out", { cls: "primary", disabled: !usable,
+          title: "Drop a picture and see what it says" })
+      : rb(null, "▷", "Try it out", { cls: "primary", disabled: !usable,
+          href: usable ? `#/play/${esc(job.id)}` : "" }),
     // The question a finished run actually raises -- is this better than what
     // I started with -- had no button anywhere on this page. It does now.
     rb("scoreRun", "◎", "Score it", { disabled: !usable,

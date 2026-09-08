@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import (Body, FastAPI, Header, HTTPException, Query, Request,
+from fastapi import (Body, FastAPI, File, Header, HTTPException, Query, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -2353,6 +2353,65 @@ async def job_system_prompt(request: Request, job_id: str) -> dict:
         cfg["system_prompt"] = found
         db.update_job_config(job_id, cfg)
     return {"system_prompt": found, "source": "dataset" if found else "none"}
+
+
+@app.post("/api/jobs/{job_id}/classify")
+async def classify_picture(request: Request, job_id: str,
+                           file: UploadFile = File(...)) -> dict:
+    """One picture to a classifier this studio trained; every label back.
+
+    The playground is built around a conversation and a classifier has none,
+    so this is its own small door: the picture goes to a machine that can
+    decode images and has, or can fetch, the model, and the answer comes back
+    with a probability per category.
+    """
+    job = _job_or_404(request, job_id)
+    if job["kind"] != "finetune_vision_cls":
+        raise HTTPException(400, "That run is not a classifier.")
+    if not _has_artifact(job_id):
+        raise HTTPException(400, "That run has no saved model to ask.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "The picture is empty.")
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(413, "That picture is over 20 MB.")
+
+    # A machine that can look at pictures. The one that trained it has the
+    # model on disk already; failing that, any that reports vision, or any
+    # at all if none has said either way.
+    online = [r for r in db.list_runners()
+              if r["status"] != "offline" and r["id"] in fleet.connections]
+    def ok(r):
+        mods = (r.get("capabilities") or {}).get("modalities")
+        return mods is None or "vision" in mods
+    able = [r for r in online if ok(r)]
+    if not able:
+        raise HTTPException(503, "No connected machine can look at pictures "
+                                 "right now.")
+    able.sort(key=lambda r: (bool(fleet.busy.get(r["id"])),
+                             r["id"] != job.get("runner_id")))
+    runner = able[0]
+
+    import base64
+    rid = db.new_id("cls")
+    queue: asyncio.Queue = asyncio.Queue()
+    fleet.waiters[rid] = queue
+    try:
+        sent = await fleet.send_to_runner(runner["id"], {
+            "type": "classify", "request_id": rid, "job_id": job_id,
+            "image_b64": base64.b64encode(raw).decode("ascii"), "top": 8})
+        if not sent:
+            raise HTTPException(503, "That machine dropped off just now.")
+        msg = await asyncio.wait_for(queue.get(), 180.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "The machine did not answer in three "
+                                 "minutes.") from None
+    finally:
+        fleet.waiters.pop(rid, None)
+    if msg.get("type") == "classify_error":
+        raise HTTPException(502, msg.get("error") or "The classifier failed.")
+    return {"labels": msg.get("labels") or [], "seconds": msg.get("seconds"),
+            "size": msg.get("size"), "runner": runner["name"]}
 
 
 @app.post("/api/jobs/{job_id}/chat")

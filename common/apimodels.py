@@ -298,7 +298,8 @@ def chat_request(conn: dict, model: str, messages: list[dict],
         # role. Sending it as a message is accepted by nothing.
         system = "\n\n".join(m["content"] for m in messages
                              if m.get("role") == "system" and m.get("content"))
-        turns = [{"role": m["role"], "content": m.get("content") or ""}
+        turns = [{"role": m["role"],
+                  "content": _anthropic_parts(m.get("content") or "", m.get("media"))}
                  for m in messages if m.get("role") in ("user", "assistant")]
         body: dict[str, Any] = {
             "model": model, "max_tokens": max_tokens, "messages": turns,
@@ -367,6 +368,41 @@ def chat_request(conn: dict, model: str, messages: list[dict],
             "json": body}
 
 
+def _openai_parts(content: str, media: list | None) -> list[dict] | None:
+    """Text plus pictures as Chat Completions content parts, or None."""
+    items = [mm for mm in (media or []) if isinstance(mm, dict)
+             and mm.get("kind") == "image" and mm.get("url")]
+    if not items:
+        return None
+    parts: list[dict] = []
+    if content:
+        parts.append({"type": "text", "text": content})
+    for mm in items:
+        parts.append({"type": "image_url", "image_url": {"url": mm["url"]}})
+    return parts
+
+
+def _anthropic_parts(content: str, media: list | None) -> list[dict] | str:
+    """The same, in Anthropic's spelling: base64 for a data URL, else a URL."""
+    items = [mm for mm in (media or []) if isinstance(mm, dict)
+             and mm.get("kind") == "image" and mm.get("url")]
+    if not items:
+        return content
+    parts: list[dict] = []
+    for mm in items:
+        url = mm["url"]
+        if url.startswith("data:"):
+            head, _, data = url.partition(",")
+            mime = head[5:].split(";")[0] or "image/png"
+            parts.append({"type": "image", "source": {
+                "type": "base64", "media_type": mime, "data": data}})
+        else:
+            parts.append({"type": "image", "source": {"type": "url", "url": url}})
+    if content:
+        parts.append({"type": "text", "text": content})
+    return parts
+
+
 def _chat_messages(messages: list[dict]) -> list[dict]:
     """Canonical messages as Chat Completions wants them.
 
@@ -385,6 +421,18 @@ def _chat_messages(messages: list[dict]) -> list[dict]:
             item["content"] = content
             if call_id := m.get("tool_call_id"):
                 item["tool_call_id"] = call_id
+            out.append(item)
+            continue
+        # A turn that shows a picture. Sent as the parts every Chat
+        # Completions provider reads -- text, then one image_url per item --
+        # rather than flattened to its words, which is what happened before
+        # and meant a hosted model was asked "what is this?" about nothing.
+        # An asset reference has to have been turned into a data URL by the
+        # runner first; one that was not is left out rather than sent as a
+        # string the provider cannot open.
+        parts = _openai_parts(content, m.get("media"))
+        if parts:
+            item["content"] = parts
             out.append(item)
             continue
         if calls := m.get("tool_calls"):

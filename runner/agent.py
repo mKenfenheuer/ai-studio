@@ -324,6 +324,12 @@ class Runner:
                 # silently cut off, so it is worth asking somebody who knows.
                 threading.Thread(target=self._tokenize, args=(msg,),
                                  daemon=True, name="tokenize").start()
+            elif kind == "classify":
+                # One picture, every label with its probability. Off the
+                # socket thread for the same reason tokenize is: the first
+                # call fetches the model.
+                threading.Thread(target=self._classify, args=(msg,),
+                                 daemon=True, name="classify").start()
             elif kind == "generate":
                 self._start_generation(msg)
             elif kind == "generate_cancel":
@@ -345,6 +351,19 @@ class Runner:
                 checkpoints.discard(msg.get("job_id") or "")
             elif kind == "discard_checkpoint":
                 checkpoints.discard(msg.get("job_id") or "")
+
+    def _classify(self, msg: dict) -> None:
+        rid = msg.get("request_id")
+        try:
+            from runner import classify as clf
+            out = clf.classify(self.controller_url, self.token,
+                               msg.get("job_id") or "", msg.get("image_b64") or "",
+                               top=int(msg.get("top") or 5))
+            self.outbox.put({"type": "classify_done", "request_id": rid,
+                             "runner": self.name, **out})
+        except Exception as e:  # noqa: BLE001 - any failure is the answer
+            self.outbox.put({"type": "classify_error", "request_id": rid,
+                             "error": _friendly_error(e)})
 
     def _tokenize(self, msg: dict) -> None:
         """Count the tokens in some texts, with a named tokenizer.

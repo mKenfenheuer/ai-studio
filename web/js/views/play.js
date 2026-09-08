@@ -157,6 +157,7 @@ function chatView(mount, run, runs) {
   // moment they are dropped, so sending is instant and a failed upload is
   // known before anybody has typed a question around it.
   let pending = [];            // [{kind, ref, url, name}]
+  let recorder = null;         // the MediaRecorder while the microphone is on
 
   // The held-out example currently loaded, if any.
   let sample = null;         // {index, messages, tools, prompt, expected, ...}
@@ -283,6 +284,9 @@ function chatView(mount, run, runs) {
       tabs: TABS, active: tab,
       body: group("Conversation", [
         ui.multiturn ? rb("resetChat", "✎", "New conversation") : "",
+        rb("recordBtn", recorder ? "■" : "●", recorder ? "Stop recording" : "Record",
+           { cls: recorder ? "danger" : "",
+             title: "Record from the microphone and send it with the next message" }),
         rb("keepTurns", "⊕", "Keep it", {
           disabled: !turns.some((m) => m.role === "assistant"),
           title: "Write this exchange into a dataset, to train on next time" }),
@@ -662,6 +666,40 @@ function chatView(mount, run, runs) {
       paintPending();
     } catch (e) { toast(e.message, "err"); }
   }
+
+  // The microphone. Recorded in the browser's own container -- WebM or OGG,
+  // whichever it has -- stored like a dropped file, sent with the next
+  // message. A speech model's playground is this button and nothing else.
+  let chunks = [];
+  async function toggleRecording() {
+    if (recorder) {
+      recorder.stop();
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return toast("This browser cannot record here (it needs a secure origin).", "err");
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"]
+        .find((t) => window.MediaRecorder?.isTypeSupported?.(t)) || "";
+      recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+      chunks = [];
+      recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const mime = recorder.mimeType || type || "audio/webm";
+        const ext = mime.includes("ogg") ? "ogg" : "webm";
+        const file = new File(chunks, `recording-${Date.now()}.${ext}`, { type: mime });
+        recorder = null;
+        paintRibbon();
+        if (file.size) attach([file]);
+      };
+      recorder.start();
+      paintRibbon();
+    } catch (e) { toast(`Could not start the microphone: ${e.message}`, "err"); recorder = null; }
+  }
+  on(mount, "click", "#recordBtn", toggleRecording);
 
   const chatCard = $(".chat", mount);
   chatCard.addEventListener("dragover", (e) => {

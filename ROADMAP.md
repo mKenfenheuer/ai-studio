@@ -619,10 +619,12 @@ dimensions, WAV durations, files whose bytes are not what their name says
 (an HTML error page saved as `.png`, the classic), pictures under 64 px, and
 files gone from disk; each becomes a finding on the Check tab. A row that
 points at a stored file is not empty, to `inspect` and to `drop_empty`,
-which had declared a folder of photographs 100% empty. *Still to do:* Hub
-image/audio datasets fetched as assets rather than as dead viewer URLs;
-durations for formats other than WAV (needs decoding, so the runner's job);
-the text-length warnings still fire on a set with no text in it.
+which had declared a folder of photographs 100% empty. A Hub image or audio dataset is fetched into the store on import -- the
+viewer links it arrives with expire -- eight at a time, capped at four
+thousand files per import, with the rest left as links and the note saying
+so. *Still to do:* durations for formats other than WAV (needs decoding, so
+the runner's job); the text-length warnings still fire on a set with no text
+in it.
 
 **P3. Typed samples and metrics (M). Done.** A sample is
 `{step, kind: text|image|audio|table, text?, prompt?, asset_id?, caption?}`;
@@ -653,10 +655,11 @@ learned to say). Rendering puts a placeholder in front of the words, one per
 item, in the format's own token (`image_token`, `audio_token`) or `<image>`
 by default -- through the chat template and on the two plainer paths alike.
 `media` is written to rows in key order and round-trips. The browser draws a
-turn's media beside its words. *Still to do:* sending an image part on to a
-hosted provider (`apimodels.chat_request` flattens to text); the playground's
-"keep it" drops media when writing a row; `generate` returning an asset
-waits for a model that produces one.
+turn's media beside its words. A picture reaches a hosted provider as the content parts it reads --
+OpenAI's `image_url`, Anthropic's base64 source -- with a stored file
+fetched by the runner and inlined as a data URL first. "Keep it" keeps the
+media. *Still to do:* `generate` returning an asset waits for a model that
+produces one.
 
 **P5. Media capture in the playground (M). Done, bar the microphone.** Drop
 or paste a picture or a clip onto the chat and it is stored at once and
@@ -664,9 +667,9 @@ shown in a strip above the box; it goes with the next message as that turn's
 `media`, is drawn beside the words in the log, is kept when the exchange is
 written back to a dataset, and reaches the model as its format's placeholder.
 A turn that shows something and says nothing is a question, on both doors.
-The strip says plainly when the model was not trained to look. *Still to
-do:* recording from the microphone, and the `seesPictures` flag reads a
-capability the run does not yet carry (P6).
+The strip says plainly when the model was not trained to look. The microphone records in the browser's own container and goes in like
+a dropped file. *Still to do:* the `seesPictures` flag reads a capability
+the run does not yet carry.
 
 **P6. Modality-aware capabilities and fit (M). Done.** The probe reports
 the libraries on the machine (torchvision, torchaudio, diffusers, PIL,
@@ -701,9 +704,13 @@ wrong pictures as an image grid; the merged model, processor and
 `labels.json` as the artifact. `#/new/vision` is the page (reached from the
 wizard's goals and the dataset page), and the run page reads accuracy as its
 headline. Verified end to end on a two-colour set: 100%, artifact uploaded.
-*Still to do:* "try it out" for a classifier (upload a picture, get labels)
-and `/v1`-style serving; a thumbnail grid with the label distribution on the
-page; the CUDA image needs rebuilding with Pillow on the Windows box.
+"Try it out" is on the run page: drop a picture, every category comes back
+with its probability, answered by a machine that can look at pictures
+(`POST /api/jobs/{id}/classify`, `runner/classify.py`). The page shows the
+pictures by label before training, because a category with nine pictures
+beside one with nine hundred is a model that will call everything the big
+one. *Still to do:* `/v1`-style serving for classifiers; the CUDA image needs
+rebuilding with Pillow on the Windows box.
 Original plan: `finetune_vision_cls`.
 `AutoModelForImageClassification`, LoRA-able, small. Dataset is
 `{image, label}` from a folder-of-folders or a manifest. Metrics are scalars

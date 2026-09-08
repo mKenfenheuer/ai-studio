@@ -297,6 +297,17 @@ export const api = {
 
   playground:  () => req("/api/playground"),
 
+  // ---- a classifier, asked about one picture ----------------------------
+  classify: async (jobId, file) => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/classify`,
+                          { method: "POST", body, credentials: "same-origin" });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `Failed (${r.status})`);
+    return data;
+  },
+
   // ---- stored files: pictures and clips a row or a turn can point at -----
   // Multipart, not JSON: `req` would set a JSON content type and the browser
   // has to write the boundary itself.

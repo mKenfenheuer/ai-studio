@@ -301,6 +301,7 @@ class HostedModel:
                  _stop, _log) -> dict:
         import httpx
 
+        messages = self._inline_media(messages)
         req = self.api.chat_request(self.conn, self.model, messages, params,
                                     tools=params.get("tools"),
                                     schema=params.get("schema"))
@@ -353,6 +354,50 @@ class HostedModel:
                 continue
             raise ProviderRefused(last)
         raise RuntimeError(last or "no reply")
+
+    def _inline_media(self, messages: list[dict]) -> list[dict]:
+        """Pictures in the studio's store, as data URLs the provider can open.
+
+        A provider cannot reach this studio, so a reference to a stored file
+        is fetched here, through the runner's own door, and sent as bytes.
+        Fetched once per file per run and remembered. A picture that cannot
+        be fetched is left out, with a note, rather than sent as a string.
+        """
+        import base64
+        cache = getattr(self, "_media_cache", None)
+        if cache is None:
+            cache = self._media_cache = {}
+        out = []
+        for m in messages:
+            media = m.get("media")
+            if not media:
+                out.append(m)
+                continue
+            fixed = []
+            for mm in media:
+                ref = (mm or {}).get("ref") or ""
+                if not ref.startswith("asset:"):
+                    fixed.append(mm)
+                    continue
+                aid = ref[6:]
+                if aid not in cache:
+                    try:
+                        import httpx as _hx
+                        r = _hx.get("%s/api/assets/%s/file" % (self.ctx.controller_url, aid),
+                                    headers={"X-Runner-Token": self.ctx.runner_token},
+                                    timeout=60.0)
+                        r.raise_for_status()
+                        mime = r.headers.get("content-type", "image/png").split(";")[0]
+                        cache[aid] = "data:%s;base64,%s" % (
+                            mime, base64.b64encode(r.content).decode("ascii"))
+                    except Exception as e:  # noqa: BLE001 - said, then skipped
+                        self.ctx.log("A picture could not be fetched for the "
+                                     "hosted model (%s); it was left out." % e, "warn")
+                        cache[aid] = None
+                if cache[aid]:
+                    fixed.append({**mm, "url": cache[aid]})
+            out.append({**m, "media": fixed})
+        return out
 
     def _corrected(self, body: dict) -> dict:
         """This request with the corrections this model already asked for."""
