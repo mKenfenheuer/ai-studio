@@ -1055,7 +1055,8 @@ def transform(dataset: dict, ops: dict | list, owner_id: str | None,
 
 
 def preview_transform(dataset: dict, ops: dict | list, sample: int | None = 2000,
-                      limit: int = 5, upto: int | None = None) -> dict:
+                      limit: int = 5, upto: int | None = None,
+                      values: str | None = None) -> dict:
     """What these settings would do, without doing it.
 
     A transform that writes a new dataset is cheap to undo and expensive to
@@ -1091,6 +1092,9 @@ def preview_transform(dataset: dict, ops: dict | list, sample: int | None = 2000
         "rows": shown,
         "rendered": [formatting.format_example(r, fmt) or "" for r in shown],
         "splits": _count_splits(rows),
+        # What one column holds at this point, when asked: the filter form
+        # offers these rather than making somebody guess the spelling.
+        "values": column_values(rows, values) if values else None,
         # What the conversion had to infer and what it could not make sense
         # of. Empty for every transform that is not a conversion.
         "report": run["report"],
@@ -1256,6 +1260,21 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
                    if c and c != SPLIT_FIELD]:
         rows = [{k: v for k, v in r.items() if k not in dropped} for r in rows]
         steps.append("Dropped the columns %s" % ", ".join(dropped))
+
+    # Filtering on what a column holds: the everyday filter, and the one a
+    # spreadsheet user reaches for first. Several conditions are all required.
+    for cond in (ops.get("where") or []):
+        column = str(cond.get("column") or "").strip()
+        if not column:
+            continue
+        op = str(cond.get("op") or "contains").strip()
+        test = _condition(op, cond.get("value"), cond.get("values"))
+        n0 = len(rows)
+        rows = [r for r in rows if test(r.get(column))]
+        steps.append("Kept rows where %s %s (%d removed)"
+                     % (column, _condition_words(op, cond.get("value"),
+                                                 cond.get("values")),
+                        n0 - len(rows)))
 
     if ops.get("drop_empty"):
         def says_something(r: dict) -> bool:
@@ -1458,6 +1477,103 @@ FILTERS = {
     "json": "as compact JSON",
     "slice": "slice:0:200 — the characters between two positions",
 }
+
+
+# What "is" means for a cell: the text of it, or the number of it when both
+# sides read as numbers -- "12" and 12 are the same value in a CSV.
+def _cell_text(cell) -> str:
+    if cell is None:
+        return ""
+    if isinstance(cell, (dict, list)):
+        return json.dumps(cell, ensure_ascii=False)
+    return str(cell)
+
+
+def _as_number(x) -> float | None:
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    try:
+        return float(str(x).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+CONDITIONS = ("eq", "ne", "contains", "not_contains", "starts", "ends",
+              "regex", "empty", "not_empty", "gt", "gte", "lt", "lte",
+              "in", "not_in")
+
+
+def _condition(op: str, value, values) -> "Callable[[object], bool]":
+    """A test on one cell, for the `where` operation."""
+    if op not in CONDITIONS:
+        raise ValueError("Unknown condition: %s" % op)
+    want = "" if value is None else str(value)
+    want_l = want.lower()
+    want_n = _as_number(value)
+    chosen = {str(v) for v in (values or [])}
+
+    if op in ("empty", "not_empty"):
+        return (lambda c: not _cell_text(c).strip()) if op == "empty" \
+            else (lambda c: bool(_cell_text(c).strip()))
+    if op in ("eq", "ne"):
+        def same(c) -> bool:
+            n = _as_number(c)
+            if want_n is not None and n is not None:
+                return n == want_n
+            return _cell_text(c) == want
+        return same if op == "eq" else (lambda c: not same(c))
+    if op in ("in", "not_in"):
+        hit = lambda c: _cell_text(c) in chosen
+        return hit if op == "in" else (lambda c: not hit(c))
+    if op in ("contains", "not_contains"):
+        has = lambda c: want_l in _cell_text(c).lower()
+        return has if op == "contains" else (lambda c: not has(c))
+    if op == "starts":
+        return lambda c: _cell_text(c).lower().startswith(want_l)
+    if op == "ends":
+        return lambda c: _cell_text(c).lower().endswith(want_l)
+    if op == "regex":
+        try:
+            pattern = re.compile(want, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError("That pattern is not valid: %s" % e) from e
+        return lambda c: bool(pattern.search(_cell_text(c)))
+    # gt, gte, lt, lte: a cell that is not a number never passes.
+    if want_n is None:
+        raise ValueError("Comparing with %r needs a number." % want)
+    cmp = {"gt": lambda n: n > want_n, "gte": lambda n: n >= want_n,
+           "lt": lambda n: n < want_n, "lte": lambda n: n <= want_n}[op]
+    return lambda c: (lambda n: n is not None and cmp(n))(_as_number(c))
+
+
+def _condition_words(op: str, value, values) -> str:
+    words = {"eq": "is", "ne": "is not", "contains": "contains",
+             "not_contains": "does not contain", "starts": "starts with",
+             "ends": "ends with", "regex": "matches", "empty": "is empty",
+             "not_empty": "is not empty", "gt": ">", "gte": ">=", "lt": "<",
+             "lte": "<=", "in": "is one of", "not_in": "is not one of"}
+    w = words.get(op, op)
+    if op in ("empty", "not_empty"):
+        return w
+    if op in ("in", "not_in"):
+        shown = [str(v) for v in (values or [])]
+        return "%s %s" % (w, ", ".join(repr(v) for v in shown[:4])
+                          + (" and %d more" % (len(shown) - 4)
+                             if len(shown) > 4 else ""))
+    return "%s %r" % (w, "" if value is None else str(value))
+
+
+def column_values(rows: list[dict], column: str, top: int = 60) -> dict:
+    """What a column holds, most common first, on rows already in hand."""
+    counts: dict[str, int] = {}
+    for r in rows:
+        key = _cell_text(r.get(column))
+        counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return {"values": [{"value": v, "count": n} for v, n in ranked[:top]],
+            "distinct": len(counts), "rows": len(rows)}
 
 
 def _apply_filter(value: str, name: str, arg: str) -> str:

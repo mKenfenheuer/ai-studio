@@ -164,6 +164,17 @@ export async function datasetView(mount, [id]) {
     // The rows a new step sees are the rows after the step before it.
     const before = at !== null ? at - 1 : selected;
     const columns = columnsAt(before);
+    // What the form may ask of the page: the columns as they stand here, and
+    // what any one of them holds -- counted on the rows after the step before.
+    const ctx = {
+      columns,
+      values: async (column) => {
+        const r = await api.previewTransform(id, {
+          ops: pipeline().slice(0, before + 1), sample: sample || "all",
+          limit: 1, upto: before, values: column });
+        return r.values || { values: [], distinct: 0, rows: 0 };
+      },
+    };
 
     if (def.instant && at === null && !ops) {
       putStep({ type, ops: def.read(null) });
@@ -174,13 +185,15 @@ export async function datasetView(mount, [id]) {
       title: existing ? `Edit: ${def.label}` : def.label, width: 640,
       body: html`
         <p class="muted tiny" style="margin:0 0 12px">${def.blurb}</p>
-        <form id="stepForm">${raw(def.form(initial, { columns }))}</form>
+        <form id="stepForm">${raw(def.form(initial, ctx))}</form>
         <div id="stepLive" class="step-live"></div>
         <div class="row" style="gap:6px;margin-top:12px">
           <button class="btn-sm btn-primary" id="stepOk">${existing ? "Save step" : "Add step"}</button>
           <button class="btn-sm" data-modal-close>Cancel</button>
           <span class="muted tiny" id="stepErr"></span>
         </div>` });
+
+    def.wire?.(dlg, ctx);
 
     // Chips insert a placeholder at the caret of the template box.
     on(dlg, "click", "[data-insert]", (_e, t) => {
@@ -359,6 +372,7 @@ export async function datasetView(mount, [id]) {
       colMenu = null; draw();
       if (!col) return;
       if (act === "rename") openStep("rename", { ops: { rename: { [col]: "" } } });
+      if (act === "filter") openStep("where", { ops: { where: [{ column: col, op: "in", values: [] }] } });
       if (act === "remove") putStep({ type: "drop_columns", ops: { drop_columns: [col] } });
       if (act === "keep") putStep({ type: "keep_columns", ops: { keep_columns: [col] } });
       if (act === "split") openStep("split_column", { ops: { split_columns: [{ from: col, into: [], by: null }] } });
@@ -991,6 +1005,7 @@ function colMenuHtml({ column, x, y }) {
   return html`
     <div class="ctx-menu" style="left:${x}px;top:${y}px" data-colmenu-box>
       <div class="ctx-title mono">${column}</div>
+      <button data-colact="filter">Filter rows by this column…</button>
       <button data-colact="rename">Rename…</button>
       <button data-colact="split">Split column…</button>
       <button data-colact="calc">Add column from this…</button>

@@ -50,6 +50,36 @@ function columnChips(columns) {
     <button type="button" class="chip" data-insert="{${c}}">{${c}}</button>`).join("")}</div>`;
 }
 
+const CONDITION_WORDS = {
+  eq: "is", ne: "is not", contains: "contains", not_contains: "does not contain",
+  starts: "starts with", ends: "ends with", regex: "matches regex",
+  empty: "is empty", not_empty: "is not empty", gt: ">", gte: "≥", lt: "<", lte: "≤",
+  in: "is one of", not_in: "is not one of",
+};
+
+/** One condition of a `where` step: column, operator, value. */
+function condRow(c, n, columns) {
+  const cols = columns.includes(c.column) || !c.column ? columns : [c.column, ...columns];
+  const multi = c.op === "in" || c.op === "not_in";
+  const noValue = c.op === "empty" || c.op === "not_empty";
+  return html`
+    <div class="cond" data-cond data-chosen="${JSON.stringify(c.values || [])}">
+      <div class="cond-line">
+        ${raw(cols.length ? html`<select class="c-col">${raw(cols.map((k) =>
+            html`<option value="${k}"${k === c.column ? " selected" : ""}>${k}</option>`).join(""))}
+          </select>` : html`<input class="c-col mono" value="${c.column || ""}" placeholder="column">`)}
+        <select class="c-op">${raw(Object.entries(CONDITION_WORDS).map(([k, w]) =>
+          html`<option value="${k}"${k === (c.op || "contains") ? " selected" : ""}>${w}</option>`).join(""))}
+        </select>
+        <input class="c-val mono" list="dl_${n}" value="${c.value ?? ""}" placeholder="value"
+               ${multi || noValue ? "hidden" : ""}>
+        <datalist id="dl_${n}"></datalist>
+        <button type="button" class="chip-x" data-del-cond title="Remove this condition">✕</button>
+      </div>
+      <div class="c-vals" ${multi ? "" : "hidden"}></div>
+    </div>`;
+}
+
 export const STEPS = {
   // ---- columns -----------------------------------------------------------
   rename: {
@@ -187,6 +217,98 @@ export const STEPS = {
   },
 
   // ---- rows --------------------------------------------------------------
+  where: {
+    tab: "rows", label: "By column value", icon: "⊟",
+    blurb: "Keep the rows where a column holds what you say. Several "
+      + "conditions all have to hold.",
+    form(ops, { columns }) {
+      const conds = (ops.where || []).length ? ops.where
+        : [{ column: columns[0] || "", op: "contains", value: "" }];
+      return html`
+        <div id="conds">${raw(conds.map((c, n) => condRow(c, n, columns)).join(""))}</div>
+        <button type="button" class="btn-sm" data-add-cond>+ Another condition</button>
+        <div class="hint" style="margin-top:8px">Text matches ignore case. “is” compares
+          numbers as numbers, so <code>12</code> matches <code>12.0</code>. The value
+          list shows what the column holds at this step, most common first.</div>`;
+    },
+    wire(dlg, ctx) {
+      const columns = ctx.columns;
+      // What a column holds, fetched when a condition's column changes and
+      // offered both as a datalist and, for "is one of", as tick boxes.
+      const load = async (row) => {
+        const col = $(".c-col", row).value;
+        const op = $(".c-op", row).value;
+        const box = $(".c-vals", row);
+        const list = $("datalist", row);
+        const multi = op === "in" || op === "not_in";
+        box.hidden = !multi;
+        $(".c-val", row).hidden = multi || op === "empty" || op === "not_empty";
+        if (!col || !ctx.values) return;
+        if (row.dataset.loadedFor !== col) {
+          row.dataset.loadedFor = col;
+          box.innerHTML = `<span class="muted tiny">Reading values…</span>`;
+          let r;
+          try { r = await ctx.values(col); }
+          catch (ex) { box.innerHTML = `<span class="muted tiny">${esc(ex.message)}</span>`; return; }
+          if ($(".c-col", row).value !== col) return;
+          const chosen = new Set(JSON.parse(row.dataset.chosen || "[]"));
+          list.innerHTML = r.values.map((v) => `<option value="${esc(v.value)}">`).join("");
+          box.innerHTML = (r.values.length ? `<div class="vals-list">${r.values.map((v) => html`
+              <label class="check"><input type="checkbox" class="c-tick" value="${v.value}"${
+                chosen.has(v.value) ? " checked" : ""}>
+                <span class="c-tick-v">${v.value === "" ? raw('<span class="muted">(empty)</span>') : v.value}</span>
+                <span class="muted tiny">${v.count}</span></label>`).join("")}</div>` : "")
+            + `<div class="muted tiny" style="margin-top:4px">${r.distinct} distinct value${
+                r.distinct === 1 ? "" : "s"} in ${r.rows} rows${
+                r.distinct > r.values.length ? ` — the ${r.values.length} most common shown` : ""}</div>`;
+        }
+      };
+      $$("[data-cond]", dlg).forEach(load);
+      dlg.addEventListener("change", (e) => {
+        const row = e.target.closest("[data-cond]");
+        if (row && (e.target.matches(".c-col") || e.target.matches(".c-op"))) load(row);
+      });
+      dlg.addEventListener("click", (e) => {
+        if (e.target.closest("[data-add-cond]")) {
+          const n = $$("[data-cond]", dlg).length;
+          $("#conds", dlg).insertAdjacentHTML("beforeend",
+            condRow({ column: columns[0] || "", op: "contains", value: "" }, n, columns));
+          load($$("[data-cond]", dlg).pop());
+        }
+        const del = e.target.closest("[data-del-cond]");
+        if (del) { del.closest("[data-cond]").remove(); dlg.dispatchEvent(new Event("input")); }
+      });
+    },
+    read(dlg) {
+      const where = $$("[data-cond]", dlg).map((row) => {
+        const column = $(".c-col", row).value.trim();
+        const op = $(".c-op", row).value;
+        const out = { column, op };
+        if (op === "in" || op === "not_in") {
+          out.values = $$(".c-tick:checked", row).map((t) => t.value);
+          if (!out.values.length) throw new Error("Tick at least one value.");
+        } else if (op !== "empty" && op !== "not_empty") {
+          out.value = $(".c-val", row).value;
+          if (out.value === "" && op !== "eq" && op !== "ne") throw new Error("What should it match?");
+        }
+        return out;
+      }).filter((c) => c.column);
+      if (!where.length) throw new Error("Which column?");
+      return { where };
+    },
+    describe: (ops) => "Kept rows where " + (ops.where || []).map((c) => {
+      const w = CONDITION_WORDS[c.op] || c.op;
+      if (c.op === "empty" || c.op === "not_empty") return `${c.column} ${w}`;
+      if (c.op === "in" || c.op === "not_in") {
+        const v = c.values || [];
+        return `${c.column} ${w} ${v.slice(0, 3).map((x) => JSON.stringify(x)).join(", ")}${
+          v.length > 3 ? ` +${v.length - 3}` : ""}`;
+      }
+      return `${c.column} ${w} ${JSON.stringify(c.value ?? "")}`;
+    }).join(" and "),
+    infer: (ops) => !!ops.where,
+  },
+
   drop_empty: {
     tab: "rows", label: "Drop empty", icon: "∅", instant: true,
     blurb: "Rows that render as nothing, and conversations whose every answer is blank.",
@@ -359,7 +481,7 @@ export const STEPS = {
 // The order the forms check an unknown options dict in. A conversion with a
 // dedupe folded in is still a conversion; a shuffle with a sample is a sample.
 const INFER_ORDER = ["to_conversations", "calc", "split_column", "rename",
-                     "drop_columns", "keep_columns", "drop_empty", "dedupe",
+                     "drop_columns", "keep_columns", "where", "drop_empty", "dedupe",
                      "max_per_prompt", "length", "contains", "excludes",
                      "sample", "shuffle"];
 
@@ -371,6 +493,7 @@ const OWN_KEYS = {
   rename: ["rename"],
   drop_columns: ["drop_columns"],
   keep_columns: ["keep_columns"],
+  where: ["where"],
   drop_empty: ["drop_empty"],
   dedupe: ["dedupe"],
   max_per_prompt: ["max_per_prompt"],

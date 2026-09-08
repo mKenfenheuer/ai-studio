@@ -416,7 +416,8 @@ async def preview_transform(request: Request, dataset_id: str,
         return ds.preview_transform(
             d, payload.get("ops") or {}, sample,
             limit=min(int(payload.get("limit") or 5), 200),
-            upto=None if upto is None else int(upto))
+            upto=None if upto is None else int(upto),
+            values=(str(payload.get("values") or "").strip() or None))
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
