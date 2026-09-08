@@ -20,7 +20,7 @@ import { html, raw, esc, on, toast, fmtAgo, fmtNum, fmtBytes, modal, $,
 import { ribbon, rb, group } from "../ribbon.js";
 import { pageHead, emptyState, breadcrumb, confirmDestructive } from "../components.js";
 import { hashParam } from "../util.js";
-import { primaryMetric } from "../kinds.js";
+import { primaryMetric, modelKinds } from "../kinds.js";
 
 // ---------------------------------------------------------------------------
 // Every project
@@ -475,7 +475,7 @@ function runRow(r, kind, p) {
       <td class="mono tiny">${pm && pm.value != null
         ? `${pm.label}: ${typeof pm.value === "number" ? pm.value.toFixed(4) : pm.value}` : ""}</td>
       <td style="text-align:right"><div class="row" style="gap:4px;justify-content:flex-end">
-        ${raw(done && r.has_model
+        ${raw(done && r.has_model && modelKinds().includes(r.kind)
           ? `<button class="btn-sm" data-publish-run="${esc(r.id)}"
                data-name="${esc(r.name)}">Publish</button>` : "")}
         ${raw(fileButton("job", r.id, p))}
