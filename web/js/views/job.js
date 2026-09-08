@@ -5,6 +5,7 @@ import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { openScoreDialog } from "../scoring.js";
 import { publishCard, wirePublish } from "./publish.js";
+import { publishDialog } from "./projects.js";
 import { kindOf, subjectOf, stagesFor } from "../kinds.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive } from "../components.js";
@@ -472,6 +473,12 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     });
   });
 
+  on(mount, "click", "#publishHere", () => {
+    publishDialog(jobId, job?.name, job?.project_id || null, async () => {
+      job = await api.job(jobId);
+      paintHeader(mount, job, getTab());
+    });
+  });
   on(mount, "click", "#goPublish", () => {
     const tab = $('[data-tab="model"]', mount);
     if (tab) tab.click();
@@ -1552,8 +1559,19 @@ function artifactsCard(job) {
  */
 function publishedCard(job) {
   const rows = job.config?.published || [];
-  if (!rows.length) return "";
+  const local = (job.published_as || []).filter((p) => p.location === "local");
+  if (!rows.length && !local.length) return "";
   return html`
+    ${raw(local.length ? html`
+      <div class="card" style="margin-bottom:14px">
+        <h3>In the model library</h3>
+        <ul class="tiny" style="margin:8px 0 0;padding-left:18px">
+          ${raw(local.map((p) => html`
+            <li><a href="#/models"><strong>${p.name}</strong></a>
+              ${p.version || ""}</li>`).join(""))}
+        </ul>
+      </div>` : "")}
+    ${raw(!rows.length ? "" : html`
     <div class="card" style="margin-bottom:14px">
       <h3>On Hugging Face</h3>
       <ul class="tiny" style="margin:8px 0 0;padding-left:18px">
@@ -1564,7 +1582,7 @@ function publishedCard(job) {
               p.artifact_kind === "adapter" ? "the adapter" : "the model"}${
               p.at ? `, ${fmtAgo(p.at)}` : ""}</span></li>`).join(""))}
       </ul>
-    </div>`;
+    </div>`)}`;
 }
 
 /** Publish and share, painted into `#ownerRow`. Returns the repaint. */
@@ -1835,7 +1853,14 @@ function runRibbon(job, tab) {
       title: "Free the space; keep the run, its chart and its log" }),
     rb(null, "↓", "Download", { disabled: !(done && job.artifacts?.length),
       href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
-    rb("goPublish", "☁", "Publish", { disabled: !usable,
+    // Two meanings of "publish", and they are different things. Keeping it
+    // here means naming a version other people in this studio can find; the
+    // Hub button below sends it out of the building. Both land in the model
+    // library, so there is one list of finished models rather than two.
+    rb("publishHere", "⬢", (job.published_as || []).length
+      ? "Publish another version" : "Add to the library", { disabled: !usable,
+      title: "Name and version it, so it can be found without a run id" }),
+    rb("goPublish", "☁", "Publish to the Hub", { disabled: !usable,
       title: "Send it to Hugging Face" }),
     // The page has said for a long time that merging produces "what Ollama
     // wants". Ollama wants GGUF, and until now this could not make one.
@@ -1885,7 +1910,10 @@ function runHead(job) {
   document.title = `${job.name} · Runs · AI Studio`;
   return html`
     <div class="page-head">
-      ${raw(breadcrumb({ href: "#/jobs", label: "Runs" }))}
+      ${raw(breadcrumb(job.project
+        ? [{ href: `#/projects/${job.project.id}`, label: job.project.name },
+           { href: "#/jobs", label: "Runs" }]
+        : { href: "#/jobs", label: "Runs" }))}
       <div class="row title-row" style="gap:4px;min-width:0;margin-top:6px">
         <h1 style="margin:0" id="runTitle">${job.name}</h1>
         <button class="btn-sm btn-quiet" data-rename="1" title="Rename this run"

@@ -338,6 +338,42 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_id, updated_at);
+
+-- A project: one model being made, and everything done to make it. The
+-- datasets prepared, the runs, the prompt sets and their scores, the
+-- benchmarks, the publications -- filed together, in the order the work
+-- goes, rather than as five lists on five pages each sorted by date. A
+-- dataset or a run can belong to one project or to none.
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    name        TEXT NOT NULL,
+    goal        TEXT,
+    notes       TEXT,
+    archived    INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+-- The model library: models that were published, here or to the Hub. Not
+-- every run -- most runs are attempts -- but the ones somebody decided were
+-- finished enough to have a name and a version and be used. A row here is a
+-- pointer at a run plus what it was published as.
+CREATE TABLE IF NOT EXISTS library (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT,
+    job_id        TEXT NOT NULL,
+    owner_id      TEXT,
+    name          TEXT NOT NULL,
+    version       TEXT,
+    notes         TEXT,
+    location      TEXT NOT NULL,      -- 'local' | 'hf'
+    repo_id       TEXT,
+    url           TEXT,
+    published_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_library_job ON library(job_id);
+CREATE INDEX IF NOT EXISTS idx_library_project ON library(project_id);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -422,6 +458,12 @@ _ADDED_COLUMNS = [
     # Short labels on a dataset, the same as on a run: for finding, not
     # for reading.
     ("datasets", "tags", "TEXT"),
+    # Which project a thing belongs to. NULL is "none yet": everything that
+    # existed before projects did, and anything made outside one.
+    ("jobs", "project_id", "TEXT"),
+    ("datasets", "project_id", "TEXT"),
+    ("evals", "project_id", "TEXT"),
+    ("conversations", "project_id", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -542,11 +584,13 @@ def get_runner(runner_id: str) -> dict | None:
 
 # ------------------------------------------------------------------- jobs
 
-def create_job(name: str, kind: str, cfg: dict, owner_id: str | None = None) -> str:
+def create_job(name: str, kind: str, cfg: dict, owner_id: str | None = None,
+               project_id: str | None = None) -> str:
     jid = new_id("job")
-    ex("INSERT INTO jobs (id,name,kind,status,config,created_at,owner_id)"
-       " VALUES (?,?,?,'queued',?,?,?)",
-       (jid, name, kind, json.dumps(cfg), now(), owner_id))
+    ex("INSERT INTO jobs (id,name,kind,status,config,created_at,owner_id,project_id)"
+       " VALUES (?,?,?,'queued',?,?,?,?)",
+       (jid, name, kind, json.dumps(cfg), now(), owner_id, project_id))
+    touch_project(project_id)
     return jid
 
 
@@ -1363,15 +1407,22 @@ def create_dataset(owner_id: str | None, name: str, source: str, **fields: Any) 
     did = new_id("ds")
     ts = now()
     ex("INSERT INTO datasets (id,owner_id,name,source,origin,rows,bytes,columns,"
-       "format,notes,parent_id,recipe,created_at,updated_at)"
-       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+       "format,notes,parent_id,recipe,created_at,updated_at,project_id)"
+       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (did, owner_id, name, source, fields.get("origin"),
         int(fields.get("rows") or 0), int(fields.get("bytes") or 0),
         json.dumps(fields.get("columns") or []),
         json.dumps(fields.get("format") or {}),
         fields.get("notes"), fields.get("parent_id"),
-        json.dumps(fields.get("recipe") or {}), ts, ts))
+        json.dumps(fields.get("recipe") or {}), ts, ts,
+        fields.get("project_id")))
+    touch_project(fields.get("project_id"))
     return did
+
+
+def project_of_dataset(dataset_id: str | None) -> str | None:
+    row = q1("SELECT project_id FROM datasets WHERE id=?", (dataset_id or "",))
+    return (row or {}).get("project_id")
 
 
 def _hydrate_dataset(r: dict) -> dict:
@@ -1554,13 +1605,15 @@ def visible_datasets(user: dict) -> list[dict]:
 # entire reason for saving them rather than typing them into the playground.
 
 def create_eval(owner_id: str | None, name: str, items: list[dict],
-                notes: str = "", source: dict | None = None) -> str:
+                notes: str = "", source: dict | None = None,
+                project_id: str | None = None) -> str:
     eid = new_id("ev")
     ts = now()
     ex("INSERT INTO evals (id,owner_id,name,notes,items,source,created_at,"
-       "updated_at) VALUES (?,?,?,?,?,?,?,?)",
+       "updated_at,project_id) VALUES (?,?,?,?,?,?,?,?,?)",
        (eid, owner_id, name, notes, json.dumps(items),
-        json.dumps(source) if source else None, ts, ts))
+        json.dumps(source) if source else None, ts, ts, project_id))
+    touch_project(project_id)
     return eid
 
 
@@ -1997,3 +2050,143 @@ def delete_conversation(owner_id: str, conversation_id: str) -> bool:
                     (conversation_id, owner_id))
     c.commit()
     return cur.rowcount > 0
+
+
+
+# =========================================================================
+# Projects and the model library
+# =========================================================================
+
+def create_project(owner_id: str | None, name: str, goal: str = "",
+                   notes: str = "") -> str:
+    pid = new_id("prj")
+    ts = now()
+    ex("INSERT INTO projects (id,owner_id,name,goal,notes,archived,created_at,"
+       "updated_at) VALUES (?,?,?,?,?,0,?,?)",
+       (pid, owner_id, name, goal or None, notes or None, ts, ts))
+    return pid
+
+
+def get_project(project_id: str) -> dict | None:
+    return q1("SELECT * FROM projects WHERE id=?", (project_id,))
+
+
+def update_project(project_id: str, **fields: Any) -> None:
+    allowed = {"name", "goal", "notes", "archived"}
+    sets, args = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            raise ValueError("refusing to update unknown column %r" % k)
+        sets.append("%s=?" % k)
+        args.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    args += [now(), project_id]
+    ex("UPDATE projects SET %s WHERE id=?" % ",".join(sets), args)
+
+
+def touch_project(project_id: str | None) -> None:
+    if project_id:
+        ex("UPDATE projects SET updated_at=? WHERE id=?", (now(), project_id))
+
+
+def delete_project(project_id: str) -> None:
+    """The project goes; what was in it is unfiled, not deleted."""
+    c = connect()
+    for table in ("jobs", "datasets", "evals", "conversations", "library"):
+        c.execute("UPDATE %s SET project_id=NULL WHERE project_id=?" % table,
+                  (project_id,))
+    c.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    c.commit()
+
+
+def visible_projects(user: dict) -> list[dict]:
+    where, args = _visible_clause(user, "project", "p")
+    rows = q("SELECT p.*, u.display_name AS owner_name,"
+             " (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id) AS runs,"
+             " (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.id) AS datasets,"
+             " (SELECT COUNT(*) FROM evals e WHERE e.project_id = p.id) AS evals,"
+             " (SELECT COUNT(*) FROM library l WHERE l.project_id = p.id) AS published,"
+             " (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id"
+             "    AND j.status IN ('queued','assigned','running')) AS active"
+             " FROM projects p LEFT JOIN users u ON u.id = p.owner_id"
+             " WHERE " + where + " ORDER BY p.archived, p.updated_at DESC", args)
+    for r in rows:
+        r["mine"] = r.get("owner_id") == user["id"]
+    return rows
+
+
+def assign_project(kind: str, resource_id: str, project_id: str | None) -> None:
+    table = {"job": "jobs", "dataset": "datasets", "eval": "evals",
+             "conversation": "conversations", "library": "library"}.get(kind)
+    if not table:
+        raise ValueError("cannot file a %r" % kind)
+    ex("UPDATE %s SET project_id=? WHERE id=?" % table, (project_id, resource_id))
+    touch_project(project_id)
+
+
+def unfiled_counts(user: dict) -> dict:
+    """How much is in no project -- counting only what this user can see.
+
+    A count is a disclosure like any other: "you have 412 unfiled runs" on an
+    account that owns three would be telling somebody about everybody else's
+    work, in a number they cannot open.
+    """
+    out = {}
+    for table, kind in (("jobs", "job"), ("datasets", "dataset"),
+                        ("evals", "eval")):
+        where, args = _visible_clause(user, kind, "t")
+        row = q1("SELECT COUNT(*) AS n FROM %s t WHERE t.project_id IS NULL"
+                 " AND %s" % (table, where), args)
+        out[table] = (row or {}).get("n") or 0
+    return out
+
+
+# ---- the library
+
+def publish_to_library(job_id: str, owner_id: str | None, name: str,
+                       version: str = "", notes: str = "",
+                       location: str = "local", repo_id: str | None = None,
+                       url: str | None = None,
+                       project_id: str | None = None) -> str:
+    """One more published model. The same run may be published more than
+    once -- locally as v1, then to the Hub -- and each is a row."""
+    lid = new_id("mdl")
+    ex("INSERT INTO library (id,project_id,job_id,owner_id,name,version,notes,"
+       "location,repo_id,url,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+       (lid, project_id, job_id, owner_id, name, version or None, notes or None,
+        location, repo_id, url, now()))
+    touch_project(project_id)
+    return lid
+
+
+def library_rows(user: dict, project_id: str | None = None) -> list[dict]:
+    """Published models this user may see: those whose run they may see."""
+    where, args = _visible_clause(user, "job", "j")
+    rows = q("SELECT l.*, j.name AS run_name, j.kind AS run_kind, j.status AS run_status,"
+             " j.summary AS run_summary, j.config AS run_config, j.owner_id AS run_owner,"
+             " p.name AS project_name,"
+             " EXISTS(SELECT 1 FROM artifacts a WHERE a.job_id = j.id) AS has_model"
+             " FROM library l JOIN jobs j ON j.id = l.job_id"
+             " LEFT JOIN projects p ON p.id = l.project_id"
+             " WHERE " + where + (" AND l.project_id=?" if project_id else "")
+             + " ORDER BY l.published_at DESC",
+             args + ([project_id] if project_id else []))
+    for r in rows:
+        for key in ("run_summary", "run_config"):
+            try:
+                r[key] = json.loads(r.get(key) or "{}") or {}
+            except (TypeError, ValueError):
+                r[key] = {}
+        r["has_model"] = bool(r["has_model"])
+        r["mine"] = r.get("owner_id") == user["id"]
+    return rows
+
+
+def get_library_row(library_id: str) -> dict | None:
+    return q1("SELECT * FROM library WHERE id=?", (library_id,))
+
+
+def delete_library_row(library_id: str) -> None:
+    ex("DELETE FROM library WHERE id=?", (library_id,))

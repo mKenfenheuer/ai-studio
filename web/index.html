@@ -20,20 +20,22 @@
     </div>
 
     <nav class="nav">
-      <!-- U+2302, not the ▤ that Datasets uses: at 17px with a truncated label
-           under it, two identical glyphs are two tabs nobody can tell apart. -->
-      <a href="#/" data-nav="dashboard"><span class="ico">⌂</span><span class="lbl">Dashboard</span></a>
+      <!-- The five things somebody comes here to do. Runs, prompt sets,
+           sweeps and comparisons are not gone -- they are inside a project,
+           which is where the question "which run was that?" is answerable. -->
+      <a href="#/" data-nav="projects"><span class="ico">◇</span><span class="lbl">Projects</span></a>
       <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">✦</span><span class="lbl">New training run</span></a>
-      <a href="#/jobs" data-nav="jobs"><span class="ico">≡</span><span class="lbl">Runs</span></a>
       <!-- U+25B7, not U+25B6: the filled triangle has an emoji presentation and
            renders as a colour glyph on most phones, which is out of place in a
            row of monochrome marks. This one has no emoji variant. -->
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
       <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
+      <a href="#/models" data-nav="models"><span class="ico">⬢</span><span class="lbl">Models</span></a>
       <!-- Below this line the tab bar on a 390px screen is out of room, so
-           these fold into "More" there and stay in the sidebar on a desktop. -->
-      <a href="#/evals" data-nav="evals" class="nav-spill"><span class="ico">◎</span><span class="lbl">Evaluate</span></a>
-      <a href="#/runners" data-nav="runners" class="nav-spill"><span class="ico">▦</span><span class="lbl">Machines</span></a>
+           these fold into "More" there and stay in the sidebar on a desktop.
+           Running the studio is a different job from using it: it is one item
+           here, and everything under it is behind that door. -->
+      <a href="#/admin" data-nav="admin" class="nav-spill" id="navAdmin" hidden><span class="ico">⌸</span><span class="lbl">Admin</span></a>
       <a href="#/settings" data-nav="settings" class="nav-spill"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
       <button type="button" class="nav-more" id="navMore">
         <span class="ico">⋯</span><span class="lbl">More</span></button>

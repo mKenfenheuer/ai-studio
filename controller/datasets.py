@@ -1632,6 +1632,9 @@ def transform(dataset: dict, ops: dict | list, owner_id: str | None,
     created = register(
         owner_id, label, "derived", iter(rows),
         origin=dataset["id"], parent_id=dataset["id"],
+        # A cleaned copy belongs to whatever the original belonged to. Nobody
+        # files the same dataset into the same project four times.
+        project_id=dataset.get("project_id"),
         columns=_columns_of(rows),
         format=run["format"],
         recipe={"from": dataset["id"], "from_name": dataset["name"],
@@ -2413,6 +2416,7 @@ def split(dataset: dict, fraction: float, owner_id: str | None,
         owner_id, name or "%s (split)" % dataset["name"], "derived",
         iter(out),
         origin=dataset["id"], parent_id=dataset["id"],
+        project_id=dataset.get("project_id"),
         columns=dataset.get("columns"), format=dataset.get("format"),
         recipe={"from": dataset["id"], "from_name": dataset["name"],
                 "steps": [note], "rows_before": len(rows),
@@ -2509,6 +2513,10 @@ def merge(datasets: list[dict], owner_id: str | None, name: str,
                         rows[::step][:_FORMAT_SAMPLE], columns)
     return register(
         owner_id, name, "derived", iter(rows),
+        # Merged from several: it belongs to the project the first of them is
+        # in, and to none if they disagree.
+        project_id=(datasets[0].get("project_id")
+                    if len({d.get("project_id") for d in datasets}) == 1 else None),
         columns=columns,
         format=fmt,
         recipe={"steps": steps, "rows_after": len(rows)})

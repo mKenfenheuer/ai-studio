@@ -530,6 +530,17 @@ class Fleet:
             "upload_job": upload_job_id,
         })
         db.add_log(trained_by, "Published to %s." % summary["repo_id"])
+        # And into the model library, which is the list people actually read.
+        # A model on the Hub is published by any definition; leaving it out
+        # because the button that sent it lived on the run page is how the
+        # library ends up saying less than the run history it replaced.
+        trained = db.get_job(trained_by) or {}
+        db.publish_to_library(
+            trained_by, trained.get("owner_id"),
+            name=summary["repo_id"].split("/")[-1],
+            version="", notes="", location="hf",
+            repo_id=summary["repo_id"], url=summary.get("url"),
+            project_id=trained.get("project_id"))
 
     async def announce_end(self, job_id: str, status: str) -> None:
         """A run has ended. Tell the browsers, and tell whoever owns it.

@@ -1623,3 +1623,35 @@ textarea.turn-edit {
   .rb-btn { min-width: 58px; font-size: 11px; }
   .pq-grid { min-height: 200px; max-height: 55vh; }
 }
+
+/* ---- projects: the five stages, as a map ---------------------------------
+   A row of stages on a desktop and a column on a phone, each one a link to
+   the page that does that stage. The state is carried by the left edge --
+   done, running, not started -- because a row of five identical cards is a
+   diagram of nothing. */
+.stage-map {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+.stage {
+  display: flex; flex-direction: column; gap: 3px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: var(--radius); padding: 12px 13px;
+  color: inherit; text-decoration: none;
+  transition: border-color .12s, transform .12s;
+}
+.stage:hover { border-color: var(--accent); transform: translateY(-1px); }
+.stage-ico { font-size: 17px; line-height: 1; color: var(--text-3); }
+.stage-label { font-weight: 640; font-size: 13.5px; }
+.stage-count { font-size: 20px; font-weight: 680; letter-spacing: -.02em; }
+.stage-best { font-size: 11.5px; color: var(--text-2); }
+.stage-next { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.stage-done { border-left-color: var(--ok, #3fa06a); }
+.stage-active { border-left-color: var(--accent); }
+.stage-todo .stage-count { color: var(--text-3); }
+
+/* A whole card that is a link -- project cards, the admin index. */
+.card-link { display: block; color: inherit; text-decoration: none;
+  transition: border-color .12s, transform .12s; }
+.card-link:hover { border-color: var(--accent); transform: translateY(-1px); }

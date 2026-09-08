@@ -264,6 +264,73 @@ const FIXTURES = [
   [/\/api\/me\/notify/, { url_hint: "", events: ["succeeded", "failed"] }],
   [/\/api\/me\/api-keys/, []],
   [/\/api\/plan/, { settings: {}, explanations: [], memory: {}, fit: {} }],
+  [/\/api\/chat-formats/, { formats: [
+    { id: "chatml", label: "ChatML", blurb: "What most instruct models speak.",
+      sample: "<|im_start|>user\nHi<|im_end|>", token_count: 2,
+      specials: ["<|im_start|>", "<|im_end|>"] }] }],
+  [/\/api\/hub\/training-preview/, {
+    available: true, columns: ["instruction", "output"],
+    detected_format: { mode: "instruction" }, format: { mode: "instruction" },
+    template_source: "builtin", resolved: {}, style: "chat", system_prompts: [],
+    rendered: [{ status: "ok", ok: true, text: "### Instruction\nHi\n\n### Response\nHello", length: 44 }],
+    counts: { ok: 3, empty: 0, unreadable: 0 }, rows_total: 500 }],
+  [/\/api\/hub\/dataset-configs/, { configs: [{ name: "default", splits: ["train"] }],
+    default_config: "default" }],
+  // ---- projects, the library and the admin section
+  [/\/api\/projects\/unfiled/, { contents: {
+      datasets: [dataset()], runs: [job()], training: [job()], writing: [],
+      scorings: [], exports: [], prompt_sets: [], benchmarks: [], library: [],
+      conversations: [] },
+    map: [{ key: "data", label: "Data", state: "done", count: 1, next: "Check the data" }] }],
+  [/\/api\/projects\/[^/]+$/, {
+    id: "prj_1", name: "Support tone", goal: "Answer tickets in our voice",
+    notes: "Tried lr 2e-4; worse.", archived: 0, owner_id: "usr_1", mine: true,
+    access: "edit", shares: [], created_at: now - 90000, updated_at: now - 400,
+    contents: {
+      datasets: [dataset()], runs: [job()], training: [job()], writing: [],
+      scorings: [], exports: [],
+      prompt_sets: [{ id: "ev_1", name: "Support questions", items: [{ prompt: "a" }],
+                      scorings: 2, is_benchmark: false }],
+      benchmarks: [{ id: "ev_2", name: "MMLU · 5-shot", items: [], scorings: 1,
+                     is_benchmark: true }],
+      library: [{ id: "mdl_1", name: "Tone model", version: "v1", location: "local",
+                  job_id: "job_1", published_at: now - 3000 }],
+      conversations: [] },
+    map: [
+      { key: "data", label: "Data", state: "done", count: 1, next: "Check the data" },
+      { key: "train", label: "Train", state: "done", count: 1,
+        best: { job_id: "job_1", name: "SmolLM2 on alpaca",
+                metric: { label: "Held-out loss", value: 1.23, lower_better: true } },
+        next: "Run again with a change" },
+      { key: "evaluate", label: "Evaluate", state: "done", count: 1, next: "Score the next run" },
+      { key: "benchmark", label: "Benchmark", state: "done", count: 1, next: "Run MMLU" },
+      { key: "publish", label: "Publish", state: "done", count: 1, next: "Publish the best run" }] }],
+  [/\/api\/projects/, { projects: [
+      { id: "prj_1", name: "Support tone", goal: "Answer tickets in our voice",
+        archived: 0, mine: true, runs: 4, datasets: 2, evals: 1, published: 1,
+        active: 1, updated_at: now - 400 },
+      { id: "prj_2", name: "Nano from scratch", goal: "", archived: 0, mine: false,
+        runs: 1, datasets: 1, evals: 0, published: 0, active: 0, updated_at: now - 90000 }],
+    unfiled: { jobs: 6, datasets: 2, evals: 1 } }],
+  [/\/api\/library/, [
+      { id: "mdl_1", name: "Tone model", version: "v1", notes: "First one that held its tone.",
+        location: "local", repo_id: null, url: null, published_at: now - 3000,
+        mine: true, project_id: "prj_1", project_name: "Support tone",
+        job_id: "job_1", run_name: "SmolLM2 on alpaca", run_kind: "finetune_llm",
+        has_model: true, base_model: "HuggingFaceTB/SmolLM2-135M", dataset: "alpaca",
+        primary_metric: { label: "Held-out loss", value: 1.23, lower_better: true },
+        served_as: ["assistant-prod"] },
+      { id: "mdl_2", name: "tone-model", version: "", notes: "", location: "hf",
+        repo_id: "max/tone-model", url: "https://huggingface.co/max/tone-model",
+        published_at: now - 80000, mine: true, project_id: "prj_1",
+        project_name: "Support tone", job_id: "job_1", run_name: "SmolLM2 on alpaca",
+        run_kind: "finetune_llm", has_model: true, served_as: [] }]],
+  [/\/api\/backups/, {
+    backups: [{ taken_at: now - 4000, stamp: "2026-09-08_02-00-00", bytes: 8.4e8,
+                runs: 19, datasets: 7, users: 3, include_models: false,
+                path: "/data/backups/2026-09-08_02-00-00" }],
+    settings: { dir: "/data/backups", every_hours: 24, keep: 7, include_models: false },
+    last: { taken_at: now - 4000, bytes: 8.4e8 } }],
 ];
 
 window.fetch = async (url) => {
@@ -303,6 +370,13 @@ const VIEWS = [
   ["rerun", "./views/rerun.js", "rerunView", ["job_1"]],
   ["users", "./views/users.js", "usersView", []],
   ["sso", "./views/sso.js", "ssoView", []],
+  ["projects", "./views/projects.js", "projectsView", []],
+  ["project", "./views/projects.js", "projectView", ["prj_1"]],
+  ["unfiled", "./views/projects.js", "projectView", ["unfiled"]],
+  ["models", "./views/models.js", "modelsView", []],
+  ["admin", "./views/admin.js", "adminView", []],
+  ["admin-storage", "./views/admin.js", "adminView", ["storage"]],
+  ["admin-backups", "./views/admin.js", "adminView", ["backups"]],
 ];
 
 const main = document.getElementById("main");
@@ -392,6 +466,22 @@ if (!only) {
     const active = main.querySelector('[data-tab][aria-selected="true"]');
     say("step from url", active?.dataset.tab === "1",
         `landed on step ${active?.dataset.tab}`);
+
+    // The format step must reach the formats. It asks for a preview of the
+    // rows before offering any layout, and it used to leave the arranging of
+    // that request to the data step -- which does not run when the step is
+    // opened directly, which is every step change, because the step is in
+    // the address. The page then waited on a request nobody had sent.
+    localStorage.removeItem("aistudio.wizard");
+    location.hash = "#/new?step=3&dataset=ds_1";
+    main.innerHTML = "";
+    await wizardView(main, []);
+    await new Promise((r) => setTimeout(r, 400));
+    const text = main.textContent;
+    const tiles = main.querySelectorAll("[data-tmpl]").length;
+    say("format step draws", tiles > 0 && !text.includes("Reading a few real rows"),
+        `${tiles} layout(s) offered`);
+    localStorage.removeItem("aistudio.wizard");
 
     // An expired draft is not resumed.
     localStorage.setItem("aistudio.wizard",

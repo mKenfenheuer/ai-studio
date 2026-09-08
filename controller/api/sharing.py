@@ -18,14 +18,14 @@ from .security import current_user, require_owner
 
 router = APIRouter(prefix="/api")
 
-KINDS = {"job": "run", "dataset": "dataset", "eval": "prompt set"}
+KINDS = {"job": "run", "dataset": "dataset", "eval": "prompt set", "project": "project"}
 
 
 def _resource(kind: str, resource_id: str) -> dict:
     if kind not in KINDS:
         raise HTTPException(404, "Nothing of that kind can be shared.")
     row = {"job": db.get_job, "dataset": db.get_dataset,
-           "eval": db.get_eval}[kind](resource_id)
+           "eval": db.get_eval, "project": db.get_project}[kind](resource_id)
     if not row:
         raise HTTPException(404, "No such %s." % KINDS[kind])
     return row

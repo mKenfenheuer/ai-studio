@@ -12,7 +12,7 @@
  * verbs live now.
  */
 import { api } from "../api.js";
-import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo } from "../util.js";
+import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo, hashParam } from "../util.js";
 import { ribbon, rb, group, rbSelect, rbSeg, rbSearch, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
 
@@ -106,7 +106,8 @@ export async function dataView(mount) {
     }
     const name = files.length === 1 ? files[0].name.replace(/\.[^.]+$/, "") : "";
     try {
-      const d = await api.uploadDataset(files, name, options);
+      const d = await api.uploadDataset(files, name,
+        { ...options, ...(hashParam("project") ? { project: hashParam("project") } : {}) });
       const skipped = (d.skipped || []).length;
       toast(`${d.added ? `Added ${fmtNum(d.added)} rows` : `Read ${fmtNum(d.rows)} rows`}${
         skipped ? ` — ${skipped} file(s) skipped` : ""}.`, skipped ? "warn" : "ok");
@@ -277,6 +278,7 @@ export async function dataView(mount) {
           // server looks up which splits exist. Same for the row count: blank
           // is all of them, not a demo-sized slice of one split.
           splits: splits.length ? splits : splitList(f.split),
+          project_id: hashParam("project"),
           limit: +f.limit || 0 });
         toast(`Imported ${fmtNum(d.rows)} rows across ${
           Object.keys(d.splits || {}).length} split(s).`, "ok");

@@ -21,7 +21,8 @@ from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
-from .api import (accounts, conversations, data, evals, media, providers, security,
+from .api import (accounts, conversations, data, evals, library, media, projects,
+                  providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
 
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(fleet.scheduler_loop())
     sync = asyncio.create_task(_directory_loop())
     tidy = asyncio.create_task(_retention_loop())
+    keep = asyncio.create_task(_backup_loop())
     yield
     for t in (task, sync):
         t.cancel()
@@ -95,6 +97,23 @@ async def _retention_loop() -> None:
         await asyncio.sleep(3600)
 
 
+async def _backup_loop() -> None:
+    """Take a backup when the schedule says so. Checked every ten minutes."""
+    from . import backup
+    await asyncio.sleep(180)
+    while True:
+        try:
+            if backup.due():
+                result = await asyncio.to_thread(backup.create)
+                print("[backup] %s: %.0f MB in %ss" % (result["path"],
+                      result["bytes"] / 1048576, result["seconds"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- a timer must not die
+            print("[backup] failed: %s" % e)
+        await asyncio.sleep(600)
+
+
 app = FastAPI(title="AI Studio", version="0.1.0", lifespan=lifespan)
 
 # Registered before anything else so that no route can be reached without
@@ -106,6 +125,8 @@ app.include_router(accounts.router)
 app.include_router(data.router)
 app.include_router(media.router)
 app.include_router(conversations.router)
+app.include_router(projects.router)
+app.include_router(library.router)
 app.include_router(evals.router)
 app.include_router(providers.router)
 app.include_router(serving_api.router)
@@ -267,6 +288,44 @@ async def status(request: Request) -> dict:
         "jobs_running": len(db.q("SELECT id FROM jobs WHERE status='running'")),
         "jobs_queued": len(db.q("SELECT id FROM jobs WHERE status='queued'")),
     }
+
+
+@app.get("/api/backups")
+async def backups_list(request: Request) -> dict:
+    security.require_admin(request)
+    from . import backup
+    return {"backups": await asyncio.to_thread(backup.list_backups),
+            "settings": backup.settings(), "last": backup.last()}
+
+
+@app.post("/api/backups")
+async def backups_create(request: Request, payload: dict = Body(default=None)) -> dict:
+    security.require_admin(request)
+    from . import backup
+    include = (payload or {}).get("include_models")
+    try:
+        return await asyncio.to_thread(backup.create, include)
+    except Exception as e:  # noqa: BLE001 - said, not swallowed
+        raise HTTPException(500, "The backup failed: %s" % e) from e
+
+
+@app.put("/api/backups/settings")
+async def backups_settings(request: Request, payload: dict = Body(...)) -> dict:
+    user = security.require_admin(request)
+    from . import backup
+    try:
+        return backup.save_settings(payload, user["id"])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.delete("/api/backups")
+async def backups_delete(request: Request, path: str = Query(...)) -> dict:
+    security.require_admin(request)
+    from . import backup
+    if not backup.delete(path):
+        raise HTTPException(404, "That is not a backup this studio made.")
+    return {"ok": True}
 
 
 @app.get("/api/storage")
@@ -473,6 +532,17 @@ async def _create_job(request: Request, payload: dict) -> str:
     user = security.current_user(request)
     kind = payload.get("kind", "finetune_llm")
     cfg = payload.get("config") or {}
+    # Which project this run belongs to: said outright, or inherited from the
+    # dataset it trains on. A run has to be somebody's project's, or it is a
+    # thing on a list nobody will find again.
+    project_id = (payload.get("project_id") or cfg.get("project_id") or "").strip() or None
+    if project_id:
+        prj = db.get_project(project_id)
+        if not prj or not db.access_level("project", project_id, prj.get("owner_id"), user):
+            raise HTTPException(404, "No such project.")
+    elif cfg.get("studio_dataset"):
+        project_id = db.project_of_dataset(cfg["studio_dataset"])
+    cfg.pop("project_id", None)
     # A dataset from the studio's own library travels as a URL the runner can
     # fetch with its join token, so a private dataset never has to be public
     # to be trained on.
@@ -725,7 +795,7 @@ async def _create_job(request: Request, payload: dict) -> str:
     # identity nobody can attribute.
     if token := hfaccount.token_for(user):
         cfg.setdefault("hf_token", token)
-    jid = db.create_job(name, kind, cfg, owner_id=user["id"])
+    jid = db.create_job(name, kind, cfg, owner_id=user["id"], project_id=project_id)
     db.add_log(jid, "Job created and queued.")
     await fleet.broadcast_ui({"type": "jobs_changed"})
     fleet.wake()
@@ -902,6 +972,15 @@ async def get_job(request: Request, job_id: str) -> dict:
     job["shares"] = db.list_shares("job", job_id)
     job["artifacts"] = db.list_artifacts(job_id)
     job["runner"] = db.get_runner(job["runner_id"]) if job["runner_id"] else None
+    # Which project this run is part of, by name: a run page that knows only
+    # an id can show a crumb that reads "Runs", and the reader has to
+    # remember what this was for.
+    prj = db.get_project(job["project_id"]) if job.get("project_id") else None
+    job["project"] = {"id": prj["id"], "name": prj["name"]} if prj else None
+    job["published_as"] = [
+        {"id": r["id"], "name": r["name"], "version": r.get("version"),
+         "location": r["location"], "url": r.get("url")}
+        for r in db.library_rows(user) if r["job_id"] == job_id]
     if job["status"] == "queued":
         positions = fleet.queue_positions()
         job["queue_position"] = positions.get(job_id)
@@ -1258,6 +1337,8 @@ def _register_generated(job: dict, archive: Path) -> dict:
         job.get("owner_id"),
         cfg.get("dataset_name") or ("Generated by %s" % job["name"]),
         "generated", iter(rows), origin=job["id"],
+        # The rows a run wrote belong where the run does.
+        project_id=job.get("project_id"),
         notes="Written by a model on %s. Read a sample before training on it: "
               "generated data can be fluent and wrong at the same time."
               % time.strftime("%d %b %Y"),

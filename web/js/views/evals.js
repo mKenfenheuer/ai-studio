@@ -8,7 +8,7 @@
  * because nothing was held constant between them.
  */
 import { api } from "../api.js";
-import { html, raw, esc, $, on, toast, modal, fmtAgo, fmtNum } from "../util.js";
+import { html, raw, esc, $, on, toast, modal, fmtAgo, fmtNum, hashParam } from "../util.js";
 import { ribbon, rb, group, rbSearch, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
 
@@ -208,7 +208,8 @@ Write a haiku about rain"></textarea>
       }
       try {
         const created = await api.createEval({
-          name: f.name, notes: f.notes || "", items: parsed.items });
+          name: f.name, notes: f.notes || "", items: parsed.items,
+          project_id: hashParam("project") });
         toast(`Saved ${parsed.items.length} prompts.`, "ok");
         location.hash = `#/evals/${created.id}`;
       } catch (ex) { toast(ex.message, "err"); }

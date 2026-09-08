@@ -55,12 +55,30 @@ export async function openSearch() {
   // the browser is instant and a search endpoint would be ceremony.
   let items = [];
   out.innerHTML = `<div class="muted tiny" style="padding:10px">Looking…</div>`;
-  const [jobs, datasets, evals] = await Promise.all([
+  const [jobs, datasets, evals, projects, library] = await Promise.all([
     api.jobs().catch(() => []),
     api.datasets().catch(() => []),
     api.evals().catch(() => []),
+    // A project is now the usual thing somebody is looking for -- it is where
+    // the runs, the data and the scores for one model all hang together --
+    // and a published model is the other, because its name is the one anybody
+    // remembers.
+    api.projects().then((d) => d.projects || []).catch(() => []),
+    api.library().catch(() => []),
   ]);
   items = [
+    ...projects.map((p) => ({
+      kind: "Project", icon: "◇", name: p.name,
+      note: p.goal || `${p.runs || 0} runs · ${p.datasets || 0} datasets`,
+      extra: fmtAgo(p.updated_at),
+      href: `#/projects/${p.id}`, hay: [p.name, p.goal],
+    })),
+    ...library.map((m) => ({
+      kind: "Model", icon: "⬢", name: `${m.name}${m.version ? " " + m.version : ""}`,
+      note: m.location === "hf" ? m.repo_id || "on the Hub" : "published here",
+      extra: fmtAgo(m.published_at),
+      href: `#/models`, hay: [m.name, m.repo_id, m.base_model],
+    })),
     ...jobs.map((j) => ({
       kind: kindOf(j).label, icon: kindOf(j).icon, name: j.name,
       note: subjectOf(j), extra: fmtAgo(j.finished_at || j.created_at),

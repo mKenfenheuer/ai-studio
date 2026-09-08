@@ -332,6 +332,40 @@ export const api = {
   assetUsage: () => req("/api/assets"),
 
   // ---- what the disk is holding, and the rules for keeping it -----------
+  // ---- projects: the work, organised as the work actually happens ------
+  projects:    () => req("/api/projects"),
+  project:     (id) => req(`/api/projects/${encodeURIComponent(id)}`),
+  unfiled:     () => req("/api/projects/unfiled"),
+  createProject: (body) =>
+    req("/api/projects", { method: "POST", body: JSON.stringify(body) }),
+  updateProject: (id, body) =>
+    req(`/api/projects/${encodeURIComponent(id)}`,
+        { method: "PATCH", body: JSON.stringify(body) }),
+  deleteProject: (id) =>
+    req(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  fileIntoProject: (id, body) =>
+    req(`/api/projects/${encodeURIComponent(id)}/file`,
+        { method: "POST", body: JSON.stringify(body) }),
+  unfile: (body) =>
+    req("/api/projects/unfile", { method: "POST", body: JSON.stringify(body) }),
+
+  // ---- the model library: what was published, here or on the Hub -------
+  library:     (projectId = "") =>
+    req(`/api/library${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
+  publishLocally: (body) =>
+    req("/api/library", { method: "POST", body: JSON.stringify(body) }),
+  unpublish:   (id) =>
+    req(`/api/library/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // ---- backups ---------------------------------------------------------
+  backups:     () => req("/api/backups"),
+  backUpNow:   (body) =>
+    req("/api/backups", { method: "POST", body: JSON.stringify(body || {}) }),
+  saveBackupSettings: (body) =>
+    req("/api/backups/settings", { method: "PUT", body: JSON.stringify(body) }),
+  deleteBackup: (path) =>
+    req(`/api/backups?path=${encodeURIComponent(path)}`, { method: "DELETE" }),
+
   storage: () => req("/api/storage"),
   saveStorageSettings: (body) =>
     req("/api/storage/settings", { method: "PUT", body: JSON.stringify(body) }),

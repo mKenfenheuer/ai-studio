@@ -831,40 +831,7 @@ function stepData(body, ctx) {
   const scratch = state.mode === "scratch";
   const catalogue = scratch ? (starters.corpora || []) : starters.datasets;
 
-  if (state.dataset && state.studioDataset) {
-    // A dataset from this studio's own library knows its own splits, and
-    // there is nothing to look up on the Hub -- asking the Hub about a name
-    // it has never heard of is how this step used to show "no preview
-    // available" for every dataset somebody brought in themselves.
-    const names = Object.keys(state.studioDataset.splits || {});
-    if (state.configs.key !== state.dataset) {
-      state.configs = { key: state.dataset, status: "ready", error: null,
-                        data: { configs: [], studio: true,
-                                splits: names.length ? names : ["train"] } };
-      state.config = "";
-      if (!names.includes(state.split)) state.split = names[0] || "train";
-    }
-    ensure(state.preview, previewKey(state, scratch),
-           () => api.trainingPreview(previewRequest(state, scratch)), draw);
-    rememberShape(state);
-  } else if (state.dataset) {
-    ensure(state.configs, state.dataset,
-           () => api.datasetConfigs(state.dataset), draw);
-    // Adopt the dataset's default configuration the moment we learn it.
-    const c = state.configs;
-    if (c.status === "ready" && c.key === state.dataset && state.config === null) {
-      state.config = c.data.default_config ?? "";
-      const chosen = c.data.configs.find((x) => x.name === state.config);
-      if (chosen && !chosen.splits.includes(state.split)) {
-        state.split = chosen.splits.includes("train") ? "train" : chosen.splits[0];
-      }
-    }
-    if (c.status === "ready") {
-      ensure(state.preview, previewKey(state, scratch),
-             () => api.trainingPreview(previewRequest(state, scratch)), draw);
-      rememberShape(state);
-    }
-  }
+  ensureRows(state, scratch, draw);
   ensure(state.selectorFields, "sel", () => api.selectorFields(), draw);
   // Your own datasets, which is where most real training data lives once
   // anybody has used this app for a week. They were reachable only from the
@@ -1125,6 +1092,52 @@ function forgetTemplate(state) {
   state.preview = resource();
 }
 
+/** Ask for the rows, and for whatever has to be known before asking.
+ *
+ *  Both the data step and the format step show rendered rows, and both used
+ *  to arrange the fetch themselves -- with the format step's copy missing the
+ *  part that gives a dataset from this studio's own library its splits. A
+ *  studio dataset reached through that step therefore never had a preview
+ *  requested at all, and the step waited for one forever.
+ */
+function ensureRows(state, scratch, draw) {
+  if (!state.dataset) return;
+  if (state.studioDataset) {
+    // A dataset from this studio's own library knows its own splits, and
+    // there is nothing to look up on the Hub -- asking the Hub about a name
+    // it has never heard of is how this step used to show "no preview
+    // available" for every dataset somebody brought in themselves.
+    const names = Object.keys(state.studioDataset.splits || {});
+    if (state.configs.key !== state.dataset) {
+      state.configs = { key: state.dataset, status: "ready", error: null,
+                        data: { configs: [], studio: true,
+                                splits: names.length ? names : ["train"] } };
+      state.config = "";
+      if (!names.includes(state.split)) state.split = names[0] || "train";
+    }
+  } else {
+    ensure(state.configs, state.dataset,
+           () => api.datasetConfigs(state.dataset), draw);
+    // Adopt the dataset's default configuration the moment we learn it.
+    const c = state.configs;
+    if (c.status === "ready" && c.key === state.dataset && state.config === null) {
+      state.config = c.data.default_config ?? "";
+      const chosen = c.data.configs.find((x) => x.name === state.config);
+      if (chosen && !chosen.splits.includes(state.split)) {
+        state.split = chosen.splits.includes("train") ? "train" : chosen.splits[0];
+      }
+    }
+    // A dataset whose configurations could not be looked up is still a
+    // dataset: ask for its rows on the default configuration rather than
+    // waiting on a lookup that has already failed.
+    if (c.status === "loading" || c.status === "idle") return;
+    if (c.status === "error" && state.config === null) state.config = "";
+  }
+  ensure(state.preview, previewKey(state, scratch),
+         () => api.trainingPreview(previewRequest(state, scratch)), draw);
+  rememberShape(state);
+}
+
 /** The dataset itself, without any decision made about it. What shape the
  *  rows are depends on this and nothing else. */
 function dataKey(state) {
@@ -1141,6 +1154,16 @@ function dataKey(state) {
 function rememberShape(state) {
   const p = state.preview;
   if (p.status !== "ready") return;
+  // Latched: the first reading of a dataset is the one we keep, until the
+  // dataset (or its config or split) actually changes.
+  //
+  // The shape is part of the preview's request key, so a later preview that
+  // reported a different mode used to change the key, which sent another
+  // request, which reported the first mode again -- the two answers taking
+  // turns forever with the step showing "reading a few real rows" between
+  // them. The second answer is not new information anyway: it is what the
+  // *format we chose* made of the rows, and the rows had already been read.
+  if (state.shape && state.shape.key === dataKey(state)) return;
   const mode = p.data.detected_format?.mode || p.data.format?.mode;
   if (mode && mode !== "auto") state.shape = { key: dataKey(state), mode };
 }
@@ -1266,11 +1289,7 @@ function stepTemplate(body, ctx) {
   // The same preview the data step asked for, under the same key: the choice
   // made here changes the key, and the rendered examples below re-render with
   // the format actually chosen rather than with a generic one.
-  if (state.dataset && state.configs.status === "ready") {
-    ensure(state.preview, previewKey(state, scratch),
-           () => api.trainingPreview(previewRequest(state, scratch)), draw);
-    rememberShape(state);
-  }
+  ensureRows(state, scratch, draw);
 
   body.innerHTML = html`
     ${raw(formatIntro(state, scratch))}
@@ -1369,9 +1388,20 @@ function formatGrid(state, scratch) {
   // sense, and which of them is suggested, both depend on what the data
   // actually is -- and a suggestion that changes under the cursor is worse
   // than one that arrives a second later.
-  if (["loading", "idle"].includes(state.preview.status)) {
+  // Only until the rows have been read *once*. Later previews are re-renders
+  // of the same rows in whichever layout is under the cursor, and hiding the
+  // choices while one is in flight would hide them on every click.
+  if (state.preview.status === "loading" && dataShape(state) === "unknown") {
     return loading("Reading a few real rows to see what shape they are…");
   }
+  // And if the rows cannot be read at all, say so and offer the layouts
+  // anyway: which format the model expects does not depend on the preview,
+  // and a step that cannot be answered is worse than one answered blind.
+  const previewFailed = state.preview.status === "error"
+    ? failed(html`The rows could not be read: ${state.preview.error}. Choose
+        the layout your model expects — the examples below stay empty, but the
+        run itself does not depend on this preview.`)
+    : "";
   const formats = r.data.formats || [];
   const shape = dataShape(state);
   const picked = selectedKey(state);
@@ -1437,6 +1467,7 @@ function formatGrid(state, scratch) {
     + "anything you invent is split into ordinary pieces by the tokenizer."));
 
   return html`
+    ${raw(previewFailed)}
     ${raw(formatCaveat(state, scratch, shape))}
     <div class="grid grid-2">${raw(tiles.join(""))}</div>`;
 }
@@ -3132,7 +3163,7 @@ function buildJob(mount, state) {
     const s = { ...state.plan.data.settings, ...state.overrides };
     delete s.fits;
     return {
-      name, kind: "pretrain_llm",
+      name, kind: "pretrain_llm", project_id: wizardParams().get("project"),
       config: { ...dataBits, text_field: state.textField || "text",
                 format: trained, system_prompt: systemPrompt,
                 required_runner: state.runnerId, ...s },
@@ -3142,7 +3173,9 @@ function buildJob(mount, state) {
   if (state.ftPlan.status !== "ready") return null;
   const s = { ...state.ftPlan.data.settings, ...state.overrides };
   return {
-    name, kind: "finetune_llm",
+    // Started from inside a project, the run is filed there. Started from the
+    // sidebar it is filed by whatever dataset it trains on, or by nothing.
+    name, kind: "finetune_llm", project_id: wizardParams().get("project"),
     config: {
       ...dataBits,
       ...(state.sourceRun

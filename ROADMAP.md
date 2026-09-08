@@ -49,7 +49,9 @@ three times. An operations track runs beside all of it.
   memory; refresh and every choice is gone.
 - A run page has no path to "score this against the base model".
 - The trainer ignores the `validation` split the dataset editor just made.
-- Every list is flat: runs, datasets, sweeps (no list at all).
+- ~~Every list is flat: runs, datasets, sweeps (no list at all).~~ **Fixed by
+  section 13**: the work is organised as projects, and the flat lists are
+  views inside one.
 - Seven state patterns across eighteen views; the one documented rule
   (`draw()`/`ensure()`) is implemented once, unexported, in the largest file.
 - The dashboard's first sentence advertises vision models. There are none.
@@ -791,9 +793,17 @@ before P1 to P5 have been shaken out by ASR.
 
 Cheap now, expensive once there are five modalities:
 
-1. **Backup**: `sqlite3 ... "VACUUM INTO"` plus rsync of `artifacts/`,
-   `datasets/`, `assets/` and `join_token`; a documented restore. There is
-   nothing today and the DB is in WAL mode, so a naive copy tears.
+1. **Backup. Done.** `controller/backup.py`: `VACUUM INTO` for the database
+   (consistent while it is running, which a file copy of a WAL-mode database
+   is not), plus `join_token`, `datasets/` and `assets/`, and `artifacts/`
+   only if asked -- the models are the largest thing by far and are the one
+   part that can be made again. Written into `<stamp>.partial` and renamed
+   into place, so a half-written backup never looks like a whole one; a
+   `MANIFEST.json` and a `RESTORE.md` travel inside every copy. Schedule,
+   destination, how many to keep and whether to include models are settings;
+   an hourly loop takes one when due, prunes the old, and records failures
+   where the last success is shown. `scripts/restore.sh` puts one back.
+   Administration → Backups.
 2. **`schema_version`** in the `settings` table; migrations stop being a list
    of swallowed `ALTER TABLE` errors.
 3. **Retention. Done.** `controller/retention.py`: models of finished runs
@@ -842,3 +852,38 @@ Cheap now, expensive once there are five modalities:
 
 Phases 1 and 2 can run in parallel (different files); Phase 5 can start
 its P1 store while Phase 4 is in progress. Phases 6 and 7 wait on 5.
+
+---
+
+## 13. Projects, the model library and the admin section. Done.
+
+The app was organised the way its tables are: runs on one page, datasets on
+another, prompt sets on a third, each sorted by date. Making a model is not
+five lists -- it is one job with stages, and the connections between the
+stages were recorded only in config fields no list could show. "Which dataset
+was the good run trained on, and did we ever score it?" cost ten minutes and
+a guess.
+
+- **A project** (`controller/api/projects.py`, `#/projects`) holds one model
+  being made: its datasets, its runs, its prompt sets and benchmarks, and
+  whatever it was published as. Its page is a **map of five stages** -- Data,
+  Train, Evaluate, Benchmark, Publish -- each with what has been done, the
+  best result so far, and the next thing to do.
+- **Nothing is copied.** A project is a `project_id` on rows that already
+  exist, so the dataset library and the run history are the same rows seen
+  from the side that matters. Filing and unfiling are one click and destroy
+  nothing; deleting a project unfiles its contents rather than deleting them.
+- **Filed automatically** where the answer is obvious: a run started from a
+  project or trained on a project's dataset, a cleaned or split copy of a
+  filed dataset, the rows a generation run wrote, a scoring run of a filed
+  prompt set. Everything from before is **Unfiled**, shown as such, with a
+  picker to file it.
+- **The model library** (`#/models`) is the shortlist: runs somebody gave a
+  name and a version to, published locally or to Hugging Face -- a Hub upload
+  files itself. Publishing points at the run; unpublishing removes the name,
+  never the model.
+- **Navigation** is now Projects, New run, Playground, Datasets, Models, with
+  **Administration** (machines, people, SSO, served names, storage, backups)
+  behind one door for admins only. Runs, prompt sets, sweeps, comparisons and
+  the activity dashboard keep their addresses and are reached from a project
+  or from the projects ribbon.

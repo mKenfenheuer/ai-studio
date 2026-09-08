@@ -23,35 +23,49 @@ import { compareView } from "./views/compare.js";
 import { sweepView, sweepsView } from "./views/sweep.js";
 import { servingView } from "./views/serving.js";
 import { visionView } from "./views/vision.js";
+import { projectsView, projectView } from "./views/projects.js";
+import { modelsView } from "./views/models.js";
+import { adminView } from "./views/admin.js";
 
 const routes = [
-  [/^\/$/,             dashboardView, "dashboard"],
+  // Home is the projects list: what you are making, not what the machine has
+  // been doing. Every page that used to be a top-level destination is still
+  // here at the same address -- links, bookmarks and half the app's own
+  // buttons point at them -- they are simply reached from a project now.
+  [/^\/$/,             projectsView,  "projects"],
+  [/^\/projects$/,     projectsView,  "projects"],
+  [/^\/projects\/(.+)$/, projectView, "projects"],
+  [/^\/models$/,       modelsView,    "models"],
+  [/^\/admin$/,        adminView,     "admin"],
+  [/^\/admin\/(\w+)$/,  adminView,     "admin"],
+  [/^\/dashboard$/,    dashboardView, "projects"],
   [/^\/new$/,          wizardView,    "new"],
   [/^\/new\/vision$/,   visionView,    "new"],
-  [/^\/jobs$/,         jobsView,      "jobs"],
+  [/^\/jobs$/,         jobsView,      "projects"],
   // Before the catch-all below, which would otherwise swallow it and open the
   // run's own page with "<id>/again" as the id.
-  [/^\/jobs\/([\w-]+)\/again$/, rerunView, "jobs"],
-  [/^\/jobs\/(.+)$/,   jobView,       "jobs"],
+  [/^\/jobs\/([\w-]+)\/again$/, rerunView, "projects"],
+  [/^\/jobs\/(.+)$/,   jobView,       "projects"],
   [/^\/play$/,         playView,      "play"],
   [/^\/play\/(.+)$/,   playView,      "play"],
-  [/^\/runners$/,      runnersView,   "runners"],
-  [/^\/settings$/,     settingsView,  "settings"],
+  [/^\/runners$/,      runnersView,   "admin"],
+  [/^\/settings$/,     settingsView,  "admin"],
   [/^\/account$/,      accountView,   "account"],
-  [/^\/users$/,        usersView,     "settings"],
-  [/^\/sso$/,          ssoView,       "settings"],
+  [/^\/users$/,        usersView,     "admin"],
+  [/^\/sso$/,          ssoView,       "admin"],
   [/^\/data$/,         dataView,      "data"],
   [/^\/data\/(.+)$/,   datasetView,   "data"],
   [/^\/generate$/,     generateView,  "data"],
   // The same page, opened on an earlier run's settings.
   [/^\/generate\/from\/([\w-]+)$/, generateView, "data"],
-  [/^\/evals$/,        evalsView,     "evals"],
-  [/^\/evals\/(.+)$/,  evalView,      "evals"],
-  [/^\/compare$/,      compareView,   "evals"],
-  [/^\/serving$/,      servingView,   "jobs"],
-  [/^\/sweeps$/,       sweepsView,    "jobs"],
-  [/^\/sweeps\/(.+)$/, sweepView,     "jobs"],
+  [/^\/evals$/,        evalsView,     "projects"],
+  [/^\/evals\/(.+)$/,  evalView,      "projects"],
+  [/^\/compare$/,      compareView,   "projects"],
+  [/^\/serving$/,      servingView,   "admin"],
+  [/^\/sweeps$/,       sweepsView,    "projects"],
+  [/^\/sweeps\/(.+)$/, sweepView,     "projects"],
 ];
+
 
 // Who is signed in. Views read it rather than each fetching /api/me.
 export const session = { user: null };
@@ -260,19 +274,14 @@ function paintWho(user) {
   // and this was the only way to the page that holds every credential.
   const mobile = $("#whoamiMobile");
   if (mobile) { mobile.textContent = initial; mobile.hidden = false; }
-  // The user administration link only exists for people who can use it.
-  const nav = $(".nav");
-  const existing = $("#navUsers");
-  if (user.role === "admin" && !existing) {
-    const a = document.createElement("a");
-    a.id = "navUsers";
-    a.href = "#/users";
-    a.dataset.nav = "settings";
-    a.innerHTML = `<span class="ico">◍</span><span class="lbl">People</span>`;
-    nav.appendChild(a);
-  } else if (user.role !== "admin" && existing) {
-    existing.remove();
-  }
+  // Administration is one door rather than three links, and it only exists
+  // for people who can open it. Everything behind it -- machines, people,
+  // single sign-on, storage, backups -- lives on that page.
+  const adminLink = $("#navAdmin");
+  if (adminLink) adminLink.hidden = user.role !== "admin";
+  // The People link the sidebar used to grow at sign-in; removed where it
+  // still exists from an older session's DOM.
+  $("#navUsers")?.remove();
 }
 
 let fleetTimer = null;

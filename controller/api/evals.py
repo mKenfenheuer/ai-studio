@@ -105,6 +105,26 @@ async def list_evals(request: Request) -> list[dict]:
     return db.visible_evals(current_user(request))
 
 
+def _project_of_first_model(models: list[dict]) -> str | None:
+    for m in models:
+        job = db.get_job(m.get("job_id") or "") if m.get("job_id") else None
+        if job and job.get("project_id"):
+            return job["project_id"]
+    return None
+
+
+def _project_of(request, payload: dict) -> str | None:
+    """Which project this prompt set belongs to, if the page said."""
+    pid = (payload.get("project_id") or "").strip()
+    if not pid:
+        return None
+    row = db.get_project(pid)
+    if not row or not db.access_level("project", pid, row.get("owner_id"),
+                                      current_user(request)):
+        raise HTTPException(404, "No such project.")
+    return pid
+
+
 @router.post("/evals")
 async def create_eval(request: Request, payload: dict = Body(...)) -> dict:
     user = current_user(request)
@@ -118,7 +138,8 @@ async def create_eval(request: Request, payload: dict = Body(...)) -> dict:
     source = None
     if tools := _clean_tools(payload.get("tools")):
         source = {"tools": tools}
-    eid = db.create_eval(user["id"], name, items, payload.get("notes") or "", source)
+    eid = db.create_eval(user["id"], name, items, payload.get("notes") or "",
+                         source, project_id=_project_of(request, payload))
     return _decorate(db.get_eval(eid), user)
 
 
@@ -223,7 +244,9 @@ async def eval_from_dataset(request: Request, payload: dict = Body(...)) -> dict
                 "not trained on these rows."))
     source = {"dataset_id": ds["id"], "dataset_name": ds["name"],
               "split": split or None, "held_out": held_out}
-    eid = db.create_eval(user["id"], name, items, notes, source)
+    eid = db.create_eval(user["id"], name, items, notes, source,
+                         project_id=_project_of(request, payload)
+                                    or ds.get("project_id"))
     return _decorate(db.get_eval(eid), user)
 
 
@@ -523,7 +546,12 @@ async def run_eval(request: Request, eval_id: str,
 
     name = "%s on %d model%s" % (row["name"], len(models),
                                  "" if len(models) == 1 else "s")
-    jid = db.create_job(name, "evaluate", cfg, owner_id=user["id"])
+    # A scoring run belongs to the same project as the prompt set it runs, or
+    # to the project of the model it is scoring. Either is better than the
+    # unfiled pile, and the prompt set is the more specific of the two.
+    jid = db.create_job(name, "evaluate", cfg, owner_id=user["id"],
+                        project_id=row.get("project_id")
+                                   or _project_of_first_model(models))
     db.add_log(jid, "Queued: %d prompt%s against %s."
                % (len(row["items"]), "" if len(row["items"]) == 1 else "s",
                   ", ".join(m["name"] for m in models)))
@@ -665,7 +693,8 @@ async def run_benchmark(request: Request, payload: dict = Body(...)) -> dict:
             "same %s are asked every time this recipe is run."
             % (bench["what"], bench.get("published") or "",
                bench["dataset"], f"{sample:,}"),
-            {"benchmark": bench["id"], "recipe": recipe})
+            {"benchmark": bench["id"], "recipe": recipe},
+            project_id=_project_of(request, payload))
         row = db.get_eval(eid)
 
     return await run_eval(request, row["id"], {

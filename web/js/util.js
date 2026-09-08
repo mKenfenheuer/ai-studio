@@ -385,3 +385,16 @@ export function inlineRename(heading, save) {
   });
   input.addEventListener("blur", () => finish(true));
 }
+
+/** The project named in the address, if the page was opened from one.
+ *
+ *  Pages that create things -- the wizard, the dataset page, the prompt sets
+ *  -- are reached both from a project map and from the sidebar. Opened from a
+ *  project, whatever they create is filed there; opened from the sidebar,
+ *  this is null and the thing is unfiled, which is what it always was.
+ */
+export function hashParam(name) {
+  const at = location.hash.indexOf("?");
+  if (at < 0) return null;
+  return new URLSearchParams(location.hash.slice(at + 1)).get(name) || null;
+}

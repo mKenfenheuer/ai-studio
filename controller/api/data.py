@@ -243,6 +243,22 @@ async def download_dataset(request: Request, dataset_id: str):
 # Getting data in
 # ---------------------------------------------------------------------------
 
+def _project(request, project_id: str) -> str | None:
+    """The project a new dataset is filed into, if the page named one.
+
+    Checked rather than trusted: a project id is a place other people can see
+    things, so filing into one you cannot open would be a way to put a dataset
+    where you cannot follow it.
+    """
+    if not project_id:
+        return None
+    row = db.get_project(project_id)
+    user = current_user(request)
+    if not row or not db.access_level("project", project_id, row.get("owner_id"), user):
+        raise HTTPException(404, "No such project.")
+    return project_id
+
+
 @router.post("/upload")
 async def upload_dataset(request: Request,
                          file: list[UploadFile] = File(...),
@@ -253,7 +269,8 @@ async def upload_dataset(request: Request,
                          delimiter: str = Query(default=""),
                          header: str = Query(default="auto"),
                          split: str = Query(default=""),
-                         into: str = Query(default="")) -> dict:
+                         into: str = Query(default=""),
+                         project: str = Query(default="")) -> dict:
     """One or many files, in whatever format, as one dataset.
 
     Many rather than one because data arrives as a folder at least as often as
@@ -329,7 +346,7 @@ async def upload_dataset(request: Request,
         else "%d files" % len(files)
     created = await run_in_threadpool(
         ds.register, user["id"], label, "upload", iter(rows),
-        split=split, origin=origin)
+        split=split, origin=origin, project_id=_project(request, project))
     # Not an error and not silence: a folder where two files of ninety could
     # not be read is a successful import with something worth knowing in it.
     created["skipped"] = failures
@@ -390,7 +407,8 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
     created = await run_in_threadpool(
         ds.register,
         user["id"], payload.get("name") or hub_id.split("/")[-1], "hub",
-        iter(rows), origin=hub_id)
+        iter(rows), origin=hub_id,
+        project_id=_project(request, payload.get("project_id") or ""))
     if fetched["stored"] or fetched["failed"]:
         created["media"] = fetched
     # The note describes what arrived, not what was asked for. Those are the
