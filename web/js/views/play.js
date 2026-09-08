@@ -495,7 +495,7 @@ function chatView(mount, run, runs) {
     node.textContent = live[channel];
     const label = $("#liveTurn .reasoning-label", mount);
     if (channel === "reasoning" && label) {
-      label.textContent = `Thinking — ${live.reasoning.length.toLocaleString()} characters`;
+      label.textContent = "Thinking…";
     }
     scroll();
   }

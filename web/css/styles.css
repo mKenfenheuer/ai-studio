@@ -453,6 +453,49 @@ textarea.mono {
   align-items: flex-start; gap: 5px; max-width: 100%; }
 .turn.me { align-self: stretch; align-items: flex-end; }
 .turn.note { align-self: center; align-items: center; width: 100%; }
+/* System and developer turns: full width, left-aligned, quiet. They are the
+   frame around the conversation, not a voice in it. */
+.turn.sys { align-self: stretch; align-items: stretch; }
+.turn.sys .bubble {
+  background: var(--surface-2); border: 1px solid var(--border);
+  color: var(--text-2); font-size: 12.5px; line-height: 1.55;
+  border-radius: 10px; max-width: 100%; padding: 9px 12px;
+}
+details.sys-fold > summary {
+  cursor: pointer; list-style: none; display: flex; gap: 10px; align-items: baseline;
+  min-width: 0;
+}
+details.sys-fold > summary::-webkit-details-marker { display: none; }
+details.sys-fold > summary::before {
+  content: ""; flex: none; width: 0; height: 0; opacity: .55; align-self: center;
+  border-left: 4.5px solid currentColor;
+  border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
+  transition: transform .15s;
+}
+details.sys-fold[open] > summary::before { transform: rotate(90deg); }
+details.sys-fold[open] > summary { margin-bottom: 8px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border); }
+.sys-peek { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text); font-weight: 550; }
+details.sys-fold > summary .muted { flex: none; font-size: 11.5px; }
+
+/* Fenced code inside a turn: the table the prompt carries, drawn as a table. */
+.bubble .code-block, .reasoning-body .code-block {
+  margin: 6px 0; padding: 8px 10px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre; overflow-x: auto; color: var(--text); max-width: 100%;
+}
+.turn.me .bubble .code-block { background: rgba(255,255,255,.14);
+  border-color: rgba(255,255,255,.3); color: #fff; }
+.bubble .code-block:first-child { margin-top: 0; }
+.bubble .code-block:last-child { margin-bottom: 0; }
+.bubble-text .prose { white-space: pre-wrap; }
+.reasoning-peek {
+  font-weight: 400; color: var(--text-3); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; flex: 1;
+}
+details.reasoning[open] .reasoning-peek { display: none; }
 .turn-who {
   display: flex; align-items: center; gap: 6px;
   font-size: 11px; font-weight: 700; letter-spacing: .05em;
@@ -892,7 +935,13 @@ details.card[open] > summary::before { content: "▾ "; }
   color: var(--text);
   box-shadow: 0 12px 40px rgba(16,24,40,.22);
   overflow: visible;
+  /* A column, so the body is whatever height the head leaves it and scrolls
+     inside that. It used to carry its own max-height computed from 86vh
+     while the dialog was capped at 900px, and on a tall window the last
+     turn of a conversation was drawn below the dialog's border. */
+  display: flex; flex-direction: column;
 }
+.modal:not([open]) { display: none; }
 .modal::backdrop { background: rgba(12,16,22,.45); backdrop-filter: blur(2px); }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .modal::backdrop { background: rgba(0,0,0,.62); }
@@ -904,7 +953,7 @@ details.card[open] > summary::before { content: "▾ "; }
   border-radius: var(--radius) var(--radius) 0 0; z-index: 2;
 }
 .modal-head h2 { margin: 0; font-size: 1.05rem; }
-.modal-body { padding: 16px; overflow-y: auto; max-height: calc(86vh - 58px); }
+.modal-body { padding: 16px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 
 /* --- the person picker --------------------------------------------------- */
 .pick { position: relative; }
@@ -1086,8 +1135,9 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
    outside .chat-log as well as inside it -- everything above that is about
    turns rather than about the chat page applies here too. */
 .convo {
-  display: flex; flex-direction: column; gap: 16px; padding: 4px 2px;
+  display: flex; flex-direction: column; gap: 14px; padding: 4px 2px; min-width: 0;
 }
+.convo .turn.it .bubble { font-size: 13.5px; }
 
 /* ---- a tool call, shown as a call rather than as syntax ---------------- */
 .tool-call {

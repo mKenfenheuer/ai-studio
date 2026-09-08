@@ -31,8 +31,8 @@ import { html, raw, esc } from "./util.js";
 const ROLE = {
   user:      { label: "You",       side: "me",   mark: "" },
   assistant: { label: "Assistant", side: "it",   mark: "◆" },
-  system:    { label: "System",    side: "note", mark: "" },
-  developer: { label: "Developer", side: "note", mark: "" },
+  system:    { label: "System",    side: "sys",  mark: "" },
+  developer: { label: "Developer", side: "sys",  mark: "" },
   tool:      { label: "Tool",      side: "note", mark: "" },
 };
 
@@ -46,6 +46,38 @@ export function pretty(text) {
   if (!s.startsWith("{") && !s.startsWith("[")) return s;
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
 }
+
+/** Text as people write it for models: prose, with fenced code blocks.
+ *
+ *  A system prompt that carries a CSV of devices, or a user turn that pastes
+ *  a stack trace, arrives with ``` fences around the part that is not prose.
+ *  Shown as one run of wrapped text the table inside becomes soup; shown as a
+ *  block it reads as the table it is. Only fences are honoured -- this is not
+ *  a Markdown renderer, and a training row should look like what it says.
+ */
+export function richText(text) {
+  const parts = String(text ?? "").split(/```([\w+-]*)[^\S\n]*\n?([\s\S]*?)(?:```|$)/g);
+  let out = "";
+  for (let i = 0; i < parts.length; i += 3) {
+    // The line breaks either side of a fence belong to the fence, not to the
+    // prose: kept, they draw a blank line above and below every block.
+    let prose = parts[i];
+    if (i > 0) prose = prose.replace(/^\n/, "");
+    if (i + 2 < parts.length) prose = prose.replace(/\n$/, "");
+    if (prose) out += `<span class="prose">${esc(prose)}</span>`;
+    if (i + 2 < parts.length) {
+      const lang = parts[i + 1];
+      out += `<pre class="code-block"${lang ? ` data-lang="${esc(lang)}"` : ""}>${
+        esc(parts[i + 2].replace(/\n$/, ""))}</pre>`;
+    }
+  }
+  return out;
+}
+
+// A system prompt longer than this is folded by default: it is context for
+// every row and rarely what anyone opened the row to read.
+const FOLD_CHARS = 500;
+const FOLD_LINES = 8;
 
 /** `get_order(order_id="12345")` — a call on one line, when it fits. */
 function callSignature(call) {
@@ -98,16 +130,17 @@ function toolCall(call, i, opts) {
  *  blank screen for twenty seconds reads as a hang.
  */
 export function reasoningBlock(text, opts = {}) {
-  const n = text.length;
-  const label = opts.live
-    ? `Thinking${n ? ` — ${n.toLocaleString()} characters` : "…"}`
-    : `Thought for ${n.toLocaleString()} character${n === 1 ? "" : "s"}`;
+  const label = opts.live ? "Thinking…" : "Reasoning";
+  // The first line, as a peek, so the fold says what was thought about rather
+  // than how long it took to think it.
+  const peek = opts.live ? "" : (text.split("\n").find((l) => l.trim()) || "").trim();
   return html`
     <details class="reasoning ${opts.live ? "live" : ""}" ${
       opts.open || opts.live ? "open" : ""}>
       <summary>
         <span class="reasoning-mark" aria-hidden="true"></span>
         <span class="reasoning-label">${label}</span>
+        ${raw(peek ? `<span class="reasoning-peek">${esc(peek)}</span>` : "")}
       </summary>
       <div class="reasoning-body">${text}</div>
     </details>`;
@@ -141,10 +174,19 @@ function toolResult(m, opts) {
  *  and a call already draws its own card, so the screen showed a box inside a
  *  box for every call a model made -- which reads as a mistake because it is.
  */
-function body(content, calls, reasoning, per) {
+function body(content, calls, reasoning, per, role) {
   const called = calls.map((c, n) => toolCall(c, n, per)).join("");
   if (content) {
-    return html`<div class="bubble"><div class="bubble-text">${content}</div>${
+    const sys = role === "system" || role === "developer";
+    const lines = content.split("\n");
+    if (sys && (content.length > FOLD_CHARS || lines.length > FOLD_LINES)) {
+      const first = (lines.find((l) => l.trim()) || "").trim();
+      return html`<details class="bubble sys-fold">
+        <summary><span class="sys-peek">${first}</span>
+          <span class="muted">${lines.length} lines</span></summary>
+        <div class="bubble-text">${raw(richText(content))}</div>${raw(called)}</details>`;
+    }
+    return html`<div class="bubble"><div class="bubble-text">${raw(richText(content))}</div>${
       raw(called)}</div>`;
   }
   if (called) return called;
@@ -202,7 +244,7 @@ export function conversationHtml(messages, opts = {}) {
         </div>
         ${raw(reasoning
           ? reasoningBlock(reasoning, { open: !!opts.openReasoning }) : "")}
-        ${raw(body(content, calls, reasoning, per))}
+        ${raw(body(content, calls, reasoning, per, role))}
         ${raw(opts.footer ? opts.footer(m, i) : "")}
         ${raw(opts.actions ? opts.actions(m, i) : "")}
       </div>`;

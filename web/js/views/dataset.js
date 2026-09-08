@@ -413,7 +413,7 @@ export async function datasetView(mount, [id]) {
       const found = (rows?.rows || []).find((r) => r.index === i);
       if (!found) return;
       const canEdit = d.access === "edit";
-      const dlg = modal({ title: `Row ${i}`, width: 720,
+      const dlg = modal({ title: `Row ${i}`, width: isConversation(found.row) ? 860 : 720,
                           body: rowEditor(found.row, found.rendered, canEdit) });
       on(dlg, "click", "#saveRow", async () => {
         const next = {};
