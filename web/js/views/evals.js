@@ -8,17 +8,102 @@
  * because nothing was held constant between them.
  */
 import { api } from "../api.js";
-import { html, raw, esc, $, on, toast, fmtAgo, fmtNum } from "../util.js";
+import { html, raw, esc, $, on, toast, modal, fmtAgo, fmtNum } from "../util.js";
+import { ribbon, rb, group, rbSearch, wireRibbon, tabState } from "../ribbon.js";
+import { pageHead, emptyState, confirmDestructive } from "../components.js";
+
+const TABS = [
+  { key: "home", label: "Home" },
+  { key: "about", label: "How to read this" },
+];
 
 export async function evalsView(mount) {
   let items = await api.evals();
   let datasets = [];
+  let filter = "";
+  let picked = new Set();
+  const tabs = tabState("evals", TABS, "home");
+  let tab = tabs.get();
 
-  const draw = () => { mount.innerHTML = layout(items, datasets); wire(); };
+  const draw = () => {
+    mount.innerHTML = layout({ items, filter, picked, tab });
+    wire();
+  };
   const refresh = async () => { items = await api.evals(); draw(); };
 
-  function wire() {
-    on(mount, "submit", "#newEvalForm", async (e) => {
+  /** Prompts typed straight in. */
+  function newSetDialog() {
+    const dlg = modal({ title: "New prompt set", width: 620, body: html`
+      <p class="muted tiny">One prompt per line. Add the answer you would call
+        correct after <code>=&gt;</code> — without it there is nothing to score
+        against, only text to read.</p>
+      <form id="newEvalForm">
+        <div class="field">
+          <label for="evName">Name</label>
+          <input id="evName" name="name" type="text" required
+                 placeholder="e.g. Home assistant commands">
+        </div>
+        <div class="field">
+          <label for="promptsBox">Prompts</label>
+          <textarea id="promptsBox" name="prompts" rows="9" class="mono"
+            placeholder="Turn off the kitchen light => {&quot;action&quot;: &quot;light.turn_off&quot;}
+What is the capital of France? => Paris
+Write a haiku about rain"></textarea>
+          <div class="hint"><span id="promptsCount">nothing yet</span></div>
+        </div>
+        <div class="field">
+          <label for="evNotes">Notes <span class="muted tiny">(optional)</span></label>
+          <input id="evNotes" name="notes" type="text"
+                 placeholder="What this set is meant to measure">
+        </div>
+        <div class="row" style="justify-content:flex-end;gap:8px">
+          <button type="button" class="btn" data-modal-close>Cancel</button>
+          <button class="btn btn-primary" type="submit">Save prompt set</button>
+        </div>
+      </form>` });
+    wireNewSet(dlg);
+  }
+
+  /** Prompts taken out of a dataset split. */
+  function fromDatasetDialog() {
+    const dlg = modal({ title: "Prompt set from a dataset", width: 560, body: html`
+      <p class="muted tiny">Takes rows straight out of your library, using one
+        column as the prompt and another as the expected answer. Build it from
+        a split you did <em>not</em> train on, or you are measuring the model's
+        memory rather than what it learned.</p>
+      <form id="fromDataForm">
+        <div class="field">
+          <label for="dsPick">Dataset</label>
+          <select id="dsPick" name="dataset_id">
+            <option value="">Choose one…</option>
+            ${raw(datasets.map((d) => html`
+              <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
+          </select>
+        </div>
+        <div id="dsSplitBox">${raw(splitPicker(null))}</div>
+        <div class="field">
+          <label for="dsLimit">How many rows</label>
+          <input id="dsLimit" name="limit" type="number" value="50" min="1" max="500">
+          <div class="hint">Every model you compare answers all of them, so
+            fifty is usually plenty and five hundred is an overnight job.</div>
+        </div>
+        <div class="row" style="justify-content:flex-end;gap:8px">
+          <button type="button" class="btn" data-modal-close>Cancel</button>
+          <button class="btn btn-primary" type="submit">Build prompt set</button>
+        </div>
+      </form>` });
+    wireFromDataset(dlg);
+  }
+
+  function wireNewSet(root) {
+    on(root, "input", "#promptsBox", (_e, t) => {
+      const p = parsePrompts(t.value);
+      $("#promptsCount", root).textContent = p.items.length
+        ? `${p.items.length} prompt${p.items.length === 1 ? "" : "s"}, `
+          + `${p.withAnswers} with an expected answer`
+        : "nothing yet";
+    });
+    on(root, "submit", "#newEvalForm", async (e) => {
       e.preventDefault();
       const f = Object.fromEntries(new FormData(e.target).entries());
       const parsed = parsePrompts(f.prompts || "");
@@ -33,15 +118,17 @@ export async function evalsView(mount) {
       } catch (ex) { toast(ex.message, "err"); }
     });
 
-    on(mount, "input", "#promptsBox", (_e, t) => {
-      const p = parsePrompts(t.value);
-      $("#promptsCount", mount).textContent = p.items.length
-        ? `${p.items.length} prompt${p.items.length === 1 ? "" : "s"}, `
-          + `${p.withAnswers} with an expected answer`
-        : "nothing yet";
-    });
+  }
 
-    on(mount, "submit", "#fromDataForm", async (e) => {
+  function wireFromDataset(root) {
+    // The split boxes follow the dataset: a held-out split is offered first
+    // when there is one, and the hint says which kind of set this will make.
+    on(root, "change", "#dsPick", (_e, t) => {
+      const d = datasets.find((x) => x.id === t.value);
+      const box = $("#dsSplitBox", root);
+      if (box) box.innerHTML = splitPicker(d);
+    });
+    on(root, "submit", "#fromDataForm", async (e) => {
       e.preventDefault();
       const f = Object.fromEntries(new FormData(e.target).entries());
       if (!f.dataset_id) return toast("Choose a dataset first.", "err");
@@ -53,21 +140,49 @@ export async function evalsView(mount) {
         location.hash = `#/evals/${created.id}`;
       } catch (ex) { toast(ex.message, "err"); }
     });
+  }
 
-    // The split boxes follow the dataset: a held-out split is offered first
-    // when there is one, and the hint says which kind of set this will make.
-    on(mount, "change", "#dsPick", (_e, t) => {
-      const d = datasets.find((x) => x.id === t.value);
-      const box = $("#dsSplitBox", mount);
-      if (box) box.innerHTML = splitPicker(d);
+  function wire() {
+    wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
+    on(mount, "click", "#newSet", newSetDialog);
+    on(mount, "click", "#fromDataset", fromDatasetDialog);
+    on(mount, "input", "#evFilter", (_e, t) => {
+      filter = t.value.toLowerCase();
+      $("#evList", mount).innerHTML = listing({ items, filter, picked });
+    });
+    on(mount, "change", "[data-pick]", (_e, t) => {
+      if (t.checked) picked.add(t.dataset.pick); else picked.delete(t.dataset.pick);
+      draw();
+    });
+    on(mount, "click", "#pickNone", () => { picked = new Set(); draw(); });
+
+    on(mount, "click", "#copySet", async () => {
+      const one = items.find((e) => picked.has(e.id));
+      if (!one) return;
+      try {
+        const made = await api.copyEval(one.id, {});
+        toast("Copied.", "ok");
+        location.hash = `#/evals/${made.id}`;
+      } catch (ex) { toast(ex.message, "err"); }
     });
 
-    on(mount, "click", "[data-del-eval]", async (_e, t) => {
-      if (!confirm(`Delete "${t.dataset.name}"?\n\nEvery score recorded `
-                   + "against it is deleted too, and those cannot be "
-                   + "recomputed without re-running the models.")) return;
-      try { await api.deleteEval(t.dataset.delEval); toast("Deleted.", "ok"); await refresh(); }
-      catch (ex) { toast(ex.message, "err"); }
+    on(mount, "click", "#deleteSet", async () => {
+      const list = items.filter((e) => picked.has(e.id) && e.mine);
+      if (!list.length) return toast("Only the owner can delete a prompt set.", "err");
+      if (!await confirmDestructive({
+        title: list.length === 1 ? `Delete "${list[0].name}"?`
+                                 : `Delete ${list.length} prompt sets?`,
+        consequences: [
+          "Every score recorded against them goes too.",
+          "Those cannot be recomputed without running the models again.",
+        ],
+        confirmLabel: "Delete" })) return;
+      for (const e of list) {
+        try { await api.deleteEval(e.id); } catch (ex) { toast(ex.message, "err"); }
+      }
+      picked = new Set();
+      toast("Deleted.", "ok");
+      await refresh();
     });
   }
 
@@ -120,102 +235,104 @@ function parsePrompts(text) {
   return { items, withAnswers };
 }
 
-function layout(items, datasets) {
+function layout(s) {
   return html`
-    <div class="page-head">
-      <h1>Evaluate</h1>
-      <p class="sub">Ask every model the same questions, and keep the answers.</p>
-    </div>
-
-    <div class="card callout" style="margin-bottom:16px">
-      <p class="tiny" style="margin:0">A model's training loss cannot be
-        compared with another run's — different data, different vocabulary,
-        different length. Two things here can. A <strong>held-out loss</strong>
-        is measured on examples the model never trained on, and every run
-        records one; <a href="#/compare">compare runs</a> puts them side by
-        side. A <strong>prompt set</strong> goes further: the same questions,
-        put to each model in turn, scored the same way.</p>
-    </div>
-
-    <div class="grid grid-2" style="margin-bottom:16px">
-      <div class="card">
-        <h3>New prompt set</h3>
-        <p class="muted tiny">One prompt per line. Add the answer you would
-          call correct after <code>=&gt;</code> — without it there is nothing to
-          score against, only text to read.</p>
-        <form id="newEvalForm" style="margin-top:10px">
-          <div class="field">
-            <label for="evName">Name</label>
-            <input id="evName" name="name" type="text" required
-                   placeholder="e.g. Home assistant commands">
-          </div>
-          <div class="field">
-            <label for="promptsBox">Prompts</label>
-            <textarea id="promptsBox" name="prompts" rows="7" class="mono"
-              placeholder="Turn off the kitchen light => {&quot;action&quot;: &quot;light.turn_off&quot;}
-What is the capital of France? => Paris
-Write a haiku about rain"></textarea>
-            <div class="hint"><span id="promptsCount">nothing yet</span></div>
-          </div>
-          <div class="field">
-            <label for="evNotes">Notes <span class="muted tiny">(optional)</span></label>
-            <input id="evNotes" name="notes" type="text"
-                   placeholder="What this set is meant to measure">
-          </div>
-          <button class="btn-primary btn-sm" type="submit">Save prompt set</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <h3>From a dataset</h3>
-        <p class="muted tiny">Takes rows straight out of your dataset library,
-          using one column as the prompt and another as the expected answer.
-          The honest way to do this is to <a href="#/data">split a dataset</a>
-          first and build the prompt set from the part you did
-          <em>not</em> train on — otherwise you are measuring the model's
-          memory, not what it learned.</p>
-        <form id="fromDataForm" style="margin-top:10px">
-          <div class="field">
-            <label for="dsPick">Dataset</label>
-            <select id="dsPick" name="dataset_id">
-              <option value="">Choose one…</option>
-              ${raw(datasets.map((d) => html`
-                <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
-            </select>
-          </div>
-          <div id="dsSplitBox">${raw(splitPicker(null))}</div>
-          <div class="field">
-            <label for="dsLimit">How many rows</label>
-            <input id="dsLimit" name="limit" type="number" value="50" min="1" max="500">
-            <div class="hint">Every model you compare answers all of them, so
-              fifty is usually plenty and five hundred is an overnight job.</div>
-          </div>
-          <button class="btn-sm" type="submit">Build prompt set</button>
-        </form>
-      </div>
-    </div>
-
-    ${raw(items.length ? html`
+    ${raw(pageHead({
+      title: "Evaluate",
+      sub: "Ask every model the same questions, and keep the answers.",
+    }))}
+    ${raw(ribbonFor(s))}
+    ${raw(s.tab === "about" ? about() : html`
       <div class="card" style="padding:0">
-        <div class="table-wrap"><table>
-          <thead><tr>
-            <th>Prompt set</th><th>Prompts</th><th>Scorings</th>
-            <th class="hide-sm">Owner</th><th class="hide-sm">Updated</th><th></th>
-          </tr></thead>
-          <tbody>${raw(items.map(row).join(""))}</tbody>
-        </table></div>
-      </div>` : html`
-      <div class="card empty"><div class="big">🎯</div>
-        <h3>No prompt sets yet</h3>
-        <p class="muted">Write down the questions you actually care about, once.
-          Every model you train from now on can be put to the same ones.</p>
+        <div id="evList">${raw(listing(s))}</div>
       </div>`)}`;
 }
 
-function row(e) {
+function ribbonFor({ tab, items, picked, filter }) {
+  const chosen = items.filter((e) => picked.has(e.id));
+  const one = chosen.length === 1 ? chosen[0] : null;
+  const mine = chosen.filter((e) => e.mine).length;
+  const body = tab === "home"
+    ? group("New prompt set", [
+        rb("newSet", "✎", "Type prompts", { cls: "primary" }),
+        rb("fromDataset", "▤", "From a dataset",
+          { title: "Take rows out of a held-out split" }),
+      ]) + group(chosen.length ? `${chosen.length} selected` : "Selected", [
+        rb(null, "◎", "Open", { disabled: !one, href: one ? `#/evals/${one.id}` : "" }),
+        rb("copySet", "⧉", "Copy", { disabled: !one,
+          title: "A copy to edit, so the scores already taken keep their meaning" }),
+        rb("deleteSet", "🗑", "Delete", { cls: "danger", disabled: !mine }),
+        rb("pickNone", "✕", "Clear", { disabled: !chosen.length }),
+      ]) + group("Compare", [
+        rb(null, "⚖", "Held-out loss", { href: "#/compare",
+          title: "Rank finished runs by the loss they measured on unseen data" }),
+      ]) + group("Find", [
+        rbSearch("evFilter", { placeholder: "Filter…", value: filter }),
+      ])
+    : group("Elsewhere", [
+        rb(null, "⚖", "Compare runs", { href: "#/compare" }),
+        rb(null, "▤", "Datasets", { href: "#/data" }),
+      ]);
+  return ribbon({ tabs: TABS, active: tab, body });
+}
+
+/** Why there are two numbers here and what each is worth. */
+function about() {
+  return html`
+    <div class="card">
+      <h3>Two numbers, and what each one means</h3>
+      <p class="muted tiny">A model's <strong>training loss</strong> cannot be
+        compared with another run's — different data, different vocabulary,
+        different length. Two things here can.</p>
+      <p class="muted tiny">A <strong>held-out loss</strong> is measured on
+        examples the model never trained on, and every run records one.
+        <a href="#/compare">Compare runs</a> puts them side by side. It is free,
+        it is honest, and it only tells you which model fits its own held-out
+        data best — not whether either is any good at your task.</p>
+      <p class="muted tiny">A <strong>prompt set</strong> goes further: the same
+        questions, put to each model in turn, scored the same way. It is the
+        only thing here that answers "is the one I trained today better than
+        the one I trained last week", and it is only worth anything if the
+        models were not trained on these prompts. Build one from a held-out
+        split and that is guaranteed rather than hoped for.</p>
+      <p class="muted tiny">When two models are close, this studio will say so
+        rather than crowning one: a difference smaller than the spread between
+        prompts is not a difference.</p>
+    </div>`;
+}
+
+function listing({ items, filter, picked }) {
+  const shown = items.filter((e) => !filter
+    || e.name.toLowerCase().includes(filter)
+    || (e.notes || "").toLowerCase().includes(filter));
+
+  if (!shown.length) {
+    return emptyState({
+      icon: "🎯",
+      title: items.length ? "Nothing matches that" : "No prompt sets yet",
+      body: items.length ? "Try a different word."
+        : "Write down the questions you actually care about, once. Every model "
+          + "you train from now on can be put to the same ones.",
+      card: false,
+    });
+  }
+  return html`
+    <div class="table-wrap"><table>
+      <thead><tr>
+        <th style="width:28px"></th>
+        <th>Prompt set</th><th>Prompts</th><th>Scorings</th>
+        <th class="hide-sm">Owner</th><th class="hide-sm">Updated</th><th></th>
+      </tr></thead>
+      <tbody>${raw(shown.map((e) => row(e, picked)).join(""))}</tbody>
+    </table></div>`;
+}
+
+function row(e, picked) {
   const answered = (e.items || []).filter((i) => i.expected).length;
   return html`
-    <tr>
+    <tr class="${picked.has(e.id) ? "row-picked" : ""}">
+      <td><input type="checkbox" data-pick="${e.id}" aria-label="Select ${e.name}"
+                 ${picked.has(e.id) ? "checked" : ""}></td>
       <td><a href="#/evals/${e.id}"><strong>${e.name}</strong></a>
         ${raw(e.notes ? `<div class="muted tiny">${esc(e.notes)}</div>` : "")}</td>
       <td>${(e.items || []).length}
@@ -224,10 +341,6 @@ function row(e) {
       <td class="tiny muted hide-sm">${e.mine ? "you" : (e.owner_name || "—")}
         ${raw(e.is_shared ? ` <span class="badge">shared</span>` : "")}</td>
       <td class="tiny muted hide-sm">${fmtAgo(e.updated_at)}</td>
-      <td><div class="row" style="gap:5px">
-        <a class="btn btn-sm" href="#/evals/${e.id}">Open</a>
-        ${raw(e.mine ? `<button class="btn-sm btn-danger" data-del-eval="${esc(e.id)}"
-                 data-name="${esc(e.name)}" title="Delete">✕</button>` : "")}
-      </div></td>
+      <td><a class="btn btn-sm" href="#/evals/${e.id}">Open</a></td>
     </tr>`;
 }

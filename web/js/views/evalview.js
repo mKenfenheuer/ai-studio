@@ -14,18 +14,51 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtDuration } from "../util.js";
 import { shareButton, wireShareBox } from "./share.js";
+import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
+import { breadcrumb, confirmDestructive } from "../components.js";
+
+const TABS = [
+  { key: "scores", label: "Scores" },
+  { key: "run", label: "Score models" },
+  { key: "prompts", label: "The prompts" },
+];
 
 export async function evalView(mount, [evalId]) {
   let ev = await api.eval(evalId);
   let candidates = [];
   let openScore = null;
+  const tabs = tabState("evalview", TABS, "scores");
+  let tab = tabs.get();
 
-  const draw = () => { mount.innerHTML = layout(ev, candidates, openScore); wire(); };
+  const draw = () => {
+    mount.innerHTML = layout(ev, candidates, openScore, tab);
+    wire();
+  };
 
   const refresh = async () => { ev = await api.eval(evalId); draw(); };
 
   function wire() {
     wireShareBox(mount, "eval", ev, refresh);
+    wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
+
+    // A prompt set with no scores yet opens on the tab that does something
+    // about that, rather than on an empty table.
+    on(mount, "click", "#goScore", () => { tab = "run"; tabs.set(tab); draw(); });
+
+    on(mount, "click", "#deleteEval", async () => {
+      if (!await confirmDestructive({
+        title: `Delete "${ev.name}"?`,
+        consequences: [
+          "Every score recorded against it goes too.",
+          "Those cannot be recomputed without running the models again.",
+        ],
+        confirmLabel: "Delete the prompt set" })) return;
+      try {
+        await api.deleteEval(evalId);
+        toast("Deleted.", "ok");
+        location.hash = "#/evals";
+      } catch (ex) { toast(ex.message, "err"); }
+    });
 
     on(mount, "click", "#runEval", async () => {
       const picked = $$("[data-model-pick]:checked", mount).map((c) => c.value);
@@ -59,14 +92,17 @@ export async function evalView(mount, [evalId]) {
     });
 
     on(mount, "click", "[data-del-score]", async (_e, t) => {
-      if (!confirm("Remove this scoring from the comparison?")) return;
+      if (!await confirmDestructive({
+        title: "Remove this scoring?",
+        body: "It leaves the comparison. The run that produced it is untouched.",
+        confirmLabel: "Remove it" })) return;
       try { await api.deleteScore(evalId, t.dataset.delScore); await refresh(); }
       catch (ex) { toast(ex.message, "err"); }
     });
 
     on(mount, "click", "#copyEval", async () => {
       try {
-        const copy = await api.copyEval(evalId);
+        const copy = await api.copyEval(evalId, {});
         toast("Copied. Edit the copy freely.", "ok");
         location.hash = `#/evals/${copy.id}`;
       } catch (ex) { toast(ex.message, "err"); }
@@ -81,92 +117,119 @@ export async function evalView(mount, [evalId]) {
 
 // ---------------------------------------------------------------------------
 
-function layout(ev, candidates, openScore) {
+function layout(ev, candidates, openScore, tab) {
   const scores = ev.scores || [];
-  const answered = (ev.items || []).filter((i) => i.expected).length;
+  const items = ev.items || [];
+  const answered = items.filter((i) => i.expected).length;
+  document.title = `${ev.name} · Evaluate · AI Studio`;
+
+  const body = tab === "run" ? runPanel(ev, candidates)
+    : tab === "prompts" ? promptsPanel(items, answered)
+    : html`${raw(scoreTable(scores, answered, items.length))}
+           ${raw(openScore ? scoreDetail(openScore) : "")}`;
+
   return html`
     <div class="page-head">
-      <a href="#/evals" class="tiny">← All prompt sets</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${ev.name}</h1>
-        <div class="row" style="gap:6px">
-          <span class="badge">${(ev.items || []).length} prompts</span>
-          <button class="btn-sm" id="copyEval" title="Make an editable copy">Copy</button>
-          ${raw(shareButton("eval", ev))}
-        </div>
-      </div>
+      ${raw(breadcrumb({ href: "#/evals", label: "Prompt sets" }))}
+      <h1 style="margin:6px 0 0">${ev.name}</h1>
       ${raw(ev.notes ? `<p class="sub">${esc(ev.notes)}</p>` : "")}
     </div>
+    ${raw(ribbonFor(ev, candidates, tab))}
+    ${raw(body)}`;
+}
 
-    ${raw(scoreTable(scores, answered, (ev.items || []).length))}
-    ${raw(openScore ? scoreDetail(openScore) : "")}
+function ribbonFor(ev, candidates, tab) {
+  const items = ev.items || [];
+  const scored = (ev.scores || []).length;
+  const body = group("This set", [
+    rb("goScore", "◎", "Score models", { cls: "primary", disabled: !candidates.length,
+      title: candidates.length ? "Put these prompts to a model"
+                               : "Train a model first" }),
+    rb("copyEval", "⧉", "Copy",
+      { title: "An editable copy, so scores already taken keep their meaning" }),
+    rb("deleteEval", "🗑", "Delete", { cls: "danger", disabled: !ev.mine }),
+  ]) + group("Compare", [
+    rb(null, "⚖", "Held-out loss", { href: "#/compare" }),
+    rb(null, "≡", "Runs", { href: "#/jobs" }),
+  ]);
+  return ribbon({
+    tabs: TABS, active: tab, body,
+    right: `<span class="badge">${items.length} prompts</span>
+            <span class="badge">${scored} scoring${scored === 1 ? "" : "s"}</span>
+            ${shareButton("eval", ev)}`,
+  });
+}
 
-    <div class="grid grid-2" style="margin-bottom:14px">
-      <div class="card">
-        <h3>Score some models</h3>
-        ${raw(candidates.length ? html`
-          <p class="muted tiny">Each one is loaded onto a machine in turn and
-            asked all ${(ev.items || []).length} prompts. That takes a while,
-            so it runs as a queued job you can watch and stop.</p>
-          <div class="picklist" style="margin-top:10px">
-            ${raw(candidates.map((c) => html`
-              <label class="check">
-                <input type="checkbox" data-model-pick value="${c.id}">
-                <span>${c.name}
-                  <span class="muted tiny">· ${c.kind === "pretrain_llm"
-                    ? "built from scratch" : (c.base_model || "fine-tune")}
-                    ${raw(c.stopped_early ? ' · <span class="badge">stopped early</span>' : "")}
-                  </span></span>
-              </label>`).join(""))}
-          </div>
-          <details class="adv" style="margin-top:10px">
-            <summary>How they are asked</summary>
-            <div class="field">
-              <label for="evSystem">System prompt <span class="muted tiny">(optional)</span></label>
-              <input id="evSystem" type="text"
-                     placeholder="Left empty, each model gets only the prompt">
-            </div>
-            <div class="row" style="gap:10px">
-              <div class="field" style="flex:1">
-                <label for="evMaxTokens">Longest answer</label>
-                <input id="evMaxTokens" type="number" value="200" min="16" max="512">
-              </div>
-              <div class="field" style="flex:1">
-                <label for="evTemp">Temperature</label>
-                <input id="evTemp" type="number" value="0" min="0" max="2" step="0.1">
-                <div class="hint">Zero means the same answer every time, which
-                  is what makes two scorings comparable.</div>
-              </div>
-            </div>
-          </details>
-          <button class="btn-primary btn-sm" id="runEval" style="margin-top:10px">
-            Score these models</button>`
-        : html`
-          <p class="muted tiny">No finished models to score yet. Train
-            something first — a run that produced a model, or one you stopped
-            and kept.</p>
-          <p><a class="btn btn-sm btn-primary" href="#/new">Start a run</a></p>`)}
+/** Choosing what to ask, and how. */
+function runPanel(ev, candidates) {
+  const items = ev.items || [];
+  if (!candidates.length) {
+    return html`
+      <div class="card empty"><div class="big" aria-hidden="true">🌱</div>
+        <h3>No finished models to score yet</h3>
+        <p class="muted">Train something first — a run that produced a model,
+          or one you stopped and kept.</p>
+        <p><a class="btn btn-primary" href="#/new">Start a run</a></p></div>`;
+  }
+  return html`
+    <div class="card">
+      <p class="muted tiny">Each model is loaded onto a machine in turn and
+        asked all ${items.length} prompts. That takes a while, so it runs as a
+        queued job you can watch and stop.</p>
+      <div class="picklist" style="margin-top:10px">
+        ${raw(candidates.map((c) => html`
+          <label class="check">
+            <input type="checkbox" data-model-pick value="${c.id}">
+            <span>${c.name}
+              <span class="muted tiny">· ${c.kind === "pretrain_llm"
+                ? "built from scratch" : (c.base_model || "fine-tune")}
+                ${raw(c.stopped_early ? ' · <span class="badge">stopped early</span>' : "")}
+              </span></span>
+          </label>`).join(""))}
       </div>
-
-      <div class="card">
-        <h3>The prompts</h3>
-        <p class="muted tiny">${answered} of ${(ev.items || []).length} have an
-          expected answer. Prompts without one still get asked, and their
-          answers are kept to read — they simply cannot be scored.</p>
-        <div class="promptlist">
-          ${raw((ev.items || []).slice(0, 40).map((i) => html`
-            <div class="prompt-row">
-              <div class="p">${i.prompt}</div>
-              ${raw(i.expected
-                ? `<div class="e">→ ${esc(i.expected)}</div>`
-                : `<div class="e muted">no expected answer</div>`)}
-            </div>`).join(""))}
-          ${raw((ev.items || []).length > 40
-            ? `<p class="muted tiny">…and ${(ev.items || []).length - 40} more.</p>` : "")}
+      <details class="adv" style="margin-top:10px">
+        <summary>How they are asked</summary>
+        <div class="field">
+          <label for="evSystem">System prompt <span class="muted tiny">(optional)</span></label>
+          <input id="evSystem" type="text"
+                 placeholder="Left empty, each model gets only the prompt">
         </div>
+        <div class="row" style="gap:10px">
+          <div class="field" style="flex:1">
+            <label for="evMaxTokens">Longest answer</label>
+            <input id="evMaxTokens" type="number" value="200" min="16" max="512">
+          </div>
+          <div class="field" style="flex:1">
+            <label for="evTemp">Temperature</label>
+            <input id="evTemp" type="number" value="0" min="0" max="2" step="0.1">
+            <div class="hint">Zero means the same answer every time, which is
+              what makes two scorings comparable.</div>
+          </div>
+        </div>
+      </details>
+      <button class="btn-primary btn-sm" id="runEval" style="margin-top:10px">
+        Score these models</button>
+    </div>`;
+}
+
+function promptsPanel(items, answered) {
+  return html`
+    <div class="card">
+      <p class="muted tiny">${answered} of ${items.length} have an expected
+        answer. Prompts without one still get asked, and their answers are kept
+        to read — they simply cannot be scored.</p>
+      <div class="promptlist">
+        ${raw(items.slice(0, 200).map((i) => html`
+          <div class="prompt-row">
+            <div class="p">${i.prompt}</div>
+            ${raw(i.expected
+              ? `<div class="e">→ ${esc(i.expected)}</div>`
+              : `<div class="e muted">no expected answer</div>`)}
+          </div>`).join(""))}
+        ${raw(items.length > 200
+          ? `<p class="muted tiny">…and ${items.length - 200} more.</p>` : "")}
       </div>
-    </div>
-`;
+    </div>`;
 }
 
 // Below this, a difference between two models is a difference between a
