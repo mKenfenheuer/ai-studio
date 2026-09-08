@@ -217,7 +217,15 @@ class Fleet:
             # different calibration.
             if fit.get("needed_gb") and not job["config"].get("estimated_vram_gb"):
                 job["config"]["estimated_vram_gb"] = fit["needed_gb"]
-                db.update_job_config(job["id"], job["config"])
+                # There may be no run yet. This same check answers "will this
+                # run here" for a job that is being *created* -- the wizard
+                # pins a machine, so every fine-tune started from it came
+                # through here with a config and no id, and writing the
+                # estimate against `job["id"]` raised KeyError inside the
+                # creation request. The estimate still travels: the caller is
+                # holding this very config dict and stores it a moment later.
+                if job.get("id"):
+                    db.update_job_config(job["id"], job["config"])
             # `fits_quantized` means "only in 4-bit". Treating it as a pass
             # regardless of what the run actually asked for was the whole bug:
             # a 7B needs 19.6 GB in 16-bit and 4.9 GB in 4-bit, and a run
