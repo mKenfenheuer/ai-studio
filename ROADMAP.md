@@ -409,10 +409,26 @@ move to `train`. The same view is the annotation tool for uploaded data
   and is a visible setting; library versions are recorded on the run.
 - **6.6, in part** — a queued run says what every connected machine made of it.
 
-Still to do: splitting wizard.js per step (6.1), compare filters and CSV
-export and run tags (6.4), the dataset hash on a run (6.5), loss masking as a
-setting, checkpoint browsing, sequence packing, full fine-tuning and preference
-tuning (6.6), and GGUF export (6.7).
+Then, in a second pass:
+
+- **6.4** — compare gained a search box, base-model and dataset filters, and a
+  CSV of every column including the seed and the note. Runs gained notes.
+- **6.5** — a run records a fingerprint of the data as it stood, so an edit
+  that leaves the row count unchanged is still visible, and the run page
+  gathers what it would take to repeat a run into one card.
+- **6.6** — loss masking is a setting on both forms and is recorded; batches
+  are padded to their own longest row rather than to the context, which on
+  short examples is most of the arithmetic; checkpoints report their size, age
+  and best point, on the run and on the machines page.
+- **6.7 GGUF export** — a job kind that converts and quantises with llama.cpp,
+  pinned to a tag in the CPU runner image. Verified on the lab: SmolLM2-135M
+  converts and quantises to 105 MB at Q4_K_M in under four seconds.
+
+Still to do: splitting wizard.js per step (6.1); run tags, as distinct from
+notes (6.4); and the larger training features — full fine-tuning, layer
+freezing, DoRA, preference tuning (DPO/ORPO), multi-GPU, and estimate
+calibration (6.6). Those are each a piece of work in their own right rather
+than a gap in the loop.
 
 
 ### 6.1 The wizard remembers
