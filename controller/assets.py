@@ -199,6 +199,22 @@ def usage(owner_id: str | None = None) -> dict:
     return db.asset_usage(owner_id)
 
 
+# How much of the disk must stay free, whatever the quota says. The quota is
+# per account and set without looking at the machine; this is the machine's
+# own limit, and it is the one that matters when the disk is nearly full --
+# the lab box this was written against had thirteen gigabytes left and a
+# twenty-gigabyte quota.
+DISK_FLOOR_BYTES = int(os.environ.get("AI_STUDIO_DISK_FLOOR_GB", "2")) * 1024 ** 3
+
+
+def free_bytes() -> int | None:
+    try:
+        ASSET_DIR.mkdir(parents=True, exist_ok=True)
+        return shutil.disk_usage(ASSET_DIR).free
+    except OSError:
+        return None
+
+
 def check_quota(owner_id: str | None, adding: int = 0) -> None:
     used = usage(owner_id)["bytes"]
     if used + adding > QUOTA_BYTES:
@@ -206,6 +222,13 @@ def check_quota(owner_id: str | None, adding: int = 0) -> None:
             "That would put this account over its %d GB of stored files. "
             "Delete a dataset of images you no longer need, or raise the "
             "quota." % (QUOTA_BYTES // (1024 ** 3)))
+    free = free_bytes()
+    if free is not None and free - adding < DISK_FLOOR_BYTES:
+        raise ValueError(
+            "The disk this studio runs on has %.1f GB left, and storing this "
+            "would take it below the %.0f GB it keeps free for running jobs. "
+            "Free some space first -- old artifacts and datasets are the "
+            "usual answer." % (free / 1024 ** 3, DISK_FLOOR_BYTES / 1024 ** 3))
 
 
 # ------------------------------------------------------------------ deleting
