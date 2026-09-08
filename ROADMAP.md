@@ -294,6 +294,29 @@ active nav item carries `aria-current`.
 
 ## 5. Phase 2: the dataset side, finished
 
+**In progress.** Done so far, deployed to the lab on 2026-09-08:
+
+- **5.1 stable row identity** — every row carries `_id`, kept through filters,
+  renames, merges, conversion to chat and edits. Positions still accepted, so
+  older datasets keep working and gain names on the first rewrite. Versions
+  (the second half of 5.1) are not done.
+- **5.5 splits that mean something** — one dataset with two splits, optionally
+  stratified, and the trainer measures on the held-out split when there is one
+  rather than carving a second slice out of the training data.
+- **5.3 the Check tab** — the report is a tab rather than a modal, the verdict
+  persists as a badge and goes stale by itself, and four new checks: leakage
+  between splits, near-duplicates, secrets, and per-column types.
+- **5.4 make it trainable, on the dataset page** — the Training tab: how the
+  rows are read and how confident that is, what the model will actually read,
+  row lengths against a context window, the conversation report, and a mapping
+  editor that writes back to the dataset.
+
+Still to do: versions and diffing (5.1), tags and "runs trained on this"
+(5.2), the generated-data review queue (5.6), and sources and scale (5.7).
+Exact token counts need a tokenizer, which needs a runner; that goes with the
+pre-flight checks in Phase 3.
+
+
 ### 5.1 Stable row identity and versions
 
 Rows are addressed by file position (`datasets.py:122`); one delete renumbers
