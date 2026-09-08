@@ -269,6 +269,9 @@ _ADDED_COLUMNS = [
     # The last quality check's verdict, so the library can say which datasets
     # have been looked at and what was found without re-reading every file.
     ("datasets", "quality", "TEXT"),
+    # Why this run was made. Nothing recorded it, so a page of six runs of the
+    # same model on the same data was six identical rows and a memory test.
+    ("jobs", "notes", "TEXT"),
     # What the run reported when it ended. It was already written into the log
     # as JSON, which was fine for reading one run and useless for comparing
     # twenty: answering "which of these had the lowest held-out loss" meant
@@ -669,6 +672,10 @@ def add_artifact(job_id: str, kind: str, filename: str, size: int) -> str:
     ex("INSERT INTO artifacts (id,job_id,kind,filename,size_bytes,created_at)"
        " VALUES (?,?,?,?,?,?)", (aid, job_id, kind, filename, size, now()))
     return aid
+
+
+def set_job_notes(job_id: str, notes: str) -> None:
+    ex("UPDATE jobs SET notes=? WHERE id=?", (notes, job_id))
 
 
 def rename_job(job_id: str, name: str) -> None:

@@ -454,6 +454,18 @@ kbd {
   border-radius: 4px; padding: 1px 5px; background: var(--surface-2);
 }
 
+/* A note on a run: a one-line box that grows when there is something in it,
+   rather than a card nobody fills in. */
+.run-notes { margin-top: 6px; max-width: 720px; }
+.run-notes textarea {
+  min-height: 0; resize: vertical; font-size: 12.5px; padding: 6px 9px;
+  background: transparent; border-color: transparent; color: var(--text-2);
+}
+.run-notes textarea:hover { border-color: var(--border); }
+.run-notes textarea:focus {
+  background: var(--surface); border-color: var(--accent); color: var(--text);
+}
+
 .consequences {
   margin: 10px 0 0; padding-left: 18px; color: var(--text-2); font-size: 13px;
 }

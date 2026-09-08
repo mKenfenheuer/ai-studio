@@ -256,6 +256,17 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   // A run is named when it is created, from the model and the dataset -- a
   // decent guess and a poor label once there are six of them. Both layouts on
   // this page draw the same heading, so it is wired once here.
+  // Saved on blur rather than on every keystroke: it is a note, not a form.
+  on(mount, "change", "#runNotes", async (_e, t) => {
+    const job = getJob();
+    if ((job.notes || "") === t.value) return;
+    try {
+      await api.patchJob(jobId, { notes: t.value });
+      job.notes = t.value;
+      toast("Noted.", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
+
   on(mount, "click", "[data-rename]", () => {
     inlineRename($("#runTitle", mount), async (name) => {
       await api.renameJob(jobId, name);
@@ -1638,6 +1649,11 @@ function runHead(job) {
           aria-label="Rename this run">&#9998;</button>
       </div>
       <p class="sub mono tiny" style="margin-top:4px">${subjectOf(job)}</p>
+      <div class="run-notes">
+        <textarea id="runNotes" rows="1" maxlength="2000"
+          placeholder="Why this run? — a note to yourself, saved as you leave the box"
+          >${job.notes || ""}</textarea>
+      </div>
       ${raw(job.config.sweep_id ? html`
         <p class="tiny" style="margin:4px 0 0">One of several variants —
           <a href="#/sweeps/${job.config.sweep_id}">see them side by

@@ -224,7 +224,7 @@ function filtered({ jobs, q, status, kind, scope, sort, bySweep }) {
     if (!q) return true;
     // Everything on the row, so searching for the dataset finds the runs that
     // trained on it and searching for a repository finds what was published.
-    const hay = [j.name, subjectOf(j), j.config?.dataset_label, j.config?.dataset,
+    const hay = [j.name, j.notes, subjectOf(j), j.config?.dataset_label, j.config?.dataset,
                  j.config?.sweep_name, ...(j.config?.published || []).map((p) => p.repo_id)]
       .filter(Boolean).join(" ").toLowerCase();
     return hay.includes(q);

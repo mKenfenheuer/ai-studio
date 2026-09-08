@@ -2138,11 +2138,20 @@ async def rename_job(request: Request, job_id: str,
     the same as anything else that changes a run.
     """
     job = _job_or_404(request, job_id, "edit")
-    name = (payload.get("name") or "").strip()[:120]
-    if not name:
-        raise HTTPException(400, "A run needs a name.")
-    db.rename_job(job_id, name)
-    return {**job, "name": name}
+    out = dict(job)
+    if "notes" in payload:
+        # Why this run was made, which nothing recorded. Six runs of the same
+        # model on the same data were six identical rows and a memory test.
+        notes = (payload.get("notes") or "")[:2000]
+        db.set_job_notes(job_id, notes)
+        out["notes"] = notes
+    if "name" in payload:
+        name = (payload.get("name") or "").strip()[:120]
+        if not name:
+            raise HTTPException(400, "A run needs a name.")
+        db.rename_job(job_id, name)
+        out["name"] = name
+    return out
 
 
 @app.get("/api/jobs/{job_id}/system-prompt")

@@ -236,6 +236,9 @@ export const api = {
     req(`/api/jobs/${encodeURIComponent(id)}/cancel`,
         { method: "POST", body: JSON.stringify({ save, force }) }),
   deleteJob:   (id) => req(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  patchJob:    (id, body) =>
+    req(`/api/jobs/${encodeURIComponent(id)}`,
+        { method: "PATCH", body: JSON.stringify(body) }),
   renameJob:   (id, name) =>
     req(`/api/jobs/${encodeURIComponent(id)}`,
         { method: "PATCH", body: JSON.stringify({ name }) }),
