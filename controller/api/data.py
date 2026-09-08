@@ -431,6 +431,8 @@ async def rename_dataset(request: Request, dataset_id: str,
         fields["notes"] = (payload["notes"] or "")[:4000]
     if "format" in payload:
         fields["format"] = payload["format"] or {}
+    if "tags" in payload:
+        fields["tags"] = db.clean_tags(payload.get("tags"))
     db.update_dataset(dataset_id, **fields)
     return db.get_dataset(dataset_id)
 

@@ -94,6 +94,59 @@ export async function datasetView(mount, [id]) {
     }
   };
 
+  // ---- the review queue --------------------------------------------------
+  //
+  // One row at a time from the `review` split. Keep moves it to train; drop
+  // deletes it; skip leaves it for later. The row is drawn the way the
+  // trainer will read it, because that is the thing being judged.
+  async function reviewQueue() {
+    let page = null;
+    let decided = 0;
+    const dlg = modal({ title: "Review", width: 720, body: `<div id="rqBody"></div>` });
+    const body = $("#rqBody", dlg);
+    const next = async () => {
+      try { page = await api.datasetRows(id, 0, 1, "", "review"); }
+      catch (ex) { toast(ex.message, "err"); return; }
+      const r = page.rows?.[0];
+      if (!r) {
+        body.innerHTML = html`<p class="muted">Nothing left to review${decided ? ` — ${decided} decided` : ""}.</p>
+          <p><button class="btn btn-primary" data-modal-close>Done</button></p>`;
+        await reload();
+        return;
+      }
+      const conv = Array.isArray(r.row.messages) ? r.row.messages : null;
+      body.innerHTML = html`
+        <p class="muted tiny">${fmtNum(page.matched)} waiting${decided ? ` · ${decided} decided` : ""}.
+          Keep sends this row to <code>train</code>; drop deletes it.</p>
+        <div class="card" style="max-height:50vh;overflow:auto">
+          ${raw(conv ? conversationHtml(conv, {}) : `<pre class="mono tiny" style="white-space:pre-wrap">${esc(r.rendered || JSON.stringify(r.row, null, 2))}</pre>`)}
+        </div>
+        <div class="row" style="gap:8px;margin-top:10px">
+          <button class="btn btn-primary" data-rq="keep">Keep → train</button>
+          <button class="btn btn-danger" data-rq="drop">Drop</button>
+          <button class="btn" data-rq="skip">Skip</button>
+          <span class="muted tiny" style="margin-left:auto">k · d · s</span>
+        </div>`;
+      body.dataset.rowId = r.row._id || "";
+    };
+    const act = async (what) => {
+      const rid = body.dataset.rowId;
+      if (what === "skip" || !rid) return next();
+      try {
+        if (what === "keep") await api.editRows(id, { move: { ids: [rid], to: "train" } });
+        else await api.editRows(id, { delete: [rid] });
+        decided++;
+      } catch (ex) { toast(ex.message, "err"); }
+      await next();
+    };
+    on(dlg, "click", "[data-rq]", (_e, t) => act(t.dataset.rq));
+    dlg.addEventListener("keydown", (e) => {
+      const k = { k: "keep", d: "drop", s: "skip" }[e.key];
+      if (k && !e.target.matches("input,textarea")) { e.preventDefault(); act(k); }
+    });
+    await next();
+  }
+
   // ---- the file itself ---------------------------------------------------
   async function showRows(offset = 0, query = null) {
     const q = query ?? ($("#rowSearch", mount)?.value || "");
@@ -552,6 +605,11 @@ export async function datasetView(mount, [id]) {
       try { d = await api.renameDataset(id, { name: t.value }); draw(); toast("Renamed.", "ok"); }
       catch (ex) { toast(ex.message, "err"); }
     });
+    on(mount, "click", "#reviewQueue", () => reviewQueue());
+    on(mount, "change", "#propTags", async (_e, t) => {
+      try { d = await api.renameDataset(id, { tags: t.value }); t.value = (d.tags || []).join(", "); toast("Tagged.", "ok"); }
+      catch (ex) { toast(ex.message, "err"); }
+    });
     on(mount, "change", "#propNotes", async (_e, t) => {
       try { d = await api.renameDataset(id, { notes: t.value }); toast("Notes saved.", "ok"); }
       catch (ex) { toast(ex.message, "err"); }
@@ -867,6 +925,13 @@ function ribbonFor(s) {
       rb("inspect", "◉", "Check the data", { title: "Empty rows, repeats, lengths — with a fix for each" }),
       canEdit ? rb("addRowsBtn", "＋", "Add rows") : "",
       rb("holdBack", "◫", "Hold back a split"),
+      // Rows a model or a person put here to be looked at -- a kept exchange
+      // from the playground, a generated set -- one at a time, with a keep
+      // and a drop. The workbench could already move and delete rows; what
+      // it lacked was a way to go through them without picking each one.
+      (d.splits || {}).review ? rb("reviewQueue", "☑", `Review ${fmtNum(d.splits.review)}`, {
+        cls: "primary", disabled: !canEdit,
+        title: "Go through the rows waiting in the review split" }) : "",
     ]) + group("Use", [
       rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
       // The other thing to do with a set of questions: have a model answer
@@ -918,6 +983,13 @@ function ribbonFor(s) {
     ]) + group("Then", [
       rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
       rb("holdBack", "◫", "Hold back a split"),
+      // Rows a model or a person put here to be looked at -- a kept exchange
+      // from the playground, a generated set -- one at a time, with a keep
+      // and a drop. The workbench could already move and delete rows; what
+      // it lacked was a way to go through them without picking each one.
+      (d.splits || {}).review ? rb("reviewQueue", "☑", `Review ${fmtNum(d.splits.review)}`, {
+        cls: "primary", disabled: !canEdit,
+        title: "Go through the rows waiting in the review split" }) : "",
     ]);
   } else {
     const items = stepsOnTab(tab).map((def) =>
@@ -1558,6 +1630,9 @@ function rightPane(s) {
         <div class="pq-sub">Properties</div>
         <div class="field" style="margin-bottom:8px"><label for="propName">Name</label>
           <input id="propName" value="${d.name}" maxlength="120" ${canEdit ? "" : "disabled"}></div>
+        <div class="field" style="margin-bottom:8px"><label for="propTags">Tags</label>
+          <input id="propTags" class="mono" value="${(d.tags || []).join(", ")}"
+                 placeholder="comma-separated — raw, cleaned, v2" ${canEdit ? "" : "disabled"}></div>
         <div class="field" style="margin-bottom:0"><label for="propNotes">Notes</label>
           <textarea id="propNotes" rows="2" placeholder="What is this, and what is it for?"
                     ${canEdit ? "" : "disabled"}>${d.notes || ""}</textarea></div>

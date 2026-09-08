@@ -311,8 +311,11 @@ active nav item carries `aria-current`.
   row lengths against a context window, the conversation report, and a mapping
   editor that writes back to the dataset.
 
-Still to do: versions and diffing (5.1), tags on datasets (5.2), the
-generated-data review queue (5.6), and sources and scale (5.7). Done since:
+Still to do: versions and diffing (5.1), and sources and scale (5.7). Done
+since: tags on datasets (5.2), filtered and shown in the library like a
+run's; the review queue (5.6) -- a `review` split gets a "Review N" button
+on the dataset page that goes through its rows one at a time, drawn the way
+the trainer reads them, keep (to train) / drop / skip, with k·d·s keys;
 "runs trained on this" -- the dataset page lists every run that read it, with
 each run's own headline number (`GET /api/datasets/{id}/runs`).
 Exact token counts need a tokenizer, which needs a runner; that goes with the
@@ -440,9 +443,7 @@ defined, so every fine-tune since had failed with a NameError -- unnoticed
 because no GPU runner had run one; both halves landed this time, verified
 on LoRA, DoRA and full runs.
 Still to do: splitting wizard.js per step (6.1); and the larger training
-features — full fine-tuning, layer
-freezing, DoRA, preference tuning (DPO/ORPO), multi-GPU, and estimate
-calibration (6.6). Those are each a piece of work in their own right rather
+features — preference tuning (DPO/ORPO) and multi-GPU (6.6). Those are each a piece of work in their own right rather
 than a gap in the loop.
 
 
@@ -570,8 +571,12 @@ Remaining in this phase:
   promotion path the registry needed. The line can be shown for one model
   at a time -- the chart has two validated colours, and a line per model
   would be a tangle nobody could read.
-- **Playground**: side-by-side (the runner already holds several models,
-  `inference.py:120-152`); saved conversations. *Done:* "keep this exchange"
+- **Playground.** *Done:* a second model can be asked the same conversation
+  and its reply shown beside this one's -- drawn as a note, never kept, so
+  the conversation carries on with the model the page belongs to; and
+  conversations can be saved, named, reopened against this run or a later
+  one, which is how the same questions get put to next month's model.
+  *Done earlier:* "keep this exchange"
   writes the conversation up to one assistant turn into a dataset's `review`
   split, with the answer editable first, mapped into the dataset's own shape
   when it is not a conversation dataset (`api/data._shaped`). That is the link

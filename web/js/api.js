@@ -297,6 +297,15 @@ export const api = {
 
   playground:  () => req("/api/playground"),
 
+  // ---- conversations somebody wanted to keep -----------------------------
+  conversations: (jobId = "") =>
+    req(`/api/conversations${jobId ? `?job_id=${encodeURIComponent(jobId)}` : ""}`),
+  conversation: (id) => req(`/api/conversations/${encodeURIComponent(id)}`),
+  saveConversation: (body) =>
+    req("/api/conversations", { method: "POST", body: JSON.stringify(body) }),
+  deleteConversation: (id) =>
+    req(`/api/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
   // ---- a classifier, asked about one picture ----------------------------
   classify: async (jobId, file) => {
     const body = new FormData();

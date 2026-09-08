@@ -580,7 +580,8 @@ function splitBoxes(splits) {
 function listing({ items, filter, sort, scope, tree, picked }) {
   let shown = items.filter((d) =>
     (!filter || d.name.toLowerCase().includes(filter)
-      || (d.origin || "").toLowerCase().includes(filter))
+      || (d.origin || "").toLowerCase().includes(filter)
+      || (d.tags || []).some((t) => t.includes(filter)))
     && (scope === "all" || (scope === "mine" ? d.mine : !d.mine)));
 
   shown.sort(sort === "name" ? (a, b) => a.name.localeCompare(b.name)
@@ -617,7 +618,7 @@ function listing({ items, filter, sort, scope, tree, picked }) {
                        ${picked.has(d.id) ? "checked" : ""}></td>
             <td>
               ${raw(d.depth ? `<span class="lineage-rail" style="--depth:${d.depth}"></span>` : "")}
-              <a href="#/data/${d.id}"><strong>${d.name}</strong></a>
+              <a href="#/data/${d.id}"><strong>${d.name}</strong></a>${raw((d.tags || []).map((t) => ` <span class="badge badge-soft">${esc(t)}</span>`).join(""))}
               ${raw(qualityBadge(d))}
               ${raw(d.mine ? "" : `<span class="badge badge-accent">shared with you</span>`)}
               ${raw(d.mine && d.is_shared ? `<span class="badge">shared</span>` : "")}

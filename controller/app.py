@@ -21,7 +21,7 @@ from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
-from .api import (accounts, data, evals, media, providers, security,
+from .api import (accounts, conversations, data, evals, media, providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
 
@@ -82,6 +82,7 @@ app.middleware("http")(security.authenticate)
 app.include_router(accounts.router)
 app.include_router(data.router)
 app.include_router(media.router)
+app.include_router(conversations.router)
 app.include_router(evals.router)
 app.include_router(providers.router)
 app.include_router(serving_api.router)

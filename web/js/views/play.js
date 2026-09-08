@@ -158,6 +158,13 @@ function chatView(mount, run, runs) {
   // known before anybody has typed a question around it.
   let pending = [];            // [{kind, ref, url, name}]
   let recorder = null;         // the MediaRecorder while the microphone is on
+  // A second model answering the same conversation beside this one. Its
+  // reply is shown and not kept: the conversation carries on with the
+  // model this page belongs to, and the other one is only ever asked.
+  let compareWith = "";
+  let live2 = null;
+  let requestId2 = null;
+  let saved = null;             // {id, title} once this conversation is saved
 
   // The held-out example currently loaded, if any.
   let sample = null;         // {index, messages, tools, prompt, expected, ...}
@@ -307,7 +314,19 @@ function chatView(mount, run, runs) {
         // have it write the data for the next one.
         rb(null, "✦", "Write data with it", { href: "#/generate",
           title: "Have this model write a dataset" }),
-      ]) + (others.length ? group("Switch to", [
+      ]) + group("Keep", [
+        rb("saveConv", "💾", saved ? "Saved" : "Save", {
+          disabled: !turns.length,
+          title: saved ? `Saved as "${saved.title}" — click to save again`
+                       : "Keep this conversation to reopen later, here or against another model" }),
+        rb("openConv", "📂", "Open…", { title: "A conversation you saved earlier" }),
+      ]) + (others.length ? group("Beside it", [
+        rbSelect("compareRun", {
+          title: "Ask a second model the same thing, and show its answer beside this one",
+          value: compareWith,
+          options: [["", "nothing"]].concat(
+            others.slice(0, 40).map((r) => [r.id, r.name])) }),
+      ]) : "") + (others.length ? group("Switch to", [
         rbSelect("otherRun", {
           title: "Another finished run", value: "",
           options: [["", "This model"]].concat(
@@ -321,6 +340,53 @@ function chatView(mount, run, runs) {
   on(mount, "click", "#scoreThis", () => openScoreDialog(run));
   on(mount, "change", "#otherRun", (_e, t) => {
     if (t.value) location.hash = `#/play/${t.value}`;
+  });
+  on(mount, "change", "#compareRun", (_e, t) => { compareWith = t.value; live2 = null; paint(); });
+
+  // ---- keeping and reopening conversations
+  on(mount, "click", "#saveConv", async () => {
+    if (!turns.length) return;
+    const first = turns.find((m) => m.role === "user")?.content || "A conversation";
+    const title = prompt("Name this conversation", saved?.title || first.slice(0, 60));
+    if (title === null) return;
+    try {
+      const r = await api.saveConversation({ id: saved?.id, job_id: run.id, title,
+                                             messages: turns, tools });
+      saved = { id: r.id, title: r.title };
+      paintRibbon();
+      toast(`Saved "${r.title}".`, "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
+  on(mount, "click", "#openConv", async () => {
+    let list = [];
+    try { list = await api.conversations(); } catch (e) { return toast(e.message, "err"); }
+    if (!list.length) return toast("Nothing saved yet. Save one first.", "");
+    const dlg = modal({ title: "Open a conversation", width: 560, body: html`
+      <p class="muted tiny">Reopened here, against <strong>${run.name}</strong> —
+        which is how the same questions get put to a later model.</p>
+      <div class="picklist">
+        ${raw(list.map((c) => html`
+          <div class="row-between" style="padding:6px 0;gap:8px">
+            <button class="btn-sm" data-open-conv="${c.id}" style="text-align:left;flex:1">
+              ${c.title} <span class="muted tiny">· ${c.job_name || "no run"} · ${fmtAgo(c.updated_at)}</span></button>
+            <button class="btn-sm btn-danger" data-drop-conv="${c.id}" title="Delete">✕</button>
+          </div>`).join(""))}
+      </div>` });
+    on(dlg, "click", "[data-open-conv]", async (_e, t) => {
+      try {
+        const c = await api.conversation(t.dataset.openConv);
+        turns = c.messages || [];
+        tools = c.tools || [];
+        saved = { id: c.id, title: c.title };
+        sample = null; live = null; live2 = null;
+        dlg.close();
+        paintRibbon(); paint();
+      } catch (e) { toast(e.message, "err"); }
+    });
+    on(dlg, "click", "[data-drop-conv]", async (_e, t) => {
+      try { await api.deleteConversation(t.dataset.dropConv); t.closest(".row-between").remove(); }
+      catch (e) { toast(e.message, "err"); }
+    });
   });
 
   const log = $("#chatLog", mount);
@@ -488,6 +554,21 @@ function chatView(mount, run, runs) {
     log.innerHTML = turns.length || live ? body : html`
       <div class="chat-empty">Nothing said yet. ${ui.title}.</div>`;
     if (live) log.insertAdjacentHTML("beforeend", liveHtml());
+    // The other model's answer to the same conversation, beside this one's.
+    // Drawn as a note rather than as a turn: it is not part of what the
+    // conversation continues from.
+    if (live2) {
+      log.insertAdjacentHTML("beforeend", html`
+        <div class="turn note beside" data-role="assistant">
+          <div class="turn-who"><span class="turn-mark">◇</span>
+            <span>${live2.name}</span>
+            <span class="badge badge-soft">beside · not kept</span></div>
+          ${raw((live2.reasoning || "").trim()
+            ? reasoningBlock(live2.reasoning.trim(), { live: !live2.content }) : "")}
+          <div class="bubble ${live2.content ? "" : "pending"}"><div class="bubble-text">${
+            live2.content || (live2.done ? "(nothing)" : "…")}</div></div>
+        </div>`);
+    }
     // Something is loaded that the model could answer without another word
     // being typed -- a row that ends on a tool result, or turns left standing
     // after an edit. Without this the conversation simply sits there.
@@ -594,6 +675,18 @@ function chatView(mount, run, runs) {
       requestId = r.request_id;
       stopBtn.hidden = false;
       statusEl.textContent = `Running on ${r.runner}…`;
+      if (compareWith) {
+        // The same conversation, to the other model, at the same settings.
+        // Its stream is kept apart and never joins `turns`.
+        live2 = { reasoning: "", content: "", name: (others.find((o) => o.id === compareWith) || {}).name || "the other model" };
+        api.chat(compareWith, {
+          messages: turns, tools, system: systemBox ? systemBox.value : "",
+          temperature: parseFloat($("#temp", mount).value) || 0.8,
+          max_new_tokens: parseInt($("#maxTok", mount).value, 10) || 512,
+          reasoning: think,
+        }).then((r2) => { requestId2 = r2.request_id; })
+          .catch((e) => { live2 = { ...live2, content: `(could not ask: ${e.message})`, done: true }; paint(); });
+      }
       started = Date.now();
       stopTicking();
       ticker = setInterval(tick, 1000);
@@ -1126,9 +1219,25 @@ function chatView(mount, run, runs) {
       if (live) early.push(msg);
       return;
     }
+    if (requestId2 && msg.request_id === requestId2) { handle2(msg); return; }
     if (msg.request_id !== requestId) return;
     handle(msg);
   });
+
+  function handle2(msg) {
+    if (!live2) return;
+    if (msg.type === "generate_delta") {
+      if (msg.channel === "reasoning") live2.reasoning += msg.delta || "";
+      else live2.content += msg.delta || "";
+      paint();
+    } else if (msg.type === "generate_done") {
+      live2.content = msg.text ?? live2.content;
+      live2.done = true; requestId2 = null; paint();
+    } else if (msg.type === "generate_error") {
+      live2.content += `\n(error: ${msg.error || "generation failed"})`;
+      live2.done = true; requestId2 = null; paint();
+    }
+  }
 
   function handle(msg) {
     if (msg.type === "generate_status") {

@@ -321,6 +321,23 @@ CREATE TABLE IF NOT EXISTS assets (
 CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(sha256);
 CREATE INDEX IF NOT EXISTS idx_assets_dataset ON assets(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_assets_owner ON assets(owner_id);
+
+-- A conversation somebody wanted to keep. The playground threw its
+-- conversations away on navigation, so the exchange that showed a model at
+-- its best or its worst was gone the moment somebody went to look at the
+-- run that produced it. Named, kept, and reopenable against the same run or
+-- a later one.
+CREATE TABLE IF NOT EXISTS conversations (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    job_id      TEXT,
+    title       TEXT NOT NULL,
+    messages    TEXT NOT NULL,
+    tools       TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_id, updated_at);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -402,6 +419,9 @@ _ADDED_COLUMNS = [
     # permanent key to everything the account can see.
     ("api_keys", "expires_at", "REAL"),
     ("api_keys", "scope", "TEXT"),
+    # Short labels on a dataset, the same as on a run: for finding, not
+    # for reading.
+    ("datasets", "tags", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -1359,6 +1379,10 @@ def _hydrate_dataset(r: dict) -> dict:
     r["format"] = json.loads(r.get("format") or "{}")
     r["recipe"] = json.loads(r.get("recipe") or "{}")
     r["quality"] = json.loads(r.get("quality") or "null")
+    try:
+        r["tags"] = json.loads(r.get("tags") or "[]")
+    except (TypeError, ValueError):
+        r["tags"] = []
     # {name: rows}. Absent on datasets written before splits existed, which
     # are one unnamed split of everything -- said here rather than at each of
     # the half-dozen places that read it.
@@ -1385,14 +1409,15 @@ def list_datasets(owner_id: str | None = None) -> list[dict]:
 
 def update_dataset(dataset_id: str, **fields: Any) -> None:
     allowed = {"name", "notes", "rows", "bytes", "columns", "format", "origin",
-               "splits", "recipe", "quality"}
+               "splits", "recipe", "quality", "tags"}
     sets, args = [], []
     for k, v in fields.items():
         if k not in allowed:
             raise ValueError("refusing to update unknown column %r" % k)
         sets.append("%s=?" % k)
         args.append(json.dumps(v)
-                    if k in ("columns", "format", "splits", "recipe", "quality")
+                    if k in ("columns", "format", "splits", "recipe", "quality",
+                             "tags")
                     else v)
     if not sets:
         return
@@ -1919,3 +1944,56 @@ def asset_usage(owner_id: str | None = None) -> dict:
     refs = q1("SELECT COUNT(*) AS n FROM assets %s" % where, args) or {}
     return {"files": row.get("files") or 0, "bytes": row.get("bytes") or 0,
             "references": refs.get("n") or 0}
+
+
+
+# ------------------------------------------------------ saved conversations
+
+def save_conversation(owner_id: str, job_id: str | None, title: str,
+                      messages: list, tools: list | None,
+                      conversation_id: str | None = None) -> str:
+    ts = now()
+    if conversation_id and get_conversation(conversation_id):
+        ex("UPDATE conversations SET title=?, messages=?, tools=?, job_id=?,"
+           " updated_at=? WHERE id=?",
+           (title, json.dumps(messages, ensure_ascii=False),
+            json.dumps(tools or []), job_id, ts, conversation_id))
+        return conversation_id
+    cid = new_id("cnv")
+    ex("INSERT INTO conversations (id,owner_id,job_id,title,messages,tools,"
+       "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+       (cid, owner_id, job_id, title, json.dumps(messages, ensure_ascii=False),
+        json.dumps(tools or []), ts, ts))
+    return cid
+
+
+def _hydrate_conversation(r: dict) -> dict:
+    for key in ("messages", "tools"):
+        try:
+            r[key] = json.loads(r.get(key) or "[]")
+        except (TypeError, ValueError):
+            r[key] = []
+    return r
+
+
+def get_conversation(conversation_id: str) -> dict | None:
+    r = q1("SELECT * FROM conversations WHERE id=?", (conversation_id,))
+    return _hydrate_conversation(r) if r else None
+
+
+def list_conversations(owner_id: str, job_id: str | None = None) -> list[dict]:
+    rows = q("SELECT c.id, c.job_id, c.title, c.created_at, c.updated_at,"
+             " LENGTH(c.messages) AS bytes, j.name AS job_name"
+             " FROM conversations c LEFT JOIN jobs j ON j.id = c.job_id"
+             " WHERE c.owner_id=?" + (" AND c.job_id=?" if job_id else "")
+             + " ORDER BY c.updated_at DESC LIMIT 200",
+             (owner_id, job_id) if job_id else (owner_id,))
+    return rows
+
+
+def delete_conversation(owner_id: str, conversation_id: str) -> bool:
+    c = connect()
+    cur = c.execute("DELETE FROM conversations WHERE id=? AND owner_id=?",
+                    (conversation_id, owner_id))
+    c.commit()
+    return cur.rowcount > 0
