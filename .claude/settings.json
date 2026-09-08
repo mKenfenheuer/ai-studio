@@ -3,7 +3,8 @@
     "allow": [
       "Bash(ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new root@10.1.250.48 'hostname; uptime; docker ps --format \"table {{.Names}}\\\\t{{.Status}}\\\\t{{.Ports}}\"; ls /opt 2>/dev/null')",
       "Bash(ssh root@10.1.250.48 'cat /opt/rebuild.sh; ls /opt/ai-studio-build | head; cd /opt/ai-studio-build && git log --oneline -3 && git status --short | head')",
-      "Bash(node --experimental-vm-modules scripts/check-web.mjs)"
+      "Bash(node --experimental-vm-modules scripts/check-web.mjs)",
+      "Bash(node scripts/check-web.mjs)"
     ]
   }
 }
