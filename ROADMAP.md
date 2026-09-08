@@ -887,3 +887,41 @@ a guess.
   behind one door for admins only. Runs, prompt sets, sweeps, comparisons and
   the activity dashboard keep their addresses and are reached from a project
   or from the projects ribbon.
+
+---
+
+## 14. What an end-to-end run through a real project found
+
+Mistral-7B-Instruct-v0.3, 4-bit LoRA, on 9,504 rows of a tool-calling
+home-automation dataset, taken through every stage of one project on the lab
+box. Six defects, none of which any check would have caught, because each one
+needed real data and a second machine to appear:
+
+1. **Starting a run returned 500.** The wizard pins a machine, and the
+   dispatch check wrote its memory estimate back to the database by job id --
+   at creation time there is no job. Every fine-tune started from the wizard.
+   Now covered by `scripts/check-dispatch.py`.
+2. **Every page defaulted to the CPU box.** The machine list is ordered by
+   when each machine joined; the CPU-only controller joined first. A machine
+   with no VRAM cannot say whether a model fits and offers no 4-bit, so a 20B
+   model looked impossible rather than 4-bit. One order now, in
+   `web/js/machines.js`, and machines say what they cannot do.
+3. **A prompt set from a tool-calling dataset was unusable**: the row's system
+   message (the device list), the expected tool call and the declared tools
+   were all dropped at the door. Items carry their own system message now, and
+   the expected call with its arguments.
+4. **A tool call whose announcement was stripped was not a call.** Mistral
+   marks one with `[TOOL_CALLS]`, a special token, and decoding for display
+   drops special tokens -- so a fine-tune that called the tool correctly
+   twelve times out of twelve scored 0.
+5. **A tool-calling comparison could not be ranked**, because a prompt counted
+   as measurable only if it carried an expected sentence. Calling the right
+   tool is the task; it ranks now, after the loss and the text overlaps.
+6. **The memory estimate ignored the run's own precision** -- 18.9 GB recorded
+   for a 4-bit run that peaked at 5.29 GB, which is what self-calibration was
+   being fed.
+
+The loop itself works: 40 steps in 8m 11s, loss 2.08 to 0.135, held-out 0.1398;
+the fine-tune calls the right tool 25% against the base's 0%; ARC-Challenge on
+60 questions puts the base ahead with overlapping intervals, and says so.
+
