@@ -21,6 +21,7 @@ import { ribbon, rb, group, rbSelect, rbSeg, wireRibbon, tabState } from "../rib
 import { confirmDestructive, breadcrumb } from "../components.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
+import { qualityBadge } from "./data.js";
 import { STEPS, TABS, stepsOnTab, stepFrom, describe } from "./dataset-steps.js";
 
 const PAGE = 25;
@@ -51,6 +52,7 @@ export async function datasetView(mount, [id]) {
   const convReport = resource();   // whether it reads as conversations
   let trainSplit = "";             // which split the training tab is showing
   let contextLen = +(localStorage.getItem("aistudio.ctxLen") || 2048);
+  let checkSample = +(localStorage.getItem("aistudio.checkSample") || 2000);
   let steps = loadDraft(id);       // [{type, ops}]
   let selected = steps.length - 1; // -1 is the source
   let history = [], future = [];   // undo and redo, as whole step lists
@@ -75,7 +77,7 @@ export async function datasetView(mount, [id]) {
   const draw = () => {
     mount.innerHTML = layout({ d, library, rows, steps, selected, preview, previewErr,
                                stages, loading, tab, view, picked, sample, leftOpen,
-                               history, future, colMenu, stats,
+                               history, future, colMenu, stats, checkSample,
                                training, convReport, trainSplit, contextLen });
     wire();
     // Everything the training tab shows is fetched the first time it is
@@ -640,21 +642,28 @@ export async function datasetView(mount, [id]) {
 
     // ---- home actions ------------------------------------------------------
     on(mount, "click", "#inspect", async () => {
-      const dlg = modal({ title: "What is in it", width: 720,
-                          body: `<div id="inspectBox"><div class="muted tiny">Reading the data…</div></div>` });
-      try {
-        stats = await api.datasetInspect(id);
-        $("#inspectBox", dlg).innerHTML = statsPanel(stats);
-      } catch (ex) { $("#inspectBox", dlg).innerHTML = `<div class="callout callout-err">${esc(ex.message)}</div>`; }
-      // Each reported problem carries the step that fixes it. Fixing adds the
-      // step to the pipeline; nothing is written until Apply.
-      on(dlg, "click", "[data-fix]", (_e, t) => {
-        const fix = t.dataset.fix;
-        dlg.close();
-        if (fix === "cap_length") putStep({ type: "length", ops: { min_chars: 0, max_chars: 8000 } });
-        else putStep({ type: fix, ops: STEPS[fix].read(null) });
-        toast("Added as a step. Apply when you are happy with the preview.", "ok");
-      });
+      if (tab !== "check") { tab = "check"; tabs.set(tab); }
+      stats = null;
+      draw();
+      try { stats = await api.datasetInspect(id, checkSample); }
+      catch (ex) { toast(ex.message, "err"); }
+      draw();
+    });
+    on(mount, "change", "#checkSample", (_e, t) => {
+      checkSample = +t.value || 2000;
+      localStorage.setItem("aistudio.checkSample", String(checkSample));
+    });
+    // Each reported finding carries the step that fixes it. Fixing adds the
+    // step to the pipeline; nothing is written until Apply.
+    on(mount, "click", "[data-fix]", (_e, t) => {
+      const fix = t.dataset.fix;
+      if (fix === "cap_length") {
+        putStep({ type: "length", ops: { min_chars: 0, max_chars: 8000 } });
+      } else if (STEPS[fix]) {
+        putStep({ type: fix, ops: STEPS[fix].read(null) });
+      } else { return; }
+      toast("Added as a step. Apply when you are happy with the preview.", "ok",
+            { href: `#/data/${id}`, label: "See it" });
     });
 
     on(mount, "click", "#holdBack", () => {
@@ -783,11 +792,11 @@ function saveDraft(id, steps) {
 
 function layout(s) {
   const { d, steps, selected, leftOpen, tab } = s;
-  if (tab === "train") {
+  if (tab === "train" || tab === "check") {
     return html`
       ${raw(header(d))}
       ${raw(ribbonFor(s))}
-      ${raw(trainPanel(s))}`;
+      ${raw(tab === "train" ? trainPanel(s) : checkPanel(s))}`;
   }
   return html`
     ${raw(header(d))}
@@ -816,6 +825,7 @@ function header(d) {
           ${raw(d.access === "edit" ? `<button class="btn-quiet" id="renameBtn" title="Rename">✎</button>` : "")}
         </div>
         <span class="muted tiny">
+          ${raw(qualityBadge(d))}
           ${fmtNum(d.rows)} rows${raw(splitBadges(d))} ·
           ${(d.bytes / 1048576).toFixed(1)} MB ·
           ${d.owner_name || "unowned"} · updated ${fmtAgo(d.updated_at)}
@@ -861,6 +871,19 @@ function ribbonFor(s) {
     ]) + group("Panes", [
       rb("toggleLeft", "▤", leftOpen ? "Hide library" : "Show library"),
     ]);
+  } else if (tab === "check") {
+    body = group("The data", [
+      rb("inspect", "◉", s.stats ? "Check it again" : "Check the data",
+        { cls: s.stats ? "" : "primary",
+          title: "Empty rows, repeats, near-copies, lengths, leakage, secrets" }),
+      rbSelect("checkSample", { title: "How many rows to read", value: s.checkSample,
+        options: [[500, "the first 500 rows"], [2000, "the first 2,000"],
+                  [10000, "the first 10,000"]] }),
+    ]) + group("Act on it", [
+      rb("applySteps", "✔", "Apply the fixes", { cls: "primary", disabled: !steps.length,
+        title: "Every fix you accepted becomes a step; this writes them" }),
+      rb("discardSteps", "✕", "Discard them", { disabled: !steps.length }),
+    ]);
   } else if (tab === "train") {
     body = group("Check it", [
       rb("recheckTraining", "↻", "Read it again",
@@ -884,6 +907,137 @@ function ribbonFor(s) {
   }
   return ribbon({ tabs: TABS, active: tab, body,
                   right: shareButton("dataset", d) });
+}
+
+// ---- the check tab -----------------------------------------------------------
+//
+// The quality report was a modal: you read it, closed it, and every number in
+// it was gone. Nothing on the library row or the page header said a dataset
+// was a third duplicates. It lives on a tab now, and each finding still
+// carries the step that fixes it.
+
+function checkPanel(s) {
+  const { stats, checkSample } = s;
+  if (!stats) {
+    return html`
+      <div class="card empty">
+        <div class="big" aria-hidden="true">◉</div>
+        <h3>Look at the data before you train on it</h3>
+        <p class="muted">Empty rows, exact repeats, rows that say the same thing
+          in nearly the same words, the spread of lengths, whether the held-out
+          split has leaked into the training data, and whether there are
+          secrets in here.</p>
+        <p><button class="btn btn-primary" id="inspect">Check ${
+          fmtNum(checkSample)} rows</button></p>
+      </div>`;
+  }
+  const worst = { error: 0, warn: 1, info: 2, ok: 3 };
+  const problems = [...(stats.problems || [])]
+    .sort((a, b) => worst[a.level] - worst[b.level]);
+  const leak = stats.leakage;
+  const near = stats.near_duplicates || {};
+
+  return html`
+    <div class="grid grid-2" style="align-items:start;gap:14px">
+      <div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="row-between" style="align-items:baseline;margin-bottom:10px">
+            <h3 style="margin:0">What is worth acting on</h3>
+            <span class="muted tiny">${fmtNum(stats.sampled)} of ${
+              fmtNum(stats.total_rows)} rows read</span>
+          </div>
+          ${raw(problems.map((p) => html`
+            <div class="callout ${p.level === "error" ? "callout-err"
+              : p.level === "warn" ? "callout-warn"
+              : p.level === "ok" ? "callout-ok" : ""}" style="margin-bottom:8px">
+              ${p.message}
+              ${raw(p.fix ? `<div style="margin-top:6px"><button class="btn-sm btn-primary"
+                data-fix="${esc(p.fix)}">Fix it — adds a step</button></div>` : "")}
+            </div>`).join(""))}
+        </div>
+
+        ${raw(leak ? html`
+          <div class="card" style="margin-bottom:14px">
+            <h3 style="margin:0 0 6px">Has the held-out split leaked?</h3>
+            <p class="muted tiny">Rows in the <strong>${leak.split}</strong>
+              split that also appear in the training data. This is the statistic
+              that decides whether a held-out score means anything at all: a
+              validation set copied from the training set produces a beautiful
+              number and measures memory.</p>
+            <div class="callout ${leak.leaked ? "callout-err" : "callout-ok"}"
+                 style="margin-top:8px">
+              <strong>${leak.leaked
+                ? `${leak.leaked} of ${leak.checked} checked rows have leaked`
+                : `None of the ${leak.checked} rows checked has leaked`}</strong>
+              ${raw(leak.leaked
+                ? "Hold the split back again from the deduplicated data."
+                : "The held-out score from this dataset can be believed.")}
+            </div>
+            ${raw((leak.examples || []).length ? html`
+              <details class="adv" style="margin-top:8px">
+                <summary>What leaked</summary>
+                ${raw(leak.examples.map((t) =>
+                  `<p class="mono tiny" style="white-space:pre-wrap">${esc(t)}…</p>`).join(""))}
+              </details>` : "")}
+          </div>` : "")}
+
+        ${raw(near.pairs ? html`
+          <div class="card" style="margin-bottom:14px">
+            <h3 style="margin:0 0 6px">Rows that say the same thing</h3>
+            <p class="muted tiny">${fmtNum(near.rows)} rows are involved${
+              near.pairs > near.rows ? ` (in ${fmtNum(near.pairs)} pairs — a group
+              of thirty alike rows is four hundred pairs, so the row count is the
+              one to read)` : ""}. Not byte-identical: these differ by a word or a
+              comma, which is what a model writes when it is asked the same thing
+              thirty times.</p>
+            ${raw((near.examples || []).map(([a, b]) => html`
+              <details class="adv" style="margin-top:6px">
+                <summary>A pair</summary>
+                <p class="mono tiny" style="white-space:pre-wrap">${a}…</p>
+                <p class="mono tiny" style="white-space:pre-wrap;border-top:1px solid var(--border);padding-top:6px">${b}…</p>
+              </details>`).join(""))}
+          </div>` : "")}
+      </div>
+
+      <div>
+        <div class="card" style="margin-bottom:14px">
+          <h3 style="margin:0 0 8px">Lengths</h3>
+          <dl class="kv">
+            <dt>Typical</dt><dd>${fmtNum(stats.chars.p50)} characters</dd>
+            <dt>Long ones</dt><dd>${fmtNum(stats.chars.p90)} at the 90th percentile</dd>
+            <dt>Longest</dt><dd>${fmtNum(stats.chars.max)}</dd>
+            <dt>Unique rows</dt><dd>${fmtNum(stats.unique_rows)} of ${fmtNum(stats.sampled)}</dd>
+          </dl>
+          <div style="margin-top:12px">
+            <div class="muted tiny" style="margin-bottom:6px">Distribution
+              (characters, log scale)</div>
+            <div class="row" style="gap:2px;align-items:flex-end;height:60px">${
+              raw(bars(stats.histogram))}</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 style="margin:0 0 8px">Columns</h3>
+          <div class="table-wrap"><table class="table"><thead><tr>
+            <th>Name</th><th>Holds</th><th>Filled</th><th class="hide-sm">Typical</th>
+          </tr></thead><tbody>
+            ${raw((stats.column_types || stats.columns).map((c) => {
+              const fill = (stats.columns.find((x) => x.name === c.name) || {}).fill_rate;
+              return html`
+                <tr>
+                  <td class="mono tiny">${c.name}</td>
+                  <td class="tiny">${c.type || "—"}${raw(c.mixed
+                    ? ` <span class="badge badge-warn">mixed</span>` : "")}${raw(
+                    c.categorical ? ` <span class="badge">${c.distinct} values</span>` : "")}</td>
+                  <td class="tiny muted">${Math.round((fill ?? 0) * 100)}%</td>
+                  <td class="tiny muted hide-sm">${c.median_chars
+                    ? fmtNum(c.median_chars) + " chars" : "—"}</td>
+                </tr>`;
+            }).join(""))}
+          </tbody></table></div>
+        </div>
+      </div>
+    </div>`;
 }
 
 // ---- the training tab --------------------------------------------------------

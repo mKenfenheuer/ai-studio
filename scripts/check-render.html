@@ -94,8 +94,27 @@ const FIXTURES = [
       columns: [{ name: "instruction", filled: 500, fill_rate: 1 }],
       empty_rows: 0, duplicate_rows: 3, unique_rows: 497,
       chars: { min: 20, p50: 340, p90: 1200, p99: 4000, max: 9000, mean: 500 },
-      est_tokens: 62500, histogram: [], preview: [], format: { mode: "instruction" },
-      problems: [] }],
+      est_tokens: 62500,
+      histogram: [{ from: 20, to: 100, count: 40 }, { from: 100, to: 400, count: 220 },
+                  { from: 400, to: 1200, count: 180 }, { from: 1200, to: 9000, count: 60 }],
+      preview: [], format: { mode: "instruction" },
+      column_types: [
+        { name: "instruction", type: "text", mixed: false, median_chars: 120,
+          distinct: null, categorical: false },
+        { name: "output", type: "text", mixed: true, median_chars: 300,
+          distinct: null, categorical: false }],
+      near_duplicates: { pairs: 870, rows: 60,
+        examples: [["The capital of France is Paris, on the Seine.",
+                    "The capital of France is Paris, upon the Seine."]] },
+      secrets: [{ what: "an email address", rows: 4 }],
+      leakage: { checked: 200, leaked: 6, split: "validation",
+                 examples: ["Example number 3, which says a particular thing."] },
+      problems: [
+        { level: "error", fix: null,
+          message: "6 of 200 rows in the validation split also appear in the training data (3%)." },
+        { level: "warn", fix: "dedupe_near",
+          message: "60 of 500 sampled rows say the same thing as another row in nearly the same words (12%)." },
+        { level: "info", fix: null, message: "Mixed types in output." }] }],
   [/\/api\/datasets\/[^/]+\/conversation-report/, { sampled: 500, canonical: 200,
       problems: [] }],
   [/\/api\/hub\/training-preview/, { available: true, columns: ["instruction", "output"],
@@ -220,6 +239,13 @@ for (const [label, path, fn, args] of RUN) {
     if (only && wantTab) {
       main.querySelector(`[data-tab="${wantTab}"]`)?.click();
       await new Promise((r) => setTimeout(r, 400));
+    }
+    // ?press=#someButton presses it, for the panels that only appear once
+    // something has been asked for.
+    const press = new URLSearchParams(location.search).get("press");
+    if (only && press) {
+      main.querySelector(press)?.click();
+      await new Promise((r) => setTimeout(r, 600));
     }
     if (typeof stop === "function" && !only) stop();
   } catch (e) {

@@ -16,6 +16,26 @@ import { html, raw, esc, $, $$, on, toast, modal, fmtNum, fmtAgo } from "../util
 import { ribbon, rb, group, rbSelect, rbSeg, rbSearch, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
 
+/** What the last quality check found, if one has been run.
+ *
+ *  Stamped with the row count it was measured at, so a dataset edited since is
+ *  shown as needing another look rather than wearing a verdict that no longer
+ *  describes it. */
+export function qualityBadge(d) {
+  const q = d.quality;
+  if (!q) return "";
+  const stale = (q.rows_at || 0) !== (d.rows || 0);
+  if (stale) {
+    return `<span class="badge" title="Checked when this had ${
+      fmtNum(q.rows_at || 0)} rows; it has ${fmtNum(d.rows || 0)} now">checked earlier</span>`;
+  }
+  const cls = q.level === "error" ? "badge-err"
+    : q.level === "warn" ? "badge-warn" : "badge-ok";
+  const label = q.level === "ok" ? "checked"
+    : `${q.findings} to look at`;
+  return `<span class="badge ${cls}" title="${esc(q.headline || "")}">${label}</span>`;
+}
+
 const SOURCE = {
   upload: ["badge", "uploaded"],
   hub: ["badge badge-accent", "from the Hub"],
@@ -600,6 +620,7 @@ function listing({ items, filter, sort, scope, tree, picked }) {
             <td>
               ${raw(d.depth ? `<span class="lineage-rail" style="--depth:${d.depth}"></span>` : "")}
               <a href="#/data/${d.id}"><strong>${d.name}</strong></a>
+              ${raw(qualityBadge(d))}
               ${raw(d.mine ? "" : `<span class="badge badge-accent">shared with you</span>`)}
               ${raw(d.mine && d.is_shared ? `<span class="badge">shared</span>` : "")}
             </td>

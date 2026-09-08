@@ -266,6 +266,9 @@ _ADDED_COLUMNS = [
     # asserted "held out" about rows that were, as often as not, the training
     # split.
     ("evals", "source", "TEXT"),
+    # The last quality check's verdict, so the library can say which datasets
+    # have been looked at and what was found without re-reading every file.
+    ("datasets", "quality", "TEXT"),
     # What the run reported when it ended. It was already written into the log
     # as JSON, which was fine for reading one run and useless for comparing
     # twenty: answering "which of these had the lowest held-out loss" meant
@@ -1189,6 +1192,7 @@ def _hydrate_dataset(r: dict) -> dict:
     r["columns"] = json.loads(r.get("columns") or "[]")
     r["format"] = json.loads(r.get("format") or "{}")
     r["recipe"] = json.loads(r.get("recipe") or "{}")
+    r["quality"] = json.loads(r.get("quality") or "null")
     # {name: rows}. Absent on datasets written before splits existed, which
     # are one unnamed split of everything -- said here rather than at each of
     # the half-dozen places that read it.
@@ -1215,15 +1219,22 @@ def list_datasets(owner_id: str | None = None) -> list[dict]:
 
 def update_dataset(dataset_id: str, **fields: Any) -> None:
     allowed = {"name", "notes", "rows", "bytes", "columns", "format", "origin",
-               "splits", "recipe"}
+               "splits", "recipe", "quality"}
     sets, args = [], []
     for k, v in fields.items():
         if k not in allowed:
             raise ValueError("refusing to update unknown column %r" % k)
         sets.append("%s=?" % k)
         args.append(json.dumps(v)
-                    if k in ("columns", "format", "splits", "recipe") else v)
+                    if k in ("columns", "format", "splits", "recipe", "quality")
+                    else v)
     if not sets:
+        return
+    # A quality check is a reading, not a change. Touching `updated_at` for it
+    # would reorder the library by "recently looked at" and tell everybody the
+    # data had been edited.
+    if list(fields) == ["quality"]:
+        ex("UPDATE datasets SET quality=? WHERE id=?", (args[0], dataset_id))
         return
     sets.append("updated_at=?")
     args.append(now())

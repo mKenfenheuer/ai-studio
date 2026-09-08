@@ -137,7 +137,8 @@ export const api = {
   // ---- datasets --------------------------------------------------------
   datasets:    () => req("/api/datasets"),
   dataset:     (id) => req(`/api/datasets/${encodeURIComponent(id)}`),
-  datasetInspect: (id) => req(`/api/datasets/${encodeURIComponent(id)}/inspect`),
+  datasetInspect: (id, sample = 2000) =>
+    req(`/api/datasets/${encodeURIComponent(id)}/inspect?sample=${+sample || 2000}`),
   datasetRows: (id, offset = 0, limit = 25, q = "", split = "") =>
     req(`/api/datasets/${encodeURIComponent(id)}/rows?offset=${offset}`
         + `&limit=${limit}&q=${encodeURIComponent(q)}`

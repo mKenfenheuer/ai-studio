@@ -323,6 +323,31 @@ export const STEPS = {
     describe: () => "Removed exact duplicates",
     infer: (ops) => !!ops.dedupe,
   },
+  dedupe_near: {
+    tab: "rows", label: "Remove near-copies", icon: "≈",
+    blurb: "Rows that say the same thing in nearly the same words. Exact "
+      + "removal cannot see these.",
+    form: (ops) => html`
+      <div class="field">
+        <label for="sf_thr">How alike counts as the same</label>
+        <input id="sf_thr" type="number" min="50" max="100" step="5"
+               value="${Math.round((ops.dedupe_near?.threshold ?? 0.8) * 100)}">
+        <div class="hint">A percentage of the five-word runs two rows share.
+          80 is high enough that a pair caught here really does read as the
+          same example twice; below about 65 it starts catching rows that
+          merely share a format.</div>
+      </div>
+      <p class="muted tiny">The first of each group is kept, so the survivor is
+        the one you have already scrolled past.</p>`,
+    // `dlg` is null when this is added straight from a finding on the Check
+    // tab rather than from its own form, so the default has to survive that.
+    read: (dlg) => ({ dedupe_near: {
+      threshold: Math.min(1, Math.max(0.5,
+        (+(dlg && $("#sf_thr", dlg)?.value) || 80) / 100)) } }),
+    describe: (ops) => `Removed rows ${Math.round(
+      (ops.dedupe_near?.threshold ?? 0.8) * 100)}% alike`,
+    infer: (ops) => !!ops.dedupe_near,
+  },
   max_per_prompt: {
     tab: "rows", label: "Per question", icon: "≤",
     blurb: "At most N rows per distinct question. The one that bites on "
@@ -482,6 +507,7 @@ export const STEPS = {
 // dedupe folded in is still a conversion; a shuffle with a sample is a sample.
 const INFER_ORDER = ["to_conversations", "calc", "split_column", "rename",
                      "drop_columns", "keep_columns", "where", "drop_empty", "dedupe",
+                     "dedupe_near",
                      "max_per_prompt", "length", "contains", "excludes",
                      "sample", "shuffle"];
 
@@ -496,6 +522,7 @@ const OWN_KEYS = {
   where: ["where"],
   drop_empty: ["drop_empty"],
   dedupe: ["dedupe"],
+  dedupe_near: ["dedupe_near"],
   max_per_prompt: ["max_per_prompt"],
   length: ["min_chars", "max_chars"],
   contains: ["contains"],
@@ -536,6 +563,9 @@ export const TABS = [
   { key: "columns", label: "Add Column" },
   { key: "rows", label: "Rows" },
   { key: "view", label: "View" },
+  // The quality report, which was a modal: read it, close it, and every number
+  // in it was gone.
+  { key: "check", label: "Check" },
   // Not a step: what the trainer will read out of these rows, and whether it
   // can. It lived only inside the wizard, three screens from the editor where
   // the mapping it depends on is decided.

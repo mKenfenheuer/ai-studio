@@ -956,6 +956,7 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
     if not rows:
         return {"sampled": 0, "problems": [
             {"level": "error", "message": "This dataset has no readable rows."}]}
+    splits_here = dataset.get("splits") or {}
 
     columns = dataset.get("columns") or sorted(
         {k for r in rows for k in r} - set(RESERVED_FIELDS))
@@ -1011,7 +1012,46 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
         "preview": [formatting.format_example(r, fmt) or "" for r in rows[:PREVIEW_ROWS]],
         "format": fmt,
     }
+
+    # The rendered text of each row, once, for the checks that read it.
+    texts = [(formatting.format_example(r, fmt) or "") for r in rows]
+    nonblank = [t for t in texts if t.strip()]
+    stats["column_types"] = _column_types(rows, columns)
+    stats["near_duplicates"] = _near_duplicates(nonblank)
+    stats["secrets"] = _secrets(nonblank)
+
+    # Leakage is only a question where there is something held back to leak
+    # into. Read separately from the sample above, because the sample is the
+    # head of the file and the held-out rows are usually not in it.
+    held_name = next((n for n in ("validation", "test", "eval", "dev", "val")
+                      if n in splits_here), None)
+    if held_name:
+        held_rows = list(iter_rows(dataset["id"], min(sample, 500), held_name))
+        train_rows = list(iter_rows(dataset["id"], min(sample, 2000), "train"))
+        stats["leakage"] = _leakage(
+            [(formatting.format_example(r, fmt) or "") for r in train_rows],
+            [(formatting.format_example(r, fmt) or "") for r in held_rows])
+        stats["leakage"]["split"] = held_name
+
     stats["problems"] = _problems(stats, dataset)
+
+    # Kept, so the library can say what was found without re-reading the file.
+    # Stamped with the row count it was measured at: a dataset that has been
+    # edited since is a dataset this verdict no longer describes, and saying
+    # so is better than quietly showing a stale badge.
+    worst = ("error" if any(p["level"] == "error" for p in stats["problems"])
+             else "warn" if any(p["level"] == "warn" for p in stats["problems"])
+             else "ok")
+    headline = next((p["message"] for p in stats["problems"]
+                     if p["level"] == worst), "")
+    db.update_dataset(dataset["id"], quality={
+        "at": __import__("time").time(),
+        "rows_at": dataset.get("rows") or 0,
+        "sampled": stats["sampled"],
+        "level": worst,
+        "findings": sum(1 for p in stats["problems"] if p["level"] != "ok"),
+        "headline": headline[:300],
+    })
     return stats
 
 
@@ -1035,6 +1075,184 @@ def _histogram(lengths: list[int], buckets: int = 12) -> list[dict]:
             idx += 1
         out.append({"from": int(edges[i]), "to": int(edges[i + 1]), "count": count})
     out[-1]["count"] += len(lengths) - idx
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The checks that need more than counting
+# ---------------------------------------------------------------------------
+
+def _shingles(text: str, k: int = 5) -> set[int]:
+    """The set of overlapping k-word runs in a text, as hashes.
+
+    Two texts that share most of their shingles say the same thing in nearly
+    the same words, which is what "near duplicate" means and what an exact
+    hash cannot see. `dedupe` finds rows that are byte-identical; a generated
+    dataset is full of rows that differ by a comma.
+    """
+    words = re.findall(r"\w+", text.lower())
+    if len(words) < k:
+        return {hash(" ".join(words))} if words else set()
+    return {hash(" ".join(words[i:i + k])) for i in range(len(words) - k + 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / (len(a) + len(b) - inter)
+
+
+# How alike two rows have to be before saying so. 0.8 is high enough that a
+# pair reported here really does read as the same example twice.
+NEAR_DUPLICATE = 0.8
+# Above this, a held-out row is a copy of something in the training data and
+# the score it contributes is a score for memorising.
+LEAKED = 0.8
+
+
+def _near_duplicates(texts: list[str]) -> dict:
+    """Rows that say the same thing in nearly the same words.
+
+    MinHash over shingles, bucketed by the three smallest hashes so only
+    plausible pairs are compared properly. Comparing every pair would be
+    quadratic, which at the two-thousand-row sample is four million
+    comparisons for a number nobody is waiting on.
+    """
+    sketches: list[tuple[int, set[int]]] = []
+    for i, t in enumerate(texts):
+        sh = _shingles(t)
+        if sh:
+            sketches.append((i, sh))
+    buckets: dict[int, list[int]] = {}
+    for i, sh in sketches:
+        for h in sorted(sh)[:3]:
+            buckets.setdefault(h, []).append(i)
+
+    by_index = dict(sketches)
+    pairs: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        if len(members) < 2 or len(members) > 60:
+            # A bucket everything falls into says the rows share a common
+            # opening, not that they are duplicates.
+            continue
+        for a_i in range(len(members)):
+            for b_i in range(a_i + 1, len(members)):
+                a, b = members[a_i], members[b_i]
+                if (a, b) in pairs:
+                    continue
+                if _jaccard(by_index[a], by_index[b]) >= NEAR_DUPLICATE:
+                    pairs.add((a, b))
+    involved = {i for pair in pairs for i in pair}
+    return {"pairs": len(pairs), "rows": len(involved),
+            "examples": [[texts[a][:200], texts[b][:200]]
+                         for a, b in sorted(pairs)[:3]]}
+
+
+def _leakage(train_texts: list[str], held_texts: list[str]) -> dict:
+    """Held-out rows that also appear in the training data.
+
+    The single statistic that decides whether a held-out score means anything.
+    A validation set copied from the training set produces a beautiful number
+    and measures nothing but memory -- and it happens easily: two datasets
+    merged that overlap, a shuffle applied after a split, an augmentation that
+    kept the original alongside the rewrite.
+    """
+    if not train_texts or not held_texts:
+        return {"checked": 0, "leaked": 0, "examples": []}
+    index: dict[int, list[int]] = {}
+    train_sets = []
+    for i, t in enumerate(train_texts):
+        sh = _shingles(t)
+        train_sets.append(sh)
+        for h in sorted(sh)[:3]:
+            index.setdefault(h, []).append(i)
+
+    leaked, examples = 0, []
+    for t in held_texts:
+        sh = _shingles(t)
+        if not sh:
+            continue
+        seen: set[int] = set()
+        for h in sorted(sh)[:3]:
+            seen.update(index.get(h, ())[:60])
+        if any(_jaccard(sh, train_sets[i]) >= LEAKED for i in seen):
+            leaked += 1
+            if len(examples) < 3:
+                examples.append(t[:200])
+    return {"checked": len(held_texts), "leaked": leaked, "examples": examples}
+
+
+# Patterns worth knowing about before a dataset is trained into a model and
+# published. Deliberately a short list of the unambiguous ones: a scanner that
+# cries wolf gets switched off, and this one is meant to be believed.
+_SECRETS = [
+    ("an email address", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]{2,}")),
+    ("what looks like an API key", re.compile(
+        r"\b(?:sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}"
+        r"|xox[baprs]-[A-Za-z0-9-]{10,})")),
+    ("a bearer token", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.")),
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("an IP address", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+]
+
+
+def _secrets(texts: list[str]) -> list[dict]:
+    found: dict[str, int] = {}
+    for t in texts:
+        for label, pattern in _SECRETS:
+            if pattern.search(t):
+                found[label] = found.get(label, 0) + 1
+    return [{"what": k, "rows": v} for k, v in
+            sorted(found.items(), key=lambda kv: -kv[1])]
+
+
+def _column_types(rows: list[dict], columns: list[str]) -> list[dict]:
+    """What each column actually holds, rather than what it is called.
+
+    A column that is a string in most rows and a list in the rest is the kind
+    of thing that renders fine in a preview of the first ten and throws on row
+    four thousand.
+    """
+    def kind(v: object) -> str:
+        if v is None or v == "":
+            return "empty"
+        if isinstance(v, bool):
+            return "boolean"
+        if isinstance(v, (int, float)):
+            return "number"
+        if isinstance(v, list):
+            return "list"
+        if isinstance(v, dict):
+            return "object"
+        return "text"
+
+    out = []
+    for c in columns:
+        kinds: dict[str, int] = {}
+        lengths: list[int] = []
+        values: set[str] = set()
+        for r in rows:
+            v = r.get(c)
+            kinds[kind(v)] = kinds.get(kind(v), 0) + 1
+            if isinstance(v, str):
+                lengths.append(len(v))
+                if len(values) <= 64:
+                    values.add(v)
+        real = {k: n for k, n in kinds.items() if k != "empty"}
+        lengths.sort()
+        out.append({
+            "name": c,
+            "kinds": kinds,
+            "type": max(real, key=real.get) if real else "empty",
+            "mixed": len(real) > 1,
+            "median_chars": lengths[len(lengths) // 2] if lengths else 0,
+            # A column with a handful of distinct values is a label, and
+            # labelled data is what a stratified hold-back needs to be told
+            # about.
+            "distinct": len(values) if len(values) <= 64 else None,
+            "categorical": bool(real) and len(values) <= 24 and len(rows) > 40,
+        })
     return out
 
 
@@ -1083,6 +1301,48 @@ def _problems(stats: dict, dataset: dict) -> list[dict]:
             "level": "warn", "fix": None,
             "message": "Half the rows are under 40 characters. Very short "
                        "examples give the model almost nothing to predict."})
+
+    near = stats.get("near_duplicates") or {}
+    if near.get("rows"):
+        share = near["rows"] / n
+        out.append({
+            "level": "warn" if share > 0.05 else "info",
+            "fix": "dedupe_near",
+            "message": "%d of %d sampled rows say the same thing as another row "
+                       "in nearly the same words (%.0f%%). Exact-duplicate "
+                       "removal does not see these -- a generated set is full of "
+                       "rows that differ by a comma."
+                       % (near["rows"], n, share * 100)})
+
+    leak = stats.get("leakage") or {}
+    if leak.get("leaked"):
+        share = leak["leaked"] / max(leak.get("checked") or 1, 1)
+        out.append({
+            "level": "error" if share > 0.02 else "warn",
+            "fix": None,
+            "message": "%d of %d rows in the %s split also appear in the "
+                       "training data (%.0f%%). A held-out score is only worth "
+                       "something if the model has not seen the answers; these "
+                       "rows measure memory. Hold the split back again from the "
+                       "deduplicated data."
+                       % (leak["leaked"], leak["checked"], leak.get("split", "held-out"),
+                          share * 100)})
+
+    if found := (stats.get("secrets") or []):
+        out.append({
+            "level": "warn", "fix": None,
+            "message": "Found %s in this data. A model trained on it can repeat "
+                       "them, and publishing the dataset publishes them."
+                       % ", ".join("%s (%d rows)" % (f["what"], f["rows"])
+                                   for f in found[:3])})
+
+    if mixed := [c["name"] for c in (stats.get("column_types") or []) if c["mixed"]]:
+        out.append({
+            "level": "info", "fix": None,
+            "message": "Mixed types in %s. A column that is text in most rows "
+                       "and a list in the rest renders fine in a preview of the "
+                       "first ten and fails on row four thousand."
+                       % ", ".join(mixed[:4])})
 
     total = dataset.get("rows") or 0
     if total and total < 200:
@@ -1405,6 +1665,40 @@ def _run_step(rows: list[dict], fmt_in: dict, ops: dict
             kept.append(r)
         rows = kept
         steps.append("Removed exact duplicates (%d removed)" % (n0 - len(rows)))
+
+    # Near-duplicates: rows that say the same thing in nearly the same words.
+    # Exact removal above cannot see these, and a generated dataset is full of
+    # them -- a model asked the same thing thirty times writes thirty answers
+    # that differ by a comma, and they teach recitation rather than the task.
+    if near := ops.get("dedupe_near"):
+        threshold = NEAR_DUPLICATE
+        if isinstance(near, dict) and near.get("threshold"):
+            threshold = min(max(float(near["threshold"]), 0.5), 1.0)
+        n0 = len(rows)
+        rendered = [(formatting.format_example(r, fmt) or "") for r in rows]
+        keep_flags = [True] * len(rows)
+        index: dict[int, list[int]] = {}
+        sets: list[set[int]] = []
+        for i, text in enumerate(rendered):
+            sh = _shingles(text)
+            sets.append(sh)
+            if not sh:
+                continue
+            candidates: set[int] = set()
+            for h in sorted(sh)[:3]:
+                candidates.update(index.get(h, ())[:60])
+            # Compared against rows already kept, so the first of a group
+            # stays and the rest go -- and the survivor is the earliest, which
+            # is the one a person scrolling from the top has already read.
+            if any(keep_flags[j] and _jaccard(sh, sets[j]) >= threshold
+                   for j in candidates):
+                keep_flags[i] = False
+                continue
+            for h in sorted(sh)[:3]:
+                index.setdefault(h, []).append(i)
+        rows = [r for r, keep in zip(rows, keep_flags) if keep]
+        steps.append("Removed near-duplicates at %d%% alike (%d removed)"
+                     % (round(threshold * 100), n0 - len(rows)))
 
     # Exact duplicates are rare in a generated set and repeated QUESTIONS are
     # not: a model asked thirty times for an example on one topic converges on
