@@ -1,9 +1,12 @@
 import { api, events } from "../api.js";
+import { session } from "../app.js";
 import { html, raw, esc, $, on, fmtAgo, toast } from "../util.js";
 
 export async function runnersView(mount) {
   const paint = async () => {
     const [status, runners] = await Promise.all([api.status(), api.runners()]);
+    const admin = session.user?.role === "admin";
+    const online = runners.filter((r) => r.status !== "offline");
     mount.innerHTML = html`
       <div class="page-head">
         <h1>Machines</h1>
@@ -12,14 +15,17 @@ export async function runnersView(mount) {
           office, or a server — no port forwarding needed.</p>
       </div>
 
-      ${raw(joinCard(status))}
+      ${raw(online.length ? nextCard(status) : "")}
+
+      ${raw(admin ? joinCard(status, online.length > 0) : memberNote(online.length))}
 
       ${raw(runners.length
-        ? `<div class="grid grid-2">${runners.map(card).join("")}</div>`
+        ? `<div class="grid grid-2">${runners.map((r) => card(r, admin)).join("")}</div>`
         : html`<div class="card empty"><div class="big">🖥️</div>
             <h3>No machines connected yet</h3>
-            <p class="muted">Run the command above on a computer with a graphics
-              card. It will appear here within a few seconds.</p></div>`)}`;
+            <p class="muted">${admin
+              ? "Run the command above on a computer with a graphics card. It will appear here within a few seconds."
+              : "An administrator connects machines. Once one is here, you can train on it."}</p></div>`)}`;
 
     on(mount, "click", "[data-copy]", (_e, t) => {
       navigator.clipboard.writeText(t.dataset.copy)
@@ -39,7 +45,38 @@ export async function runnersView(mount) {
   return unsub;
 }
 
-function joinCard(status) {
+/** Where to go from here. The onboarding sends people to this page to connect
+ *  a machine, and used to leave them on it with nowhere to go once it was. */
+function nextCard(status) {
+  return html`
+    <div class="card" style="margin-bottom:18px;border-color:var(--accent)">
+      <div class="row-between" style="flex-wrap:wrap;gap:8px">
+        <div>
+          <h2 style="margin:0">Connected</h2>
+          <p class="muted tiny" style="margin:2px 0 0">
+            ${status.jobs_running ? `${status.jobs_running} running` : "Nothing is running"}${
+            status.jobs_queued ? ` · ${status.jobs_queued} waiting` : ""}.
+            The next step is data, or a run.</p>
+        </div>
+        <div class="row">
+          <a class="btn btn-primary" href="#/new">Start a training run →</a>
+          <a class="btn" href="#/data">Datasets</a>
+          <a class="btn" href="#/jobs">Runs</a>
+        </div>
+      </div>
+    </div>`;
+}
+
+function memberNote(onlineCount) {
+  if (onlineCount) return "";
+  return html`
+    <div class="callout" style="margin-bottom:18px">
+      <strong>Connecting a machine needs the join token</strong>
+      Only an administrator can see it. Ask them to connect one, or to make
+      you an administrator.</div>`;
+}
+
+function joinCard(status, collapsed) {
   const url = location.origin;
   const cmd = `ai-studio-runner --controller ${url} --token ${status.join_token}`;
   const docker = `docker run --rm \\
@@ -52,9 +89,12 @@ function joinCard(status) {
   -e AI_STUDIO_JOIN_TOKEN=${status.join_token} \\
   ghcr.io/ai-studio/runner:cuda`;
 
+  // Once a machine is here the twenty-line install snippet is reference
+  // material, not the point of the page; it folds away.
   return html`
-    <div class="card" style="margin-bottom:18px">
-      <h2>Connect a machine</h2>
+    <details class="card" style="margin-bottom:18px" ${collapsed ? "" : "open"}>
+      <summary style="cursor:pointer"><h2 style="display:inline;margin:0">Connect ${
+        collapsed ? "another" : "a"} machine</h2></summary>
       <p class="muted tiny">Run one of these on the computer with the graphics card.
         Anyone holding this token can join your studio, so treat it like a password.</p>
 
@@ -87,10 +127,10 @@ function joinCard(status) {
           <code>scripts/install-runner.sh</code>, which picks the right PyTorch
           build for your hardware.</p>
       </details>
-    </div>`;
+    </details>`;
 }
 
-function card(r) {
+function card(r, admin) {
   const c = r.capabilities || {};
   const offline = r.status === "offline";
   const dot = offline ? "dot-err" : r.status === "busy" ? "dot-busy" : "dot-ok";
@@ -119,6 +159,12 @@ function card(r) {
         <dt>Biggest model</dt><dd>${c.max_finetune_params_b
           ? "about " + c.max_finetune_params_b + "B parameters" : "—"}</dd>
         <dt>Last seen</dt><dd>${fmtAgo(r.last_seen)}</dd>
+        ${raw(r.current_job ? html`
+          <dt>Working on</dt><dd><a href="#/jobs/${r.current_job}">open the run →</a></dd>` : "")}
+        ${raw(r.disk?.free_gb != null ? html`
+          <dt>Disk</dt><dd>${Math.round(r.disk.free_gb)} GB free of ${
+            Math.round(r.disk.total_gb || 0)}${r.disk.models_gb != null
+            ? ` · ${Math.round(r.disk.models_gb)} GB of models` : ""}</dd>` : "")}
         ${raw(c.kinds?.length ? html`
           <dt>Takes</dt><dd>${c.kinds.join(", ").replace(/_/g, " ")}
             <span class="muted tiny">— and nothing else</span></dd>` : "")}
@@ -141,7 +187,7 @@ function card(r) {
       ${raw((c.warnings || []).map((w) =>
         `<div class="callout callout-warn tiny">${esc(w)}</div>`).join(""))}
 
-      ${raw(!offline ? `<button class="btn-sm" data-reprobe="${esc(r.id)}">
+      ${raw(!offline && admin ? `<button class="btn-sm" data-reprobe="${esc(r.id)}">
         Re-check hardware</button>` : "")}
     </div>`;
 }

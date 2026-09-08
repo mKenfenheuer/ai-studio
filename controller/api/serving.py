@@ -80,7 +80,9 @@ def _finish(msg: dict) -> str:
     one, and reporting "stop" for both told it the reply was complete when it
     had been cut mid-sentence.
     """
-    return "length" if msg.get("stop_reason") == "length" else "stop"
+    # A reply the runner cut at its deadline is exactly as incomplete as one
+    # cut at the token ceiling, and was being reported as a clean "stop".
+    return "length" if msg.get("stop_reason") in ("length", "timeout") else "stop"
 
 
 def _error(status: int, message: str, code: str = "invalid_request_error"):

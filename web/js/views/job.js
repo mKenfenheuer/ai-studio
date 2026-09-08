@@ -976,9 +976,10 @@ function evalResult(job) {
         }).join(""))}</tbody>
       </table></div>
       <p class="muted tiny" style="margin:8px 0 0">
-        Every number is on prompts the models did not train on. Loss is the one
-        to compare between runs; the others reward answers that happen to be
-        worded like the expected one.</p>
+        Only meaningful where the models were not trained on these prompts —
+        a set built from a held-out split is. Loss is the one to compare
+        between runs; the others reward answers that happen to be worded like
+        the expected one.</p>
     </div>`;
 }
 
@@ -1209,6 +1210,12 @@ function furtherJob(job, form) {
   delete cfg.token_budget;
   delete cfg.studio_dataset;
   delete cfg.source_run_name;
+  // Not inherited either: the follow-on is its own run, not a sweep member
+  // and not on the Hub.
+  delete cfg.sweep_id;
+  delete cfg.sweep_name;
+  delete cfg.sweep_values;
+  delete cfg.published;
 
   if (form.studio_dataset) {
     cfg.studio_dataset = form.studio_dataset;

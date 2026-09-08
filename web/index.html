@@ -34,7 +34,7 @@
     </nav>
 
     <div class="sidebar-foot">
-      <a class="who" href="#/account" id="whoami" hidden>
+      <a class="who" href="#/account" id="whoami" hidden data-nav="account">
         <span class="who-avatar" id="whoAvatar">?</span>
         <span class="who-text">
           <span class="who-name" id="whoName">…</span>
@@ -63,6 +63,8 @@
     </div>
     <button class="icon-btn" id="helpToggleMobile" type="button"
             aria-label="Help for beginners">?</button>
+    <a class="who-avatar" id="whoamiMobile" href="#/account" hidden
+       aria-label="Your account" data-nav="account">?</a>
   </header>
 
   <main class="main" id="main"><div class="loading">Loading…</div></main>

@@ -403,9 +403,10 @@ dataset when it was not — so runs made before this existed, or through the API
 get theirs back too. "What the model is actually being sent" shows the finished
 prompt after templating, for when the answer is not what you expected.
 
-Runners fetch and cache the artifact from the controller on first use, and
-release the GPU after 15 idle minutes so a chat cannot block the next training
-run.
+Runners fetch and cache the artifact from the controller on first use. Loaded
+models stay resident while there is memory for them and are evicted least
+recently used when there is not, so a chat never blocks the next training run
+and the second turn does not pay for the first turn's load.
 
 ---
 
@@ -459,12 +460,26 @@ before a crash are recovered from a partial report.
 
 ## Security
 
-The join token is the only credential; anyone holding it can attach a machine
-and read job data, so treat it as a password. `HF_TOKEN` is set on the
-controller and forwarded to runners — it is deliberately **not** editable from
-the browser, so a UI session can never read or change your credentials. There
-is no user authentication yet: run this on a trusted network, or behind a
-reverse proxy that provides auth.
+**People sign in.** The first boot asks for an administrator password; after
+that there are accounts with two roles (administrator, member), sessions in an
+httpOnly cookie, scrypt-hashed passwords with a rate limit on failures, and
+optional single sign-on through any OIDC provider (Entra, Google, Keycloak,
+Authentik, ...) with PKCE and directory sync. Runs, datasets and prompt sets
+are private to their owner unless shared with a named person or with everyone
+in the studio; anything you cannot see answers 404, not 403.
+
+**Credentials are per account.** Each person connects their own Hugging Face
+token and their own hosted-model keys on the account page; they are encrypted
+at rest, never returned to the browser, and attached to a run at the moment it
+is created so "whose key paid for this" has an answer. `HF_TOKEN` in the
+environment is the fallback for people who have not connected one. API keys
+for the OpenAI-compatible endpoint are minted on the same page and shown once.
+
+**The join token is the machine credential.** Anyone holding it can attach a
+runner and read the work on it, so treat it as a password. Only administrators
+see it. There is no TLS in the controller itself: put it behind a reverse
+proxy that terminates HTTPS, and set `AI_STUDIO_PUBLIC_URL` so SSO redirects
+carry the right address.
 
 ## Project layout
 
@@ -502,6 +517,16 @@ Working end-to-end:
 - **Training from scratch** — trained tokenizer, packed corpus, held-out loss,
   live text samples, a standalone model with usage instructions in the zip.
 - **Playground** — streaming chat with any finished run, template-aware.
+- **Evaluation** — prompt sets with expected answers, scored across several
+  runs in one job (expected-answer loss, exact match, token F1) with a paired
+  significance test that refuses to name a winner it cannot defend, and the
+  scores written into the model card.
+- **An OpenAI-compatible endpoint** — `/v1/chat/completions` and `/v1/models`
+  over every finished run, streaming, with tool calls and reasoning, behind
+  per-user API keys.
+- **Datasets written by a model** — a local run or a hosted provider writes
+  rows from prompts, topics or seed conversations, and the result lands in the
+  library as a dataset.
 
 Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 
@@ -550,15 +575,17 @@ really did start from nothing.
   `rocm/dev-ubuntu-24.04:*-complete`, which is needed to compile bitsandbytes.
   A multi-stage build that compiles the wheel and copies it into a slim runtime
   would cut this substantially.
-- **No user authentication.** The join token is the only credential. Put it
-  behind a reverse proxy or keep it on a trusted network.
+- **No TLS in the controller.** Put it behind a reverse proxy that terminates
+  HTTPS.
 - **One job per runner at a time.** No multi-GPU or multi-job scheduling yet,
   and a runner that is training will not serve the playground. A second job
   waits on the queue and is told so once, rather than being offered to the busy
   machine every five seconds.
-- **Training learns from the whole conversation**, including the system prompt
-  and the user's turns, rather than masking the loss to assistant replies only.
-  Standard, and it works; masking would squeeze more out of the same data.
+- **Loss masking is not a setting yet.** Fine-tuning on conversations trains
+  on the assistant's turns only (the system prompt and the user's turns are
+  masked), and the dataset editor can mark earlier assistant turns as context
+  rather than targets. Which of those a run used is not yet shown on its page,
+  and there is no switch to train on every token instead.
 - **From-scratch tops out around 200M parameters**, which is a compute limit
   rather than an arbitrary one. See the table above.
 - **The corpus is held in host RAM** while training (capped at 500M tokens,
@@ -567,4 +594,4 @@ really did start from nothing.
 
 ### Next
 
-Vision-model fine-tuning and an evaluation harness.
+See `ROADMAP.md`.

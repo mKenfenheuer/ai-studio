@@ -47,10 +47,19 @@ export async function evalsView(mount) {
       if (!f.dataset_id) return toast("Choose a dataset first.", "err");
       try {
         const created = await api.evalFromDataset({
-          dataset_id: f.dataset_id, limit: +f.limit || 50 });
+          dataset_id: f.dataset_id, limit: +f.limit || 50,
+          split: f.split || "" });
         toast("Prompt set created.", "ok");
         location.hash = `#/evals/${created.id}`;
       } catch (ex) { toast(ex.message, "err"); }
+    });
+
+    // The split boxes follow the dataset: a held-out split is offered first
+    // when there is one, and the hint says which kind of set this will make.
+    on(mount, "change", "#dsPick", (_e, t) => {
+      const d = datasets.find((x) => x.id === t.value);
+      const box = $("#dsSplitBox", mount);
+      if (box) box.innerHTML = splitPicker(d);
     });
 
     on(mount, "click", "[data-del-eval]", async (_e, t) => {
@@ -70,6 +79,29 @@ export async function evalsView(mount) {
 }
 
 /** Free text to prompts. One prompt per line; "prompt => expected" splits. */
+const HELD_OUT = /^(validation|test|eval|dev|val|holdout)/i;
+
+/** Which split the prompts come from, held-out ones first. */
+function splitPicker(d) {
+  const names = Object.keys(d?.splits || {});
+  if (!d || !names.length) return "";
+  const held = names.filter((n) => HELD_OUT.test(n));
+  const rest = names.filter((n) => !HELD_OUT.test(n));
+  const ordered = held.concat(rest);
+  return html`
+    <div class="field">
+      <label for="dsSplit">Which split</label>
+      <select id="dsSplit" name="split">
+        ${raw(ordered.map((n, i) => html`
+          <option value="${n}"${i === 0 ? " selected" : ""}>${n} · ${
+            fmtNum(d.splits[n])} rows${HELD_OUT.test(n) ? " · held out" : ""}</option>`).join(""))}
+      </select>
+      <div class="hint">${held.length
+        ? "A held-out split is a fair test of anything that trained on the rest."
+        : "This dataset has no held-out split. Hold one back in the dataset editor first, or accept that these scores measure memory as much as skill."}</div>
+    </div>`;
+}
+
 function parsePrompts(text) {
   const items = [];
   let withAnswers = 0;
@@ -151,6 +183,7 @@ Write a haiku about rain"></textarea>
                 <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
             </select>
           </div>
+          <div id="dsSplitBox">${raw(splitPicker(null))}</div>
           <div class="field">
             <label for="dsLimit">How many rows</label>
             <input id="dsLimit" name="limit" type="number" value="50" min="1" max="500">

@@ -799,6 +799,9 @@ details.reasoning.live { border-color: var(--accent); }
   color: inherit;
 }
 .who:hover { background: var(--surface-2); }
+.topbar .who-avatar { text-decoration: none; }
+.topbar .who-avatar.active, .who.active .who-avatar {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent); }
 .who-avatar {
   width: 30px;
   height: 30px;

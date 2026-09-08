@@ -169,18 +169,19 @@ async def events_ws(ws: WebSocket) -> None:
     for everyone in the studio.
     """
     from . import auth
-    if not auth.session_user(ws.cookies.get(auth.SESSION_COOKIE)):
+    user = auth.session_user(ws.cookies.get(auth.SESSION_COOKIE))
+    if not user:
         await ws.close(code=4401)
         return
     await ws.accept()
-    fleet.ui_clients.add(ws)
+    fleet.ui_clients[ws] = user
     try:
         while True:
             await ws.receive_text()
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        fleet.ui_clients.discard(ws)
+        fleet.ui_clients.pop(ws, None)
 
 
 # ===========================================================================
@@ -247,12 +248,17 @@ async def get_runners() -> list[dict]:
         r["connected"] = r["id"] in fleet.connections
         r["current_job"] = fleet.busy.get(r["id"])
         r["checkpoints"] = sorted(fleet.checkpoints.get(r["id"], set()))
+        # The heartbeat has always carried this; the page never got it.
+        r["disk"] = fleet.disk.get(r["id"])
         out.append(r)
     return out
 
 
 @app.post("/api/runners/{runner_id}/reprobe")
-async def reprobe(runner_id: str) -> dict:
+async def reprobe(request: Request, runner_id: str) -> dict:
+    # Re-probing pauses a machine's hardware for a benchmark. Members can see
+    # the fleet; only an administrator gets to poke it.
+    security.require_admin(request)
     if runner_id not in fleet.connections:
         raise HTTPException(404, "That runner is not connected right now.")
     await fleet.send_to_runner(runner_id, {"type": "reprobe"})
@@ -2222,12 +2228,19 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
     if not sent:
         raise HTTPException(503, "That machine dropped off just now. Try again.")
     fleet.generations[request_id] = runner_id
+    fleet.generation_owner[request_id] = security.current_user(request)["id"]
     return {"request_id": request_id, "runner": runner["name"],
             "runner_id": runner_id, "style": spec["style"]}
 
 
 @app.post("/api/chat/{request_id}/cancel")
-async def chat_cancel(request_id: str) -> dict:
+async def chat_cancel(request: Request, request_id: str) -> dict:
+    # Only the person who asked may stop the answer. Ids are random, so this
+    # was a small hole, but it was the one route here with no check at all.
+    user = security.current_user(request)
+    owner = fleet.generation_owner.get(request_id)
+    if owner and owner != user["id"] and user["role"] != "admin":
+        raise HTTPException(404, "No such request.")
     runner_id = fleet.generations.get(request_id)
     if runner_id:
         await fleet.send_to_runner(runner_id, {"type": "generate_cancel",

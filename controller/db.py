@@ -261,6 +261,11 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 # each one is attempted and its "duplicate column" complaint ignored.
 _ADDED_COLUMNS = [
     ("jobs", "owner_id", "TEXT"),
+    # Where a prompt set's rows came from: a dataset id and a split, and
+    # whether that split is one nothing trained on. Without it the model card
+    # asserted "held out" about rows that were, as often as not, the training
+    # split.
+    ("evals", "source", "TEXT"),
     # What the run reported when it ended. It was already written into the log
     # as JSON, which was fine for reading one run and useless for comparing
     # twenty: answering "which of these had the lowest held-out loss" meant
@@ -742,7 +747,8 @@ def scores_for_model(model_job_id: str, limit: int = 12) -> list[dict]:
     compare on this eval" but "what has this model been measured on".
     """
     rows = q("SELECT sc.id, sc.eval_id, sc.created_at, sc.metrics,"
-             " sc.run_job_id, e.name AS eval_name, e.notes AS eval_notes"
+             " sc.run_job_id, e.name AS eval_name, e.notes AS eval_notes,"
+             " e.source AS eval_source"
              " FROM eval_scores sc LEFT JOIN evals e ON e.id = sc.eval_id"
              " WHERE sc.model_job_id=? ORDER BY sc.created_at DESC LIMIT ?",
              (model_job_id, limit))
@@ -751,6 +757,10 @@ def scores_for_model(model_job_id: str, limit: int = 12) -> list[dict]:
             r["metrics"] = json.loads(r["metrics"] or "{}")
         except (TypeError, ValueError):
             r["metrics"] = {}
+        try:
+            r["eval_source"] = json.loads(r.get("eval_source") or "null")
+        except (TypeError, ValueError):
+            r["eval_source"] = None
     return rows
 
 
@@ -1342,17 +1352,22 @@ def visible_datasets(user: dict) -> list[dict]:
 # entire reason for saving them rather than typing them into the playground.
 
 def create_eval(owner_id: str | None, name: str, items: list[dict],
-                notes: str = "") -> str:
+                notes: str = "", source: dict | None = None) -> str:
     eid = new_id("ev")
     ts = now()
-    ex("INSERT INTO evals (id,owner_id,name,notes,items,created_at,updated_at)"
-       " VALUES (?,?,?,?,?,?,?)",
-       (eid, owner_id, name, notes, json.dumps(items), ts, ts))
+    ex("INSERT INTO evals (id,owner_id,name,notes,items,source,created_at,"
+       "updated_at) VALUES (?,?,?,?,?,?,?,?)",
+       (eid, owner_id, name, notes, json.dumps(items),
+        json.dumps(source) if source else None, ts, ts))
     return eid
 
 
 def _hydrate_eval(r: dict) -> dict:
     r["items"] = json.loads(r.get("items") or "[]")
+    try:
+        r["source"] = json.loads(r.get("source") or "null")
+    except (TypeError, ValueError):
+        r["source"] = None
     return r
 
 

@@ -13,7 +13,7 @@ export async function dashboardView(mount) {
     mount.innerHTML = html`
       <div class="page-head">
         <h1>Dashboard</h1>
-        <p class="sub">Train and fine-tune language and vision models on your own hardware.</p>
+        <p class="sub">Train and fine-tune language models on your own hardware.</p>
       </div>
 
       ${raw(online.length === 0 ? firstRun(status) : "")}

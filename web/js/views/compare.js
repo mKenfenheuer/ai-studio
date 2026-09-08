@@ -13,17 +13,32 @@
  * question, and magnitude is what the table's bars are for.
  */
 import { api } from "../api.js";
-import { html, raw, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
+import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { LineChart } from "../chart.js";
 
+// The kinds of run that leave a model behind. `has_model` alone let
+// dataset-generation runs in -- they register an artifact too -- and they
+// sat in the table labelled "fine-tune" with nothing to rank.
+const MODEL_KINDS = { finetune_llm: "Fine-tunes", pretrain_llm: "From scratch",
+                      merge_adapter: "Fine-tunes" };
+const family = (j) => MODEL_KINDS[j.kind];
+
 export async function compareView(mount) {
-  const jobs = (await api.jobs())
-    .filter((j) => ["succeeded", "cancelled"].includes(j.status) && j.has_model);
+  const all = (await api.jobs())
+    .filter((j) => ["succeeded", "cancelled"].includes(j.status) && j.has_model
+                   && family(j));
+  // One family at a time. A from-scratch model's held-out loss is measured
+  // against its own small vocabulary and a fine-tune's against a 150k one;
+  // ranking the two together was a league table of unrelated numbers.
+  const families = [...new Set(all.map(family))];
+  let shown = families.includes("Fine-tunes") ? "Fine-tunes" : families[0];
   const picked = new Set();
   let chart = null;
 
+  const jobsShown = () => all.filter((j) => family(j) === shown);
+
   const draw = () => {
-    mount.innerHTML = layout(jobs, picked);
+    mount.innerHTML = layout(jobsShown(), picked, families, shown);
     if (chart) { chart.destroy(); chart = null; }
     wire();
     paintCurves();
@@ -35,13 +50,16 @@ export async function compareView(mount) {
       draw();
     });
     on(mount, "click", "#cmpClear", () => { picked.clear(); draw(); });
+    on(mount, "click", "[data-family]", (_e, t) => {
+      shown = t.dataset.family; picked.clear(); draw();
+    });
   }
 
   async function paintCurves() {
     const box = $("#cmpChart", mount);
     if (!box || picked.size !== 2) return;
     const [a, b] = [...picked];
-    const nameOf = (id) => (jobs.find((j) => j.id === id) || {}).name || id;
+    const nameOf = (id) => (all.find((j) => j.id === id) || {}).name || id;
     try {
       const [ma, mb] = await Promise.all([api.jobMetrics(a), api.jobMetrics(b)]);
       chart = new LineChart(box, {
@@ -75,7 +93,7 @@ export async function compareView(mount) {
 
 const heldOut = (j) => j.summary?.best_val_loss ?? null;
 
-function layout(jobs, picked) {
+function layout(jobs, picked, families, shown) {
   const withHeld = jobs.filter((j) => heldOut(j) != null);
   const best = withHeld.length ? Math.min(...withHeld.map(heldOut)) : null;
   const worst = withHeld.length ? Math.max(...withHeld.map(heldOut)) : null;
@@ -88,7 +106,11 @@ function layout(jobs, picked) {
           <h1>Compare runs</h1>
           <p class="sub">Held-out loss is the number that carries between runs.</p>
         </div>
-        <a class="btn" href="#/evals">Prompt sets →</a>
+        <div class="row">
+          ${raw(families.length > 1 ? `<div class="seg">${families.map((f) =>
+            `<button class="btn-sm ${f === shown ? "on" : ""}" data-family="${esc(f)}">${esc(f)}</button>`).join("")}</div>` : "")}
+          <a class="btn" href="#/evals">Prompt sets →</a>
+        </div>
       </div>
     </div>
 

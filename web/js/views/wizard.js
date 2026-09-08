@@ -216,6 +216,7 @@ export async function wizardView(mount) {
       sessionStorage.removeItem("aistudio.dataset");
       state.studioDataset = d;
       state.dataset = d.name;
+      state.split = defaultSplit(d.splits);
     }
   } catch { /* nothing was handed over */ }
 
@@ -804,12 +805,12 @@ function stepData(body, ctx) {
   on(body, "click", "[data-studio-ds]", (_e, t) => {
     const d = (state.myDatasets.data || []).find((x) => x.id === t.dataset.studioDs);
     if (!d) return;
-    state.studioDataset = { id: d.id, name: d.name, splits: d.splits || {} };
+    state.studioDataset = { id: d.id, name: d.name, splits: d.splits || {}, rows: d.rows };
     state.dataset = d.name;
     state.configs = resource();
     state.preview = resource();
     state.config = "";
-    state.split = Object.keys(d.splits || {})[0] || "train";
+    state.split = defaultSplit(d.splits);
     state.textField = (d.format || {}).text_field || null;
     state.formatMode = null;
     // Roughly four characters to a token. Approximate, and it only feeds the
@@ -2183,7 +2184,10 @@ function stepReview(body, ctx) {
       // whether 16-bit fits and quietly assumes it does.
       base_model: state.model || state.sourceRun?.base_model || null,
       goal: state.goal,
-      dataset_rows: 2000,
+      // The plan derives epochs and the step budget from this. It was a
+      // constant 2,000 for every dataset, so a 200-row set got the schedule
+      // of a 2,000-row one and a 200,000-row set got it too.
+      dataset_rows: datasetRows(state),
     }), draw);
     body.innerHTML = finetuneReview(state, runner, caps);
     if (state.ftPlan.status === "ready") wireOverrides(body, ctx);
@@ -2326,6 +2330,17 @@ function finetuneReview(state, runner, caps) {
                 + "form no adapter can attach to; the run says so in its log "
                 + "and falls back to attention. The router is never adapted.")
             : "")}
+          ${raw(toggle("merge_after", "Also produce a standalone model",
+            s.merge_after !== false,
+            "A fine-tune produces an adapter, which needs the exact base model "
+            + "it was trained against in order to run anywhere. Merging folds it "
+            + "into the weights, so what you are left with needs nothing else — "
+            + "which is what every tool outside this studio wants. It is the "
+            + "last step of this run, on the machine that still has the weights "
+            + "in memory: no second run appears and nothing is downloaded again. "
+            + "The cost is disk: a merged 7B is about 14 GB where its adapter "
+            + "was 50 MB. The adapter is kept as well — it is what a later run "
+            + "continues from, and either can be published."))}
         </div>
       </details>
     </div>
@@ -2423,17 +2438,6 @@ function scratchReview(state, runner, caps) {
         ${raw(toggle("optim_8bit", "8-bit optimiser", s.optim_8bit,
           "Stores Adam's two running averages in 8 bits instead of 32. Frees "
           + "memory for a bigger batch at no measurable quality cost."))}
-        ${raw(toggle("merge_after", "Also produce a standalone model",
-          s.merge_after !== false,
-          "A fine-tune produces an adapter, which needs the exact base model "
-          + "it was trained against in order to run anywhere. Merging folds it "
-          + "into the weights, so what you are left with needs nothing else — "
-          + "which is what every tool outside this studio wants. It is the "
-          + "last step of this run, on the machine that still has the weights "
-          + "in memory: no second run appears and nothing is downloaded again. "
-          + "The cost is disk: a merged 7B is about 14 GB where its adapter "
-          + "was 50 MB. The adapter is kept as well — it is what a later run "
-          + "continues from, and either can be published."))}
       </div>
     </div>
 
@@ -2791,6 +2795,28 @@ function parseSweep(state) {
                          "grad_accum", "max_steps", "lora_alpha"]);
   return { key: state.sweepKey,
            values: whole.has(state.sweepKey) ? values.map(Math.round) : values };
+}
+
+/** How many rows the run will actually see: the chosen split of a studio
+ *  dataset when its count is known, the whole dataset otherwise, and a guess
+ *  only for a Hub dataset whose size nobody has measured yet. */
+/** The split a run trains on unless told otherwise. It was the first key
+ *  of the counts dict -- insertion order -- so a file that happened to start
+ *  with a validation row trained on the validation split. */
+function defaultSplit(splits) {
+  const names = Object.keys(splits || {});
+  if (!names.length || names.includes("train")) return "train";
+  return names.find((n) => !/^(val|validation|dev|test|eval)/i.test(n)) || names[0];
+}
+
+function datasetRows(state) {
+  const d = state.studioDataset;
+  if (d) {
+    const inSplit = (d.splits || {})[state.split];
+    if (inSplit) return inSplit;
+    if (d.rows) return d.rows;
+  }
+  return state.preview.data?.rows_total || 2000;
 }
 
 function buildJob(mount, state) {

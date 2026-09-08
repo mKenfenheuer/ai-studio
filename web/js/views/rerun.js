@@ -78,7 +78,11 @@ const DATA_KEYS = ["studio_dataset", "dataset", "dataset_split",
                    "dataset_config", "text_field"];
 // Derived by the controller from studio_dataset on every create, so carrying
 // the old values across would only ever be misleading.
-const DERIVED = ["dataset", "dataset_is_local", "dataset_label", "sweep_id"];
+const DERIVED = ["dataset", "dataset_is_local", "dataset_label",
+                 // A copy is not a member of its parent's sweep and has not
+                 // been published anywhere; carrying these over made the new
+                 // run's page list repositories it never wrote to.
+                 "sweep_id", "sweep_name", "sweep_values", "published"];
 
 export async function rerunView(mount, [jobId]) {
   const job = await api.job(jobId);

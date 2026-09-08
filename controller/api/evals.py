@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
+from common import conversation, formatting
+
 from .. import config, datasets as dsets, db, serving
 from .security import current_user, require_edit, require_owner, require_view
 
@@ -113,34 +115,80 @@ async def eval_from_dataset(request: Request, payload: dict = Body(...)) -> dict
     limit = min(int(payload.get("limit") or 50), MAX_ITEMS)
     prompt_field = payload.get("prompt_field")
     answer_field = payload.get("answer_field")
-    rows = list(dsets.iter_rows(ds["id"], limit))
+
+    # Which split. Given one, that one; given none, the held-out split when
+    # the dataset has one, because that is the whole point of the exercise.
+    # Reading the first N rows of the file regardless -- which is what this
+    # did -- took the training split nearly every time and then let the model
+    # card say the numbers were on rows the model never saw.
+    splits = ds.get("splits") or {}
+    split = (payload.get("split") or "").strip() or _held_out_split(splits)
+    if split and split not in splits:
+        raise HTTPException(400, "That dataset has no split called %r. It has: %s."
+                            % (split, ", ".join(splits) or "none"))
+    rows = list(dsets.iter_rows(ds["id"], limit, split or None))
     if not rows:
-        raise HTTPException(400, "That dataset has no rows to take.")
+        raise HTTPException(400, "That dataset has no rows to take%s."
+                            % (" in the %s split" % split if split else ""))
 
-    if not prompt_field:
-        prompt_field = next((f for f in ("instruction", "prompt", "question",
-                                         "input", "text")
-                             if f in rows[0]), None)
-    if not answer_field:
-        answer_field = next((f for f in ("output", "response", "answer",
-                                         "completion")
-                             if f in rows[0] and f != prompt_field), None)
-    if not prompt_field:
-        raise HTTPException(
-            400, "Could not tell which column holds the prompt. Its columns "
-                 "are: %s." % ", ".join(map(str, rows[0].keys())))
+    fmt = formatting.resolve_format(ds.get("format") or {})
+    if not prompt_field and (fmt.get("mode") == "chat" or "messages" in rows[0]):
+        # A conversation dataset: the prompt is the last thing the user said
+        # and the answer is what the data says came next. The flat-column
+        # guess below would have found no prompt column and refused.
+        pairs = []
+        for r in rows:
+            conv, _ = conversation.repair(conversation.from_row(r, fmt))
+            prompt, expected = conversation.split_for_trial(conv)
+            asked = next((m.get("content") for m in reversed(prompt)
+                          if m.get("role") == "user"), None)
+            answer = next((m.get("content") for m in expected
+                           if m.get("role") == "assistant"), "")
+            if asked:
+                pairs.append({"prompt": asked, "expected": answer or ""})
+        items = _clean_items(pairs)
+        how = "last user turn -> first assistant reply"
+    else:
+        if not prompt_field:
+            prompt_field = next((f for f in ("instruction", "prompt", "question",
+                                             "input", "text")
+                                 if f in rows[0]), None)
+        if not answer_field:
+            answer_field = next((f for f in ("output", "response", "answer",
+                                             "completion")
+                                 if f in rows[0] and f != prompt_field), None)
+        if not prompt_field:
+            raise HTTPException(
+                400, "Could not tell which column holds the prompt. Its columns "
+                     "are: %s." % ", ".join(map(str, rows[0].keys())))
+        items = _clean_items([
+            {"prompt": r.get(prompt_field), "expected": r.get(answer_field) or ""}
+            for r in rows])
+        how = ("%s -> %s" % (prompt_field, answer_field) if answer_field
+               else prompt_field)
 
-    items = _clean_items([
-        {"prompt": r.get(prompt_field), "expected": r.get(answer_field) or ""}
-        for r in rows])
-    name = (payload.get("name") or "").strip() or ("%s (%d prompts)"
-                                                   % (ds["name"], len(items)))
-    notes = ("Taken from the dataset \"%s\"%s. Only meaningful as a measure if "
-             "the models being scored were not trained on these rows."
-             % (ds["name"],
-                " (%s -> %s)" % (prompt_field, answer_field) if answer_field else ""))
-    eid = db.create_eval(user["id"], name, items, notes)
+    held_out = bool(split) and split != dsets.DEFAULT_SPLIT
+    name = (payload.get("name") or "").strip() or ("%s%s (%d prompts)"
+        % (ds["name"], " · " + split if split else "", len(items)))
+    notes = ("Taken from the %s of the dataset \"%s\" (%s). %s"
+             % ("%s split" % split if split else "whole", ds["name"], how,
+                "A held-out split: a fair test of any model that trained on "
+                "the rest of this dataset." if held_out else
+                "Only meaningful as a measure if the models being scored were "
+                "not trained on these rows."))
+    source = {"dataset_id": ds["id"], "dataset_name": ds["name"],
+              "split": split or None, "held_out": held_out}
+    eid = db.create_eval(user["id"], name, items, notes, source)
     return _decorate(db.get_eval(eid), user)
+
+
+def _held_out_split(splits: dict) -> str:
+    """The split nothing trains on, when the dataset has one."""
+    for name in ("validation", "test", "eval", "dev", "val", "holdout"):
+        if name in splits:
+            return name
+    return next((n for n in splits if n != dsets.DEFAULT_SPLIT
+                 and n.lower().startswith(("val", "test", "eval", "dev"))), "")
 
 
 @router.get("/evals/{eval_id}")

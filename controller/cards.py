@@ -438,17 +438,36 @@ def _evaluations(f: dict) -> list[str]:
     if not f["scores"]:
         return []
     out = ["", "## How it scored", "",
-           "Measured in AI Studio against saved prompt sets. Every number is "
-           "on prompts the model did not train on.", "",
-           "| Prompt set | When | Loss | Token overlap | Exact |",
-           "|---|---|---|---|---|"]
+           "Measured in AI Studio against saved prompt sets.", "",
+           "| Prompt set | Rows | When | Loss | Token overlap | Exact |",
+           "|---|---|---|---|---|---|"]
     for s in f["scores"]:
         m = s.get("metrics") or {}
-        out.append("| %s | %s | %s | %s | %s |" % (
-            s.get("eval_name") or "—", _date(s.get("created_at")),
+        out.append("| %s | %s | %s | %s | %s | %s |" % (
+            s.get("eval_name") or "—", _provenance(f, s),
+            _date(s.get("created_at")),
             _float(m.get("expected_loss")), _pct(m.get("f1")),
             _pct(m.get("exact"))))
     return out
+
+
+def _provenance(f: dict, score: dict) -> str:
+    """Whether this model could have seen these prompts, said plainly.
+
+    The card used to assert that every number was on rows the model never
+    trained on. It could not know that, and for a prompt set built from the
+    first rows of the training dataset it was false.
+    """
+    src = score.get("eval_source") or {}
+    cfg = f["cfg"]
+    if not src or not src.get("dataset_id"):
+        return "hand-written"
+    same_data = src["dataset_id"] == cfg.get("studio_dataset")
+    if same_data and (src.get("split") or "train") == (cfg.get("dataset_split") or "train"):
+        return "**from the split this model trained on**"
+    if src.get("held_out"):
+        return "held-out split" if same_data else "held-out split of another dataset"
+    return "another dataset"
 
 
 def _talking_to_it(f: dict) -> list[str]:

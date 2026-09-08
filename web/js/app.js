@@ -33,7 +33,7 @@ const routes = [
   [/^\/play\/(.+)$/,   playView,      "play"],
   [/^\/runners$/,      runnersView,   "runners"],
   [/^\/settings$/,     settingsView,  "settings"],
-  [/^\/account$/,      accountView,   ""],
+  [/^\/account$/,      accountView,   "account"],
   [/^\/users$/,        usersView,     "settings"],
   [/^\/sso$/,          ssoView,       "settings"],
   [/^\/data$/,         dataView,      "data"],
@@ -78,7 +78,7 @@ async function render() {
   for (const [re, view, nav] of routes) {
     const m = path.match(re);
     if (!m) continue;
-    $$(".nav a").forEach((a) =>
+    $$(".nav a, #whoami, #whoamiMobile").forEach((a) =>
       a.classList.toggle("active", a.dataset.nav === nav));
     // Shaped like the page that is coming rather than a word in the corner,
     // so the layout settles once instead of twice.
@@ -199,8 +199,12 @@ function paintWho(user) {
   if (!user) return;
   $("#whoName").textContent = user.display_name || user.username;
   $("#whoRole").textContent = user.role === "admin" ? "administrator" : "member";
-  $("#whoAvatar").textContent =
-    (user.display_name || user.username || "?").trim()[0].toUpperCase();
+  const initial = (user.display_name || user.username || "?").trim()[0].toUpperCase();
+  $("#whoAvatar").textContent = initial;
+  // The same link on the phone's top bar, where the sidebar foot is hidden
+  // and this was the only way to the page that holds every credential.
+  const mobile = $("#whoamiMobile");
+  if (mobile) { mobile.textContent = initial; mobile.hidden = false; }
   // The user administration link only exists for people who can use it.
   const nav = $(".nav");
   const existing = $("#navUsers");

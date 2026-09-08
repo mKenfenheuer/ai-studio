@@ -554,7 +554,7 @@ export async function datasetView(mount, [id]) {
     });
 
     on(mount, "click", "#useForTraining", () => {
-      sessionStorage.setItem("aistudio.dataset", JSON.stringify({ id: d.id, name: d.name, splits: d.splits || {} }));
+      sessionStorage.setItem("aistudio.dataset", JSON.stringify({ id: d.id, name: d.name, splits: d.splits || {}, rows: d.rows }));
       location.hash = "#/new";
     });
 

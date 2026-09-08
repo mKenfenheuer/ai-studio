@@ -31,8 +31,17 @@ class Fleet:
     def __init__(self) -> None:
         self.connections: dict[str, WebSocket] = {}
         self.busy: dict[str, str] = {}          # runner_id -> job_id
-        self.ui_clients: set[WebSocket] = set()
+        # Each browser socket, and who is signed in on it. The stream carries
+        # run logs, metrics and playground tokens, and every one of those has
+        # an owner; a socket that does not know whose it is cannot be told
+        # what it may hear.
+        self.ui_clients: dict[WebSocket, dict] = {}
         self.generations: dict[str, str] = {}   # request_id -> runner_id
+        self.generation_owner: dict[str, str] = {}  # request_id -> user id
+        # (user id, job id) -> (may see it, when that was checked). Visibility
+        # is a database question, and a run emits a metric every step; this
+        # keeps it to one query per viewer per run every half minute.
+        self._visible: dict[tuple[str, str], tuple[bool, float]] = {}
         # request_id -> a queue for a caller waiting on the reply over HTTP.
         # The websocket relay is fire-and-forget, which is right for a browser
         # watching tokens appear and useless for a request that has to return
@@ -91,18 +100,49 @@ class Fleet:
         except Exception:  # noqa: BLE001 - a dead socket is handled by its own task
             return False
 
-    async def broadcast_ui(self, msg: dict) -> None:
+    # Frames that carry a run's own data, as opposed to "something changed,
+    # go and look" -- which carries nothing a list page would not show anyway.
+    _PER_JOB = frozenset(("job_log", "job_metric", "job_progress",
+                          "job_checkpoint", "job_sample", "job_finished"))
+
+    def _can_see(self, user: dict, job_id: str) -> bool:
+        key = (user["id"], job_id)
+        hit = self._visible.get(key)
+        now = time.time()
+        if hit and now - hit[1] < 30:
+            return hit[0]
+        job = db.get_job(job_id)
+        ok = bool(job) and db.access_level(
+            "job", job_id, job.get("owner_id"), user) is not None
+        self._visible[key] = (ok, now)
+        if len(self._visible) > 5000:
+            self._visible.clear()
+        return ok
+
+    async def broadcast_ui(self, msg: dict, *, user_id: str | None = None) -> None:
+        """Send a frame to the browsers that may have it.
+
+        `user_id` narrows it to one person's tabs. Frames about a run go only
+        to people who can see that run. Everything else -- "the queue moved",
+        "a machine connected" -- goes to everyone signed in, because it says
+        nothing a list page would not.
+        """
         if not self.ui_clients:
             return
         payload = json.dumps(msg)
+        jid = msg.get("job_id") if msg.get("type") in self._PER_JOB else None
         dead = []
-        for ws in list(self.ui_clients):
+        for ws, user in list(self.ui_clients.items()):
+            if user_id is not None and user.get("id") != user_id:
+                continue
+            if jid and not self._can_see(user, jid):
+                continue
             try:
                 await ws.send_text(payload)
             except Exception:  # noqa: BLE001
                 dead.append(ws)
         for ws in dead:
-            self.ui_clients.discard(ws)
+            self.ui_clients.pop(ws, None)
 
     # --------------------------------------------------------- scheduling
     def can_run(self, job: dict, caps: dict) -> tuple[bool, str]:
@@ -512,9 +552,13 @@ class Fleet:
                 # studio would put one person's conversation on another
                 # person's screen.
                 waiter.put_nowait(msg)
-            else:
-                # Passed through whole, reasoning field included.
-                await self.broadcast_ui({**msg, "type": msg["type"]})
+            elif (owner := self.generation_owner.get(rid)):
+                # Passed through whole, reasoning field included -- to the
+                # tabs of the person who asked, and nobody else's. This used
+                # to go to every signed-in browser, which put one person's
+                # conversation on every other person's screen.
+                await self.broadcast_ui({**msg, "type": msg["type"]},
+                                        user_id=owner)
             if kind == "generate_error":
                 # The one part of a conversation worth keeping. It lands in the
                 # run's own log, which is where somebody looking into "the
@@ -529,6 +573,7 @@ class Fleet:
                          ) if facts else ""), "error")
             if kind in ("generate_done", "generate_error"):
                 self.generations.pop(rid, None)
+                self.generation_owner.pop(rid, None)
             return
 
         if kind == "heartbeat":

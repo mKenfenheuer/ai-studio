@@ -147,10 +147,15 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
     seen = set()
     splits: dict[str, int] = {}
     n = 0
+    dropped = 0
     with p.open("w", encoding="utf-8") as fh:
         for row in rows:
             if n >= MAX_ROWS:
-                break
+                # Count what did not fit rather than stopping quietly: a merge
+                # of three large datasets used to lose rows with no sign of it
+                # anywhere but the total.
+                dropped += 1
+                continue
             for k in row:
                 if k not in seen:
                     seen.add(k)
@@ -159,8 +164,11 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
             splits[name] = splits.get(name, 0) + 1
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             n += 1
+    if dropped:
+        print("[datasets] %s: kept the first %s rows, dropped %s over the"
+              " AI_STUDIO_MAX_DATASET_ROWS limit" % (dataset_id, n, dropped))
     return {"rows": n, "bytes": p.stat().st_size if p.exists() else 0,
-            "columns": columns, "splits": splits}
+            "columns": columns, "splits": splits, "dropped": dropped}
 
 
 def delete_files(dataset_id: str) -> None:
@@ -181,9 +189,16 @@ def register(owner_id: str | None, name: str, source: str, rows: Iterator[dict],
     sample = list(iter_rows(did, PREVIEW_ROWS * 4))
     fmt = fields.get("format") or (
         formatting.detect_format(written["columns"], sample) if sample else {})
+    extra: dict[str, Any] = {}
+    if written["dropped"]:
+        notes = fields.get("notes") or ""
+        extra["notes"] = (notes + "\n\n" if notes else "") + (
+            "Only the first %s rows were kept: %s more were over this studio's "
+            "limit (AI_STUDIO_MAX_DATASET_ROWS)."
+            % (f"{written['rows']:,}", f"{written['dropped']:,}"))
     db.update_dataset(did, rows=written["rows"], bytes=written["bytes"],
                       columns=written["columns"], format=fmt,
-                      splits=written["splits"])
+                      splits=written["splits"], **extra)
     return db.get_dataset(did)
 
 
