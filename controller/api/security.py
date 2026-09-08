@@ -45,6 +45,8 @@ PUBLIC_PREFIXES = ("/api/auth/sso/",)
 RUNNER_TOKEN_PATHS = (
     "/artifact",
     "/download",
+    # A sample a running job produced, into the asset store.
+    "/sample",
     "/dataset-file",
     # Read by the deploy script on the host, which has the join token in the
     # same .env that starts the containers and has no browser session.

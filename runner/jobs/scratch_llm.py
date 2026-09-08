@@ -1270,6 +1270,11 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
         "initial_loss": round(stats["first_loss"], 5) if stats["first_loss"] else None,
         "final_loss": round(stats["last_loss"], 5) if stats["last_loss"] else None,
         "best_val_loss": round(stats["best_val"], 5) if stats["best_val"] else None,
+        # Named and signed: see the same field in lora_llm.
+        "primary_metric": {"name": "held_out_loss", "label": "Held-out loss",
+                           "value": round(stats["best_val"], 5),
+                           "lower_better": True}
+                          if stats["best_val"] else None,
         "final_perplexity": round(math.exp(min(stats["last_loss"] or 20, 20)), 2),
         "tokens_seen": stats["tokens_seen"],
         # Against effective parameters, so a sparse model is judged by the

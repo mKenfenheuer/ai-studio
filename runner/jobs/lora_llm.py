@@ -1025,6 +1025,16 @@ def run(cfg: dict, ctx: Any) -> dict:
         # training loss cannot, because it falls just as happily when the model
         # is memorising the examples it is being scored on.
         "best_val_loss": round(best_val, 5) if best_val is not None else None,
+        # The same number, named. Every page that ranks runs -- compare, a
+        # sweep, the champion of a prompt set -- used to reach for
+        # best_val_loss by name and assume smaller was better, which is true
+        # of a loss and false of an accuracy, a WER-inverse or an F1. A run
+        # says what it should be judged by and which way is up, and a
+        # classifier's accuracy ranks beside a language model's loss without
+        # either page knowing the difference.
+        "primary_metric": {"name": "held_out_loss", "label": "Held-out loss",
+                           "value": round(best_val, 5), "lower_better": True}
+                          if best_val is not None else None,
         "held_out_rows": len(val_ds) if val_ds is not None else 0,
         # Which rows the held-out loss was measured on, because "on unseen
         # examples" means two quite different things: a split somebody

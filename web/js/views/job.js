@@ -83,8 +83,10 @@ export async function jobView(mount, [jobId]) {
   lrChart.setData(metrics.filter((m) => m.learning_rate != null)
     .map((m) => ({ x: m.step, y: m.learning_rate })));
 
-  const samples = metrics.filter((m) => m.sample_text)
-    .map((m) => ({ step: m.step, text: m.sample_text, prompt: m.sample_prompt }));
+  const samples = metrics.filter((m) => m.sample_text || m.sample_asset)
+    .map((m) => ({ step: m.step, kind: m.sample_kind || "text", text: m.sample_text,
+                   prompt: m.sample_prompt, asset_id: m.sample_asset,
+                   caption: m.sample_caption }));
   if (scratch) paintSamples(mount, samples);
 
   const logBox = $("#logBox", mount);
@@ -130,7 +132,8 @@ export async function jobView(mount, [jobId]) {
         expertChart?.push({ x: msg.step, y: msg.data.expert_balance });
       stats();
     } else if (msg.type === "job_sample") {
-      samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
+      samples.push({ step: msg.step, kind: msg.kind || "text", text: msg.text,
+                     prompt: msg.prompt, asset_id: msg.asset_id, caption: msg.caption });
       paintSamples(mount, samples);
     } else if (msg.type === "job_log") {
       const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
@@ -2017,14 +2020,31 @@ function paintSamples(mount, samples) {
     ${raw(newest.length ? html`
       <div class="samples">
         ${raw(newest.map((s) => {
-          const seed = s.prompt || "";
-          const rest = s.text.startsWith(seed) ? s.text.slice(seed.length) : s.text;
+          // Drawn by what the runner said it is. A picture is shown, a clip
+          // gets a player, and a table of predictions is a table -- never a
+          // string of an asset id in a paragraph.
+          let body;
+          if (s.kind === "image" && s.asset_id) {
+            body = `<img class="sample-img" src="/api/assets/${esc(s.asset_id)}" alt="${esc(s.caption || "sample")}" loading="lazy">`
+                 + (s.caption ? `<p class="tiny muted">${esc(s.caption)}</p>` : "");
+          } else if (s.kind === "audio" && s.asset_id) {
+            body = `<audio controls preload="none" src="/api/assets/${esc(s.asset_id)}" style="width:100%"></audio>`
+                 + (s.text ? `<p class="txt">${esc(s.text)}</p>` : "")
+                 + (s.caption ? `<p class="tiny muted">${esc(s.caption)}</p>` : "");
+          } else if (s.kind === "table") {
+            body = `<pre class="mono tiny" style="white-space:pre-wrap;margin:0">${esc(s.text || "")}</pre>`;
+          } else {
+            const seed = s.prompt || "";
+            const text = s.text || "";
+            const rest = text.startsWith(seed) ? text.slice(seed.length) : text;
+            body = `<p class="txt"><span class="seed">${esc(seed)}</span>${esc(rest)}</p>`;
+          }
           return html`
             <div class="sample">
               <div class="hd">
                 <span class="badge badge-accent">step ${s.step}</span>
               </div>
-              <p class="txt"><span class="seed">${seed}</span>${rest}</p>
+              ${raw(body)}
             </div>`;
         }).join(""))}
       </div>` : html`

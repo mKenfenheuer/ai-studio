@@ -621,10 +621,19 @@ image/audio datasets fetched as assets rather than as dead viewer URLs;
 durations for formats other than WAV (needs decoding, so the runner's job);
 the text-length warnings still fire on a set with no text in it.
 
-**P3. Typed samples and metrics (M).** `job_meta.sample` becomes
-`{step, kind: text|image_grid|audio|table, asset_id?, text?}`; a
-`primary_metric` with polarity in the summary so WER, accuracy and FID rank
-in sweeps, compare and early stopping without special cases.
+**P3. Typed samples and metrics (M). Done.** A sample is
+`{step, kind: text|image|audio|table, text?, prompt?, asset_id?, caption?}`;
+anything that is not text is a file the runner puts in the store first
+(`POST /api/assets/from-runner/{job}`, join-token authenticated, belonging
+to the run and released with it) and the run page draws it by kind --
+`ctx.sample(step, kind, path=…)` on the runner. Every trainer's summary
+names its headline number: `primary_metric: {name, label, value,
+lower_better}`. One reader on each side (`app.primary_metric`,
+`kinds.primaryMetric`) with the old `best_val_loss` read as a held-out loss,
+lower better; compare, the sweep page and the sweep's champion rank through
+it, in the metric's own direction, with its own label as the column heading.
+*Still to do:* early stopping in the trainers reads `val_loss` directly and
+will need the same treatment when a trainer with a different metric exists.
 
 **P4. Typed content end to end (L).** `content` in `common/conversation.py`
 becomes `str | list[Part]`; `_part_text` stops turning images into the string

@@ -265,6 +265,12 @@ def release(asset_ids: Iterable[str]) -> dict:
     return {"rows": len(rows), "files": files, "bytes": freed}
 
 
+def release_job(job_id: str) -> dict:
+    """Everything a run drew while it ran, when the run goes."""
+    return release([r["id"] for r in db.q(
+        "SELECT id FROM assets WHERE job_id=?", (job_id,))])
+
+
 def release_dataset(dataset_id: str) -> dict:
     """Everything a dataset brought with it, when the dataset goes."""
     return release([r["id"] for r in db.assets_of_dataset(dataset_id)])

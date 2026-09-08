@@ -136,6 +136,36 @@ class JobContext:
     def emit_meta(self, meta: dict) -> None:
         self._put({"type": "job_meta", "meta": meta})
 
+    def sample(self, step: int, kind: str = "text", text: str = "",
+               prompt: str = "", path: str | None = None,
+               caption: str = "") -> None:
+        """Show something the model produced, in the panel on the run page.
+
+        Text goes straight through. Anything else -- a grid of what a
+        classifier got wrong, a clip a speech model produced -- is a file,
+        put in the studio's store first under this run's name and then
+        announced by id; the page draws it by kind. The upload is small and
+        synchronous, and a failure to store it is logged rather than raised:
+        a sample is a courtesy, and a run must not die of one.
+        """
+        meta: dict = {"step": int(step), "kind": kind, "text": text,
+                      "prompt": prompt, "caption": caption}
+        if path:
+            try:
+                with open(path, "rb") as fh:
+                    r = httpx.post(
+                        "%s/api/assets/from-runner/%s/sample"
+                        % (self.controller_url, self.job_id),
+                        files={"file": (os.path.basename(path), fh)},
+                        headers={"X-Runner-Token": self.runner_token},
+                        timeout=120.0)
+                r.raise_for_status()
+                meta["asset_id"] = r.json().get("id", "")
+            except Exception as e:  # noqa: BLE001 - see the docstring
+                self.log("Could not store a sample to show (%s)." % e, "warn")
+                return
+        self.emit_meta({"sample": meta})
+
 
 class Runner:
     def __init__(self, controller_url: str, token: str, name: str | None = None,

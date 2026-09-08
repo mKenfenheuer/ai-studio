@@ -152,3 +152,28 @@ export const STAGES = {
   converting: "Reading the weights and writing one file…",
   quantizing: "Shrinking it to the size you asked for…",
 };
+
+
+/** What a run says it should be judged by, and which way is up.
+ *
+ *  `{name, label, value, lower}` or null. A run finished before it said
+ *  carries only `best_val_loss`, read as a held-out loss, lower better --
+ *  which is what it always was. Every page that ranks runs reads this and
+ *  nothing else, so a classifier's accuracy and a language model's loss
+ *  sort correctly side by side without the page knowing which is which. */
+export function primaryMetric(job) {
+  const s = job?.summary || {};
+  const m = s.primary_metric;
+  if (m && m.value != null) {
+    return { name: m.name || "metric", label: m.label || "Metric",
+             value: +m.value, lower: m.lower_better !== false };
+  }
+  if (s.best_val_loss != null) {
+    return { name: "held_out_loss", label: "Held-out loss",
+             value: +s.best_val_loss, lower: true };
+  }
+  return null;
+}
+
+/** The better of two values under a metric's polarity. */
+export const betterOf = (m, a, b) => (m?.lower === false ? Math.max(a, b) : Math.min(a, b));

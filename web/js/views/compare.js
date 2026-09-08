@@ -16,6 +16,7 @@ import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { LineChart } from "../chart.js";
 import { ribbon, rb, group, rbSeg, rbSelect, rbSearch, wireRibbon } from "../ribbon.js";
+import { primaryMetric } from "../kinds.js";
 import { pageHead, emptyState } from "../components.js";
 
 // The kinds of run that leave a model behind. `has_model` alone let
@@ -116,7 +117,11 @@ function distinct(jobs, pick) {
   return seen.map((v) => [v, v.length > 44 ? "…" + v.slice(-42) : v]);
 }
 
-const heldOut = (j) => j.summary?.best_val_loss ?? null;
+const heldOut = (j) => primaryMetric(j)?.value ?? null;
+// Which way is up, from the first run that says. Mixed polarities in one
+// table would be a comparison of unrelated numbers, which the family
+// switch already prevents.
+const lowerBetter = (rows) => (rows.map(primaryMetric).find(Boolean)?.lower) !== false;
 
 /** The table as a file, because the next question is always asked in a
  *  spreadsheet and there was no way to get the numbers out of here. */
@@ -148,8 +153,12 @@ function downloadCsv(jobs) {
 
 function layout(jobs, picked, families, shown, filters = {}) {
   const withHeld = jobs.filter((j) => heldOut(j) != null);
-  const best = withHeld.length ? Math.min(...withHeld.map(heldOut)) : null;
-  const worst = withHeld.length ? Math.max(...withHeld.map(heldOut)) : null;
+  const lower = lowerBetter(withHeld);
+  const best = withHeld.length
+    ? (lower ? Math.min : Math.max)(...withHeld.map(heldOut)) : null;
+  const worst = withHeld.length
+    ? (lower ? Math.max : Math.min)(...withHeld.map(heldOut)) : null;
+  const metricLabel = (withHeld.map(primaryMetric).find(Boolean)?.label) || "Held-out loss";
   const span = (worst ?? 0) - (best ?? 0) || 1;
 
   return html`
@@ -204,7 +213,7 @@ function layout(jobs, picked, families, shown, filters = {}) {
           <thead><tr>
             <th style="width:34px"></th>
             <th>Run</th>
-            <th>Held-out loss</th>
+            <th>${metricLabel}</th>
             <th class="hide-sm">Training loss</th>
             <th class="hide-sm">Steps</th>
             <th class="hide-sm">Trained on</th>
@@ -214,7 +223,8 @@ function layout(jobs, picked, families, shown, filters = {}) {
           <tbody>${raw(jobs.map((j) => {
             const held = heldOut(j);
             const s = j.summary || {};
-            const width = held != null ? 12 + 88 * (1 - (held - best) / span) : 0;
+            // Distance from the best, whichever direction the metric runs.
+            const width = held != null ? 12 + 88 * (1 - Math.abs(held - best) / span) : 0;
             return html`
               <tr class="${held != null && held === best ? "row-best" : ""}">
                 <td><input type="checkbox" data-cmp="${j.id}"

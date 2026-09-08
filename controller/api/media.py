@@ -21,10 +21,11 @@ dataset of images work at all.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import (APIRouter, File, Header, HTTPException, Query, Request,
+                     UploadFile)
 from fastapi.responses import FileResponse
 
-from .. import assets, db
+from .. import assets, config, db
 from .security import current_user
 
 router = APIRouter(prefix="/api/assets")
@@ -173,3 +174,31 @@ async def delete_asset(request: Request, asset_id: str) -> dict:
             "note": "The reference is gone. The file itself stays as long as "
                     "anything else points at it." if not freed["files"]
                     else "Removed, and the last reference to it went with it."}
+
+
+# Ends in a fixed word because the runner-token check matches paths by their
+# last segment, and a path that ends in a job id has no last segment to match.
+@router.post("/from-runner/{job_id}/sample")
+async def upload_from_runner(job_id: str, file: UploadFile = File(...),
+                             x_runner_token: str = Header(default="")) -> dict:
+    """A file a running job produced -- a sample grid, a clip -- into the store.
+
+    The runner's door, not a person's: authenticated by the join token, as
+    artifact uploads are, and the asset belongs to the job rather than to an
+    account, so whoever may see the run may see what it drew. It is released
+    when the run is deleted, with everything else the run left.
+    """
+    if x_runner_token != config.join_token():
+        raise HTTPException(403, "Invalid runner token.")
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "No such run.")
+    mime = assets.guess_mime(file.filename or "", file.content_type or "")
+    if not mime:
+        raise HTTPException(400, "Not a kind of file the studio stores.")
+    try:
+        row = assets.store(_chunks(file), file.filename or "", mime,
+                           owner_id=job.get("owner_id"), job_id=job_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return _public(row)

@@ -767,15 +767,25 @@ class Fleet:
                 await self.broadcast_ui({"type": "job_checkpoint", "job_id": jid,
                                          "step": int(ckpt.get("step") or 0)})
             elif sample := meta.get("sample"):
-                # Generated text gets its own channel rather than being buried
-                # in the log. Watching noise turn into sentences is the clearest
-                # signal a from-scratch run gives that it is working, so it is
-                # stored per step and shown as its own panel.
+                # Generated output gets its own channel rather than being
+                # buried in the log. Watching noise turn into sentences is the
+                # clearest signal a from-scratch run gives that it is working,
+                # so it is stored per step and shown as its own panel.
+                #
+                # Typed, because a sample is not always text: a classifier
+                # shows a grid of what it got wrong, a speech model a clip
+                # and what it heard. Anything that is not text is a stored
+                # file the runner put in the asset store first, named by id;
+                # the panel draws it by kind and never guesses.
+                kind = str(sample.get("kind") or "text")
                 db.add_metric(jid, int(sample.get("step") or 0),
-                              {"sample_text": sample.get("text", ""),
-                               "sample_prompt": sample.get("prompt", "")})
+                              {"sample_kind": kind,
+                               "sample_text": sample.get("text", ""),
+                               "sample_prompt": sample.get("prompt", ""),
+                               "sample_asset": sample.get("asset_id", ""),
+                               "sample_caption": sample.get("caption", "")})
                 await self.broadcast_ui({"type": "job_sample", "job_id": jid,
-                                         **sample})
+                                         "kind": kind, **sample})
             else:
                 db.add_log(jid, "Details: %s" % json.dumps(meta)[:800])
 

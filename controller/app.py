@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from common import apimodels, formatting
 
+from . import assets
 from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
@@ -284,6 +285,25 @@ async def get_jobs(request: Request, limit: int = 100) -> list[dict]:
             j["queue_length"] = waiting
         _hide_credentials(j)
     return jobs
+
+
+def primary_metric(summary: dict) -> dict | None:
+    """What a run says it should be judged by, and which way is up.
+
+    Runs finished before they said carry only best_val_loss; that is read as
+    a held-out loss, lower better, which is what it always was.
+    """
+    if not summary:
+        return None
+    if isinstance(summary.get("primary_metric"), dict) \
+            and summary["primary_metric"].get("value") is not None:
+        m = summary["primary_metric"]
+        return {"name": m.get("name") or "metric", "label": m.get("label") or "Metric",
+                "value": float(m["value"]), "lower_better": bool(m.get("lower_better", True))}
+    if summary.get("best_val_loss") is not None:
+        return {"name": "held_out_loss", "label": "Held-out loss",
+                "value": float(summary["best_val_loss"]), "lower_better": True}
+    return None
 
 
 def _hide_credentials(job: dict) -> None:
@@ -742,9 +762,19 @@ async def get_sweep(request: Request, sweep_id: str) -> dict:
     done = [r for r in row["runs"]
             if r["status"] in ("succeeded", "cancelled", "failed")]
     row["finished"] = len(done)
-    scored = [r for r in done if (r.get("summary") or {}).get("best_val_loss")]
-    row["best"] = min(scored,
-                      key=lambda r: r["summary"]["best_val_loss"])["id"]         if scored else None
+    scored = [(r, m) for r in done
+              if (m := primary_metric(r.get("summary") or {}))]
+    # The best run, by whatever the runs said they should be judged on and
+    # in the direction they said. A sweep of classifiers ranks by accuracy,
+    # highest first; a sweep of language models by loss, lowest first.
+    if scored:
+        lower = scored[0][1]["lower_better"]
+        pick = min if lower else max
+        row["best"] = pick(scored, key=lambda rm: rm[1]["value"])[0]["id"]
+        row["ranked_by"] = scored[0][1]
+    else:
+        row["best"] = None
+        row["ranked_by"] = None
     return row
 
 
@@ -936,6 +966,8 @@ async def delete_job(request: Request, job_id: str) -> dict:
         raise HTTPException(
             400, "This run has not finished. Stop it first, then delete it.")
 
+    # What the run drew while it ran -- sample grids, clips -- goes with it.
+    assets.release_job(job_id)
     for filename in db.delete_job(job_id):
         with contextlib.suppress(OSError):
             (config.ARTIFACT_DIR / filename).unlink()

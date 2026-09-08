@@ -14,6 +14,7 @@ import { api, events } from "../api.js";
 import { html, raw, esc, on, toast, fmtAgo, fmtDuration, fmtNum,
          statusBadge } from "../util.js";
 import { ribbon, rb, group } from "../ribbon.js";
+import { primaryMetric } from "../kinds.js";
 import { breadcrumb, pageHead, emptyState } from "../components.js";
 
 export async function sweepView(mount, [sweepId]) {
@@ -85,7 +86,8 @@ export async function sweepsView(mount) {
 function sweepRow(s) {
   const runs = s.runs || [];
   const scored = runs.filter((r) => heldOut(r) != null);
-  const best = scored.length ? Math.min(...scored.map(heldOut)) : null;
+  const best = scored.length
+    ? (lowerBetter(scored) ? Math.min : Math.max)(...scored.map(heldOut)) : null;
   const running = runs.filter((r) =>
     ["queued", "assigned", "running"].includes(r.status)).length;
   const varied = [...new Set(runs.flatMap((r) => Object.keys(r.values || {})))];
@@ -102,13 +104,18 @@ function sweepRow(s) {
     </tr>`;
 }
 
-const heldOut = (r) => r.summary?.best_val_loss ?? null;
+const heldOut = (r) => primaryMetric(r)?.value ?? null;
+// Which way is up, from the first run that says. Mixed polarities in one
+// table would be a comparison of unrelated numbers, which the family
+// switch already prevents.
+const lowerBetter = (rows) => (rows.map(primaryMetric).find(Boolean)?.lower) !== false;
 
 function layout(s) {
   const runs = s.runs || [];
   const scored = runs.filter((r) => heldOut(r) != null);
-  const best = scored.length ? Math.min(...scored.map(heldOut)) : null;
-  const worst = scored.length ? Math.max(...scored.map(heldOut)) : null;
+  const lower = lowerBetter(scored);
+  const best = scored.length ? (lower ? Math.min : Math.max)(...scored.map(heldOut)) : null;
+  const worst = scored.length ? (lower ? Math.max : Math.min)(...scored.map(heldOut)) : null;
   const span = (worst ?? 0) - (best ?? 0) || 1;
   const running = runs.filter((r) =>
     ["queued", "assigned", "running"].includes(r.status));
@@ -116,7 +123,8 @@ function layout(s) {
   // computed to draw a bar next to and then nothing was offered to do with it:
   // the point of a sweep is the winner, and the page stopped at naming it.
   const winner = scored.length
-    ? scored.reduce((a, b) => (heldOut(a) <= heldOut(b) ? a : b)) : null;
+    ? scored.reduce((a, b) => ((lower ? heldOut(a) <= heldOut(b)
+                                       : heldOut(a) >= heldOut(b)) ? a : b)) : null;
 
   return html`
     <div class="page-head">
@@ -161,7 +169,7 @@ function layout(s) {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Setting</th><th>Status</th>
-          <th>Held-out loss</th>
+          <th>${(scored.map(primaryMetric).find(Boolean)?.label) || "Held-out loss"}</th>
           <th class="hide-sm">Training loss</th>
           <th class="hide-sm">Steps</th>
           <th class="hide-sm">Took</th>
@@ -171,7 +179,7 @@ function layout(s) {
           ${raw(runs.map((r) => {
             const held = heldOut(r);
             const sm = r.summary || {};
-            const width = held != null ? 12 + 88 * (1 - (held - best) / span) : 0;
+            const width = held != null ? 12 + 88 * (1 - Math.abs(held - best) / span) : 0;
             const live = ["queued", "assigned", "running"].includes(r.status);
             const pct = r.total_steps ? Math.min(100, (r.step / r.total_steps) * 100) : 0;
             return html`
