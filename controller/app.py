@@ -251,6 +251,7 @@ async def get_runners() -> list[dict]:
         r["checkpoints"] = sorted(fleet.checkpoints.get(r["id"], set()))
         # The heartbeat has always carried this; the page never got it.
         r["disk"] = fleet.disk.get(r["id"])
+        r["checkpoint_detail"] = fleet.checkpoint_detail.get(r["id"]) or []
         out.append(r)
     return out
 
@@ -727,12 +728,19 @@ def _resumable(job: dict) -> dict | None:
         return None
     holder = job.get("checkpoint_runner")
     runner = db.get_runner(holder) if holder else None
+    detail = next((c for c in fleet.checkpoint_detail.get(holder or "", [])
+                   if c.get("job_id") == job["id"]), None)
     return {
         "step": step,
         "total": job.get("total_steps") or 0,
         "runner_id": holder,
         "runner": (runner or {}).get("name"),
         "online": holder in fleet.connections,
+        # What is actually on that disk, when the machine is here to say.
+        "bytes": (detail or {}).get("bytes"),
+        "at": (detail or {}).get("at"),
+        "best_step": (detail or {}).get("best_step"),
+        "best_val_loss": (detail or {}).get("best_val_loss"),
     }
 
 

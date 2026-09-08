@@ -396,6 +396,11 @@ class Runner:
                 "cached": artifacts.cached_ids(),
                 "disk": artifacts.usage(),
                 "checkpoints": checkpoints.list_ids(),
+                # What each one is and what it costs to keep. The ids alone
+                # were enough to route a resume, and told nobody that this
+                # machine is holding forty gigabytes of snapshots for runs
+                # that finished a fortnight ago.
+                "checkpoint_detail": checkpoints.describe(),
             }))
             self._touch_liveness()
 

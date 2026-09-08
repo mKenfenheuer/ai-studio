@@ -15,7 +15,7 @@
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { LineChart } from "../chart.js";
-import { ribbon, rb, group, rbSeg, wireRibbon } from "../ribbon.js";
+import { ribbon, rb, group, rbSeg, rbSelect, rbSearch, wireRibbon } from "../ribbon.js";
 import { pageHead, emptyState } from "../components.js";
 
 // The kinds of run that leave a model behind. `has_model` alone let
@@ -36,11 +36,23 @@ export async function compareView(mount) {
   let shown = families.includes("Fine-tunes") ? "Fine-tunes" : families[0];
   const picked = new Set();
   let chart = null;
+  let q = "";
+  let onlyBase = "";
+  let onlyData = "";
 
-  const jobsShown = () => all.filter((j) => family(j) === shown);
+  const jobsShown = () => all.filter((j) => {
+    if (family(j) !== shown) return false;
+    if (onlyBase && (j.config?.base_model || "") !== onlyBase) return false;
+    if (onlyData && (j.config?.dataset_label || j.config?.dataset || "") !== onlyData) return false;
+    if (!q) return true;
+    return [j.name, j.notes, j.config?.base_model,
+            j.config?.dataset_label, j.config?.dataset]
+      .filter(Boolean).join(" ").toLowerCase().includes(q);
+  });
 
   const draw = () => {
-    mount.innerHTML = layout(jobsShown(), picked, families, shown);
+    mount.innerHTML = layout(jobsShown(), picked, families, shown,
+                             { all, q, onlyBase, onlyData });
     if (chart) { chart.destroy(); chart = null; }
     wire();
     paintCurves();
@@ -55,6 +67,10 @@ export async function compareView(mount) {
     on(mount, "click", "[data-family]", (_e, t) => {
       shown = t.dataset.family; picked.clear(); draw();
     });
+    on(mount, "input", "#cmpQ", (_e, t) => { q = t.value.toLowerCase(); draw(); });
+    on(mount, "change", "#cmpBase", (_e, t) => { onlyBase = t.value; draw(); });
+    on(mount, "change", "#cmpData", (_e, t) => { onlyData = t.value; draw(); });
+    on(mount, "click", "#cmpCsv", () => downloadCsv(jobsShown()));
     wireRibbon(mount, () => {});
   }
 
@@ -94,9 +110,43 @@ export async function compareView(mount) {
   return () => { chart?.destroy(); };
 }
 
+/** The distinct values of one field across these runs, as select options. */
+function distinct(jobs, pick) {
+  const seen = [...new Set((jobs || []).map(pick).filter(Boolean))].sort();
+  return seen.map((v) => [v, v.length > 44 ? "…" + v.slice(-42) : v]);
+}
+
 const heldOut = (j) => j.summary?.best_val_loss ?? null;
 
-function layout(jobs, picked, families, shown) {
+/** The table as a file, because the next question is always asked in a
+ *  spreadsheet and there was no way to get the numbers out of here. */
+function downloadCsv(jobs) {
+  const cell = (v) => {
+    const s = v == null ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const head = ["name", "kind", "base_model", "dataset", "held_out_loss",
+                "final_loss", "steps", "tokens_seen", "duration_s", "seed",
+                "status", "finished_at", "notes"];
+  const rows = jobs.map((j) => {
+    const s = j.summary || {};
+    return [j.name, j.kind, j.config?.base_model || "",
+            j.config?.dataset_label || j.config?.dataset || "",
+            s.best_val_loss ?? "", s.final_loss ?? "", s.steps ?? j.step ?? "",
+            s.tokens_seen ?? "", s.duration_s ?? "", s.seed ?? "",
+            j.status, j.finished_at ? new Date(j.finished_at * 1000).toISOString() : "",
+            j.notes || ""].map(cell).join(",");
+  });
+  const blob = new Blob([[head.join(","), ...rows].join("\n")],
+                        { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `runs-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function layout(jobs, picked, families, shown, filters = {}) {
   const withHeld = jobs.filter((j) => heldOut(j) != null);
   const best = withHeld.length ? Math.min(...withHeld.map(heldOut)) : null;
   const worst = withHeld.length ? Math.max(...withHeld.map(heldOut)) : null;
@@ -115,6 +165,18 @@ function layout(jobs, picked, families, shown) {
                                          data: `data-family="${esc(f)}"` })))
           : "",
         rb("cmpClear", "✕", "Clear selection", { disabled: !picked.size }),
+      ]) + group("Narrow it", [
+        rbSearch("cmpQ", { placeholder: "Name, model or dataset…",
+                           value: filters.q || "" }),
+        rbSelect("cmpBase", { title: "Base model", value: filters.onlyBase || "",
+          options: [["", "Any base model"]].concat(
+            distinct(filters.all, (j) => j.config?.base_model)) }),
+        rbSelect("cmpData", { title: "Dataset", value: filters.onlyData || "",
+          options: [["", "Any dataset"]].concat(
+            distinct(filters.all, (j) => j.config?.dataset_label || j.config?.dataset)) }),
+      ]) + group("Take it away", [
+        rb("cmpCsv", "↓", "As a spreadsheet", { disabled: !jobs.length,
+          title: "Every row in this table, as CSV" }),
       ]) + group("Elsewhere", [
         rb(null, "◎", "Prompt sets", { href: "#/evals",
           title: "The same questions, put to every model" }),

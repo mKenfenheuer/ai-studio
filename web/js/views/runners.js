@@ -1,6 +1,6 @@
 import { api, events } from "../api.js";
 import { session } from "../app.js";
-import { html, raw, esc, $, on, fmtAgo, fmtNum, toast, modal } from "../util.js";
+import { html, raw, esc, $, on, fmtAgo, fmtNum, fmtBytes, toast, modal } from "../util.js";
 import { ribbon, rb, group, rbSeg, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, copyButton } from "../components.js";
 import { subjectOf, kindOf } from "../kinds.js";
@@ -258,6 +258,11 @@ function card(r, admin, dense = false) {
           <dt>Disk</dt><dd>${Math.round(r.disk.free_gb)} GB free of ${
             Math.round(r.disk.total_gb || 0)}${r.disk.models_gb != null
             ? ` · ${Math.round(r.disk.models_gb)} GB of models` : ""}</dd>` : "")}
+        ${raw((r.checkpoint_detail || []).length ? html`
+          <dt>Checkpoints</dt><dd>${r.checkpoint_detail.length} held ·
+            ${fmtBytes(r.checkpoint_detail.reduce((n, c) => n + (c.bytes || 0), 0))}
+            <span class="muted tiny">— a run can carry on from these; they are
+            cleared after a fortnight</span></dd>` : "")}
         ${raw(c.kinds?.length ? html`
           <dt>Takes</dt><dd>${c.kinds.join(", ").replace(/_/g, " ")}
             <span class="muted tiny">— and nothing else</span></dd>` : "")}

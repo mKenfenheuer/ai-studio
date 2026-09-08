@@ -1,6 +1,6 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, $$, on, fmtNum, fmtDuration, fmtAgo, statusBadge,
-         toast, modal, skeletonValue, inlineRename } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtNum, fmtBytes, fmtDuration, fmtAgo,
+         statusBadge, toast, modal, skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { publishCard, wirePublish } from "./publish.js";
@@ -1767,6 +1767,15 @@ function resumeCard(job) {
           lost ? `, so ${fmtNum(lost)} steps would be redone` : ""}.
         Starting it again picks up the weights and the optimiser exactly where
         they were, rather than beginning from noise.</p>
+      ${raw(r.bytes || r.best_step ? html`
+        <p class="muted tiny" style="margin:0 0 10px">${[
+          r.bytes ? `${fmtBytes(r.bytes)} on that machine's disk` : null,
+          r.at ? `saved ${fmtAgo(r.at)}` : null,
+          r.best_step ? `its best point was step ${fmtNum(r.best_step)}${
+            r.best_val_loss != null
+              ? `, held-out loss ${r.best_val_loss.toFixed(4)}` : ""}` : null,
+        ].filter(Boolean).join(" · ")}. Checkpoints older than a fortnight are
+        cleared when the machine restarts.</p>` : "")}
       ${raw(r.online
         ? html`<button class="btn-primary btn-sm" id="resumeBtn">
                  Carry on from step ${fmtNum(r.step)}</button>`

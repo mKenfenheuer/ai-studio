@@ -65,6 +65,9 @@ class Fleet:
         self.loaded: dict[str, list[str]] = {}   # runner_id -> job ids, MRU first
         self.cached: dict[str, set[str]] = {}    # runner_id -> job ids on disk
         self.disk: dict[str, dict] = {}          # runner_id -> free/total GB
+        # runner_id -> [{job_id, step, bytes, at}]. What each machine is
+        # holding, so a run can say how much of it exists and where.
+        self.checkpoint_detail: dict[str, list] = {}
         self.gave_up_waiting: set[str] = set()
         self._wake = asyncio.Event()
 
@@ -625,6 +628,8 @@ class Fleet:
                                           for c in on_disk}
             if (space := msg.get("disk")) is not None:
                 self.disk[runner_id] = space
+            if (held := msg.get("checkpoint_detail")) is not None:
+                self.checkpoint_detail[runner_id] = held
             # The runner is the authority on what it is doing. Deriving this
             # from dispatch bookkeeping alone loses track the moment the
             # controller restarts, and then hands work to a machine that is

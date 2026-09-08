@@ -161,6 +161,33 @@ def list_ids() -> list[str]:
         return []
 
 
+def describe() -> list[dict]:
+    """Every checkpoint on this machine, with what it costs to keep.
+
+    The size and the age have always been computable and were never reported,
+    so a machine could be holding forty gigabytes of snapshots for runs that
+    finished a fortnight ago and the only way to find out was to ssh in.
+    """
+    out = []
+    for job_id in list_ids():
+        state = peek(job_id, "state") or {}
+        best = peek(job_id, "best") or {}
+        try:
+            newest = max(p.stat().st_mtime
+                         for p in dir_for(job_id).rglob("*") if p.is_file())
+        except (OSError, ValueError):
+            newest = 0.0
+        out.append({
+            "job_id": job_id,
+            "step": state.get("step") or 0,
+            "best_step": best.get("step") or 0,
+            "best_val_loss": best.get("val_loss"),
+            "bytes": size_bytes(job_id),
+            "at": newest,
+        })
+    return out
+
+
 def size_bytes(job_id: str, path: Path | None = None) -> int:
     """Bytes on disk, for the whole job or for one generation.
 
