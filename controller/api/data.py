@@ -464,8 +464,67 @@ def add_rows(request: Request, dataset_id: str,
         raise HTTPException(400, "No rows were given.")
     if not all(isinstance(r, dict) for r in rows):
         raise HTTPException(400, "Every row has to be an object.")
-    return ds.append_rows(d, rows, (payload.get("split") or "").strip()
+    return ds.append_rows(d, _shaped(d, rows),
+                          (payload.get("split") or "").strip()
                           or ds.DEFAULT_SPLIT)
+
+
+def _shaped(d: dict, rows: list[dict]) -> list[dict]:
+    """Conversations, written in the shape this dataset already uses.
+
+    The playground hands a kept exchange over as a canonical conversation --
+    a `messages` list -- because that is what it holds and what the trainer
+    reads. Most datasets are conversations too and take it unchanged. A flat
+    one, with an instruction column and a response column, would take it as a
+    brand new `messages` column: a dataset half in one shape and half in
+    another, which every later step then has to guess about.
+
+    So it is mapped instead, into the columns the dataset has. A dataset that
+    cannot hold a conversation at all -- a corpus of plain prose -- is refused
+    rather than half-filled, because "the last thing the assistant said" is
+    not a line of a corpus and pretending it is teaches the model nothing.
+    """
+    if not any(isinstance(r.get("messages"), list) for r in rows):
+        return rows
+    cols = list(d.get("columns") or [])
+    fmt = formatting.resolve_format(d.get("format") or {})
+    if not cols or "messages" in cols or fmt.get("mode") == "chat":
+        return rows
+
+    instr = fmt.get("instruction_field") or next(
+        (c for c in ("instruction", "prompt", "question", "input") if c in cols), "")
+    resp = fmt.get("response_field") or next(
+        (c for c in ("output", "response", "answer", "completion")
+         if c in cols and c != instr), "")
+    if not instr or not resp:
+        raise HTTPException(
+            400, "This dataset's rows are not conversations and have no "
+                 "question and answer columns to put one in — its columns "
+                 "are: %s. Keep this into a dataset of conversations, or one "
+                 "with a prompt column and a reply column." % ", ".join(cols))
+
+    system_col = next((c for c in ("system", "system_prompt") if c in cols), "")
+    out = []
+    for r in rows:
+        msgs = r.get("messages")
+        if not isinstance(msgs, list):
+            out.append(r)
+            continue
+        asked = next((m.get("content") for m in reversed(msgs)
+                      if m.get("role") == "user"), "")
+        said = next((m.get("content") for m in reversed(msgs)
+                     if m.get("role") == "assistant"), "")
+        if not asked or not said:
+            raise HTTPException(
+                400, "That exchange has no question and answer to write into "
+                     "%s and %s." % (instr, resp))
+        row = {instr: asked, resp: said}
+        if system_col:
+            if sys_msg := next((m.get("content") for m in msgs
+                                if m.get("role") == "system"), ""):
+                row[system_col] = sys_msg
+        out.append(row)
+    return out
 
 
 @router.post("/{dataset_id}/rows/edit")

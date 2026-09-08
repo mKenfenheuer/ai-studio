@@ -448,6 +448,10 @@ def record_scores(job: dict, summary: dict) -> int:
         return 0
     written = 0
     cfg = job.get("config") or {}
+    # The machine's name, not its id. A score is read months later and
+    # "controller-cpu" is a thing somebody recognises; "run_be7c0e2bac7d" is
+    # not, and the machine it names may not exist by then either.
+    runner = db.get_runner(job.get("runner_id") or "") if job.get("runner_id") else None
     for score in summary.get("scores") or []:
         if score.get("metrics", {}).get("error"):
             continue
@@ -478,7 +482,7 @@ def record_scores(job: dict, summary: dict) -> int:
                 "system_prompt": score.get("system_prompt") or "",
                 "system_prompt_override": bool(cfg.get("system_prompt_override")),
                 "source": score.get("source") or "run",
-                "runner": job.get("runner_name") or job.get("runner_id"),
+                "runner": (runner or {}).get("name") or job.get("runner_id"),
             })
         written += 1
     return written

@@ -529,9 +529,11 @@ Remaining in this phase:
 - **Regression view**: one prompt set over time per model lineage, with a
   pinned champion.
 - **Playground**: side-by-side (the runner already holds several models,
-  `inference.py:120-152`); saved conversations; thumbs up/down and "correct
-  this answer" that append to a chosen dataset's `review` split — this is what
-  turns the playground into the source of the next training run.
+  `inference.py:120-152`); saved conversations. *Done:* "keep this exchange"
+  writes the conversation up to one assistant turn into a dataset's `review`
+  split, with the answer editable first, mapped into the dataset's own shape
+  when it is not a conversation dataset (`api/data._shaped`). That is the link
+  that turns the playground into the source of the next training run.
 - **Batch inference**: run a model over a dataset split and save the answers
   as a new dataset (the eval job already does the loop).
 - **Registry**: named aliases (`assistant-prod`) pointing at a run, with
@@ -539,6 +541,13 @@ Remaining in this phase:
   eval page.
 - **Usage**: per-key and per-model token counts from what `_collect` already
   measures; expiry and scope on keys.
+- **A studio with no GPU cannot score anything.** `can_run` refuses an
+  evaluation on a CPU machine unless every model in it is hosted, so a
+  baseline off the Hub -- a 135M model that scores three prompts in three
+  seconds -- has nowhere to run on a GPU-less box. Either a size-aware rule or
+  an explicit "run it here anyway", but `_by_preference` sends kind-restricted
+  machines the work first, so allowing it naively would send small scorings to
+  the CPU on machines that do have a card.
 - "Write data with it" on every model that can be a generation source.
 
 ---

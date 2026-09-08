@@ -1,5 +1,5 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, $$, on, fmtAgo, toast, inlineRename } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtAgo, toast, modal, inlineRename } from "../util.js";
 import { conversationHtml, reasoningBlock, pretty } from "../conversation.js";
 import { ribbon, rb, group, rbSelect, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb } from "../components.js";
@@ -229,7 +229,7 @@ function chatView(mount, run, runs) {
       <div class="row" style="margin-top:8px;flex-wrap:wrap">
         <span class="tiny muted" id="turnCount"></span>
         <span class="tiny muted" id="turnHint">· right-click a message to edit,
-          remove or regenerate it</span>
+          regenerate, remove or keep it as training data</span>
       </div>
       ${raw(run.reasoning ? html`
         <p class="muted tiny" style="margin:8px 0 0">This model was trained to
@@ -276,6 +276,9 @@ function chatView(mount, run, runs) {
       tabs: TABS, active: tab,
       body: group("Conversation", [
         ui.multiturn ? rb("resetChat", "✎", "New conversation") : "",
+        rb("keepTurns", "⊕", "Keep it", {
+          disabled: !turns.some((m) => m.role === "assistant"),
+          title: "Write this exchange into a dataset, to train on next time" }),
         run.reasoning
           ? rb("thinkBtn", "◔", think ? "Reasoning: on" : "Reasoning: off",
                { cls: think ? "primary" : "",
@@ -754,6 +757,93 @@ function chatView(mount, run, runs) {
     loadRow(at + 1);
   });
 
+  // --------------------------------------------- keeping what it got right
+  //
+  // The loop this studio was missing its last link of. A fine-tune is trained,
+  // talked to, and found to be wrong about something -- and the fix is another
+  // example, which until now meant remembering the exchange, opening the
+  // dataset, and typing it back in by hand. Nobody does that, so the model
+  // never improves at the thing you actually noticed.
+  //
+  // What is written is the conversation up to and including one assistant
+  // turn, in the same canonical shape the trainer reads. The answer is
+  // editable first and that is the point: the useful row is usually not what
+  // the model said but what it should have said, which is a correction you
+  // are holding in your head at exactly this moment and nowhere else.
+  //
+  // It goes into a split of its own -- `review` by default -- rather than
+  // straight into the training data. Rows written from a conversation are
+  // unreviewed by construction, and mixing them into `train` unseen is how a
+  // dataset quietly fills with the model's own output.
+  const KEEP_SPLIT = "review";
+
+  function keepDialog(upto) {
+    const cut = upto ?? turns.map((m) => m.role).lastIndexOf("assistant");
+    if (cut < 0) return toast("Nothing to keep yet — ask it something first.", "");
+    const kept = turns.slice(0, cut + 1)
+      .filter((m) => (m.content || "").trim() || (m.tool_calls || []).length);
+    if (!kept.some((m) => m.role === "assistant")) {
+      return toast("Nothing to keep yet — ask it something first.", "");
+    }
+    const options = datasets.length ? datasets
+      : (run.dataset_id
+         ? [{ id: run.dataset_id, name: run.dataset_name || "the training data" }] : []);
+    if (!options.length) {
+      return toast("No dataset to write it into.", "",
+                   { href: "#/data", label: "Datasets" });
+    }
+    const preferred = options.find((d) => d.id === run.dataset_id) || options[0];
+    const answer = kept[kept.length - 1];
+
+    const dlg = modal({ title: "Keep this exchange", width: 560, body: html`
+      <p class="muted tiny">${kept.length} message${kept.length === 1 ? "" : "s"},
+        written as one row. Correct the answer first if it is nearly right —
+        what it <em>should</em> have said is the example worth keeping.</p>
+      <div class="field">
+        <label for="keepAnswer">The answer to keep</label>
+        <textarea id="keepAnswer" class="mono" rows="6">${answer.content || ""}</textarea>
+      </div>
+      <div class="row" style="gap:10px">
+        <div class="field" style="flex:1">
+          <label for="keepDs">Dataset</label>
+          <select id="keepDs">${raw(options.map((d) => html`
+            <option value="${d.id}"${d.id === preferred.id ? " selected" : ""}>${d.name}</option>`).join(""))}</select>
+        </div>
+        <div class="field" style="flex:1">
+          <label for="keepSplit">Split</label>
+          <input id="keepSplit" type="text" value="${KEEP_SPLIT}">
+          <div class="hint">Kept apart from <code>train</code> on purpose: a
+            row written here has not been reviewed by anyone yet.</div>
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="keepGo">Keep it</button>
+      </div>` });
+
+    on(dlg, "click", "#keepGo", async (_e, btn) => {
+      btn.disabled = true;
+      const rows = kept.map((m, i) => (i === kept.length - 1
+        ? { ...m, content: $("#keepAnswer", dlg).value } : m));
+      const dsId = $("#keepDs", dlg).value;
+      const split = ($("#keepSplit", dlg).value || "").trim() || KEEP_SPLIT;
+      const row = { messages: rows.map((m) => ({
+        role: m.role, content: m.content,
+        ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      })) };
+      if (tools.length) row.tools = tools;
+      try {
+        await api.addRows(dsId, { rows: [row], split });
+        dlg.close();
+        toast("Kept.", "ok",
+              { href: `#/data/${dsId}`, label: "Open the dataset" });
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  }
+
+  on(mount, "click", "#keepTurns", () => keepDialog());
+
   // ------------------------------------------------------- the turn menu
   //
   // Every message can be edited, removed or regenerated: the useful thing to
@@ -832,6 +922,8 @@ function chatView(mount, run, runs) {
       <button data-act="edit">Edit</button>
       <button data-act="regen" ${requestId ? "disabled" : ""}>${
         m.role === "assistant" ? "Regenerate" : "Answer again"}</button>
+      ${raw(m.role === "assistant"
+        ? `<button data-act="keep">Keep up to here</button>` : "")}
       <button data-act="remove" class="danger">Remove</button>`;
     document.body.append(menu);
     // Placed at the pointer, then pulled back inside the window -- a menu
@@ -845,6 +937,7 @@ function chatView(mount, run, runs) {
       if (act === "edit") editTurn(i);
       else if (act === "remove") { turns.splice(i, 1); paint(); }
       else if (act === "regen") regenerate(i);
+      else if (act === "keep") keepDialog(i);
     });
     $("button", menu)?.focus();
   }
