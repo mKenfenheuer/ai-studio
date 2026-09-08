@@ -18,6 +18,7 @@ from common import apimodels, formatting
 
 from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
+from . import preflight
 from . import serving
 from .api import (accounts, data, evals, providers, security,
                   serving as serving_api, sharing, sso)
@@ -1547,6 +1548,27 @@ async def hub_training_preview(request: Request,
     except Exception as e:  # noqa: BLE001
         return {"available": False, "reason": str(e)[:300],
                 "dataset": payload.get("dataset")}
+
+
+@app.post("/api/preflight")
+async def preflight_check(request: Request, payload: dict = Body(...)) -> dict:
+    """What would go wrong with this configuration, before it is queued.
+
+    Everything here used to be found out an hour into a run, on a machine, by
+    reading a log: rows cut off at the context length, a split with no rows in
+    it, a dataset too small to hold anything back, a corpus read six times
+    over. Counting the tokens needs a tokenizer, which the controller does not
+    have and should not; a runner answers that part.
+    """
+    cfg = payload.get("config") or payload
+    if ds_id := cfg.get("studio_dataset"):
+        if d := db.get_dataset(ds_id):
+            security.require_view(request, "dataset", d)
+    try:
+        return await preflight.check(cfg, fleet)
+    except Exception as e:  # noqa: BLE001 - a check that fails is not a block
+        return {"issues": [], "facts": {}, "blocked": False,
+                "reason": str(e)[:300]}
 
 
 @app.post("/api/plan")

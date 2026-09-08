@@ -541,6 +541,13 @@ class Fleet:
         # Generated text is relayed straight through rather than stored. A
         # conversation is not a training artifact, and writing every token to
         # SQLite would turn a chat into a few hundred transactions a minute.
+        # A counted answer to "how long are these rows, really". Always to a
+        # waiting caller, never broadcast: nobody's browser wants it.
+        if kind in ("tokenize_done", "tokenize_error"):
+            if waiter := self.waiters.get(msg.get("request_id")):
+                waiter.put_nowait(msg)
+            return
+
         if kind in ("generate_delta", "generate_status", "generate_done",
                     "generate_error"):
             rid = msg.get("request_id")

@@ -38,6 +38,16 @@ RECONNECT_MIN_S = 2
 # machine on the same network costs nothing to weigh against that.
 RECONNECT_MAX_S = 10
 
+def _sane_max_len(tok) -> int | None:
+    """The tokenizer's own context limit, when it states a believable one.
+
+    Many publish `model_max_length` as a sentinel the size of a 64-bit int,
+    which is not a context length and must not be shown to anybody as one.
+    """
+    n = getattr(tok, "model_max_length", None)
+    return int(n) if isinstance(n, int) and 0 < n <= 1_000_000 else None
+
+
 JOB_HANDLERS = {
     "finetune_llm": lora_llm.run,
     "pretrain_llm": scratch_llm.run,
@@ -139,6 +149,10 @@ class Runner:
         self.host: inference.ModelHost | None = None
         self.generating = False
         self.generating_since = 0.0
+        # Tokenizers, kept between requests. A few megabytes each, and the
+        # alternative is downloading one every time somebody adjusts a
+        # context length on the review step.
+        self._tokenizers: dict = {}
 
     def _stable_id(self) -> str:
         """Reuse the same identity across restarts so the controller shows one
@@ -261,6 +275,17 @@ class Runner:
                 self.caps = await asyncio.get_event_loop().run_in_executor(
                     None, capabilities.probe)
                 self.outbox.put({"type": "capabilities", "capabilities": self.caps})
+            elif kind == "tokenize":
+                # How many tokens these rows actually are, with the tokenizer
+                # the run will use. The controller has no tokenizer and cannot
+                # have one -- it installs four pure-Python packages on purpose
+                # -- so it has been estimating at four characters a token,
+                # which is out by a third on code and much worse on a language
+                # that does not put spaces between words. It is the number
+                # that decides whether the end of every long example is
+                # silently cut off, so it is worth asking somebody who knows.
+                threading.Thread(target=self._tokenize, args=(msg,),
+                                 daemon=True, name="tokenize").start()
             elif kind == "generate":
                 self._start_generation(msg)
             elif kind == "generate_cancel":
@@ -282,6 +307,40 @@ class Runner:
                 checkpoints.discard(msg.get("job_id") or "")
             elif kind == "discard_checkpoint":
                 checkpoints.discard(msg.get("job_id") or "")
+
+    def _tokenize(self, msg: dict) -> None:
+        """Count the tokens in some texts, with a named tokenizer.
+
+        No GPU and no model weights: a tokenizer is a few megabytes of JSON,
+        so a CPU-only runner answers this as well as a card does. Off the
+        socket thread because the first call for a given tokenizer downloads
+        it, and a socket that stops reading for ten seconds looks like a
+        machine that has gone away.
+        """
+        rid = msg.get("request_id")
+        try:
+            from transformers import AutoTokenizer
+            name = msg.get("tokenizer") or ""
+            tok = self._tokenizers.get(name)
+            if tok is None:
+                tok = AutoTokenizer.from_pretrained(
+                    name, token=os.environ.get("HF_TOKEN") or None,
+                    trust_remote_code=False)
+                # A handful, kept: somebody checking three candidate models
+                # against one dataset should not download each twice.
+                if len(self._tokenizers) > 3:
+                    self._tokenizers.clear()
+                self._tokenizers[name] = tok
+            texts = [t for t in (msg.get("texts") or []) if isinstance(t, str)]
+            lengths = [len(ids) for ids in
+                       tok(texts, add_special_tokens=True,
+                           truncation=False)["input_ids"]] if texts else []
+            self.outbox.put({"type": "tokenize_done", "request_id": rid,
+                             "lengths": lengths,
+                             "model_max_length": _sane_max_len(tok)})
+        except Exception as e:  # noqa: BLE001 - any failure is the answer
+            self.outbox.put({"type": "tokenize_error", "request_id": rid,
+                             "error": str(e)[:300]})
 
     async def _send_loop(self, ws) -> None:
         """Drain the training thread's outbox onto the socket.

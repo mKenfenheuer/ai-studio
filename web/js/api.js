@@ -264,6 +264,8 @@ export const api = {
   datasetConfigs: (id) =>
     req(`/api/hub/dataset-configs?id=${encodeURIComponent(id)}`),
   // The rendered training text, built by the same code the runner uses.
+  preflight: (body) =>
+    req("/api/preflight", { method: "POST", body: JSON.stringify(body) }),
   trainingPreview: (body) =>
     req("/api/hub/training-preview", { method: "POST", body: JSON.stringify(body) }),
   modelTemplate: (id) =>

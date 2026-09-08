@@ -243,6 +243,10 @@ export async function wizardView(mount) {
     // not a size of its own, so it lives beside the size rather than in it.
     moe: { enabled: false, num_local_experts: 8, num_experts_per_tok: 2 },
     sizes: resource(), plan: resource(), ftPlan: resource(),
+    // What would go wrong with this exact configuration, asked of the
+    // controller (and, for the token counts, of a runner) before anything is
+    // queued rather than an hour into a run.
+    preflight: resource(),
     overrides: {}, archOverrides: {},
     starting: false,
   };
@@ -2270,6 +2274,81 @@ function designSummary(state, plan) {
     ${raw(issueList(plan.issues))}`;
 }
 
+/**
+ * What would go wrong, before it does.
+ *
+ * Everything here was found out an hour into a run by reading a log on a
+ * machine: rows cut off at the context length, a split with no rows in it, a
+ * dataset too small to hold anything back, a corpus read six times over. The
+ * token counts come from a runner, because counting them needs the tokenizer
+ * the run will use and the controller deliberately has no such thing.
+ */
+/** Ask the controller what is wrong with this configuration.
+ *
+ *  Keyed on the decisions that change the answer, so adjusting a learning rate
+ *  does not re-count two hundred rows on a runner, and changing the context
+ *  length does. */
+/** The reason the pre-flight check gives for not starting, if it has one. */
+function preflightBlocker(state) {
+  const r = state.preflight;
+  if (r.status !== "ready" || !r.data?.blocked) return null;
+  const first = (r.data.issues || []).find((i) => i.level === "error");
+  return first ? first.message.slice(0, 120) : "Fix the problems above first.";
+}
+
+function askPreflight(state, ctx) {
+  const job = buildJob(null, state);
+  if (!job) return;
+  const c = job.config;
+  const key = JSON.stringify([
+    c.studio_dataset || c.dataset, c.dataset_split, c.base_model,
+    c.max_seq_len, c.token_budget, c.train_on,
+    (c.format || {}).mode, (c.format || {}).chat_format,
+    (c.format || {}).use_model_template, (c.format || {}).template,
+  ]);
+  ensure(state.preflight, key,
+         () => api.preflight({ config: { ...c, kind: job.kind } }),
+         ctx.draw);
+}
+
+function preflightPanel(state) {
+  const res = state.preflight;
+  if (res.status === "idle") return "";
+  if (res.status === "loading") {
+    return html`<div class="card muted tiny" aria-busy="true">
+      Checking the data against these settings…
+      <div class="sk-line shimmer" style="margin-top:10px;width:65%"></div></div>`;
+  }
+  if (res.status === "error") {
+    // A check that cannot run is not a reason to stop: it is a reason to say
+    // it could not run.
+    return html`<div class="callout callout-warn"><strong>Could not check the
+      data first</strong>${res.error} The run can still be started.</div>`;
+  }
+  const r = res.data || {};
+  const f = r.facts || {};
+  const counted = f.tokens?.available;
+  if (!(r.issues || []).length && !counted) return "";
+  return html`
+    <div style="margin-bottom:14px">
+      ${raw(issueList((r.issues || []).filter((i) => i.level !== "ok")))}
+      ${raw(counted ? html`
+        <div class="card" style="box-shadow:none;background:var(--surface-2)">
+          <div class="row-between" style="flex-wrap:wrap;gap:8px">
+            <strong class="tiny">Counted on ${f.tokens.runner}, with this
+              model's own tokenizer</strong>
+            <span class="muted tiny">${fmtNum(f.rows || 0)} rows in the split</span>
+          </div>
+          <p class="muted tiny" style="margin:6px 0 0">
+            Typical row ${fmtNum(f.token_p50 || 0)} tokens · nine in ten under
+            ${fmtNum(f.token_p90 || 0)} · longest ${fmtNum(f.token_max || 0)}${
+            f.over_limit ? ` · ${fmtNum(f.over_limit)} over the limit` : ""}${
+            f.held_out_split ? ` · measuring on the ${f.held_out_split} split` : ""}
+          </p>
+        </div>` : "")}
+    </div>`;
+}
+
 // ===========================================================================
 // Step 4 — review
 // ===========================================================================
@@ -2295,7 +2374,10 @@ function stepReview(body, ctx) {
       dataset_rows: datasetRows(state),
     }), draw);
     body.innerHTML = finetuneReview(state, runner, caps);
-    if (state.ftPlan.status === "ready") wireOverrides(body, ctx);
+    if (state.ftPlan.status === "ready") {
+      wireOverrides(body, ctx);
+      askPreflight(state, ctx);
+    }
     wireSweep(body, ctx);
     return;
   }
@@ -2384,6 +2466,8 @@ function finetuneReview(state, runner, caps) {
           : "")}
       </dl>
     </div>
+
+    <div id="preflight">${raw(preflightPanel(state))}</div>
 
     ${raw((caps.warnings || []).map((w) => html`
       <div class="callout callout-warn"><strong>About this machine</strong>${w}</div>`).join(""))}
@@ -2506,6 +2590,7 @@ function scratchReview(state, runner, caps) {
     </div>
 
     <div id="reviewIssues">${raw(issueList(plan.issues))}</div>
+    <div id="preflight">${raw(preflightPanel(state))}</div>
 
     ${raw((plan.notes || []).map((n) => html`
       <div class="callout callout-warn"><strong>Worth knowing</strong>${n}</div>`).join(""))}
@@ -2840,7 +2925,8 @@ function wireNav(mount, ctx) {
     noFormat,
     () => (!state.size ? "Choose a size to continue." : null),
     () => (state.plan.status !== "ready" ? "Working out the settings…"
-           : state.blocked ? "Fix the problems above before starting." : null),
+           : state.blocked ? "Fix the problems above before starting."
+           : preflightBlocker(state)),
   ] : [
     () => (!state.runnerId ? "Choose a machine to continue." : null),
     () => (!state.model && !state.sourceRun
@@ -2848,7 +2934,8 @@ function wireNav(mount, ctx) {
     () => (!state.dataset ? "Choose a dataset to continue." : null),
     noFormat,
     () => (state.ftPlan.status !== "ready" ? "Working out the settings…"
-           : state.blocked ? "Choose a smaller model to continue." : null),
+           : state.blocked ? "Choose a smaller model to continue."
+           : preflightBlocker(state)),
   ];
   const blocker = blockers[state.step]();
 
@@ -2950,7 +3037,9 @@ function datasetRows(state) {
 }
 
 function buildJob(mount, state) {
-  const name = $("#jobName", mount)?.value || undefined;
+  // `mount` may be null: the pre-flight check builds a job to ask about
+  // without having a page in hand. The name box is in the document either way.
+  const name = $("#jobName", mount || document)?.value || undefined;
   const dataBits = state.studioDataset
     // The split travels with a studio dataset too: it is one file holding
     // every split, and the runner reads the one named here.
