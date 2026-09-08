@@ -13,7 +13,7 @@
  */
 import { api, events } from "../api.js";
 import { LineChart } from "../chart.js";
-import { html, raw, esc, $, $$, on, toast, modal, fmtAgo, fmtDuration } from "../util.js";
+import { html, raw, esc, $, $$, on, toast, modal, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive, emptyState } from "../components.js";
@@ -257,8 +257,11 @@ function layout(ev, candidates, openScore, tab, state) {
 
   const body = tab === "trend" ? trendPanel(ev)
     : tab === "run" ? runPanel(ev, candidates, state)
-    : tab === "prompts" ? promptsPanel(items, answered)
-    : html`${raw(scoreTable(scores, answered, items.length))}
+    : tab === "prompts" ? ((ev.source || {}).benchmark
+        ? benchmarkPrompts(ev) : promptsPanel(items, answered))
+    : html`${raw((ev.source || {}).benchmark
+             ? benchmarkTable(ev, scores)
+             : scoreTable(scores, answered, items.length))}
            ${raw(openScore ? scoreDetail(openScore) : "")}`;
 
   return html`
@@ -508,6 +511,37 @@ function trendPanel(ev) {
     </div>`;
 }
 
+/** Where a benchmark's questions come from, since they are not held here. */
+function benchmarkPrompts(ev) {
+  const r = (ev.source || {}).recipe || {};
+  return html`
+    <div class="card">
+      <h3 style="margin:0 0 8px">The questions are not stored here</h3>
+      <p class="muted tiny">They are fetched from
+        <a href="https://huggingface.co/datasets/${esc(r.dataset)}"
+           target="_blank" rel="noopener">${esc(r.dataset)}</a> by whichever
+        machine runs the scoring — the same way the tools that publish these
+        numbers get them. Keeping a copy here would let it drift from the
+        dataset everybody else is measuring against.</p>
+      <table class="table" style="margin-top:10px"><tbody>
+        ${raw([
+          ["Dataset", `${esc(r.dataset)}${r.config ? ` · ${esc(r.config)}` : ""}`],
+          ["Split", esc(r.split || "")],
+          ["Worked examples", `${r.shots} from the ${esc(r.fewshot_split || "same")} split`],
+          ["Questions asked", `${fmtNum(r.sample)} of them, chosen with seed ${r.seed}`],
+          ["Scored by", r.protocol === "multiple_choice"
+            ? (r.style === "letter"
+               ? "the probability the model gives each answer's letter"
+               : "the probability of each answer, normalised by its length")
+            : "the last number in what the model wrote"],
+        ].map(([k, v]) => `<tr><td class="muted tiny">${k}</td><td class="tiny">${v}</td></tr>`).join(""))}
+      </tbody></table>
+      <p class="muted tiny" style="margin-top:10px">Every one of those lines
+        moves the score. That is why they are written down rather than
+        assumed.</p>
+    </div>`;
+}
+
 function promptsPanel(items, answered) {
   return html`
     <div class="card">
@@ -537,6 +571,8 @@ const ENOUGH_PROMPTS = 10;
 // One table, because the column heading, the bar, the winner's rosette and
 // the sentence underneath all have to agree about it.
 const MEASURES = {
+  accuracy: { label: "Accuracy", lower: false,
+              fmt: (v) => (v * 100).toFixed(1) + "%" },
   expected_loss: { label: "Loss on expected", lower: true,
                    fmt: (v) => v.toFixed(4) },
   chrf: { label: "Character overlap", lower: false,
@@ -544,6 +580,92 @@ const MEASURES = {
   f1: { label: "Token overlap", lower: false,
         fmt: (v) => (v * 100).toFixed(0) + "%" },
 };
+
+/** A published benchmark's results: one number, and how wide it is. */
+function benchmarkTable(ev, scores) {
+  const recipe = (ev.source || {}).recipe || {};
+  if (!scores.length) {
+    return html`
+      <div class="card empty" style="margin-bottom:14px">
+        <div class="big">📊</div>
+        <h3>Not run yet</h3>
+        <p class="muted">Pick some models on the next tab. Every model is
+          asked the same ${fmtNum(recipe.sample)} questions, chosen with the
+          same seed.</p>
+      </div>`;
+  }
+  const latest = scores[0]?.metrics || {};
+  const decisive = latest.ranking_decisive === true;
+  const best = Math.max(...scores.map((s) => s.metrics.accuracy ?? -1));
+
+  return html`
+    <div class="card" style="margin-bottom:14px;padding:0">
+      <div class="row-between" style="padding:14px 16px 0">
+        <h3 style="margin:0">${esc(recipe.label || "Benchmark")}</h3>
+        <span class="tiny muted">${recipe.shots}-shot ·
+          ${fmtNum(recipe.sample)} questions · seed ${recipe.seed}</span>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Model</th><th>Accuracy</th>
+          <th class="hide-sm" title="95% confidence interval on this sample">Within</th>
+          <th class="hide-sm">Asked</th><th class="hide-sm">Took</th>
+          <th>When</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${raw(scores.map((s) => {
+            const m = s.metrics || {};
+            const isBest = decisive && m.accuracy === best && scores.length > 1;
+            return html`
+              <tr class="${isBest ? "row-best" : ""}">
+                <td>
+                  ${raw(s.is_run
+                    ? `<a href="#/jobs/${esc(s.model_job_id)}">${esc(s.model_name)}</a>`
+                    : `<span>${esc(s.model_name)}</span>`)}
+                  ${raw(isBest ? ` <span class="badge badge-ok">best</span>` : "")}
+                  ${raw(baselineBadge(s))}
+                </td>
+                <td style="min-width:130px">
+                  ${raw(m.accuracy != null ? html`
+                    <strong>${(m.accuracy * 100).toFixed(1)}%</strong>
+                    <div class="meter"><i style="width:${(m.accuracy * 100).toFixed(1)}%"></i></div>`
+                    : `<span class="muted">—</span>`)}
+                </td>
+                <td class="hide-sm tiny muted">${m.accuracy_low != null
+                  ? `${(m.accuracy_low * 100).toFixed(1)}–${(m.accuracy_high * 100).toFixed(1)}%`
+                  : "—"}</td>
+                <td class="hide-sm tiny">${fmtNum(m.items || 0)}</td>
+                <td class="hide-sm tiny muted">${m.seconds
+                  ? fmtDuration(m.seconds) : "—"}</td>
+                <td class="tiny muted">${fmtAgo(s.created_at)}</td>
+                <td><div class="row" style="gap:4px">
+                  <button class="btn-sm" data-open-score="${s.id}">Answers</button>
+                  <button class="btn-sm btn-danger" data-del-score="${s.id}"
+                          title="Remove from the comparison">✕</button>
+                </div></td>
+              </tr>`;
+          }).join(""))}
+        </tbody>
+      </table></div>
+      ${raw(latest.verdict ? html`
+        <div class="callout ${decisive ? "callout-ok" : "callout-warn"}"
+             style="margin:0 16px 12px">
+          <strong>${decisive ? "This sample separated them"
+                             : "This sample could not separate them"}</strong>
+          ${latest.verdict}
+        </div>` : "")}
+      <p class="muted tiny" style="padding:10px 16px 14px;margin:0">
+        Measured here, not copied from anywhere: ${esc(recipe.dataset)},
+        ${esc(recipe.split)} split, ${recipe.shots}-shot,
+        ${recipe.protocol === "multiple_choice"
+          ? (recipe.style === "letter"
+             ? "scored on the probability of each answer's letter"
+             : "scored on the probability of each answer, normalised by its length")
+          : "scored on the last number in what the model wrote"}.
+        A published score uses a different harness and will differ by
+        several points; these are exactly comparable to each other.</p>
+    </div>`;
+}
 
 function scoreTable(scores, answered, total) {
   if (!scores.length) {

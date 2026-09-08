@@ -186,6 +186,17 @@ const FIXTURES = [
   [/\/api\/idp\/presets/, []],
   [/\/api\/idp/, []],
   [/\/api\/hub\//, { models: [], datasets: [], configs: [] }],
+  [/\/api\/benchmarks/, { default_sample: 400,
+      caveat: "These are this studio's own measurements.",
+      benchmarks: [
+        { id: "mmlu", label: "MMLU", what: "Fifty-seven subjects.",
+          dataset: "cais/mmlu", split: "test", protocol: "multiple_choice",
+          style: "letter", shots: 5, size: 14042, needs_local: true,
+          published: "Quoted 5-shot." },
+        { id: "gsm8k", label: "GSM8K", what: "Word problems.",
+          dataset: "openai/gsm8k", split: "test", protocol: "generate_extract",
+          style: "", shots: 5, size: 1319, needs_local: false, published: "" }],
+      unavailable: [{ name: "HumanEval", why: "It needs a sandbox." }] }],
   [/\/api\/providers/, { connections: [], studio: [] }],
   [/\/api\/models/, [
     { alias: "assistant-prod", stage: "production", notes: "What Home Assistant talks to",

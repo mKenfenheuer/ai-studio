@@ -14,22 +14,115 @@ import { pageHead, emptyState, confirmDestructive } from "../components.js";
 
 const TABS = [
   { key: "home", label: "Home" },
+  { key: "benchmarks", label: "Benchmarks" },
   { key: "about", label: "How to read this" },
 ];
 
 export async function evalsView(mount) {
   let items = await api.evals();
   let datasets = [];
+  let bench = null;
+  let models = [];
   let filter = "";
   let picked = new Set();
   const tabs = tabState("evals", TABS, "home");
   let tab = tabs.get();
 
   const draw = () => {
-    mount.innerHTML = layout({ items, filter, picked, tab });
+    mount.innerHTML = layout({ items, filter, picked, tab, bench });
     wire();
   };
   const refresh = async () => { items = await api.evals(); draw(); };
+
+  const loadBenchmarks = async () => {
+    if (bench) return;
+    try {
+      [bench, models] = await Promise.all([
+        api.benchmarks(),
+        api.playground().catch(() => []),
+      ]);
+    } catch (e) { toast(e.message, "err"); return; }
+    draw();
+  };
+
+  /** Which models, at what sample size, on one benchmark. */
+  function benchDialog(b) {
+    const runs = models || [];
+    const dlg = modal({ title: `Run ${b.label}`, width: 620, body: html`
+      <p class="muted tiny">${b.what}</p>
+      <div class="callout callout-warn">
+        <strong>This is not the number on the model card</strong>
+        ${bench.caveat}
+      </div>
+      ${raw(runs.length ? html`
+        <div class="field">
+          <label>Models</label>
+          <div class="picklist">
+            ${raw(runs.map((r, i) => html`
+              <label class="check">
+                <input type="checkbox" data-bm-run value="${r.id}"${i === 0 ? " checked" : ""}>
+                <span>${r.name}
+                  <span class="muted tiny">· ${r.base_model || r.kind}</span></span>
+              </label>`).join(""))}
+          </div>
+        </div>` : html`
+        <p class="muted tiny">No finished models of your own yet — a model off
+          the Hub can still be run on its own.</p>`)}
+      <div class="field">
+        <label for="bmBase">And a model off the Hub <span class="muted tiny">(optional)</span></label>
+        <input id="bmBase" type="text" class="mono" placeholder="owner/name"
+               value="${esc(runs[0]?.base_model || "")}">
+        <div class="hint">The base a run was trained from is the comparison
+          worth having: it says whether the training helped or cost you
+          something.</div>
+      </div>
+      <div class="row" style="gap:10px">
+        <div class="field" style="flex:1">
+          <label for="bmSample">How many questions</label>
+          <input id="bmSample" type="number" min="20" max="${b.size}"
+                 value="${Math.min(bench.default_sample, b.size)}">
+          <div class="hint">Out of ${fmtNum(b.size)}. Fewer is faster and
+            wider: a sample cannot separate two models a couple of points
+            apart, and every result says by how much.</div>
+        </div>
+        <div class="field" style="flex:1">
+          <label for="bmShots">Worked examples</label>
+          <input id="bmShots" type="number" min="0" max="25" value="${b.shots}">
+          <div class="hint">${b.shots} is what this one is published at.
+            Changing it changes the number.</div>
+        </div>
+      </div>
+      ${raw(b.needs_local ? html`
+        <p class="muted tiny">Answered by scoring each option's probability, so
+          it needs the weights on a machine here — a hosted model cannot be run
+          on this one.</p>` : "")}
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="bmGo">Run it</button>
+      </div>` });
+
+    on(dlg, "click", "#bmGo", async (_e, btn) => {
+      const chosen = [...dlg.querySelectorAll("[data-bm-run]:checked")]
+        .map((c) => c.value);
+      const hub = ($("#bmBase", dlg).value || "").trim();
+      if (!chosen.length && !hub) {
+        return toast("Choose at least one model.", "err");
+      }
+      btn.disabled = true;
+      try {
+        const r = await api.runBenchmark({
+          benchmark: b.id,
+          model_job_ids: chosen,
+          baselines: hub ? [{ source: "hub", model: hub }] : [],
+          sample: +$("#bmSample", dlg).value || undefined,
+          shots: +$("#bmShots", dlg).value,
+        });
+        dlg.close();
+        toast("Queued.", "ok", { href: `#/jobs/${r.id}`, label: "Watch it" });
+        location.hash = `#/jobs/${r.id}`;
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  }
 
   /** Prompts typed straight in. */
   function newSetDialog() {
@@ -143,7 +236,12 @@ Write a haiku about rain"></textarea>
   }
 
   function wire() {
-    wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
+    wireRibbon(mount, (key) => {
+      tab = key; tabs.set(key); draw();
+      if (key === "benchmarks") loadBenchmarks();
+    });
+    on(mount, "click", "[data-run-bm]", (_e, t) =>
+      benchDialog((bench.benchmarks || []).find((b) => b.id === t.dataset.runBm)));
     on(mount, "click", "#newSet", newSetDialog);
     on(mount, "click", "#fromDataset", fromDatasetDialog);
     on(mount, "input", "#evFilter", (_e, t) => {
@@ -242,10 +340,60 @@ function layout(s) {
       sub: "Ask every model the same questions, and keep the answers.",
     }))}
     ${raw(ribbonFor(s))}
-    ${raw(s.tab === "about" ? about() : html`
+    ${raw(s.tab === "about" ? about()
+      : s.tab === "benchmarks" ? benchmarkPanel(s.bench)
+      : html`
       <div class="card" style="padding:0">
         <div id="evList">${raw(listing(s))}</div>
       </div>`)}`;
+}
+
+/** The published benchmarks, and the warning that has to come with them. */
+function benchmarkPanel(bench) {
+  if (!bench) {
+    return `<div class="card empty"><p class="muted">Loading the catalogue…</p></div>`;
+  }
+  return html`
+    <div class="callout callout-warn" style="margin-bottom:14px">
+      <strong>These will not match a model card, and cannot be made to</strong>
+      ${bench.caveat}
+    </div>
+    <div class="card" style="padding:0;margin-bottom:14px">
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Benchmark</th><th class="hide-sm">What it asks</th>
+          <th class="hide-sm">Questions</th><th class="hide-sm">Scored by</th>
+          <th></th>
+        </tr></thead>
+        <tbody>
+          ${raw(bench.benchmarks.map((b) => html`
+            <tr>
+              <td><strong>${b.label}</strong>
+                <div class="muted tiny mono">${b.dataset}</div></td>
+              <td class="hide-sm tiny muted">${b.what}
+                ${raw(b.published ? `<div style="margin-top:4px">${esc(b.published)}</div>` : "")}</td>
+              <td class="hide-sm tiny">${fmtNum(b.size)}
+                <div class="muted">${b.shots}-shot</div></td>
+              <td class="hide-sm tiny muted">${b.protocol === "multiple_choice"
+                ? "the probability it gives each option"
+                : "a number pulled out of what it writes"}</td>
+              <td><button class="btn-sm btn-primary" data-run-bm="${b.id}">Run it</button></td>
+            </tr>`).join(""))}
+        </tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3 style="margin:0 0 6px">Not here, and why</h3>
+      <p class="muted tiny">A list with these missing would read as an
+        oversight rather than a decision.</p>
+      <div class="picklist" style="margin-top:8px">
+        ${raw(bench.unavailable.map((u) => html`
+          <div style="padding:6px 0">
+            <strong class="tiny">${u.name}</strong>
+            <div class="muted tiny">${u.why}</div>
+          </div>`).join(""))}
+      </div>
+    </div>`;
 }
 
 function ribbonFor({ tab, items, picked, filter }) {
@@ -268,6 +416,11 @@ function ribbonFor({ tab, items, picked, filter }) {
           title: "Rank finished runs by the loss they measured on unseen data" }),
       ]) + group("Find", [
         rbSearch("evFilter", { placeholder: "Filter…", value: filter }),
+      ])
+    : tab === "benchmarks"
+    ? group("Benchmarks", [
+        rb(null, "≡", "Prompt sets", { href: "#/evals" }),
+        rb(null, "⚖", "Compare runs", { href: "#/compare" }),
       ])
     : group("Elsewhere", [
         rb(null, "⚖", "Compare runs", { href: "#/compare" }),

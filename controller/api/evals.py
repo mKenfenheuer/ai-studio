@@ -18,7 +18,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 
 from common import apimodels, conversation, formatting
 
-from .. import config, datasets as dsets, db, hfaccount, serving
+from .. import benchmarks as bm, config, datasets as dsets, db, hfaccount, serving
 from . import providers
 from .security import current_user, require_edit, require_owner, require_view
 
@@ -415,6 +415,29 @@ async def run_eval(request: Request, eval_id: str,
         "system_prompt": override,
         "system_prompt_override": bool(override),
     }
+    # A benchmark set carries a recipe instead of prompts: the questions are
+    # on the Hub and the runner fetches them. Everything above is unchanged,
+    # which is the point of a benchmark being a prompt set at all -- adding a
+    # model to one months later goes through the same button.
+    if recipe := ((row.get("source") or {}).get("recipe")):
+        bench = bm.get(recipe.get("benchmark") or "")
+        if not bench:
+            raise HTTPException(
+                400, "This set was built from a benchmark called %r, which "
+                     "this studio no longer describes."
+                     % recipe.get("benchmark"))
+        cfg["benchmark"] = bench
+        cfg["recipe"] = recipe
+        cfg.pop("items", None)
+        if bench["protocol"] == "multiple_choice":
+            hosted = [m["name"] for m in models if m["source"] == "api"]
+            if hosted:
+                raise HTTPException(
+                    400, "%s is decided by the model's own probability for "
+                         "each answer, and a model reached over the network "
+                         "does not expose those. Leave %s out of this one."
+                         % (bench["label"], ", ".join(hosted)))
+
     if pinned := payload.get("runner_id"):
         cfg["required_runner"] = pinned
     # Nothing here needs a graphics card if every model being scored is behind
@@ -486,3 +509,89 @@ def record_scores(job: dict, summary: dict) -> int:
             })
         written += 1
     return written
+
+
+# ------------------------------------------------------------- benchmarks
+#
+# A benchmark is a prompt set whose questions come from a public dataset
+# rather than from you. Making it a prompt set rather than a thing of its own
+# is what gives it, for free, the scores table, the trend over time, the
+# champion, sharing and the "add another model to this" button -- all of which
+# a benchmark wants exactly as much as a hand-written set does.
+
+
+@router.get("/benchmarks")
+async def list_benchmarks(request: Request) -> dict:
+    current_user(request)
+    return {
+        "benchmarks": bm.public(),
+        # Named rather than omitted. A list of benchmarks with no HumanEval in
+        # it reads as an oversight; a list that says why it is missing reads
+        # as a decision, which it is.
+        "unavailable": [{"name": k, "why": v} for k, v in bm.UNAVAILABLE.items()],
+        "default_sample": bm.DEFAULT_SAMPLE,
+        "caveat": (
+            "These are this studio's own measurements. A published score is "
+            "the output of one particular harness with its own wording, its "
+            "own worked examples and its own normalisation, and those choices "
+            "move a benchmark by several points -- more than the gap between "
+            "most models. The recipe used here is recorded with every result, "
+            "so these numbers are exactly comparable to each other and only "
+            "roughly comparable to a model card."),
+    }
+
+
+def _existing_set(user: dict, recipe: dict) -> dict | None:
+    """A set already built for this exact recipe.
+
+    Reused rather than duplicated so that scoring next month's model on MMLU
+    lands on the same page as last month's, with the same questions and a line
+    between them. A second set with the same name and a different seed would
+    look identical and compare nothing.
+    """
+    for row in db.visible_evals(user):
+        got = ((row.get("source") or {}).get("recipe")) or {}
+        if got == recipe:
+            return db.get_eval(row["id"])
+    return None
+
+
+@router.post("/benchmarks/run")
+async def run_benchmark(request: Request, payload: dict = Body(...)) -> dict:
+    """Queue a published benchmark against one or more models."""
+    user = current_user(request)
+    bench = bm.get(payload.get("benchmark") or "")
+    if not bench:
+        raise HTTPException(404, "No benchmark by that name.")
+
+    shots = payload.get("shots")
+    shots = bench["shots"] if shots is None else max(0, min(int(shots), 25))
+    sample = int(payload.get("sample") or bm.DEFAULT_SAMPLE)
+    sample = max(20, min(sample, min(bm.MAX_SAMPLE, bench["size"])))
+    seed = int(payload.get("seed") or 1234)
+    recipe = bm.recipe(bench, shots, sample, seed)
+
+    models = _runs_to_score(request, user, payload.get("model_job_ids") or []) \
+        + _baselines(request, user, payload.get("baselines") or [])
+    if not models:
+        raise HTTPException(400, "Choose at least one model to score.")
+    if len(models) > MAX_MODELS:
+        raise HTTPException(
+            400, "Score at most %d models at a time." % MAX_MODELS)
+
+    row = _existing_set(user, recipe)
+    if not row:
+        eid = db.create_eval(
+            user["id"], bm.title(bench, shots, sample), [],
+            "%s %s Questions come from %s; they are not stored here, and the "
+            "same %s are asked every time this recipe is run."
+            % (bench["what"], bench.get("published") or "",
+               bench["dataset"], f"{sample:,}"),
+            {"benchmark": bench["id"], "recipe": recipe})
+        row = db.get_eval(eid)
+
+    return await run_eval(request, row["id"], {
+        "model_job_ids": payload.get("model_job_ids") or [],
+        "baselines": payload.get("baselines") or [],
+        "runner_id": payload.get("runner_id"),
+    })

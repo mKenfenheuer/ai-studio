@@ -207,6 +207,10 @@ export const api = {
     req(`/api/evals/${encodeURIComponent(id)}/run`,
         { method: "POST", body: JSON.stringify(body) }),
   evalScores:  (id) => req(`/api/evals/${encodeURIComponent(id)}/scores`),
+  // Published benchmarks: the catalogue, and running one.
+  benchmarks:  () => req("/api/benchmarks"),
+  runBenchmark: (body) =>
+    req("/api/benchmarks/run", { method: "POST", body: JSON.stringify(body) }),
   evalScore:   (id, scoreId) =>
     req(`/api/evals/${encodeURIComponent(id)}/scores/${encodeURIComponent(scoreId)}`),
   deleteScore: (id, scoreId) =>

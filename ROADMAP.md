@@ -520,6 +520,23 @@ and two more measures:
   models, with the third above it in the table, was the most misleading thing
   the page could have done.
 
+- **Published benchmarks.** *Done:* MMLU, MMLU-Pro, ARC-Challenge, HellaSwag
+  and GSM8K, run the way the people who publish those numbers run them --
+  multiple choice decided by the probability the model gives each option
+  (letter-style for MMLU, length-normalised cloze for ARC and HellaSwag), and
+  GSM8K by pulling the last number out of what the model writes. The runner
+  fetches the dataset itself with `load_dataset`, so nothing is sampled
+  badly on the way in. Every result records the whole recipe -- dataset,
+  split, shots, sample, seed, protocol -- and a Wilson interval, because a
+  sampled benchmark cannot separate two models a couple of points apart and
+  a bare number invites exactly that comparison. A benchmark is a prompt set
+  whose questions live on the Hub, which is what gives it the scores table,
+  the trend over time, the champion and sharing for nothing.
+  `controller/benchmarks.py`, `runner/jobs/benchmark.py`.
+  Still to do: the code benchmarks (HumanEval, MBPP) need a sandbox to
+  execute what the model wrote, which is its own piece of work; IFEval needs
+  its verifier library; TruthfulQA MC2 is a third scoring protocol.
+
 Remaining in this phase:
 - **Metrics**: schema conformance beyond "it parses"; tool-call correctness
   (name, arguments); LLM-as-judge using the hosted providers that already

@@ -75,6 +75,7 @@ from typing import Any
 
 from runner import inference
 
+from . import benchmark as benchmarks
 from .lora_llm import Cancelled
 
 # A hard ceiling on how much text one answer contributes to the stored record.
@@ -225,7 +226,14 @@ def _host_for(entry: dict, shared, ctx: Any):
 def run(cfg: dict, ctx: Any) -> dict:
     items = list(cfg.get("items") or [])
     models = list(cfg.get("models") or [])
-    if not items:
+    # A published benchmark: the questions are not in the config, because
+    # there are fourteen thousand of them and they live on the Hub. Everything
+    # else about this run -- which models, how they are loaded, how a hosted
+    # baseline is reached, where the results are filed -- is the same, which
+    # is why it is the same job rather than a second one.
+    bench = cfg.get("benchmark")
+    recipe = cfg.get("recipe") or {}
+    if not items and not bench:
         raise ValueError("This prompt set has no prompts in it.")
     if not models:
         raise ValueError("No models were chosen to score.")
@@ -251,15 +259,28 @@ def run(cfg: dict, ctx: Any) -> dict:
         shared = inference.ModelHost(ctx.controller_url, ctx.runner_token,
                                      ctx.capabilities)
 
-    total_work = len(items) * len(models)
+    per_model = (min(int(recipe.get("sample") or 0) or bench["size"],
+                     bench["size"]) if bench else len(items))
+    total_work = per_model * len(models)
     done = 0
     scores = []
 
-    ctx.log("Scoring %d model%s on %d prompt%s. Every model gets the same "
-            "prompts in the same order, which is the only thing that makes "
-            "the results comparable."
-            % (len(models), "" if len(models) == 1 else "s",
-               len(items), "" if len(items) == 1 else "s"))
+    if bench:
+        ctx.log("Running %s on %d model%s: %s questions each, %d-shot."
+                % (bench["label"], len(models), "" if len(models) == 1 else "s",
+                   f"{per_model:,}", int(recipe.get("shots") or 0)))
+        ctx.log("This is this studio's own measurement, not the number on a "
+                "model card. A published score comes from one particular "
+                "harness with its own wording, its own examples and its own "
+                "normalisation, and those choices move it by several points. "
+                "The recipe used here is recorded with the result, so these "
+                "numbers are exactly comparable to each other.")
+    else:
+        ctx.log("Scoring %d model%s on %d prompt%s. Every model gets the same "
+                "prompts in the same order, which is the only thing that makes "
+                "the results comparable."
+                % (len(models), "" if len(models) == 1 else "s",
+                   len(items), "" if len(items) == 1 else "s"))
     if override:
         ctx.log("Every model is given the same system prompt, which overrides "
                 "the one each was trained with.")
@@ -295,6 +316,36 @@ def run(cfg: dict, ctx: Any) -> dict:
             record_failure(str(e))
             done += len(items)
             ctx.progress(done, total_work, stage="evaluating")
+            continue
+
+        if bench:
+            try:
+                def tick() -> None:
+                    nonlocal done
+                    done += 1
+                    ctx.progress(done, total_work, stage="evaluating")
+                    ctx.metric(done, {"questions": done})
+                kept, metrics = benchmarks.score(bench, recipe, host, spec,
+                                                 local, params, ctx, tick)
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 - one model, not the run
+                ctx.log("%s could not be scored on %s (%s)."
+                        % (label, bench["label"], e), "error")
+                record_failure(str(e))
+                done = min(total_work, done + per_model)
+                ctx.progress(done, total_work, stage="evaluating")
+                continue
+            scores.append({"model_job_id": job_id if source == "run" else "",
+                           "ref": ref, "source": source, "name": label,
+                           "system_prompt": system,
+                           "metrics": metrics, "items": kept})
+            ctx.log("  %s: %.1f%% (%.1f–%.1f%% at 95%% confidence, %s "
+                    "questions)"
+                    % (bench["label"], 100 * metrics["accuracy"],
+                       100 * metrics["accuracy_low"],
+                       100 * metrics["accuracy_high"],
+                       f"{metrics['items']:,}"))
             continue
 
         results = []
@@ -434,6 +485,9 @@ def _describe(m: dict) -> str:
 # model does have is better than declining to say anything at all, as long as
 # the verdict says which measure it used.
 RANKING = [
+    # Accuracy first: when a scoring has one, it is a benchmark and nothing
+    # else on the row means anything next to it.
+    ("accuracy", "accuracy", False),
     ("expected_loss", "loss on the expected answers", True),
     ("chrf", "character overlap with the expected answers", False),
     ("f1", "token overlap with the expected answers", False),
@@ -490,10 +544,34 @@ def _rank(scores: list[dict]) -> dict | None:
             return {
                 "key": key, "label": label, "lower": lower,
                 "best": best, "worst": worst,
-                "sep": _separation(best, worst, key, lower),
+                # A benchmark is not compared prompt by prompt: only a sample
+                # of its answers is kept, and the accuracy is over all of
+                # them. Its two confidence intervals do the same job -- if
+                # they overlap, this many questions did not separate these
+                # models, which is the same sentence in different arithmetic.
+                "sep": None if key == "accuracy"
+                       else _separation(best, worst, key, lower),
+                "overlap": _overlap(best, worst) if key == "accuracy" else None,
                 "excluded": [s["name"] for s in scored if s not in usable],
             }
     return None
+
+
+def _overlap(best: dict, worst: dict) -> dict | None:
+    """Whether two benchmark scores' confidence intervals meet.
+
+    Non-overlapping intervals is the conservative test -- it misses some real
+    differences -- and it is the one worth using here, because the mistake
+    this whole page exists to prevent is announcing a winner that a bigger
+    sample would have unseated.
+    """
+    a, b = best["metrics"], worst["metrics"]
+    if a.get("accuracy_low") is None or b.get("accuracy_high") is None:
+        return None
+    return {"separated": a["accuracy_low"] > b["accuracy_high"],
+            "best": [a["accuracy_low"], a["accuracy_high"]],
+            "worst": [b["accuracy_low"], b["accuracy_high"]],
+            "asked": a.get("items")}
 
 
 def _decisive(ranked: dict | None) -> bool:
@@ -504,7 +582,11 @@ def _decisive(ranked: dict | None) -> bool:
     differ by a little more training, and exactly when a table drawing a
     winner would be inventing one.
     """
-    if not ranked or not ranked["sep"]:
+    if not ranked:
+        return False
+    if ranked.get("overlap") is not None:
+        return bool(ranked["overlap"]["separated"])
+    if not ranked["sep"]:
         return False
     mean, se, _n = ranked["sep"]
     return mean >= 2 * se
@@ -549,6 +631,20 @@ def _verdict(scores: list[dict], ranked: dict | None) -> str:
                     "is" if len(ranked["excluded"]) == 1 else "are",
                     ranked["label"],
                     "it" if len(ranked["excluded"]) == 1 else "them"))
+
+    if overlap := ranked.get("overlap"):
+        span = lambda pair: "%.1f–%.1f%%" % (pair[0] * 100, pair[1] * 100)  # noqa: E731
+        if overlap["separated"]:
+            return (head + " On %s questions that is %s against %s at 95%% "
+                    "confidence -- the two do not overlap, so it is a real "
+                    "difference at this sample size."
+                    % (f"{overlap['asked']:,}", span(overlap["best"]),
+                       span(overlap["worst"])))
+        return (head + " But on %s questions that is %s against %s at 95%% "
+                "confidence, and those overlap: this many questions cannot "
+                "tell these two apart. Run more of the benchmark."
+                % (f"{overlap['asked']:,}", span(overlap["best"]),
+                   span(overlap["worst"])))
 
     if not ranked["sep"]:
         return (head + " With so few prompts that is a difference between two "
