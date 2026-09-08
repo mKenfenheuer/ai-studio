@@ -2512,6 +2512,23 @@ function finetuneReview(state, runner, caps) {
             <div class="hint">Recommended here: ${caps.recommended_dtype}</div>
           </div>
           ${raw(quantField(s, plan, caps))}
+          ${raw(state.preview.data?.style === "chat" ? html`
+            <div class="field">
+              <label for="f_train_on">Learn from</label>
+              <select id="f_train_on" data-setting="train_on">
+                <option value="assistant"${s.train_on !== "all" ? " selected" : ""}
+                  >The assistant's replies only</option>
+                <option value="all"${s.train_on === "all" ? " selected" : ""}
+                  >Every token, questions included</option>
+              </select>
+              <div class="hint">The replies are what you want it to produce;
+                the questions are what it will be given. Training on both
+                spends capacity teaching it to write your users' half of the
+                conversation. Some templates rewrite earlier turns as later
+                ones arrive, and the boundaries cannot be measured on those —
+                the run says so in its log and falls back to learning from
+                everything.</div>
+            </div>` : "")}
           ${raw(state.modelDetail.data?.moe
             ? toggle("adapt_experts", "Also adapt the experts",
                 s.adapt_experts,
@@ -2727,6 +2744,9 @@ function wireSweep(mount, ctx) {
   box?.addEventListener("input", () => { state.sweepValues = box.value; });
 }
 
+// Settings whose value changes what the pre-flight check would find.
+const PREFLIGHT_SETTINGS = new Set(["max_seq_len", "train_on"]);
+
 function wireOverrides(body, ctx) {
   const { state, draw } = ctx;
   on(body, "change", "[data-setting]", (_e, t) => {
@@ -2740,6 +2760,11 @@ function wireOverrides(body, ctx) {
     if (state.mode === "scratch") {
       state.plan = resource();
       refreshPlan(ctx, "#reviewIssues", (_s, plan) => issueList(plan.issues));
+    } else if (PREFLIGHT_SETTINGS.has(k)) {
+      // These two change what the data check would say -- how long a row may
+      // be, and which tokens are learned from -- so the answer on screen has
+      // to be asked again rather than left describing the previous setting.
+      draw();
     }
   });
 }

@@ -699,7 +699,7 @@ def run(cfg: dict, ctx: Any) -> dict:
         held_ds = held_raw.map(tokenize, batched=True, batch_size=64,
                                remove_columns=held_raw.column_names,
                                desc="Tokenizing the held-out split")
-        held_ds.set_format(type="torch",
+        held_ds.set_format(type=None,
                            columns=["input_ids", "attention_mask", "labels"])
     ds = ds.map(tokenize, batched=True, batch_size=64,
                 remove_columns=ds.column_names, desc="Tokenizing")
@@ -757,8 +757,9 @@ def run(cfg: dict, ctx: Any) -> dict:
     _gen = torch.Generator()
     _gen.manual_seed(seed)
     loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=False,
-                        generator=_gen)
-    val_loader = DataLoader(val_ds, batch_size=bs) if val_ds is not None else None
+                        generator=_gen, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=bs,
+                            collate_fn=collate) if val_ds is not None else None
     steps_per_epoch = max(1, math.ceil(len(loader) / accum))
     total_steps = int(cfg.get("max_steps") or max(1, int(steps_per_epoch * epochs)))
     eval_every = int(cfg.get("eval_every") or max(5, total_steps // 20))
@@ -1032,6 +1033,10 @@ def run(cfg: dict, ctx: Any) -> dict:
         # What it would take to run this again and get this back.
         "seed": seed,
         "versions": _versions(),
+        # Which tokens the loss covered. "On unseen examples" is not the only
+        # phrase on this page that meant two quite different things.
+        "trained_on": ("the assistant's replies only" if can_mask
+                       else "every token, including the questions"),
         "held_out_from": ("the %s split of the dataset" % held_split
                           if held_split else
                           "a slice taken from the training data"

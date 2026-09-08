@@ -380,6 +380,11 @@ async def _create_job(request: Request, payload: dict) -> str:
             str(request.base_url).rstrip("/"), studio_id)
         cfg["dataset_is_local"] = True
         cfg["dataset_label"] = d["name"]
+        # What the data looked like at this moment. A dataset can be edited in
+        # place -- curating rows is the work -- so the id alone does not answer
+        # "was this trained on the same data", which is the first question
+        # asked when two runs of the same settings disagree.
+        cfg["dataset_fingerprint"] = dsets.fingerprint(d)
 
     # Training on top of something this studio already built. The permission
     # check is the point: without it, any run id pasted into this field would

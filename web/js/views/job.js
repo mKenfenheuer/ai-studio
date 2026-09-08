@@ -149,6 +149,7 @@ export async function jobView(mount, [jobId]) {
       // A run that just finished has a model to build on, and one that just
       // failed has a checkpoint to carry on from. Both change this panel.
       paintFurther();
+      paintProvenance();
       paintReport();
       // And a run that just finished has a card, written from numbers that
       // did not exist a second ago.
@@ -186,7 +187,12 @@ export async function jobView(mount, [jobId]) {
     const box = $("#furtherRow", mount);
     if (box) box.innerHTML = artifactsCard(job) + furtherCard(job, datasets);
   };
+  const paintProvenance = () => {
+    const box = $("#provenanceRow", mount);
+    if (box) box.innerHTML = provenanceCard(job);
+  };
   paintFurther();
+  paintProvenance();
   if (job.artifacts?.length) {
     api.datasets().then((d) => { datasets = d; paintFurther(); }).catch(() => {});
   }
@@ -1051,6 +1057,8 @@ function layout(job, scratch, experts = 0) {
       </div>
     </div>
 
+    <div id="provenanceRow" data-sec="model"></div>
+
     <div id="furtherRow" data-sec="model"></div>
 
     <div id="cardRow" data-sec="model"></div>
@@ -1817,6 +1825,33 @@ function paintStats(mount, job, m, scratch, stage = "training",
  *  number -- but the last one is still the truth, and saying when the next is
  *  due is more use than a placeholder that pulses in the meantime.
  */
+/** The facts about this run that decide whether it can be repeated. */
+function provenanceCard(job) {
+  const s = job.summary || {};
+  const fp = job.config?.dataset_fingerprint;
+  const rows = [
+    ["Loss covered", s.trained_on],
+    ["Measured on", s.held_out_from],
+    ["Seed", s.seed],
+    ["Data", fp ? `${fp.name} · ${fmtNum(fp.rows || 0)} rows · ${fp.head_sha1}` : null],
+  ].filter(([, v]) => v != null && v !== "");
+  const versions = s.versions || {};
+  if (!rows.length && !Object.keys(versions).length) return "";
+  return html`
+    <div class="card" data-sec="model" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">What it would take to repeat this</h3>
+      <p class="muted tiny">The same settings are not the same run if the data
+        was edited or the libraries moved underneath. Both change the result
+        while every number on this page stays identical.</p>
+      <dl class="kv" style="margin-top:8px">
+        ${raw(rows.map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`).join(""))}
+        ${raw(Object.keys(versions).length ? html`
+          <dt>Trained with</dt><dd class="mono tiny">${
+            Object.entries(versions).map(([k, v]) => `${k} ${v}`).join(" · ")}</dd>` : "")}
+      </dl>
+    </div>`;
+}
+
 function heldOutCard(job, m, lastEval) {
   // Where the rows came from, when the run said. "On unseen examples" covers
   // both a split somebody deliberately held back and 5% of the training data

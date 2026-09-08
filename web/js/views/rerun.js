@@ -98,6 +98,11 @@ const CHOICES = [
               ["4bit", "4-bit — fits far more"]],
     hint: "Only the frozen base is compressed; the adapter stays at full "
         + "precision either way." },
+  { key: "train_on", label: "Learn from",
+    options: [["assistant", "The assistant's replies only"],
+              ["all", "Every token, questions included"]],
+    hint: "Training on the questions as well spends capacity teaching the "
+        + "model to write your users' half of the conversation." },
   { key: "dtype", label: "Arithmetic precision",
     options: [["float16", "float16"], ["bfloat16", "bfloat16"],
               ["float32", "float32"]],

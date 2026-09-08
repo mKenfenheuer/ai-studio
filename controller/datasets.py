@@ -215,6 +215,31 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
             "columns": columns, "splits": splits, "dropped": dropped}
 
 
+def fingerprint(dataset: dict) -> dict:
+    """Enough to tell whether this is the same data as last time.
+
+    A run records the dataset it used by id, and a dataset can be edited in
+    place -- curating rows is the work, and it is deliberately allowed. So the
+    id alone does not answer "was this trained on the same data", which is the
+    first question anybody asks when two runs of the same settings disagree.
+
+    Not a hash of the whole file: on two million rows that is a minute of
+    reading for a fact nobody is waiting on. The row count, the byte count and
+    a digest of the first and last hundred rows will differ for any edit that
+    matters, and the counts alone catch nearly all of them.
+    """
+    head = list(iter_rows(dataset["id"], 100))
+    digest = hashlib.sha1()
+    for row in head:
+        digest.update(json.dumps(row, sort_keys=True,
+                                 ensure_ascii=False).encode("utf-8"))
+    return {"id": dataset["id"], "name": dataset.get("name"),
+            "rows": dataset.get("rows"), "bytes": dataset.get("bytes"),
+            "splits": dataset.get("splits"),
+            "updated_at": dataset.get("updated_at"),
+            "head_sha1": digest.hexdigest()[:16]}
+
+
 def delete_files(dataset_id: str) -> None:
     import shutil
     shutil.rmtree(DATASET_DIR / dataset_id, ignore_errors=True)
