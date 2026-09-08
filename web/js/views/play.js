@@ -1,6 +1,8 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, $, $$, on, fmtAgo, toast, inlineRename } from "../util.js";
 import { conversationHtml, reasoningBlock, pretty } from "../conversation.js";
+import { ribbon, rb, group, rbSelect, wireRibbon, tabState } from "../ribbon.js";
+import { breadcrumb } from "../components.js";
 
 // Talking to what you trained.
 //
@@ -160,36 +162,38 @@ function chatView(mount, run, runs) {
   let datasets = [];
   let autoTools = true;      // hand back recorded results without being asked
 
+  document.title = `${run.name} · Playground · AI Studio`;
+  const TABS = [{ key: "chat", label: "Chat" }]
+    .concat(ui.multiturn || ui.system ? [{ key: "data", label: "Try your data" }] : [])
+    .concat([{ key: "settings", label: "Settings" }]);
+  const tabs = tabState("play", TABS, "chat");
+
   mount.innerHTML = html`
     <div class="page-head">
-      <a href="#/play" class="tiny">← All finished runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <div class="row title-row" style="gap:4px;min-width:0">
-          <h1 style="margin:0" id="runTitle">${run.name}</h1>
-          <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
-            aria-label="Rename this run">&#9998;</button>
-        </div>
-        <div class="row">
-          <a class="btn btn-sm" href="#/jobs/${run.id}">Training details</a>
-          <a class="btn btn-sm" href="/api/jobs/${run.id}/download">↓ Download</a>
-        </div>
+      ${raw(breadcrumb({ href: "#/play", label: "Playground" }))}
+      <div class="row title-row" style="gap:4px;min-width:0;margin-top:6px">
+        <h1 style="margin:0" id="runTitle">${run.name}</h1>
+        <button class="btn-sm btn-quiet" id="renameRun" title="Rename this run"
+          aria-label="Rename this run">&#9998;</button>
       </div>
       <p class="sub tiny" style="margin-top:4px">${ui.title}</p>
     </div>
 
-    <div class="callout" style="margin-bottom:14px">
+    <div id="playRibbon"></div>
+
+    <div class="callout" data-sec="chat" style="margin-bottom:14px">
       <strong>${ui.icon} ${run.kind === "pretrain_llm"
         ? "This is the model you built" : "This is your fine-tune"}</strong>
       ${ui.note}
     </div>
 
-    <div class="card" id="trialCard" style="margin-bottom:14px"></div>
+    <div class="card" id="trialCard" data-sec="data" style="margin-bottom:14px"></div>
 
     ${raw(ui.system ? html`
-      <details class="adv" id="sysBox">
-        <summary>System prompt${raw(run.system_prompt
-          ? ` <span class="badge badge-accent">from your training data</span>` : "")}</summary>
+      <div data-sec="settings" id="sysBox">
         <div class="card" style="margin-top:10px">
+          <h3 style="margin:0 0 8px">System prompt${raw(run.system_prompt
+            ? ` <span class="badge badge-accent">from your training data</span>` : "")}</h3>
           <div class="field" style="margin-bottom:8px">
             <label for="systemBox">Standing instructions, sent before every message</label>
             <textarea id="systemBox" rows="5" class="mono"
@@ -207,9 +211,9 @@ function chatView(mount, run, runs) {
             <button class="btn-sm" id="clearSystem">Clear</button>
           </div>
         </div>
-      </details>` : "")}
+      </div>` : "")}
 
-    <div class="card chat" style="margin-top:14px">
+    <div class="card chat" data-sec="chat" style="margin-top:14px">
       <div class="chat-log" id="chatLog">
         <div class="chat-empty" id="chatEmpty">Nothing said yet. ${ui.title}.</div>
       </div>
@@ -223,12 +227,6 @@ function chatView(mount, run, runs) {
         <button class="btn-danger" id="stopBtn" hidden>Stop</button>
       </div>
       <div class="row" style="margin-top:8px;flex-wrap:wrap">
-        ${raw(ui.multiturn
-          ? `<button class="btn-sm" id="resetChat">New conversation</button>` : "")}
-        ${raw(run.reasoning
-          ? `<button class="btn-sm btn-primary" id="thinkBtn"
-                     title="Ask it to work through the problem first">Reasoning: on</button>`
-          : "")}
         <span class="tiny muted" id="turnCount"></span>
         <span class="tiny muted" id="turnHint">· right-click a message to edit,
           remove or regenerate it</span>
@@ -237,46 +235,71 @@ function chatView(mount, run, runs) {
         <p class="muted tiny" style="margin:8px 0 0">This model was trained to
           reason before answering. Its working is shown above each reply and
           can be folded away.</p>` : "")}
-      <details class="adv">
-        <summary>Generation settings</summary>
-        <div class="grid grid-3" style="margin-top:10px">
-          <div class="field">
-            <label for="temp">Creativity</label>
-            <input type="number" id="temp" value="0.8" step="0.1" min="0" max="2">
-            <div class="hint">0 always picks the likeliest next word. Higher is
-              more varied and less reliable.</div>
-          </div>
-          <div class="field">
-            <label for="maxTok">Length limit</label>
-            <input type="number" id="maxTok" value="2048" step="64" min="16" max="4096">
-            <div class="hint">Most tokens it may write before it is stopped.
-              You are told in the conversation when a reply reaches this, so a
-              cut-off answer is never mistaken for a finished one. Long limits
-              are long waits — this writes one token at a time — and Stop works
-              at any point.</div>
-          </div>
-        </div>
-        <details class="adv">
-          <summary>What the model is actually being sent</summary>
-          <p class="muted tiny" style="margin:8px 0 4px">The finished prompt,
-            after your conversation is put through the format this run was
-            trained with. Filled in after the first reply.</p>
-          <pre class="txt mono tiny" id="promptPeek"
-               style="white-space:pre-wrap;background:var(--surface-2);
-                      padding:10px;border-radius:8px;max-height:240px;
-                      overflow:auto">(nothing sent yet)</pre>
-        </details>
-      </details>
     </div>
 
-    ${raw(runs.length > 1 ? html`
-      <div class="card" style="margin-top:14px">
-        <h3 style="margin:0 0 8px">Other finished runs</h3>
-        <div class="row" style="flex-wrap:wrap;gap:8px">
-          ${raw(runs.filter((r) => r.id !== run.id).slice(0, 8).map((r) =>
-            `<a class="btn btn-sm" href="#/play/${esc(r.id)}">${esc(r.name)}</a>`).join(""))}
+    <div class="card" data-sec="settings" style="margin-top:14px">
+      <h3 style="margin:0 0 8px">Generation settings</h3>
+      <div class="grid grid-2">
+        <div class="field">
+          <label for="temp">Creativity</label>
+          <input type="number" id="temp" value="0.8" step="0.1" min="0" max="2">
+          <div class="hint">0 always picks the likeliest next word. Higher is
+            more varied and less reliable.</div>
         </div>
-      </div>` : "")}`;
+        <div class="field">
+          <label for="maxTok">Length limit</label>
+          <input type="number" id="maxTok" value="2048" step="64" min="16" max="4096">
+          <div class="hint">Most tokens it may write before it is stopped. You
+            are told in the conversation when a reply reaches this, so a
+            cut-off answer is never mistaken for a finished one. Long limits
+            are long waits — this writes one token at a time — and Stop works
+            at any point.</div>
+        </div>
+      </div>
+      <details class="adv">
+        <summary>What the model is actually being sent</summary>
+        <p class="muted tiny" style="margin:8px 0 4px">The finished prompt,
+          after your conversation is put through the format this run was
+          trained with. Filled in after the first reply.</p>
+        <pre class="txt mono tiny" id="promptPeek"
+             style="white-space:pre-wrap;background:var(--surface-2);
+                    padding:10px;border-radius:8px;max-height:240px;
+                    overflow:auto">(nothing sent yet)</pre>
+      </details>
+    </div>`;
+
+  // ---- the ribbon --------------------------------------------------------
+  const others = runs.filter((r) => r.id !== run.id);
+  const paintRibbon = () => {
+    const tab = tabs.get();
+    $("#playRibbon", mount).innerHTML = ribbon({
+      tabs: TABS, active: tab,
+      body: group("Conversation", [
+        ui.multiturn ? rb("resetChat", "✎", "New conversation") : "",
+        run.reasoning
+          ? rb("thinkBtn", "◔", think ? "Reasoning: on" : "Reasoning: off",
+               { cls: think ? "primary" : "",
+                 title: "Ask it to work through the problem first" })
+          : "",
+      ]) + group("This model", [
+        rb(null, "≡", "Training details", { href: `#/jobs/${esc(run.id)}` }),
+        rb(null, "↓", "Download", { href: `/api/jobs/${esc(run.id)}/download` }),
+        rb(null, "◎", "Score it", { href: "#/evals",
+          title: "Put a saved set of prompts to it" }),
+      ]) + (others.length ? group("Switch to", [
+        rbSelect("otherRun", {
+          title: "Another finished run", value: "",
+          options: [["", "This model"]].concat(
+            others.slice(0, 40).map((r) => [r.id, r.name])) }),
+      ]) : ""),
+    });
+    $$("[data-sec]", mount).forEach((el) => { el.hidden = el.dataset.sec !== tab; });
+  };
+  paintRibbon();
+  wireRibbon(mount, (key) => { tabs.set(key); paintRibbon(); });
+  on(mount, "change", "#otherRun", (_e, t) => {
+    if (t.value) location.hash = `#/play/${t.value}`;
+  });
 
   const log = $("#chatLog", mount);
   const box = $("#chatBox", mount);
@@ -680,10 +703,11 @@ function chatView(mount, run, runs) {
     if (requestId) await api.chatCancel(requestId).catch(() => {});
   });
 
-  on(mount, "click", "#thinkBtn", (_e, t) => {
+  on(mount, "click", "#thinkBtn", () => {
     think = !think;
-    t.textContent = think ? "Reasoning: on" : "Reasoning: off";
-    t.classList.toggle("btn-primary", think);
+    // The button says which way it is set, and it is on the ribbon, so the
+    // ribbon is what has to be redrawn.
+    paintRibbon();
   });
   on(mount, "click", "#resetChat", () => {
     turns = [];

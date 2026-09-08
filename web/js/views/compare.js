@@ -15,6 +15,8 @@
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtNum, fmtDuration } from "../util.js";
 import { LineChart } from "../chart.js";
+import { ribbon, rb, group, rbSeg, wireRibbon } from "../ribbon.js";
+import { pageHead, emptyState } from "../components.js";
 
 // The kinds of run that leave a model behind. `has_model` alone let
 // dataset-generation runs in -- they register an artifact too -- and they
@@ -49,10 +51,11 @@ export async function compareView(mount) {
       if (t.checked) picked.add(t.dataset.cmp); else picked.delete(t.dataset.cmp);
       draw();
     });
-    on(mount, "click", "#cmpClear", () => { picked.clear(); draw(); });
+    on(mount, "click", "#cmpClear, [data-clear-picks]", () => { picked.clear(); draw(); });
     on(mount, "click", "[data-family]", (_e, t) => {
       shown = t.dataset.family; picked.clear(); draw();
     });
+    wireRibbon(mount, () => {});
   }
 
   async function paintCurves() {
@@ -100,19 +103,24 @@ function layout(jobs, picked, families, shown) {
   const span = (worst ?? 0) - (best ?? 0) || 1;
 
   return html`
-    <div class="page-head">
-      <div class="row-between" style="flex-wrap:wrap;gap:8px">
-        <div>
-          <h1>Compare runs</h1>
-          <p class="sub">Held-out loss is the number that carries between runs.</p>
-        </div>
-        <div class="row">
-          ${raw(families.length > 1 ? `<div class="seg">${families.map((f) =>
-            `<button class="btn-sm ${f === shown ? "on" : ""}" data-family="${esc(f)}">${esc(f)}</button>`).join("")}</div>` : "")}
-          <a class="btn" href="#/evals">Prompt sets →</a>
-        </div>
-      </div>
-    </div>
+    ${raw(pageHead({
+      title: "Compare runs",
+      sub: "Held-out loss is the number that carries between runs.",
+    }))}
+    ${raw(ribbon({
+      tabs: [{ key: "home", label: "Compare" }], active: "home",
+      body: group("Which runs", [
+        families.length > 1
+          ? rbSeg(families.map((f) => ({ label: f, on: f === shown,
+                                         data: `data-family="${esc(f)}"` })))
+          : "",
+        rb("cmpClear", "✕", "Clear selection", { disabled: !picked.size }),
+      ]) + group("Elsewhere", [
+        rb(null, "◎", "Prompt sets", { href: "#/evals",
+          title: "The same questions, put to every model" }),
+        rb(null, "≡", "All runs", { href: "#/jobs" }),
+      ]),
+    }))}
 
     ${raw(picked.size === 2 ? html`
       <div class="card" style="margin-bottom:14px">
@@ -125,7 +133,7 @@ function layout(jobs, picked, families, shown) {
         lines need a colour each, and this app has two colours that are
         verified to stay distinguishable for colourblind readers rather than
         eight that are not.
-        <button class="btn-sm" id="cmpClear" style="margin-left:8px">Clear</button>
+        <button class="btn-sm" data-clear-picks style="margin-left:8px">Clear</button>
       </div>` : "")}
 
     ${raw(jobs.length ? html`
@@ -179,10 +187,10 @@ function layout(jobs, picked, families, shown) {
           trained on a dataset too small to hold any of it back. Their training
           loss is shown and deliberately not ranked: two runs on different data
           produce training losses that are not the same quantity.</p>
-      </div>` : html`
-      <div class="card empty"><div class="big">📈</div>
-        <h3>Nothing to compare yet</h3>
-        <p class="muted">Finished runs that produced a model appear here.</p>
-        <p><a class="btn btn-primary" href="#/new">Start a run</a></p>
-      </div>`)}`;
+      </div>` : emptyState({
+        icon: "📈",
+        title: "Nothing to compare yet",
+        body: "Finished runs that produced a model appear here.",
+        cta: { href: "#/new", label: "Start a run" },
+      }))}`;
 }
