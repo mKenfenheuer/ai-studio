@@ -331,6 +331,14 @@ export const api = {
   },
   assetUsage: () => req("/api/assets"),
 
+  // ---- what the disk is holding, and the rules for keeping it -----------
+  storage: () => req("/api/storage"),
+  saveStorageSettings: (body) =>
+    req("/api/storage/settings", { method: "PUT", body: JSON.stringify(body) }),
+  sweepStorage: () => req("/api/storage/sweep", { method: "POST" }),
+  dropJobModel: (id) =>
+    req(`/api/jobs/${encodeURIComponent(id)}/artifacts`, { method: "DELETE" }),
+
   // ---- served models: the names other software is pointed at ------------
   registeredModels: () => req("/api/models"),
   registerModel: (alias, body) =>

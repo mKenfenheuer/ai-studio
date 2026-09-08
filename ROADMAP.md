@@ -796,9 +796,16 @@ Cheap now, expensive once there are five modalities:
    nothing today and the DB is in WAL mode, so a naive copy tears.
 2. **`schema_version`** in the `settings` table; migrations stop being a list
    of swallowed `ALTER TABLE` errors.
-3. **Retention**: artifact TTL, per-user quota, `metrics`/`logs` trimming for
-   finished runs; disk usage shown on Machines (the heartbeat already sends
-   it and `GET /api/runners` drops it).
+3. **Retention. Done.** `controller/retention.py`: models of finished runs
+   expire after N days unless the run is served under a registered name or
+   tagged `keep` -- the run, its chart, its log and its notes always stay,
+   with a line saying the model went and why; old runs get lighter (metrics
+   thinned to ~400 points with held-out and sample points always kept, the
+   log cut to head and tail); a per-account ceiling on stored models,
+   checked when a run starts rather than when its model arrives. An hourly
+   sweep, and a "Tidy now". Settings shows what the disk holds by kind, the
+   biggest runs with a "Remove model" each, and the rules; a run page can
+   remove its own model. Runner disk was already on Machines.
 4. **Protocol and agent version** in the `register` frame, shown on the
    Machines page; "update available".
 5. **Tests and CI**: pytest for `fair_order`, `requeue_jobs_for_runner`,

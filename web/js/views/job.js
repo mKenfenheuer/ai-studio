@@ -374,6 +374,26 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     });
   }
 
+  on(mount, "click", "#dropModel", async () => {
+    const job = getJob();
+    const size = (job.artifacts || []).reduce((n, a) => n + (a.size_bytes || 0), 0);
+    if (!await confirmDestructive({
+      title: `Remove the model from "${job.name}"?`,
+      consequences: [
+        `${(size / 1024 ** 3).toFixed(1)} GB comes back. The run, its chart, its log and its notes stay.`,
+        "It cannot be talked to, scored, published or exported afterwards — \"Run again\" trains it afresh.",
+      ],
+      confirmLabel: "Remove the model" })) return;
+    try {
+      const r = await api.dropJobModel(jobId);
+      toast(`Removed — ${(r.bytes / 1024 ** 3).toFixed(1)} GB freed.`, "ok");
+      job = await api.job(jobId);
+      paintHeader(mount, job, getTab());
+      paintCard();
+      paintFurther();
+    } catch (e) { toast(e.message, "err"); }
+  });
+
   on(mount, "click", "#serveAs", async () => {
     const job = getJob();
     let names = [];
@@ -856,6 +876,12 @@ function mergeLayout(job) {
       <div id="mergeResult" style="margin-top:10px"></div>
     </div>
 
+    ${raw(job.summary?.artifact_removed ? html`
+      <div class="callout callout-warn" data-sec="home model" style="margin-bottom:14px">
+        <strong>The model is no longer here</strong>
+        Removed ${fmtAgo(job.summary.artifact_removed.at)} — ${job.summary.artifact_removed.why}.
+        The run, its chart, its log and its settings stay; "Run again" trains
+        it afresh.</div>` : "")}
     ${raw(job.kind === "finetune_vision_cls" ? html`
       <div class="card" id="tryCard" data-sec="home model" style="margin-bottom:14px">
         <h3 style="margin:0 0 6px">Try it on a picture</h3>
@@ -1224,6 +1250,12 @@ function layout(job, scratch, experts = 0) {
 
     <div id="furtherRow" data-sec="model"></div>
 
+    ${raw(job.summary?.artifact_removed ? html`
+      <div class="callout callout-warn" data-sec="home model" style="margin-bottom:14px">
+        <strong>The model is no longer here</strong>
+        Removed ${fmtAgo(job.summary.artifact_removed.at)} — ${job.summary.artifact_removed.why}.
+        The run, its chart, its log and its settings stay; "Run again" trains
+        it afresh.</div>` : "")}
     ${raw(job.kind === "finetune_vision_cls" ? html`
       <div class="card" id="tryCard" data-sec="home model" style="margin-bottom:14px">
         <h3 style="margin:0 0 6px">Try it on a picture</h3>
@@ -1797,6 +1829,10 @@ function runRibbon(job, tab) {
     // breaks the next time somebody renames it.
     rb("serveAs", "🏷", "Serve as…", { disabled: !usable,
       title: "Give it a name other software can be pointed at" }),
+    // The usual reason to delete a run is the space its model takes, and
+    // deleting the run threw away the record of what was tried with it.
+    rb("dropModel", "⌫", "Remove model", { disabled: !(done && job.artifacts?.length) || !job.mine,
+      title: "Free the space; keep the run, its chart and its log" }),
     rb(null, "↓", "Download", { disabled: !(done && job.artifacts?.length),
       href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
     rb("goPublish", "☁", "Publish", { disabled: !usable,

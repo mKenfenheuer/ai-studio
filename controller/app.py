@@ -44,6 +44,7 @@ async def lifespan(app: FastAPI):
               "so the memory checks apply to them." % sized, flush=True)
     task = asyncio.create_task(fleet.scheduler_loop())
     sync = asyncio.create_task(_directory_loop())
+    tidy = asyncio.create_task(_retention_loop())
     yield
     for t in (task, sync):
         t.cancel()
@@ -69,6 +70,28 @@ async def _directory_loop() -> None:
             raise
         except Exception as e:  # noqa: BLE001 -- a timer must not die
             print("[directory] sync failed: %s" % e)
+        await asyncio.sleep(3600)
+
+
+async def _retention_loop() -> None:
+    """Once an hour: expire old models, thin old runs, sweep orphans.
+
+    Off the request path, in a thread, because a sweep over a few thousand
+    runs reads and writes the database for a while and the studio must keep
+    answering meanwhile. Errors are printed and the timer goes on: a tidy
+    that dies is a disk that fills.
+    """
+    from . import retention
+    await asyncio.sleep(120)
+    while True:
+        try:
+            result = await asyncio.to_thread(retention.sweep)
+            if result["models_removed"] or result["runs_thinned"] or result["orphan_files"]:
+                print("[retention] %s" % json.dumps(result))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- a timer must not die
+            print("[retention] sweep failed: %s" % e)
         await asyncio.sleep(3600)
 
 
@@ -244,6 +267,55 @@ async def status(request: Request) -> dict:
         "jobs_running": len(db.q("SELECT id FROM jobs WHERE status='running'")),
         "jobs_queued": len(db.q("SELECT id FROM jobs WHERE status='queued'")),
     }
+
+
+@app.get("/api/storage")
+async def storage_report(request: Request) -> dict:
+    """What the disk is holding, and the rules for keeping it. Administrators."""
+    security.require_admin(request)
+    from . import retention
+    return await asyncio.to_thread(retention.report)
+
+
+@app.put("/api/storage/settings")
+async def storage_settings(request: Request, payload: dict = Body(...)) -> dict:
+    user = security.require_admin(request)
+    from . import retention
+    try:
+        return retention.save_settings(payload, user["id"])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/storage/sweep")
+async def storage_sweep(request: Request) -> dict:
+    security.require_admin(request)
+    from . import retention
+    return await asyncio.to_thread(retention.sweep)
+
+
+@app.delete("/api/jobs/{job_id}/artifacts")
+async def drop_job_model(request: Request, job_id: str) -> dict:
+    """Remove a run's model and keep the run: the chart, the log, the notes.
+
+    The usual reason to delete a run is the space its model takes, and
+    deleting the run threw away the record of what was tried with it.
+    """
+    job = _job_or_404(request, job_id, "own")
+    if job["status"] in ("queued", "assigned", "running"):
+        raise HTTPException(400, "This run has not finished.")
+    if not db.list_artifacts(job_id):
+        raise HTTPException(400, "This run has no model to remove.")
+    if db.aliases_for_job(job_id):
+        raise HTTPException(400, "This run is served under a name (%s). Point "
+                                 "the name elsewhere first."
+                            % ", ".join(db.aliases_for_job(job_id)))
+    from . import retention
+    result = retention.drop_model(job_id, "removed by %s" % (
+        security.current_user(request).get("display_name") or "its owner"))
+    for runner_id in list(fleet.connections):
+        await fleet.send_to_runner(runner_id, {"type": "purge_model", "job_id": job_id})
+    return {"ok": True, **result}
 
 
 @app.get("/api/runners")
@@ -446,6 +518,14 @@ async def _create_job(request: Request, payload: dict) -> str:
             cfg.setdefault("base_model", src["config"].get("base_model"))
         cfg["source_run_name"] = src["name"]
 
+    if kind in ("finetune_llm", "pretrain_llm", "finetune_vision_cls"):
+        # Over the account's ceiling of stored models? Said now, with the
+        # numbers, rather than when the model arrives after four hours.
+        from . import retention
+        try:
+            retention.check_quota(user["id"])
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
     if kind == "finetune_llm":
         if not cfg.get("base_model") and not cfg.get("base_model_job"):
             raise HTTPException(400, "Missing required setting: base_model")
