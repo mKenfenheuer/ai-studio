@@ -118,12 +118,12 @@ function layout({ usable, picked, inspect, datasets }) {
           ${raw(labelType?.distinct != null ? html`
             <p class="muted tiny">${labelType.distinct} categories in the sampled
               rows${labelType.distinct > 40 ? " — a lot; each needs its own pictures" : ""}.</p>`
-            : inspect ? `<p class="muted tiny">The label column has more than 64 distinct values, or none.</p>` : "")}
+            : labelType ? `<p class="muted tiny">The label column has more than 64 distinct values — is it really a category?</p>` : "")}
           ${raw(media ? html`
             <p class="muted tiny">${fmtNum(media.referenced)} pictures${media.images
-              ? `, ${media.images.width.median}×${media.images.height.median} px typical` : ""}${
-              media.mismatched ? ` · <span class="badge badge-warn">${media.mismatched} not really pictures</span>` : ""}${
-              media.missing_files ? ` · <span class="badge badge-err">${media.missing_files} missing</span>` : ""}.
+              ? `, ${media.images.width.median}×${media.images.height.median} px typical` : ""}${raw(
+              media.mismatched ? ` · <span class="badge badge-warn">${media.mismatched} not really pictures</span>` : "")}${raw(
+              media.missing_files ? ` · <span class="badge badge-err">${media.missing_files} missing</span>` : "")}.
               <a href="#/data/${esc(picked)}">Check the data</a> first if anything is flagged.</p>` : "")}
         </div>
         <div class="card">
