@@ -16,6 +16,7 @@
  * one.
  */
 import { api } from "../api.js";
+import { usableMachines, machineLimits } from "../machines.js";
 import { html, raw, esc, $, on, toast } from "../util.js";
 import { ribbon, rb, group } from "../ribbon.js";
 import { breadcrumb } from "../components.js";
@@ -139,7 +140,7 @@ export async function rerunView(mount, [jobId]) {
     api.runners(),
     api.datasets().catch(() => []),
   ]);
-  const online = runners.filter((r) => r.status !== "offline");
+  const online = usableMachines(runners);
   // The machine it ran on last time, if it is still here. Otherwise whichever
   // is available -- an offline id in this field is a run that sits queued
   // forever waiting for a machine that is not coming back.
@@ -281,6 +282,7 @@ function layout(job, cfg, online, runnerId, datasets, carried, applied = []) {
             <select id="rr_runner">
               ${raw(online.map((r) => `<option value="${esc(r.id)}"${
                 r.id === runnerId ? " selected" : ""}>${esc(r.name || r.id)}${
+                machineLimits(r).map((l) => " · " + l.label).join("")}${
                 r.id === cfg.required_runner ? " — the one it ran on" : ""
               }</option>`).join(""))}
             </select>

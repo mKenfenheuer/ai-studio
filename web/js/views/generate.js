@@ -8,6 +8,7 @@
 import { api } from "../api.js";
 import { html, raw, esc, $, $$, on, toast, fmtNum } from "../util.js";
 import { requireProject } from "./projects.js";
+import { usableMachines, machineLimits } from "../machines.js";
 import { ribbon, rb, group, rbSelect } from "../ribbon.js";
 import { breadcrumb } from "../components.js";
 
@@ -82,7 +83,9 @@ export async function generateView(mount, [fromJob] = []) {
     api.datasets().catch(() => []),
     api.jobs().catch(() => []),
   ]);
-  const online = runners.filter((r) => r.status !== "offline");
+  // Best first, so the default is a machine that can do the work rather
+  // than whichever one joined the studio first.
+  const online = usableMachines(runners);
   const connected = hosted.connected || [];
   const labelOf = Object.fromEntries(
     (hosted.providers || []).map((p) => [p.id, p.label]));
@@ -595,7 +598,9 @@ function layout(state, online, playable, connected = [], labelOf = {},
               <label for="genRunner">Machine</label>
               <select id="genRunner" name="runner">
                 ${raw(online.map((r) => `<option value="${esc(r.id)}"${
-                  sel(r.id, state.runnerId)}>${esc(r.name)}</option>`).join(""))}
+                  sel(r.id, state.runnerId)}>${esc(r.name)}${
+                  machineLimits(r).map((l) => " · " + l.label).join("")
+                  }</option>`).join(""))}
               </select>
             </div>
           </div>

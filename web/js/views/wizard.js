@@ -2,6 +2,7 @@ import { api, events } from "../api.js";
 import { html, raw, esc, on, $, $$, fmtNum, fmtDuration, toast, resource,
          ensure } from "../util.js";
 import { requireProject } from "./projects.js";
+import { byCapability, machineLimits } from "../machines.js";
 import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
 import { pageHead, emptyState } from "../components.js";
 
@@ -165,23 +166,6 @@ const DRAFT_FIELDS = [
   "minutes", "size", "vocab", "custom", "moe", "overrides", "archOverrides",
   "sweepKey", "sweepValues",
 ];
-
-/** Machines in the order somebody would choose them: the ones that can train
- *  the most, first, and a machine with no graphics card last whatever else it
- *  reports. Idle before busy at equal capability -- a run that can start now
- *  beats a slightly larger card with a queue in front of it. */
-function byCapability(runners) {
-  const rank = (r) => {
-    const c = r.capabilities || {};
-    const gpu = c.backend && c.backend !== "cpu" ? 1 : 0;
-    return [gpu, c.vram_gb || 0, r.status === "busy" ? 0 : 1];
-  };
-  return [...runners].sort((a, b) => {
-    const [ga, va, fa] = rank(a);
-    const [gb, vb, fb] = rank(b);
-    return gb - ga || vb - va || fb - fa;
-  });
-}
 
 /** Whatever follows the `?` in `#/new?step=2&dataset=ds_x`.
  *
@@ -546,13 +530,9 @@ function stepGoal(body, { state, runners, draw }) {
               <span class="row" style="gap:6px;flex-wrap:wrap">
                 ${raw(c.vram_gb ? `<span class="badge">${c.vram_gb} GB memory</span>` : "")}
                 ${raw(c.backend ? `<span class="badge">${esc(c.backend.toUpperCase())}</span>` : "")}
-                ${raw(!c.vram_gb ? `<span class="badge badge-warn"
-                  title="No graphics card: fine for trying the app out, far too slow for real training"
-                  >no GPU</span>` : "")}
-                ${raw(c.vram_gb && !((c.quantization || {})["4bit"])
-                  ? `<span class="badge badge-warn"
-                       title="Without 4-bit, a model has to fit in 16-bit — about four times the memory"
-                       >no 4-bit</span>` : "")}
+                ${raw(machineLimits(r).map((l) =>
+                  `<span class="badge badge-warn" title="${esc(l.why)}">${
+                    esc(l.label)}</span>`).join(""))}
                 ${raw(ceiling ? `<span class="badge badge-accent">${esc(ceiling)}</span>` : "")}
                 ${raw(r.status === "busy" ? `<span class="badge badge-warn">busy</span>` : "")}
               </span>
