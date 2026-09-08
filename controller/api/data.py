@@ -674,3 +674,38 @@ async def publish_dataset(request: Request, dataset_id: str,
         }})
     return {"job_id": jid, "repo_id": repo_id,
             "url": "https://huggingface.co/datasets/%s" % repo_id}
+
+
+@router.get("/{dataset_id}/runs")
+def dataset_runs(request: Request, dataset_id: str) -> list[dict]:
+    """Every run that trained on this dataset, that the caller may see.
+
+    The fact was always in each run's config; there was no way to ask it
+    from the dataset's side, which is the side you are on when deciding
+    whether a dataset is worth keeping.
+    """
+    _get(request, dataset_id)
+    user = current_user(request)
+    out = []
+    for j in db.jobs_trained_on(dataset_id):
+        if not db.access_level("job", j["id"], j.get("owner_id"), user):
+            continue
+        try:
+            summary = json.loads(j.get("summary") or "null") or {}
+        except (TypeError, ValueError):
+            summary = {}
+        try:
+            cfg = json.loads(j.get("config") or "{}") or {}
+        except (TypeError, ValueError):
+            cfg = {}
+        pm = summary.get("primary_metric") if isinstance(summary, dict) else None
+        out.append({"id": j["id"], "name": j["name"], "kind": j["kind"],
+                    "status": j["status"], "created_at": j["created_at"],
+                    "finished_at": j.get("finished_at"),
+                    "base_model": cfg.get("base_model_label") or cfg.get("base_model"),
+                    "primary_metric": pm or (
+                        {"label": "Held-out loss", "value": summary.get("best_val_loss"),
+                         "lower_better": True}
+                        if isinstance(summary, dict) and summary.get("best_val_loss") is not None
+                        else None)})
+    return out

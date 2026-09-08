@@ -15,14 +15,20 @@ import { html, raw, esc, on, toast, fmtAgo, fmtDuration, fmtNum,
          statusBadge } from "../util.js";
 import { ribbon, rb, group } from "../ribbon.js";
 import { primaryMetric } from "../kinds.js";
+import { openServeDialog } from "../registry.js";
 import { breadcrumb, pageHead, emptyState } from "../components.js";
 
 export async function sweepView(mount, [sweepId]) {
+  let sweep = null;
   const paint = async () => {
-    const s = await api.sweep(sweepId);
-    mount.innerHTML = layout(s);
+    sweep = await api.sweep(sweepId);
+    mount.innerHTML = layout(sweep);
   };
   await paint();
+  on(mount, "click", "#serveWinner", () => {
+    const w = (sweep?.runs || []).find((r) => r.id === sweep?.best);
+    if (w) openServeDialog({ id: w.id, name: w.name });
+  });
   on(mount, "click", "[data-stop-run]", async (_e, t) => {
     try { await api.cancelJob(t.dataset.stopRun, true); toast("Stopping…"); }
     catch (e) { toast(e.message, "err"); }
@@ -138,6 +144,11 @@ function layout(s) {
     ${raw(ribbon({
       tabs: [{ key: "home", label: "Variants" }], active: "home",
       body: group("The winner", [
+        // Promotion from the page that decided it. The sweep is where you
+        // learn which run deserves the name; sending somebody off to find it
+        // again on the Served models page was the gap.
+        rb("serveWinner", "🏷", "Serve it under a name", { disabled: !winner,
+          title: winner ? `Point a registered name at ${winner.name}` : "No finished variant yet" }),
         rb(null, "▷", "Try it", { cls: winner ? "primary" : "", disabled: !winner,
           href: winner ? `#/play/${esc(winner.id)}` : "",
           title: "Talk to the variant with the lowest held-out loss" }),

@@ -311,8 +311,10 @@ active nav item carries `aria-current`.
   row lengths against a context window, the conversation report, and a mapping
   editor that writes back to the dataset.
 
-Still to do: versions and diffing (5.1), tags and "runs trained on this"
-(5.2), the generated-data review queue (5.6), and sources and scale (5.7).
+Still to do: versions and diffing (5.1), tags on datasets (5.2), the
+generated-data review queue (5.6), and sources and scale (5.7). Done since:
+"runs trained on this" -- the dataset page lists every run that read it, with
+each run's own headline number (`GET /api/datasets/{id}/runs`).
 Exact token counts need a tokenizer, which needs a runner; that goes with the
 pre-flight checks in Phase 3.
 
@@ -424,8 +426,8 @@ Then, in a second pass:
   pinned to a tag in the CPU runner image. Verified on the lab: SmolLM2-135M
   converts and quantises to 105 MB at Q4_K_M in under four seconds.
 
-Still to do: splitting wizard.js per step (6.1); run tags, as distinct from
-notes (6.4); and the larger training features — full fine-tuning, layer
+Still to do: splitting wizard.js per step (6.1); and the larger training
+features — full fine-tuning, layer
 freezing, DoRA, preference tuning (DPO/ORPO), multi-GPU, and estimate
 calibration (6.6). Those are each a piece of work in their own right rather
 than a gap in the loop.
@@ -545,8 +547,9 @@ Remaining in this phase:
 - **Regression view.** *Done:* an "Over time" tab on a prompt set draws every
   scoring in the order it happened with the best-so-far beside it, names the
   champion, and offers to serve it under a registered name -- which is the
-  promotion path the registry needed. Still to do: splitting the line per
-  model lineage when a set has been used by several.
+  promotion path the registry needed. The line can be shown for one model
+  at a time -- the chart has two validated colours, and a line per model
+  would be a tangle nobody could read.
 - **Playground**: side-by-side (the runner already holds several models,
   `inference.py:120-152`); saved conversations. *Done:* "keep this exchange"
   writes the conversation up to one assistant turn into a dataset's `review`
@@ -562,22 +565,22 @@ Remaining in this phase:
   note and the last twenty things it pointed at; `_resolve` checks aliases
   before run ids and names; `/v1/models` lists them as models in their own
   right; a Served models page registers and repoints them, and the run page
-  has "Serve as…". Still to do: promotion from the sweep page and the eval
-  page, which is where you learn which run deserves the name.
+  has "Serve as…"; the sweep page and the eval page offer it for their
+  winner, through one shared dialog (`web/js/registry.js`).
 - **Usage.** *Done:* every reply the OpenAI-compatible API serves writes one
   row of the runner's real token counts, against the key, the run and the
   alias it was asked for; summed on the Served models page, kept 90 days.
-  Still to do: expiry and scope on keys.
+  A key can expire on a date and can be made for only some models --
+  registered names or run ids; a key made for a name follows the name when it
+  is repointed and reaches nothing else. An expired key is no key.
 - **Score it** and **Write data with it** now sit on the run page and in the
   playground; the score dialog is one module, `web/js/scoring.js`, so the
   baseline checkbox cannot exist in one copy of it and not the other.
-- **A studio with no GPU cannot score anything.** `can_run` refuses an
-  evaluation on a CPU machine unless every model in it is hosted, so a
-  baseline off the Hub -- a 135M model that scores three prompts in three
-  seconds -- has nowhere to run on a GPU-less box. Either a size-aware rule or
-  an explicit "run it here anyway", but `_by_preference` sends kind-restricted
-  machines the work first, so allowing it naively would send small scorings to
-  the CPU on machines that do have a card.
+- **A studio with no GPU can score after all**, when asked: the score
+  dialog has "allow a machine without a graphics card", which sets
+  `allow_cpu` on that one run. Explicit rather than a size rule, because the
+  scheduler asks kind-restricted machines first and a rule would have sent
+  small scorings to the CPU box on machines that do have a card.
 
 
 ---
@@ -632,8 +635,9 @@ lower_better}`. One reader on each side (`app.primary_metric`,
 `kinds.primaryMetric`) with the old `best_val_loss` read as a held-out loss,
 lower better; compare, the sweep page and the sweep's champion rank through
 it, in the metric's own direction, with its own label as the column heading.
-*Still to do:* early stopping in the trainers reads `val_loss` directly and
-will need the same treatment when a trainer with a different metric exists.
+Early stopping knows which way is up too: `earlystop.Stopper` takes
+`lower_better` and the metric's name, and the classifier uses it rather than
+a loop of its own.
 
 **P4. Typed content end to end (L). Done, with one deliberate deviation.**
 `content` stays the words; a message's pictures and clips ride beside it in

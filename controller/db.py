@@ -339,6 +339,10 @@ _ADDED_COLUMNS = [
     # Why this run was made. Nothing recorded it, so a page of six runs of the
     # same model on the same data was six identical rows and a memory test.
     ("jobs", "notes", "TEXT"),
+    # Short labels a person puts on a run to find it again -- "baseline",
+    # "shipped", "bad-data". Distinct from notes, which are prose: a tag is
+    # something to filter on, and a note is something to read.
+    ("jobs", "tags", "TEXT"),
     # What the run reported when it ended. It was already written into the log
     # as JSON, which was fine for reading one run and useless for comparing
     # twenty: answering "which of these had the lowest held-out loss" meant
@@ -393,6 +397,11 @@ _ADDED_COLUMNS = [
     # the thing that was uploaded. Null on every artifact made before this
     # existed, which is why nothing is allowed to require it.
     ("artifacts", "sha256", "TEXT"),
+    # A key that stops working on a date, and one that can only reach some
+    # models. A key pasted into a script on a shared machine should not be a
+    # permanent key to everything the account can see.
+    ("api_keys", "expires_at", "REAL"),
+    ("api_keys", "scope", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -523,6 +532,10 @@ def create_job(name: str, kind: str, cfg: dict, owner_id: str | None = None) -> 
 
 def _hydrate(r: dict) -> dict:
     r["config"] = json.loads(r["config"])
+    try:
+        r["tags"] = json.loads(r.get("tags") or "[]")
+    except (TypeError, ValueError):
+        r["tags"] = []
     if r.get("summary"):
         try:
             r["summary"] = json.loads(r["summary"])
@@ -758,6 +771,34 @@ def add_artifact(job_id: str, kind: str, filename: str, size: int,
 
 def set_job_notes(job_id: str, notes: str) -> None:
     ex("UPDATE jobs SET notes=? WHERE id=?", (notes, job_id))
+
+
+def set_job_tags(job_id: str, tags: list[str]) -> None:
+    ex("UPDATE jobs SET tags=? WHERE id=?", (json.dumps(tags), job_id))
+
+
+def clean_tags(raw: object) -> list[str]:
+    """Tags as people type them: short, lowercase, no duplicates, no blanks."""
+    if isinstance(raw, str):
+        raw = raw.replace(";", ",").split(",")
+    out: list[str] = []
+    for t in (raw or []):
+        t = str(t or "").strip().lower()[:32]
+        if t and t not in out:
+            out.append(t)
+    return out[:20]
+
+
+def jobs_trained_on(dataset_id: str) -> list[dict]:
+    """Every run whose data came from this dataset, newest first.
+
+    Read off the config rather than a join table, because that is where the
+    fact was already written and a second copy could disagree with it. A
+    LIKE on the JSON is cheap at the sizes a studio has.
+    """
+    return q("SELECT id, name, kind, status, owner_id, created_at, finished_at,"
+             " summary, config FROM jobs WHERE config LIKE ? ORDER BY created_at DESC",
+             ('%"studio_dataset": "' + dataset_id + '"%',))
 
 
 def rename_job(job_id: str, name: str) -> None:
@@ -1206,10 +1247,26 @@ def take_oauth_state(state: str, max_age_s: float = 600.0) -> dict | None:
 
 # ---------------------------------------------------------------- api keys
 
-def create_api_key(user_id: str, name: str, key_hash: str, prefix: str) -> str:
+def key_scope(key_id: str) -> list[str] | None:
+    """The names or run ids this key may reach, or None for everything."""
+    row = q1("SELECT scope FROM api_keys WHERE id=?", (key_id,)) if key_id else None
+    if not row or not row.get("scope"):
+        return None
+    try:
+        got = json.loads(row["scope"])
+    except (TypeError, ValueError):
+        return None
+    return [str(x) for x in got] if isinstance(got, list) and got else None
+
+
+def create_api_key(user_id: str, name: str, key_hash: str, prefix: str,
+                   expires_at: float | None = None,
+                   scope: list[str] | None = None) -> str:
     kid = new_id("key")
-    ex("INSERT INTO api_keys (id,user_id,name,key_hash,prefix,created_at)"
-       " VALUES (?,?,?,?,?,?)", (kid, user_id, name, key_hash, prefix, now()))
+    ex("INSERT INTO api_keys (id,user_id,name,key_hash,prefix,created_at,"
+       "expires_at,scope) VALUES (?,?,?,?,?,?,?,?)",
+       (kid, user_id, name, key_hash, prefix, now(), expires_at,
+        json.dumps(scope) if scope else None))
     return kid
 
 
@@ -1231,6 +1288,8 @@ def api_key_identity(key_hash: str) -> tuple[dict | None, str]:
     row = q1("SELECT * FROM api_keys WHERE key_hash=?", (key_hash,))
     if not row:
         return None, ""
+    if row.get("expires_at") and now() > float(row["expires_at"]):
+        return None, ""            # a key past its date is no key
     user = get_user(row["user_id"])
     if not user or not user["active"]:
         return None, ""
@@ -1245,8 +1304,15 @@ def api_key_owner(key_hash: str) -> dict | None:
 
 
 def list_api_keys(user_id: str) -> list[dict]:
-    return q("SELECT id,name,prefix,created_at,last_used,calls FROM api_keys"
-             " WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+    rows = q("SELECT id,name,prefix,created_at,last_used,calls,expires_at,scope"
+             " FROM api_keys WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+    for r in rows:
+        try:
+            r["scope"] = json.loads(r["scope"]) if r.get("scope") else None
+        except (TypeError, ValueError):
+            r["scope"] = None
+        r["expired"] = bool(r.get("expires_at")) and now() > float(r["expires_at"])
+    return rows
 
 
 def revoke_api_keys(user_id: str) -> int:

@@ -114,7 +114,25 @@ def _servable(user: dict) -> list[dict]:
     return out
 
 
-def _resolve(user: dict, wanted: str) -> dict | None:
+def _in_scope(request: Request, jobs: list[dict]) -> list[dict]:
+    """The runs a scoped key may reach: by run id, or by a name it serves.
+
+    A key made for `assistant-prod` follows the name when it is repointed --
+    that is what a name is for -- and reaches nothing else, including the run
+    the name used to point at.
+    """
+    scope = getattr(request.state, "api_key_scope", None)
+    if not scope:
+        return jobs
+    allowed = set(scope)
+    out = []
+    for j in jobs:
+        if j["id"] in allowed or any(a in allowed for a in db.aliases_for_job(j["id"])):
+            out.append(j)
+    return out
+
+
+def _resolve(user: dict, wanted: str, request: Request | None = None) -> dict | None:
     """Find the run a client means by `model`.
 
     Five ways, in order of how specific they are: a registered alias, the
@@ -130,6 +148,8 @@ def _resolve(user: dict, wanted: str) -> dict | None:
     about somebody else's work.
     """
     jobs = _servable(user)
+    if request is not None:
+        jobs = _in_scope(request, jobs)
     wanted = (wanted or "").strip()
     if not wanted:
         return None
@@ -181,7 +201,7 @@ async def list_models(request: Request) -> dict:
     outside this studio being edited.
     """
     user = current_user(request)
-    jobs = _servable(user)
+    jobs = _in_scope(request, _servable(user))
     by_job: dict[str, list[str]] = {}
     for row in db.list_aliases():
         by_job.setdefault(row["job_id"], []).append(row["alias"])
@@ -316,7 +336,7 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
 
     wanted = str(payload.get("model") or "")
     try:
-        job = _resolve(user, wanted)
+        job = _resolve(user, wanted, request)
     except HTTPException as e:
         return _error(e.status_code, e.detail)
     if not job:

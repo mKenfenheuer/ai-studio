@@ -44,12 +44,20 @@ class Stopper:
     """Watches the held-out loss and says when to stop and what to keep."""
 
     def __init__(self, ctx: Any, patience: int, enabled: bool = True,
-                 rel_delta: float = REL_DELTA, kind: str = "model"):
+                 rel_delta: float = REL_DELTA, kind: str = "model",
+                 lower_better: bool = True, metric: str = "held-out loss"):
         self.ctx = ctx
         self.patience = max(1, int(patience))
         self.enabled = bool(enabled)
         self.rel_delta = float(rel_delta)
         self.kind = kind
+        # Which way is up. A loss falls as the model improves; an accuracy
+        # rises. Read once here rather than assumed, so the classifier and
+        # the language model stop on the same rule and say so in the same
+        # words -- the classifier had its own copy of this loop for a while,
+        # which is exactly how the two would have drifted.
+        self.lower_better = bool(lower_better)
+        self.metric = metric
         self.best: float | None = None
         self.best_step = 0
         self.waited = 0
@@ -60,10 +68,11 @@ class Stopper:
         if not self.enabled:
             return
         self.ctx.log(
-            "Watching the held-out loss. If it has not improved after %d "
+            "Watching the %s. If it has not improved after %d "
             "checks in a row -- that is %d steps -- training stops there, and "
             "whichever %s scored best is the one kept."
-            % (self.patience, self.patience * max(eval_every, 1), self.kind))
+            % (self.metric, self.patience, self.patience * max(eval_every, 1),
+               self.kind))
 
     def update(self, step: int, val_loss: float | None) -> str:
         """Record a held-out reading. Returns "improved", "stop", or "".
@@ -74,14 +83,14 @@ class Stopper:
         """
         if val_loss is None:
             return ""
-        if self.best is None or val_loss < self.best * (1 - self.rel_delta):
+        if self.best is None or self._better_by_enough(val_loss):
             self.best = val_loss
             self.best_step = step
             self.waited = 0
             return "improved"
 
         # Still the best number seen, just not by enough to count as progress.
-        if self.best is not None and val_loss < self.best:
+        if self.best is not None and self._better(val_loss):
             self.best = val_loss
 
         self.waited += 1
@@ -89,13 +98,22 @@ class Stopper:
             return ""
         self.stopped = True
         self.ctx.log(
-            "Stopping: the held-out loss has not improved for %d checks. Its "
+            "Stopping: the %s has not improved for %d checks. Its "
             "best was %.4f at step %d, and it has been %.4f since. More "
             "training from here makes the %s worse at everything except the "
             "examples it has already seen."
-            % (self.patience, self.best, self.best_step, val_loss, self.kind),
-            "warn")
+            % (self.metric, self.patience, self.best, self.best_step, val_loss,
+               self.kind), "warn")
         return "stop"
+
+    def _better(self, value: float) -> bool:
+        return value < self.best if self.lower_better else value > self.best
+
+    def _better_by_enough(self, value: float) -> bool:
+        """Better, and by more than noise: `rel_delta` of the best so far."""
+        if self.lower_better:
+            return value < self.best * (1 - self.rel_delta)
+        return value > self.best * (1 + self.rel_delta)
 
     def should_restore(self, final_val: float | None, step: int) -> bool:
         """Is the snapshot worth going back for?

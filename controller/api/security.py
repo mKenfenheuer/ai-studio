@@ -73,6 +73,7 @@ async def authenticate(request: Request, call_next):
     request.state.user = None
     # Which API key this is, when it is one. Usage is recorded against it.
     request.state.api_key_id = ""
+    request.state.api_key_scope = None
 
     # The OpenAI-compatible surface. A different door with a different key,
     # because the caller is a script or a piece of home automation rather than
@@ -83,6 +84,9 @@ async def authenticate(request: Request, call_next):
         raw = _bearer(request)
         user, request.state.api_key_id = (
             db.api_key_identity(auth.api_key_hash(raw)) if raw else (None, ""))
+        # Which models this key may reach, when it was made for only some.
+        request.state.api_key_scope = (
+            db.key_scope(request.state.api_key_id) if request.state.api_key_id else None)
         if not user:
             # Falls back to a session so the studio's own pages can call this
             # surface without minting a key to talk to itself.

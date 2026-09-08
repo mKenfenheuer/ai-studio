@@ -17,6 +17,7 @@ import { html, raw, esc, $, $$, on, toast, modal, fmtAgo, fmtNum, fmtDuration } 
 import { shareButton, wireShareBox } from "./share.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive, emptyState } from "../components.js";
+import { openServeDialog } from "../registry.js";
 
 const TABS = [
   { key: "scores", label: "Scores" },
@@ -159,40 +160,13 @@ export async function evalView(mount, [evalId]) {
     // Promotion from the eval page: the run that won this prompt set is
     // exactly the one that should answer to the name other software uses, and
     // getting there meant remembering which run it was and finding it again.
-    on(mount, "click", "#promoteBest", async (_e, t) => {
-      const jobId = t.dataset.job;
-      let existing = [];
-      try { existing = await api.registeredModels(); } catch { /* offer anyway */ }
-      const dlg = modal({ title: "Serve the best model under a name", width: 500,
-        body: html`
-        <p class="muted tiny">A name other software is configured with. Point
-          it here and every client follows, with nothing out there to edit.</p>
-        <div class="field">
-          <label for="promName">Name</label>
-          <input id="promName" type="text" class="mono" placeholder="assistant-prod"
-                 list="promNames" value="${esc(existing[0]?.alias || "")}">
-          <datalist id="promNames">${raw(existing.map((n) =>
-            `<option value="${esc(n.alias)}"></option>`).join(""))}</datalist>
-          <div class="hint">An existing name is repointed; a new one is
-            created.</div>
-        </div>
-        <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
-          <button type="button" class="btn" data-modal-close>Cancel</button>
-          <button type="button" class="btn btn-primary" id="promGo">Serve it</button>
-        </div>` });
-      on(dlg, "click", "#promGo", async (_e2, btn) => {
-        const alias = ($("#promName", dlg).value || "").trim().toLowerCase();
-        if (!alias) return toast("Give it a name.", "err");
-        btn.disabled = true;
-        try {
-          const r = await api.registerModel(alias, { job_id: jobId });
-          dlg.close();
-          toast(r.moved ? `"${alias}" now answers with this model.`
-                        : `Serving as "${alias}".`, "ok",
-                { href: "#/serving", label: "Served models" });
-        } catch (ex) { toast(ex.message, "err"); btn.disabled = false; }
-      });
-    });
+    // Promotion from the eval page: the run that won this prompt set is
+    // exactly the one that should answer to the name other software uses.
+    on(mount, "click", "#promoteBest", (_e, t) =>
+      openServeDialog({ id: t.dataset.job, name: t.dataset.name || "this run" },
+                      { title: "Serve the best model under a name" }));
+
+    on(mount, "change", "#trendOnly", (_e, t) => { ev._trendOnly = t.value; draw(); });
 
     on(mount, "click", "#copyEval", async () => {
       try {
@@ -216,9 +190,10 @@ function drawTrend(mount, ev, tab) {
   if (!el) return;
   const key = el.dataset.trend;
   const measure = MEASURES[key] || MEASURES.expected_loss;
+  const only = el.dataset.only || "";
   const scores = (ev.scores || []).slice()
     .sort((a, b) => a.created_at - b.created_at)
-    .filter((s) => s.metrics[key] != null);
+    .filter((s) => s.metrics[key] != null && (!only || s.model_ref === only));
 
   const each = scores.map((s) => ({ x: s.created_at, y: s.metrics[key] }));
   let running = null;
@@ -471,16 +446,32 @@ function trendPanel(ev) {
     });
   }
 
-  const best = usable.reduce((a, b) =>
+  // One model at a time, when asked. The chart has two validated series
+  // colours and a prompt set may have been used by ten models; a line per
+  // model would be a tangle in colours nobody could tell apart, so the
+  // choice is every scoring together, or one model's own history.
+  const models = [...new Map(usable.map((s) => [s.model_ref, s.model_name])).entries()];
+  const only = ev._trendOnly || "";
+  const shown = only ? usable.filter((s) => s.model_ref === only) : usable;
+  const best = (shown.length ? shown : usable).reduce((a, b) =>
     (measure.lower ? b.metrics[key] < a.metrics[key]
                    : b.metrics[key] > a.metrics[key]) ? b : a);
-  const first = usable[0];
+  const first = (shown.length ? shown : usable)[0];
   const moved = measure.lower ? first.metrics[key] - best.metrics[key]
                               : best.metrics[key] - first.metrics[key];
 
   return html`
     <div class="card" style="margin-bottom:14px">
-      <div id="trendChart" data-trend="${esc(key)}"></div>
+      ${raw(models.length > 1 ? html`
+        <div class="row-between" style="margin-bottom:6px">
+          <span class="tiny muted">Show</span>
+          <select id="trendOnly" class="tiny">
+            <option value="">every model</option>
+            ${raw(models.map(([ref, name]) => html`
+              <option value="${ref}"${ref === only ? " selected" : ""}>${name}</option>`).join(""))}
+          </select>
+        </div>` : "")}
+      <div id="trendChart" data-trend="${esc(key)}" data-only="${esc(only)}"></div>
       <p class="muted tiny" style="margin:8px 0 0">Every scoring of this set,
         in the order it happened. The second line is the best result so far,
         which is the one that answers whether the work is going anywhere —
@@ -504,7 +495,7 @@ function trendPanel(ev) {
         </div>
         ${raw(best.is_run ? html`
           <button class="btn btn-primary btn-sm" id="promoteBest"
-                  data-job="${esc(best.model_job_id)}">Serve it under a name</button>`
+                  data-job="${esc(best.model_job_id)}" data-name="${esc(best.model_name)}">Serve it under a name</button>`
           : `<span class="muted tiny">A baseline, not a run here — there is
              nothing of yours to serve.</span>`)}
       </div>

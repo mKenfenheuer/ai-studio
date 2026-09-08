@@ -277,6 +277,16 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     } catch (e) { toast(e.message, "err"); }
   });
 
+  on(mount, "change", "#runTags", async (_e, t) => {
+    const job = getJob();
+    try {
+      const r = await api.patchJob(jobId, { tags: t.value });
+      job.tags = r.tags || [];
+      t.value = job.tags.join(", ");
+      toast(job.tags.length ? "Tagged." : "Tags cleared.", "ok");
+    } catch (e) { toast(e.message, "err"); }
+  });
+
   on(mount, "click", "[data-rename]", () => {
     inlineRename($("#runTitle", mount), async (name) => {
       await api.renameJob(jobId, name);
@@ -1784,6 +1794,10 @@ function runHead(job) {
         <textarea id="runNotes" rows="1" maxlength="2000"
           placeholder="Why this run? — a note to yourself, saved as you leave the box"
           >${job.notes || ""}</textarea>
+        <input id="runTags" class="mono tiny" type="text"
+          placeholder="tags, comma-separated — baseline, shipped, bad-data"
+          value="${(job.tags || []).join(", ")}"
+          title="Short labels to find this run by. Notes are for reading; tags are for filtering.">
       </div>
       ${raw(job.config.sweep_id ? html`
         <p class="tiny" style="margin:4px 0 0">One of several variants —

@@ -445,6 +445,13 @@ async def run_eval(request: Request, eval_id: str,
     # queue waiting for the one machine with a GPU in it.
     if all(m["source"] == "api" for m in models):
         cfg["allow_cpu"] = True
+    # Or when asked. A studio with no card at all could not score anything,
+    # and a small model on a few dozen prompts is minutes on a processor. The
+    # scheduler still tries every machine with a card first; only the
+    # kind-restricted CPU box is asked ahead of them, and only for the kinds
+    # it was set aside for.
+    if payload.get("allow_cpu"):
+        cfg["allow_cpu"] = True
 
     name = "%s on %d model%s" % (row["name"], len(models),
                                  "" if len(models) == 1 else "s")

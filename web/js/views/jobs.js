@@ -9,7 +9,7 @@
  */
 import { api, events } from "../api.js";
 import { html, raw, esc, $, on, fmtAgo, fmtDuration, statusBadge, toast } from "../util.js";
-import { KINDS, kindOf, subjectOf } from "../kinds.js";
+import { KINDS, kindOf, subjectOf, primaryMetric } from "../kinds.js";
 import { ribbon, rb, group, rbSelect, rbSeg, rbSearch, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
 
@@ -213,7 +213,13 @@ function ribbonFor(s) {
   return ribbon({ tabs: TABS, active: tab, body });
 }
 
-const heldOut = (j) => j.summary?.best_val_loss ?? null;
+const heldOut = (j) => primaryMetric(j)?.value ?? null;
+// Sorting "by loss" is really sorting by the run's own headline number, in
+// its own direction: a classifier's 91% belongs above its 87%, not below.
+const rankKey = (j) => {
+  const m = primaryMetric(j);
+  return m ? (m.lower ? m.value : -m.value) : 1e9;
+};
 
 function filtered({ jobs, q, status, kind, scope, sort, bySweep }) {
   let out = jobs.filter((j) => {
@@ -227,13 +233,14 @@ function filtered({ jobs, q, status, kind, scope, sort, bySweep }) {
     // Everything on the row, so searching for the dataset finds the runs that
     // trained on it and searching for a repository finds what was published.
     const hay = [j.name, j.notes, subjectOf(j), j.config?.dataset_label, j.config?.dataset,
-                 j.config?.sweep_name, ...(j.config?.published || []).map((p) => p.repo_id)]
+                 j.config?.sweep_name, ...(j.tags || []),
+                 ...(j.config?.published || []).map((p) => p.repo_id)]
       .filter(Boolean).join(" ").toLowerCase();
     return hay.includes(q);
   });
 
   out.sort(sort === "name" ? (a, b) => a.name.localeCompare(b.name)
-    : sort === "loss" ? (a, b) => (heldOut(a) ?? 1e9) - (heldOut(b) ?? 1e9)
+    : sort === "loss" ? (a, b) => rankKey(a) - rankKey(b)
     : sort === "duration" ? (a, b) => (b.summary?.duration_s || 0) - (a.summary?.duration_s || 0)
     : (a, b) => (b.created_at || 0) - (a.created_at || 0));
 
@@ -302,7 +309,8 @@ function row(j, picked) {
     <tr class="${picked.has(j.id) ? "row-picked" : ""}">
       <td><input type="checkbox" data-pick="${j.id}" aria-label="Select ${j.name}"
                  ${picked.has(j.id) ? "checked" : ""}></td>
-      <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a>
+      <td><a href="#/jobs/${j.id}"><strong>${j.name}</strong></a>${raw((j.tags || [])
+          .map((t) => ` <span class="badge badge-soft">${esc(t)}</span>`).join(""))}
         ${raw(j.config.sweep_id
           ? `<div class="tiny"><a href="#/sweeps/${esc(j.config.sweep_id)}"
                >part of a sweep</a></div>` : "")}

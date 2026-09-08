@@ -41,7 +41,7 @@ from typing import Any
 
 import httpx
 
-from runner import artifacts
+from runner import artifacts, earlystop
 
 from . import source
 from .lora_llm import Cancelled, _versions
@@ -284,8 +284,12 @@ def run(cfg: dict, ctx: Any) -> dict:
     best_acc: float | None = None
     best_state = None
     best_step = 0
-    patience = int(cfg.get("early_stop_patience") or 3)
-    since_best = 0
+    # The same stopper the language models use, told which way is up.
+    stopper = earlystop.Stopper(
+        ctx, int(cfg.get("early_stop_patience") or 3),
+        enabled=bool(cfg.get("early_stop", True)) and held_loader is not None,
+        kind="classifier", lower_better=False, metric="held-out accuracy")
+    stopper.announce(steps_per_epoch)
     stopped_early = False
     last_eval: dict = {}
     step = 0
@@ -318,16 +322,13 @@ def run(cfg: dict, ctx: Any) -> dict:
                 % (epoch + 1, 100 * acc, f1))
         _show_mistakes(ctx, step, worst, labels, confusion, files, image_field,
                        held_rows, Image)
-        if best_acc is None or acc > best_acc + 1e-9:
-            best_acc, best_step, since_best = acc, step, 0
+        verdict = stopper.update(step, acc)
+        if verdict == "improved" or best_acc is None:
+            best_acc, best_step = acc, step
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            since_best += 1
-            if since_best >= patience:
-                ctx.log("No better for %d epochs; stopping and keeping the best "
-                        "(epoch of step %d, %.1f%%)." % (patience, best_step, 100 * best_acc))
-                stopped_early = True
-                break
+        elif verdict == "stop":
+            stopped_early = True
+            break
         model.train()
 
     if best_state is not None and (stopped_early or (last_eval.get("accuracy", 0) < (best_acc or 0))):

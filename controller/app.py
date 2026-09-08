@@ -2307,6 +2307,12 @@ async def rename_job(request: Request, job_id: str,
         notes = (payload.get("notes") or "")[:2000]
         db.set_job_notes(job_id, notes)
         out["notes"] = notes
+    if "tags" in payload:
+        # Labels to find it by -- "baseline", "shipped" -- as distinct from
+        # notes, which are for reading.
+        tags = db.clean_tags(payload.get("tags"))
+        db.set_job_tags(job_id, tags)
+        out["tags"] = tags
     if "name" in payload:
         name = (payload.get("name") or "").strip()[:120]
         if not name:

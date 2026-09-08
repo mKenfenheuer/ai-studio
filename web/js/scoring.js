@@ -48,6 +48,17 @@ export async function openScoreDialog(model) {
             the same format. Without it the result can only say which of your
             own models won.</span></span>
       </label>` : "")}
+    <details class="adv" style="margin-top:8px">
+      <summary>If no machine has a graphics card</summary>
+      <label class="check">
+        <input type="checkbox" id="scoreCpu">
+        <span>Allow a machine without one
+          <span class="muted tiny">· slow, but a small model on a few dozen
+            prompts is minutes, and a studio with no card at all could not
+            score anything otherwise. Never chosen over a card that is
+            free.</span></span>
+      </label>
+    </details>
     <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
       <button type="button" class="btn" data-modal-close>Cancel</button>
       <button type="button" class="btn btn-primary" id="scoreGo">Score it</button>
@@ -61,6 +72,7 @@ export async function openScoreDialog(model) {
         model_job_ids: [model.id],
         baselines: base && $("#scoreBase", dlg)?.checked
           ? [{ source: "hub", model: base, like_run: model.id }] : [],
+        allow_cpu: !!$("#scoreCpu", dlg)?.checked,
       });
       dlg.close();
       toast("Scoring queued.", "ok",

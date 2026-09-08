@@ -79,8 +79,8 @@ export const api = {
 
   // ---- api keys --------------------------------------------------------
   apiKeys:     () => req("/api/me/api-keys"),
-  createApiKey: (name) =>
-    req("/api/me/api-keys", { method: "POST", body: JSON.stringify({ name }) }),
+  createApiKey: (name, opts = {}) =>
+    req("/api/me/api-keys", { method: "POST", body: JSON.stringify({ name, ...opts }) }),
   deleteApiKey: (id) =>
     req(`/api/me/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
@@ -137,6 +137,7 @@ export const api = {
   // ---- datasets --------------------------------------------------------
   datasets:    () => req("/api/datasets"),
   dataset:     (id) => req(`/api/datasets/${encodeURIComponent(id)}`),
+  datasetRuns: (id) => req(`/api/datasets/${encodeURIComponent(id)}/runs`),
   datasetInspect: (id, sample = 2000) =>
     req(`/api/datasets/${encodeURIComponent(id)}/inspect?sample=${+sample || 2000}`),
   datasetRows: (id, offset = 0, limit = 25, q = "", split = "") =>

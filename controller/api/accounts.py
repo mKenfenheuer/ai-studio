@@ -234,9 +234,29 @@ async def api_key_create(request: Request, payload: dict = Body(default=None)) -
     if len(db.list_api_keys(user["id"])) >= 20:
         raise HTTPException(400, "That is twenty keys. Delete one you no "
                                  "longer use before making another.")
+    # How long it lives, and what it may reach. Both optional, both worth
+    # having: a key pasted into a script on a shared machine should not be a
+    # permanent key to everything this account can see.
+    days = (payload or {}).get("expires_days")
+    expires_at = None
+    if days not in (None, "", 0, "0"):
+        try:
+            days = float(days)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Expiry is a number of days.") from None
+        if not 0 < days <= 3650:
+            raise HTTPException(400, "Expiry is between one day and ten years.")
+        expires_at = time.time() + days * 86400
+    models = (payload or {}).get("models")
+    if isinstance(models, str):
+        models = [m for m in (x.strip() for x in models.replace(";", ",").split(","))
+                  if m]
+    scope = [str(m)[:80] for m in (models or [])][:50] or None
     raw, key_hash, prefix = auth.new_api_key()
-    kid = db.create_api_key(user["id"], name[:60], key_hash, prefix)
+    kid = db.create_api_key(user["id"], name[:60], key_hash, prefix,
+                            expires_at=expires_at, scope=scope)
     return {"id": kid, "name": name[:60], "prefix": prefix, "key": raw,
+            "expires_at": expires_at, "scope": scope,
             "note": "Copy this now. It is stored hashed and cannot be shown "
                     "again -- if you lose it, delete it and make another."}
 

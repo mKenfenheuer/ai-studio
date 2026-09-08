@@ -48,6 +48,8 @@ export async function datasetView(mount, [id]) {
   let library = [];
   let rows = null;                 // a page of the file itself
   let stats = null;                // the quality report, once asked for
+  let trainedOn = [];              // the runs that read this data
+  api.datasetRuns(id).then((r) => { trainedOn = r; draw(); }).catch(() => {});
   const training = resource();     // what the trainer will read, once asked
   const convReport = resource();   // whether it reads as conversations
   let trainSplit = "";             // which split the training tab is showing
@@ -75,7 +77,7 @@ export async function datasetView(mount, [id]) {
 
   // ---- drawing -----------------------------------------------------------
   const draw = () => {
-    mount.innerHTML = layout({ d, library, rows, steps, selected, preview, previewErr,
+    mount.innerHTML = layout({ d, library, rows, steps, selected, preview, previewErr, trainedOn,
                                stages, loading, tab, view, picked, sample, leftOpen,
                                history, future, colMenu, stats, checkSample,
                                training, convReport, trainSplit, contextLen });
@@ -104,6 +106,7 @@ export async function datasetView(mount, [id]) {
 
   async function reload(offset = rows?.offset || 0) {
     d = await api.dataset(id);
+    api.datasetRuns(id).then((r) => { trainedOn = r; draw(); }).catch(() => {});
     previewCache.clear();
     await showRows(offset);
   }
@@ -1543,7 +1546,7 @@ function statusBar({ d, rows, steps, selected, preview, stages, sample, loading 
 // ---- right: properties and applied steps -------------------------------------
 
 function rightPane(s) {
-  const { d, steps, selected, stages, previewErr } = s;
+  const { d, steps, selected, stages, previewErr , trainedOn } = s;
   const canEdit = d.access === "edit";
   const total = stages ? stages[0].kept + stages[0].removed : null;
   const edits = (d.recipe?.edits || []).slice(-8).reverse();
@@ -1589,6 +1592,19 @@ function rightPane(s) {
           the Transform, Add Column or Rows tabs. Each one becomes a step here,
           with a preview of what it does — nothing is written until you apply.</p>`)}
       </div>
+      ${raw(trainedOn.length ? html`
+        <div class="pq-props">
+          <div class="pq-sub">Trained on this</div>
+          <ul class="tiny" style="margin:4px 0;padding-left:16px">${raw(trainedOn.slice(0, 8).map((r) => html`
+            <li><a href="#/jobs/${r.id}">${r.name}</a>
+              <span class="muted">· ${r.status}${r.primary_metric?.value != null
+                ? ` · ${r.primary_metric.label.toLowerCase()} ${r.primary_metric.lower_better
+                    ? r.primary_metric.value.toFixed(4) : (r.primary_metric.value * 100).toFixed(1) + "%"}`
+                : ""}</span></li>`).join(""))}</ul>
+          ${raw(trainedOn.length > 8 ? `<div class="tiny muted">and ${trainedOn.length - 8} more</div>` : "")}
+          <div class="tiny muted">Delete this dataset and those runs keep their
+            models, but lose the record of what they were trained on.</div>
+        </div>` : "")}
       ${raw(made.length || edits.length ? html`
         <div class="pq-props">
           <div class="pq-sub">History</div>

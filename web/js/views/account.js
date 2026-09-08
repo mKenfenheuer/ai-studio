@@ -40,9 +40,12 @@ export async function accountView(mount) {
     wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
     on(mount, "submit", "#keyForm", async (e) => {
       e.preventDefault();
-      const name = new FormData(e.target).get("name");
+      const f = new FormData(e.target);
       try {
-        freshKey = await api.createApiKey(name);
+        freshKey = await api.createApiKey(f.get("name"), {
+          expires_days: f.get("expires_days") || 0,
+          models: f.get("models") || "",
+        });
         keys = await api.apiKeys();
         draw();
       } catch (ex) { toast(ex.message, "err"); }
@@ -407,10 +410,28 @@ function keysCard(keys, fresh) {
           </div>
         </div>` : "")}
 
-      <form id="keyForm" class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
-        <input type="text" name="name" placeholder="What is it for? e.g. Home Assistant"
-               style="flex:1;min-width:160px">
-        <button class="btn-primary btn-sm" type="submit">Create a key</button>
+      <form id="keyForm" style="margin-top:10px">
+        <div class="row" style="gap:6px;flex-wrap:wrap">
+          <input type="text" name="name" placeholder="What is it for? e.g. Home Assistant"
+                 style="flex:1;min-width:160px">
+          <select name="expires_days" title="When it stops working">
+            <option value="0">never expires</option>
+            <option value="7">7 days</option>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">a year</option>
+          </select>
+          <button class="btn-primary btn-sm" type="submit">Create a key</button>
+        </div>
+        <details class="adv" style="margin-top:6px">
+          <summary>Only some models</summary>
+          <input type="text" name="models" class="mono"
+                 placeholder="assistant-prod, job_3f2a…  (blank: everything this account can reach)">
+          <div class="hint">Registered names or run ids, comma-separated. A key made
+            for a name follows the name when it is repointed, and reaches nothing
+            else — which is what a key pasted into a script on a shared machine
+            should be.</div>
+        </details>
       </form>
 
       ${raw(keys.length ? html`
@@ -421,6 +442,10 @@ function keysCard(keys, fresh) {
                 <div class="muted tiny mono">${k.prefix}…</div></td>
               <td class="tiny muted">${k.last_used
                 ? `used ${fmtAgo(k.last_used)}` : "never used"}
+                ${raw(k.expired ? `<div><span class="badge badge-err">expired</span></div>`
+                  : k.expires_at ? `<div>expires ${esc(fmtAgo(k.expires_at).replace(" ago", "").replace("in ", ""))}${
+                      k.expires_at > Date.now() / 1000 ? " from now" : ""}</div>` : "")}
+                ${raw(k.scope?.length ? `<div class="mono">only ${k.scope.map(esc).join(", ")}</div>` : "")}
                 ${raw(k.last_used
                   ? `<div><a href="#/serving">what it served</a></div>` : "")}</td>
               <td><button class="btn-sm btn-danger" data-del-key="${k.id}"
