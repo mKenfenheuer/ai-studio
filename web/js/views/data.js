@@ -581,7 +581,9 @@ function listing({ items, filter, sort, scope, tree, picked }) {
     });
   }
 
-  return html`<table class="table">
+  // In its own scroll container: a wide table in a card is a page that scrolls
+  // sideways, and on a phone that takes the tab bar with it.
+  return html`<div class="table-wrap"><table class="table">
     <thead><tr>
       <th style="width:28px"></th><th>Name</th><th>Rows</th>
       <th class="hide-sm">Where from</th><th class="hide-sm">Owner</th>
@@ -608,7 +610,7 @@ function listing({ items, filter, sort, scope, tree, picked }) {
             <td class="tiny muted hide-sm">${fmtAgo(d.updated_at)}</td>
           </tr>`;
       }).join(""))}
-    </tbody></table>`;
+    </tbody></table></div>`;
 }
 
 /**

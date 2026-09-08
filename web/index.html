@@ -20,7 +20,9 @@
     </div>
 
     <nav class="nav">
-      <a href="#/" data-nav="dashboard"><span class="ico">▤</span><span class="lbl">Dashboard</span></a>
+      <!-- U+2302, not the ▤ that Datasets uses: at 17px with a truncated label
+           under it, two identical glyphs are two tabs nobody can tell apart. -->
+      <a href="#/" data-nav="dashboard"><span class="ico">⌂</span><span class="lbl">Dashboard</span></a>
       <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">✦</span><span class="lbl">New training run</span></a>
       <a href="#/jobs" data-nav="jobs"><span class="ico">≡</span><span class="lbl">Runs</span></a>
       <!-- U+25B7, not U+25B6: the filled triangle has an emoji presentation and
@@ -28,9 +30,13 @@
            row of monochrome marks. This one has no emoji variant. -->
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
       <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
-      <a href="#/evals" data-nav="evals"><span class="ico">◎</span><span class="lbl">Evaluate</span></a>
-      <a href="#/runners" data-nav="runners"><span class="ico">▦</span><span class="lbl">Machines</span></a>
-      <a href="#/settings" data-nav="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
+      <!-- Below this line the tab bar on a 390px screen is out of room, so
+           these fold into "More" there and stay in the sidebar on a desktop. -->
+      <a href="#/evals" data-nav="evals" class="nav-spill"><span class="ico">◎</span><span class="lbl">Evaluate</span></a>
+      <a href="#/runners" data-nav="runners" class="nav-spill"><span class="ico">▦</span><span class="lbl">Machines</span></a>
+      <a href="#/settings" data-nav="settings" class="nav-spill"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
+      <button type="button" class="nav-more" id="navMore">
+        <span class="ico">⋯</span><span class="lbl">More</span></button>
     </nav>
 
     <div class="sidebar-foot">
@@ -45,6 +51,9 @@
         <span class="dot dot-idle" data-fleet-dot></span>
         <span data-fleet-text>connecting…</span>
       </div>
+      <button class="link-btn" id="omniOpen" type="button">
+        <span aria-hidden="true">⌕</span> Find anything <kbd>/</kbd>
+      </button>
       <button class="link-btn" id="helpToggle" type="button">
         New to this? Start here →
       </button>
@@ -61,6 +70,8 @@
       <span class="dot dot-idle" data-fleet-dot></span>
       <span data-fleet-text>connecting…</span>
     </div>
+    <button class="icon-btn" id="omniOpenMobile" type="button"
+            aria-label="Find anything">⌕</button>
     <button class="icon-btn" id="helpToggleMobile" type="button"
             aria-label="Help for beginners">?</button>
     <a class="who-avatar" id="whoamiMobile" href="#/account" hidden

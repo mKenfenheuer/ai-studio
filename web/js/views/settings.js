@@ -1,6 +1,6 @@
 import { api } from "../api.js";
-import { html, raw, $, on } from "../util.js";
-import { session } from "../app.js";
+import { html, raw, $, $$, on } from "../util.js";
+import { session, applyTheme, currentTheme } from "../app.js";
 import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
 import { pageHead, copyButton } from "../components.js";
 
@@ -58,6 +58,17 @@ export async function settingsView(mount) {
         on the controller and restart. Every machine must then rejoin.</div>
     </div>`)}
 
+    <div class="card" style="margin-bottom:14px">
+      <h3>Appearance</h3>
+      <p class="muted tiny">Follows your operating system unless you say
+        otherwise. Kept in this browser, not on your account.</p>
+      <div class="seg" style="margin-top:8px" role="group" aria-label="Theme">
+        ${raw([["system", "Match my system"], ["light", "Light"], ["dark", "Dark"]]
+          .map(([v, label]) => `<button class="btn-sm ${
+            currentTheme() === v ? "on" : ""}" data-theme-set="${v}">${label}</button>`).join(""))}
+      </div>
+    </div>
+
     <div class="card">
       <h3>About</h3>
       <dl class="kv">
@@ -70,6 +81,11 @@ export async function settingsView(mount) {
     </div>`;
 
   wireRibbon(mount, () => {});
+  on(mount, "click", "[data-theme-set]", (_e, t) => {
+    applyTheme(t.dataset.themeSet);
+    $$("[data-theme-set]", mount).forEach((b) =>
+      b.classList.toggle("on", b.dataset.themeSet === t.dataset.themeSet));
+  });
   on(mount, "click", "#signOut", async () => {
     await api.logout().catch(() => {});
     location.reload();

@@ -122,7 +122,12 @@ p { margin: 0 0 .8em; }
 @keyframes pulse { 50% { opacity: .35; } }
 
 /* ------------------------------------------------------------- main */
-.main { padding: 28px 34px 60px; max-width: 1180px; }
+/* `min-width: 0` is load-bearing, not tidying. A grid item defaults to
+   `min-width: auto`, which is "at least as wide as my content" -- so one wide
+   child, such as a ribbon with nine buttons on it, pushed the whole column
+   past the viewport and took the page and the mobile tab bar sideways with
+   it. The ribbon has its own horizontal scroll; this is what lets it use it. */
+.main { padding: 28px 34px 60px; max-width: 1180px; min-width: 0; }
 .loading { color: var(--text-3); padding: 40px; }
 
 /* --- things that have not arrived yet ------------------------------------
@@ -414,6 +419,39 @@ tr:last-child td { border-bottom: none; }
   display: inline-block; width: calc(var(--depth) * 16px); height: 1em;
   vertical-align: middle;
   border-left: 1px solid var(--border-2); margin-right: 6px; opacity: .6;
+}
+
+/* ---- navigation overflow, and finding anything ------------------------- */
+/* "More" is a button among links and inherits none of their shape. */
+.nav-more {
+  display: none; background: transparent; border: 0; width: 100%;
+  color: inherit; font: inherit; text-align: left;
+}
+.more-sheet { display: grid; gap: 2px; }
+.more-link {
+  display: flex; align-items: center; gap: 12px; padding: 12px 10px;
+  border-radius: 8px; color: var(--text); text-decoration: none;
+  min-height: 44px;
+}
+.more-link:hover { background: var(--surface-2); }
+.more-link .ico { width: 22px; text-align: center; color: var(--text-2); }
+
+#omniBox { width: 100%; font-size: 15px; padding: 11px 12px; }
+.omni-results { margin-top: 10px; max-height: 46vh; overflow-y: auto; }
+.omni-hit {
+  display: flex; align-items: center; gap: 10px; padding: 9px 10px;
+  border-radius: 8px; color: var(--text); text-decoration: none;
+}
+.omni-hit.on, .omni-hit:hover { background: var(--accent-bg); }
+.omni-hit .ico { width: 20px; text-align: center; flex: none; }
+.omni-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.omni-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.omni-note { font-size: 11.5px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.omni-when { font-size: 11px; color: var(--text-3); flex: none; }
+kbd {
+  font: 11px var(--mono); border: 1px solid var(--border-2); border-bottom-width: 2px;
+  border-radius: 4px; padding: 1px 5px; background: var(--surface-2);
 }
 
 .consequences {
@@ -711,8 +749,17 @@ details.reasoning.live { border-color: var(--accent); }
   .nav a.nav-cta, .nav a.nav-cta:hover, .nav a.nav-cta.active {
     background: transparent; color: var(--accent); margin: 0;
   }
-  /* Six tabs share a 390px screen, so the two long labels are swapped for
-     short ones rather than being ellipsised into "New tra…" and "Playgro…". */
+  /* Five tabs and a More, because the app now has eight or nine places to be
+     and 390px divided nine ways is 43px against the 44px floor the tab height
+     above was chosen to hold. */
+  .nav a.nav-spill, #navUsers { display: none; }
+  .nav-more {
+    display: flex; flex: 1; flex-direction: column; gap: 3px;
+    padding: 9px 2px 7px; align-items: center; justify-content: center;
+    min-height: 52px; font-size: 10.5px; color: var(--text-2);
+  }
+  .nav-more.active { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+  .nav-more .ico { font-size: 17px; }
   .nav a[data-nav="new"] .lbl { font-size: 0; }
   .nav a[data-nav="new"] .lbl::after { content: "New"; font-size: 10.5px; }
   .nav a[data-nav="play"] .lbl { font-size: 0; }
@@ -1358,6 +1405,10 @@ textarea.turn-edit {
 .rb-btn.primary .ico { color: var(--accent); }
 .rb-btn.danger, .rb-btn.danger .ico { color: var(--err); }
 .rb-btn:disabled { opacity: .4; cursor: not-allowed; }
+/* A disabled destructive button should not still be shouting: red is a
+   warning about what pressing it does, and it cannot be pressed. */
+.rb-btn.danger:disabled, .rb-btn.danger:disabled .ico,
+.rb-btn.primary:disabled .ico { color: var(--text-2); }
 .rb-select { width: auto; padding: 6px 10px; font-size: 12.5px; }
 .ribbon-body .seg { align-self: center; }
 

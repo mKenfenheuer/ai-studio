@@ -1,6 +1,7 @@
 import { api, events, handleUnauthorized, NotSignedIn } from "./api.js";
-import { $, $$, toast, takeSsoError, skeleton, resetDelegated } from "./util.js";
+import { $, $$, toast, takeSsoError, skeleton, resetDelegated, modal, esc } from "./util.js";
 import { initGate, showGate, hideGate } from "./views/gate.js";
+import { openSearch, wireSearchKey } from "./search.js";
 
 import { dashboardView } from "./views/dashboard.js";
 import { wizardView } from "./views/wizard.js";
@@ -78,8 +79,18 @@ async function render() {
   for (const [re, view, nav] of routes) {
     const m = path.match(re);
     if (!m) continue;
-    $$(".nav a, #whoami, #whoamiMobile").forEach((a) =>
-      a.classList.toggle("active", a.dataset.nav === nav));
+    $$(".nav a, #whoami, #whoamiMobile").forEach((a) => {
+      const on = a.dataset.nav === nav;
+      a.classList.toggle("active", on);
+      // Class alone says nothing to a screen reader, which is how a nav with
+      // a highlighted item reads as a nav with no current page at all.
+      if (on) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
+    });
+    // The tab bar shows five; the rest are behind More, which highlights when
+    // the page you are on is one of them.
+    const spilled = $$(".nav-spill").some((a) => a.dataset.nav === nav);
+    $("#navMore")?.classList.toggle("active", spilled);
     // Shaped like the page that is coming rather than a word in the corner,
     // so the layout settles once instead of twice.
     main.innerHTML = skeleton({ cards: 3, rows: 2 });
@@ -176,6 +187,24 @@ function announce(msg) {
   } catch { /* the browser may refuse; the toast already happened */ }
 }
 
+// ---- find anything ------------------------------------------------------
+$$("#omniOpen, #omniOpenMobile").forEach((b) =>
+  b.addEventListener("click", () => openSearch()));
+wireSearchKey();
+
+// ---- the tab bar's overflow ---------------------------------------------
+// Eight nav items, or nine for an administrator, on a 390px screen is 43px
+// per tab against the 44px floor the layout was written to hold. Five stay;
+// the rest are one press away.
+$("#navMore")?.addEventListener("click", () => {
+  const links = $$(".nav-spill").map((a) => `
+    <a class="more-link" href="${a.getAttribute("href")}">
+      <span class="ico">${a.querySelector(".ico").textContent}</span>
+      <span>${esc(a.querySelector(".lbl").textContent)}</span></a>`).join("");
+  const dlg = modal({ title: "More", width: 360, body: `<div class="more-sheet">${links}</div>` });
+  dlg.addEventListener("click", (e) => { if (e.target.closest(".more-link")) dlg.close(); });
+});
+
 // ---- help drawer --------------------------------------------------------
 $$("#helpToggle, #helpToggleMobile").forEach((b) =>
   b.addEventListener("click", () => { $("#helpDrawer").hidden = false; }));
@@ -189,6 +218,27 @@ document.addEventListener("keydown", (e) => {
 
 window.addEventListener("hashchange", render);
 window.addEventListener("error", (e) => toast(e.message, "err"));
+
+// ---- appearance ---------------------------------------------------------
+// The stylesheet has always had the hook -- every dark rule is written as
+// `:root:not([data-theme="light"])`, and `[data-theme="dark"]` overrides in
+// the other direction -- and nothing ever set the attribute, so the escape
+// hatch existed and could not be reached. A studio is a thing people leave
+// open all day; which end of the day it is, is theirs to say.
+export function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "light" || mode === "dark") root.dataset.theme = mode;
+  else delete root.dataset.theme;
+  try {
+    if (mode === "system") localStorage.removeItem("aistudio.theme");
+    else localStorage.setItem("aistudio.theme", mode);
+  } catch { /* private browsing; it lasts for this page either way */ }
+}
+export const currentTheme = () => {
+  try { return localStorage.getItem("aistudio.theme") || "system"; }
+  catch { return "system"; }
+};
+applyTheme(currentTheme());
 
 // ---- identity -----------------------------------------------------------
 
