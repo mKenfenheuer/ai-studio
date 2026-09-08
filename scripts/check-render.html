@@ -155,7 +155,10 @@ const FIXTURES = [
       offset: 0, total: 52002, columns: ["instruction", "output", "image", "clip", "split"] }],
   [/\/api\/datasets\/[^/]+$/, dataset()],
   [/\/api\/datasets/, [dataset(), dataset({ id: "ds_2", name: "alpaca (cleaned)",
-                                            parent_id: "ds_1", source: "derived", rows: 48000 })]],
+                                            parent_id: "ds_1", source: "derived", rows: 48000 }),
+                       dataset({ id: "ds_3", name: "pets", rows: 1200, source: "upload",
+                                 columns: ["image", "filename", "label", "split"],
+                                 splits: { train: 1080, validation: 120 } })]],
   [/\/api\/evals\/[^/]+$/, { id: "ev_1", name: "Support questions", notes: "", items: [
       { prompt: "Where is my order?", expected: "I will check.", note: "" }],
       // Three scorings, newest first, so the table, the verdict and the trend
@@ -279,6 +282,7 @@ const VIEWS = [
   ["evalview", "./views/evalview.js", "evalView", ["ev_1"]],
   ["compare", "./views/compare.js", "compareView", []],
   ["serving", "./views/serving.js", "servingView", []],
+  ["vision", "./views/vision.js", "visionView", []],
   ["settings", "./views/settings.js", "settingsView", []],
   ["account", "./views/account.js", "accountView", []],
   ["wizard", "./views/wizard.js", "wizardView", []],

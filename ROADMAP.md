@@ -684,7 +684,23 @@ exists (diffusion's is its activations).
 
 In order of how much of the existing machinery each reuses.
 
-**6.1 Image classification (ViT / CLIP), effort M.** `finetune_vision_cls`.
+**6.1 Image classification (ViT / CLIP), effort M. First pass done.**
+`runner/jobs/vision_cls.py`: a pretrained backbone (ViT-Base by default;
+ConvNeXt, ResNet, ViT-Large offered) with a new head, LoRA on the attention
+blocks where peft is present and the head alone where it is not; pictures
+fetched through the runner's own door and cached by asset id; a tenth of
+each category held back (stratified -- a plain random tenth once held back
+four of one colour and none of the other); accuracy and macro-F1 after every
+pass, accuracy as `primary_metric` (higher better) and what early stopping
+watches; the confusion matrix as a table sample and the most confidently
+wrong pictures as an image grid; the merged model, processor and
+`labels.json` as the artifact. `#/new/vision` is the page (reached from the
+wizard's goals and the dataset page), and the run page reads accuracy as its
+headline. Verified end to end on a two-colour set: 100%, artifact uploaded.
+*Still to do:* "try it out" for a classifier (upload a picture, get labels)
+and `/v1`-style serving; a thumbnail grid with the label distribution on the
+page; the CUDA image needs rebuilding with Pillow on the Windows box.
+Original plan: `finetune_vision_cls`.
 `AutoModelForImageClassification`, LoRA-able, small. Dataset is
 `{image, label}` from a folder-of-folders or a manifest. Metrics are scalars
 (accuracy, F1) and flow through unchanged; a confusion matrix and a

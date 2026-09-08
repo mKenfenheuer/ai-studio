@@ -20,7 +20,8 @@ import { esc } from "./util.js";
  *  held-out loss is measured against its own small vocabulary and a
  *  fine-tune's against a borrowed 150k one; putting both in one table is a
  *  league table of unrelated numbers. */
-export const FAMILY = { TUNED: "Fine-tunes", SCRATCH: "From scratch" };
+export const FAMILY = { TUNED: "Fine-tunes", SCRATCH: "From scratch",
+                        CLASSIFIER: "Classifiers" };
 
 export const KINDS = {
   finetune_llm: {
@@ -42,6 +43,23 @@ export const KINDS = {
     leavesModel: true,
     family: FAMILY.SCRATCH,
     subject: (c) => "from scratch · " + (c.dataset_label || c.dataset || "text"),
+  },
+  finetune_vision_cls: {
+    label: "Classifier",
+    icon: "🖼",
+    running: "Training",
+    unit: null,
+    page: "training",
+    leavesModel: true,
+    family: FAMILY.CLASSIFIER,
+    subject: (c) => (c.base_model_label || c.base_model || "a vision model")
+      + " on " + (c.dataset_label || "pictures"),
+    stages: {
+      loading_dataset: "Fetching the pictures…",
+      loading_model: "Downloading and loading the model…",
+      training: "Training",
+      evaluating: "Checking it on the held-out pictures…",
+    },
   },
   generate_dataset: {
     label: "Dataset",

@@ -1985,6 +1985,17 @@ function provenanceCard(job) {
 }
 
 function heldOutCard(job, m, lastEval) {
+  // A classifier is judged by how many it names right, not by a loss.
+  if (job.kind === "finetune_vision_cls") {
+    const acc = m.val_accuracy ?? lastEval?.val_accuracy ?? job.summary?.best_accuracy;
+    const at = m.val_accuracy != null ? m.step : lastEval?.step;
+    if (acc != null) {
+      return ["Accuracy", (acc * 100).toFixed(1) + "%",
+              `on ${job.summary?.held_out_from || "the held-out pictures"}${
+                at ? ` · step ${fmtNum(at)}` : ""}`];
+    }
+    return ["Accuracy", "—", "measured after the first pass"];
+  }
   // Where the rows came from, when the run said. "On unseen examples" covers
   // both a split somebody deliberately held back and 5% of the training data
   // taken at random, and only the first is a fair test of anything.

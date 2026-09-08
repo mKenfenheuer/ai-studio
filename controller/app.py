@@ -453,6 +453,26 @@ async def _create_job(request: Request, payload: dict) -> str:
             raise HTTPException(400, "Choose some text to learn from.")
         if not cfg.get("arch"):
             raise HTTPException(400, "No model architecture was chosen.")
+    elif kind == "finetune_vision_cls":
+        # Pictures and labels, from the studio's own library only: the rows
+        # point at stored files, and a Hub image dataset would arrive as URLs
+        # nobody here can fetch. The columns are checked against the dataset
+        # so a typo fails now rather than after the download.
+        if not cfg.get("studio_dataset"):
+            raise HTTPException(400, "Choose a dataset of labelled pictures.")
+        d = db.get_dataset(cfg["studio_dataset"]) or {}
+        cols = list(d.get("columns") or [])
+        cfg["image_field"] = (cfg.get("image_field") or "image").strip()
+        cfg["label_field"] = (cfg.get("label_field") or "label").strip()
+        for field, what in ((cfg["image_field"], "pictures"), (cfg["label_field"], "labels")):
+            if cols and field not in cols:
+                raise HTTPException(
+                    400, "This dataset has no \"%s\" column to take the %s from. "
+                         "Its columns are: %s." % (field, what, ", ".join(cols)))
+        cfg.setdefault("base_model", "google/vit-base-patch16-224")
+        cfg["modality"] = "vision"
+        cfg["params_b"] = cfg.get("params_b") or 0.09
+        cfg.setdefault("hf_token", hfaccount.token_for(user))
     elif kind == "generate_dataset":
         model = cfg.get("model") or {}
         if not model.get("job_id") and not model.get("base_model") \

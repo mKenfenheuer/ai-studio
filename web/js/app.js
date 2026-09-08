@@ -22,10 +22,12 @@ import { evalView } from "./views/evalview.js";
 import { compareView } from "./views/compare.js";
 import { sweepView, sweepsView } from "./views/sweep.js";
 import { servingView } from "./views/serving.js";
+import { visionView } from "./views/vision.js";
 
 const routes = [
   [/^\/$/,             dashboardView, "dashboard"],
   [/^\/new$/,          wizardView,    "new"],
+  [/^\/new\/vision$/,   visionView,    "new"],
   [/^\/jobs$/,         jobsView,      "jobs"],
   // Before the catch-all below, which would otherwise swallow it and open the
   // run's own page with "<id>/again" as the id.

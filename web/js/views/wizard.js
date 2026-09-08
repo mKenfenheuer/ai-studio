@@ -39,6 +39,12 @@ const GOALS = [
   { id: "format", icon: "📐", title: "Always answer in a fixed format",
     desc: "Force replies into a shape you can parse, like JSON or a template.",
     hint: "Very reliable, even with small datasets." },
+  // Not a language model at all. Its own page, because none of the steps
+  // that follow -- format, template, context length -- mean anything for a
+  // model that looks at a picture and names it.
+  { id: "vision", icon: "🖼", title: "Sort pictures into categories",
+    desc: "Teach a vision model to tell your categories apart, from a folder of labelled pictures.",
+    hint: "A few hundred pictures per category is plenty.", href: "#/new/vision" },
 ];
 
 // The format step is its own step in both paths, and not an afterthought at
@@ -533,7 +539,11 @@ function stepGoal(body, { state, runners, draw }) {
     });
     draw();
   });
-  on(body, "click", "[data-goal]", (_e, t) => { state.goal = t.dataset.goal; draw(); });
+  on(body, "click", "[data-goal]", (_e, t) => {
+    const goal = GOALS.find((g) => g.id === t.dataset.goal);
+    if (goal?.href) { location.hash = goal.href; return; }
+    state.goal = t.dataset.goal; draw();
+  });
   on(body, "click", "[data-runner]", (_e, t) => {
     state.runnerId = t.dataset.runner;
     // Another card, another answer to "what fits".

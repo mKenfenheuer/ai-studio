@@ -25,8 +25,7 @@ import httpx
 import websockets
 
 from . import artifacts, capabilities, checkpoints, inference
-from .jobs import (evaluate, export_gguf, generate_data, lora_llm,
-                   scratch_llm, upload)
+from .jobs import (evaluate, export_gguf, generate_data, lora_llm, scratch_llm, upload, vision_cls)
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
@@ -60,6 +59,10 @@ JOB_HANDLERS = {
     # time, and it belongs in the queue with everything else competing for
     # the same card.
     "evaluate": evaluate.run,
+    # The first trainer that reads pictures. Its imports are lazy, so a
+    # machine without an image library still starts and reports that it
+    # cannot take this kind of work rather than failing to import at all.
+    "finetune_vision_cls": vision_cls.run,
     # Merging is no longer a job: a fine-tune merges its own adapter as the
     # last step of the run that produced it, while the base is still in
     # memory. See runner/jobs/merge.py, now a library.

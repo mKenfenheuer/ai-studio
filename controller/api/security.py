@@ -47,6 +47,8 @@ RUNNER_TOKEN_PATHS = (
     "/download",
     # A sample a running job produced, into the asset store.
     "/sample",
+    # A stored file a running job trains on, out of it.
+    "/file",
     "/dataset-file",
     # Read by the deploy script on the host, which has the join token in the
     # same .env that starts the containers and has no browser session.

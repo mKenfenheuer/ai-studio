@@ -202,3 +202,25 @@ async def upload_from_runner(job_id: str, file: UploadFile = File(...),
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return _public(row)
+
+
+@router.get("/{asset_id}/file")
+async def get_asset_for_runner(asset_id: str,
+                               x_runner_token: str = Header(default="")) -> FileResponse:
+    """The bytes, for a machine about to train on them.
+
+    The runner's door: join-token authenticated, like the dataset file it
+    fetched a moment earlier. Ends in a fixed word because the token check
+    matches a path by its last segment.
+    """
+    if x_runner_token != config.join_token():
+        raise HTTPException(403, "Invalid runner token.")
+    asset = db.get_asset(asset_id)
+    if not asset:
+        raise HTTPException(404, "No such file.")
+    path = assets.path_for(asset["sha256"])
+    if not path.exists():
+        raise HTTPException(410, "The record of this file is here but its "
+                                 "contents are not.")
+    return FileResponse(path, media_type=asset["mime"],
+                        headers={**SAFE_HEADERS, "ETag": '"%s"' % asset["sha256"]})
