@@ -3,6 +3,7 @@ import { html, raw, esc, $, $$, on, fmtAgo, toast, modal, inlineRename } from ".
 import { conversationHtml, reasoningBlock, pretty } from "../conversation.js";
 import { ribbon, rb, group, rbSelect, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb } from "../components.js";
+import { openScoreDialog } from "../scoring.js";
 
 // Talking to what you trained.
 //
@@ -287,8 +288,15 @@ function chatView(mount, run, runs) {
       ]) + group("This model", [
         rb(null, "≡", "Training details", { href: `#/jobs/${esc(run.id)}` }),
         rb(null, "↓", "Download", { href: `/api/jobs/${esc(run.id)}/download` }),
-        rb(null, "◎", "Score it", { href: "#/evals",
-          title: "Put a saved set of prompts to it" }),
+        // It used to send you to Evaluate to find this model in a list. The
+        // question comes up here, three messages into discovering the model
+        // is not as good as you hoped, and it should be answerable here.
+        rb("scoreThis", "◎", "Score it",
+           { title: "Put a saved set of prompts to it, against its own base" }),
+        // The other thing to do with a model you have just been talking to:
+        // have it write the data for the next one.
+        rb(null, "✦", "Write data with it", { href: "#/generate",
+          title: "Have this model write a dataset" }),
       ]) + (others.length ? group("Switch to", [
         rbSelect("otherRun", {
           title: "Another finished run", value: "",
@@ -300,6 +308,7 @@ function chatView(mount, run, runs) {
   };
   paintRibbon();
   wireRibbon(mount, (key) => { tabs.set(key); paintRibbon(); });
+  on(mount, "click", "#scoreThis", () => openScoreDialog(run));
   on(mount, "change", "#otherRun", (_e, t) => {
     if (t.value) location.hash = `#/play/${t.value}`;
   });

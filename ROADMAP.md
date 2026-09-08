@@ -521,7 +521,6 @@ and two more measures:
   the page could have done.
 
 Remaining in this phase:
-- **Score it** in the playground as well as on the run page.
 - **Metrics**: schema conformance beyond "it parses"; tool-call correctness
   (name, arguments); LLM-as-judge using the hosted providers that already
   exist in `common/apimodels.py`; pass@k with `n>1` sampling for code sets
@@ -552,6 +551,9 @@ Remaining in this phase:
   row of the runner's real token counts, against the key, the run and the
   alias it was asked for; summed on the Served models page, kept 90 days.
   Still to do: expiry and scope on keys.
+- **Score it** and **Write data with it** now sit on the run page and in the
+  playground; the score dialog is one module, `web/js/scoring.js`, so the
+  baseline checkbox cannot exist in one copy of it and not the other.
 - **A studio with no GPU cannot score anything.** `can_run` refuses an
   evaluation on a CPU machine unless every model in it is hosted, so a
   baseline off the Hub -- a 135M model that scores three prompts in three
@@ -559,7 +561,7 @@ Remaining in this phase:
   an explicit "run it here anyway", but `_by_preference` sends kind-restricted
   machines the work first, so allowing it naively would send small scorings to
   the CPU on machines that do have a card.
-- "Write data with it" on every model that can be a generation source.
+
 
 ---
 

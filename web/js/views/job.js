@@ -3,6 +3,7 @@ import { html, raw, esc, $, $$, on, fmtNum, fmtBytes, fmtDuration, fmtAgo,
          statusBadge, toast, modal, skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
 import { shareButton, wireShareBox } from "./share.js";
+import { openScoreDialog } from "../scoring.js";
 import { publishCard, wirePublish } from "./publish.js";
 import { kindOf, subjectOf, stagesFor } from "../kinds.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
@@ -319,57 +320,9 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   // "Score it" had no home on this page at all: the question a finished run
   // raises is whether it is better than what you started with, and answering
   // it meant navigating to Evaluate and finding the run again in a list of
-  // every model in the studio.
-  on(mount, "click", "#scoreRun", async () => {
-    const job = getJob();
-    let sets = [];
-    try { sets = await api.evals(); }
-    catch (e) { return toast(e.message, "err"); }
-    if (!sets.length) {
-      toast("No prompt sets yet — write one first.", "", { href: "#/evals", label: "Prompt sets" });
-      return;
-    }
-    // The base it was trained from, offered in the same breath. "Is it better
-    // than what I started with" is the question this button raises, and until
-    // the baseline existed the answer took a second scoring, a second visit
-    // to Evaluate, and knowing that it was possible at all.
-    const base = !(job.config || {}).base_model_job
-      && (job.config || {}).base_model || "";
-    const dlg = modal({ title: `Score "${job.name}"`, width: 480, body: html`
-      <p class="muted tiny">Every model you put the same prompts to can be
-        compared. Pick the set to ask.</p>
-      <div class="field">
-        <label for="scoreSet">Prompt set</label>
-        <select id="scoreSet">${raw(sets.map((e) => html`
-          <option value="${e.id}">${e.name} · ${(e.items || []).length} prompts</option>`).join(""))}</select>
-      </div>
-      ${raw(base ? html`
-        <label class="check">
-          <input type="checkbox" id="scoreBase" checked>
-          <span>Score ${base} beside it
-            <span class="muted tiny">· the model this was trained from, asked
-              in the same format. Without it the result can only say which of
-              your own models won.</span></span>
-        </label>` : "")}
-      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
-        <button type="button" class="btn" data-modal-close>Cancel</button>
-        <button type="button" class="btn btn-primary" id="scoreGo">Score it</button>
-      </div>` });
-    on(dlg, "click", "#scoreGo", async (_e, btn) => {
-      btn.disabled = true;
-      const evalId = $("#scoreSet", dlg).value;
-      try {
-        const r = await api.runEval(evalId, {
-          model_job_ids: [job.id],
-          baselines: base && $("#scoreBase", dlg)?.checked
-            ? [{ source: "hub", model: base, like_run: job.id }] : [],
-        });
-        dlg.close();
-        toast("Scoring queued.", "ok",
-              r.job_id ? { href: `#/jobs/${r.job_id}`, label: "Watch it" } : null);
-      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
-    });
-  });
+  // every model in the studio. The dialog is shared with the playground,
+  // which raises the same question three messages into a conversation.
+  on(mount, "click", "#scoreRun", () => openScoreDialog(getJob()));
 
   on(mount, "click", "#serveAs", async () => {
     const job = getJob();
