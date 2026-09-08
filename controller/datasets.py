@@ -969,12 +969,16 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
             if v not in (None, "", [], {}):
                 fill[c] += 1
 
+    # Rendered once, here, and reused by everything below. Rendering is the
+    # expensive part on a conversation dataset -- a Jinja template over a
+    # nineteen-tool schema -- and this used to do it twice over every row.
+    texts = [(formatting.format_example(r, fmt) or "").strip() for r in rows]
+
     lengths: list[int] = []
     empty = 0
     seen: dict[str, int] = {}
     duplicates = 0
-    for r in rows:
-        text = (formatting.format_example(r, fmt) or "").strip()
+    for text in texts:
         if not text:
             empty += 1
             continue
@@ -1009,13 +1013,11 @@ def inspect(dataset: dict, sample: int = 2000) -> dict:
         # Called an estimate everywhere it is shown, because it is one.
         "est_tokens": int(sum(lengths) / 4) if lengths else 0,
         "histogram": _histogram(lengths),
-        "preview": [formatting.format_example(r, fmt) or "" for r in rows[:PREVIEW_ROWS]],
+        "preview": texts[:PREVIEW_ROWS],
         "format": fmt,
     }
 
-    # The rendered text of each row, once, for the checks that read it.
-    texts = [(formatting.format_example(r, fmt) or "") for r in rows]
-    nonblank = [t for t in texts if t.strip()]
+    nonblank = [t for t in texts if t]
     stats["column_types"] = _column_types(rows, columns)
     stats["near_duplicates"] = _near_duplicates(nonblank)
     stats["secrets"] = _secrets(nonblank)

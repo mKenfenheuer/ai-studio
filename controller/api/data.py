@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import (APIRouter, Body, File, HTTPException, Query, Request,
                      Response, UploadFile)
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from common import conversation, formatting
 
@@ -55,7 +56,7 @@ async def get_dataset(request: Request, dataset_id: str) -> dict:
 
 
 @router.get("/{dataset_id}/inspect")
-async def inspect_dataset(request: Request, dataset_id: str,
+def inspect_dataset(request: Request, dataset_id: str,
                           sample: int = 2000) -> dict:
     return ds.inspect(_get(request, dataset_id), min(int(sample), 20000))
 
@@ -67,7 +68,7 @@ SEARCH_SCAN = 50_000
 
 
 @router.get("/{dataset_id}/rows")
-async def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
+def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
                        limit: int = 25, q: str = "", split: str = "") -> dict:
     """A page of rows, rendered the way training will read them.
 
@@ -118,7 +119,7 @@ async def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
 
 
 @router.get("/{dataset_id}/conversations")
-async def dataset_conversations(request: Request, dataset_id: str,
+def dataset_conversations(request: Request, dataset_id: str,
                                 offset: int = 0, limit: int = 20,
                                 split: str = "") -> dict:
     """Rows as conversations, each cut where a model would have to take over.
@@ -174,7 +175,7 @@ async def dataset_conversations(request: Request, dataset_id: str,
 
 
 @router.get("/{dataset_id}/conversation-report")
-async def conversation_report(request: Request, dataset_id: str,
+def conversation_report(request: Request, dataset_id: str,
                               sample: int = 2000) -> dict:
     """Whether this dataset is usable as conversations, and what is wrong.
 
@@ -267,7 +268,11 @@ async def upload_dataset(request: Request,
                      "this size on the Hub and import it by name instead."
                      % (MAX_UPLOAD_BYTES // (1024 * 1024)))
         try:
-            rows += list(ds.rows_from_upload(
+            # Parsing a 256 MB CSV is seconds of pure Python. On the event loop
+            # that is seconds of the whole studio: nobody else's page loads,
+            # no runner heartbeat is read, no training metric is stored.
+            rows += list(await run_in_threadpool(
+                ds.rows_from_upload,
                 f.filename or "", blob, options,
                 source=f.filename if len(files) > 1 else None,
                 problems=failures))
@@ -284,7 +289,7 @@ async def upload_dataset(request: Request,
     if target:
         # Added to a dataset that already exists, which is what "here is the
         # test set for the data I uploaded yesterday" means.
-        created = ds.append_rows(target, rows, split)
+        created = await run_in_threadpool(ds.append_rows, target, rows, split)
         created["skipped"] = failures
         created["added"] = len(rows)
         return created
@@ -293,8 +298,9 @@ async def upload_dataset(request: Request,
         else (name or "%d uploaded files" % len(files))
     origin = files[0].filename if len(files) == 1 \
         else "%d files" % len(files)
-    created = ds.register(user["id"], label, "upload", iter(rows),
-                          split=split, origin=origin)
+    created = await run_in_threadpool(
+        ds.register, user["id"], label, "upload", iter(rows),
+        split=split, origin=origin)
     # Not an error and not silence: a folder where two files of ninety could
     # not be read is a successful import with something worth knowing in it.
     created["skipped"] = failures
@@ -346,7 +352,8 @@ async def import_dataset(request: Request, payload: dict = Body(...)) -> dict:
     if not rows:
         raise HTTPException(400, "That dataset returned no rows.")
 
-    created = ds.register(
+    created = await run_in_threadpool(
+        ds.register,
         user["id"], payload.get("name") or hub_id.split("/")[-1], "hub",
         iter(rows), origin=hub_id)
     # The note describes what arrived, not what was asked for. Those are the
@@ -385,7 +392,7 @@ async def rename_dataset(request: Request, dataset_id: str,
 
 
 @router.post("/{dataset_id}/transform")
-async def transform_dataset(request: Request, dataset_id: str,
+def transform_dataset(request: Request, dataset_id: str,
                             payload: dict = Body(...)) -> dict:
     d = _get(request, dataset_id)
     user = current_user(request)
@@ -397,7 +404,7 @@ async def transform_dataset(request: Request, dataset_id: str,
 
 
 @router.post("/{dataset_id}/transform/preview")
-async def preview_transform(request: Request, dataset_id: str,
+def preview_transform(request: Request, dataset_id: str,
                             payload: dict = Body(...)) -> dict:
     """What a transform would do, without doing it.
 
@@ -423,7 +430,7 @@ async def preview_transform(request: Request, dataset_id: str,
 
 
 @router.post("/{dataset_id}/rows/add")
-async def add_rows(request: Request, dataset_id: str,
+def add_rows(request: Request, dataset_id: str,
                    payload: dict = Body(...)) -> dict:
     """Write new rows by hand, into a named split.
 
@@ -462,7 +469,7 @@ async def add_rows(request: Request, dataset_id: str,
 
 
 @router.post("/{dataset_id}/rows/edit")
-async def edit_rows(request: Request, dataset_id: str,
+def edit_rows(request: Request, dataset_id: str,
                     payload: dict = Body(...)) -> dict:
     """Delete rows, move them to another split, or rewrite one.
 
@@ -480,7 +487,7 @@ async def edit_rows(request: Request, dataset_id: str,
 
 
 @router.post("/{dataset_id}/split")
-async def split_dataset(request: Request, dataset_id: str,
+def split_dataset(request: Request, dataset_id: str,
                         payload: dict = Body(...)) -> dict:
     """Hold part of a dataset back, as a validation split of one new dataset.
 
@@ -501,7 +508,7 @@ async def split_dataset(request: Request, dataset_id: str,
 
 
 @router.post("/merge")
-async def merge_datasets(request: Request, payload: dict = Body(...)) -> dict:
+def merge_datasets(request: Request, payload: dict = Body(...)) -> dict:
     user = current_user(request)
     ids = payload.get("datasets") or []
     if len(ids) < 2:
