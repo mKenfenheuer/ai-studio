@@ -37,6 +37,13 @@ def join_token() -> str:
     return tok
 
 
+# The address people actually type. Only needed behind a reverse proxy or a
+# tunnel, and only by single sign-on -- a provider matches the redirect URI it
+# was given character for character, and behind a proxy the URL the
+# application sees is the internal one, which matches nothing anybody
+# registered. Left unset, the forwarded headers are used, then the request.
+PUBLIC_URL: str | None = (os.environ.get("AI_STUDIO_PUBLIC_URL") or "").strip() or None
+
 # Optional Hugging Face token, forwarded to runners so they can pull gated
 # models (Llama, Gemma) and get better rate limits.
 HF_TOKEN: str | None = os.environ.get("HF_TOKEN") or None
@@ -44,7 +51,40 @@ HF_TOKEN: str | None = os.environ.get("HF_TOKEN") or None
 # A runner that has not sent a heartbeat within this window is shown as lost.
 HEARTBEAT_TIMEOUT_S: int = int(os.environ.get("AI_STUDIO_HEARTBEAT_TIMEOUT", "45"))
 
+# ...and how long it must stay silent before the work it was given is taken
+# off it and put back on the queue. Deliberately much longer than the window
+# above, because the two decisions are not the same size. Greying a machine out
+# in the UI is cosmetic and undoes itself the moment it speaks again; requeuing
+# is destructive, and on a fleet with a second free machine it starts the same
+# work twice.
+#
+# The gap has to cover a runner that is *doing the work asked of it* rather than
+# one that has gone. Merging a 7B on the same box that is training on the GPU
+# oversubscribes four cores, and an event loop that gets no time slice for
+# twenty seconds fails its websocket keepalive and reconnects -- repeatedly,
+# through a merge that takes fifteen minutes. Under the old window each of
+# those blips looked like a dead machine, and the log filled with a run being
+# requeued and re-assigned to the machine that had never stopped running it.
+ORPHAN_TIMEOUT_S: int = int(os.environ.get("AI_STUDIO_ORPHAN_TIMEOUT", "300"))
+
 WEB_DIR: Path = Path(__file__).resolve().parent.parent / "web"
+
+# The longest reply anybody may ask for, in tokens. A ceiling on what a caller
+# can request rather than a target: generation here is one forward pass per
+# token, so a long limit is a long wait, and the Stop button is what a reader
+# uses when they have seen enough. Memory is not the binding constraint -- the
+# key/value cache of a 7B costs about an eighth of a megabyte per token, so
+# even the whole of this is a fraction of what serving the weights already
+# takes.
+MAX_NEW_TOKENS: int = int(os.environ.get("AI_STUDIO_MAX_NEW_TOKENS") or 4096)
+
+# How long one reply may take before the runner stops and hands back what it
+# has. A runner serves one message at a time, so this bounds how long everybody
+# else is refused -- not how good the reply is. Kept under the API's own wait
+# below, so the runner gives up first and returns a real (if short) answer
+# rather than the caller timing out on a machine still working.
+GENERATION_DEADLINE_S: float = float(
+    os.environ.get("AI_STUDIO_GENERATION_DEADLINE_S") or 300)
 
 
 def ensure_dirs() -> None:

@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -23,18 +24,44 @@ from typing import Any
 import httpx
 import websockets
 
-from . import capabilities, inference
-from .jobs import lora_llm, scratch_llm
+from . import artifacts, capabilities, checkpoints, inference
+from .jobs import evaluate, generate_data, lora_llm, scratch_llm, upload
 
 HEARTBEAT_S = 15
 LIVENESS_FILE = os.environ.get("AI_STUDIO_LIVENESS", "/tmp/ai-studio-runner.alive")
 RECONNECT_MIN_S = 2
-RECONNECT_MAX_S = 30
+# Ten, not thirty. The backoff exists so a runner does not hammer a
+# controller that is gone; it is not a reason to stay dark for half a minute
+# after one that came back. A controller restart takes a few seconds, and the
+# old ceiling meant the studio showed "no machines are connected" for up to
+# thirty of them afterwards -- one connection attempt every ten seconds to a
+# machine on the same network costs nothing to weigh against that.
+RECONNECT_MAX_S = 10
 
 JOB_HANDLERS = {
     "finetune_llm": lora_llm.run,
     "pretrain_llm": scratch_llm.run,
+    # Writing a dataset with a model is a GPU job of hours that wants
+    # progress, logs and a stop button, so it is a job like the others rather
+    # than a script bolted to the side.
+    "generate_dataset": generate_data.run,
+    # Same reasoning: scoring ten models on fifty prompts is an hour of GPU
+    # time, and it belongs in the queue with everything else competing for
+    # the same card.
+    "evaluate": evaluate.run,
+    # Merging is no longer a job: a fine-tune merges its own adapter as the
+    # last step of the run that produced it, while the base is still in
+    # memory. See runner/jobs/merge.py, now a library.
+    # Sending a model to Hugging Face: no GPU, but twenty minutes of network
+    # and every bit as much in need of a progress bar and a stop button.
+    "upload": upload.run,
 }
+
+
+# How long a force stop waits for the job to end politely before ending the
+# whole process. Long enough for a run that is merely between steps to save and
+# exit; short enough that somebody who pressed "force" is not left watching.
+FORCE_GRACE_S = 20
 
 
 class JobContext:
@@ -46,20 +73,35 @@ class JobContext:
     """
 
     def __init__(self, job_id: str, outbox: queue.Queue, workdir: str,
-                 caps: dict, hf_token: str | None):
+                 caps: dict, hf_token: str | None,
+                 controller_url: str = "", runner_token: str = ""):
         self.job_id = job_id
         self.workdir = workdir
         self.capabilities = caps
         self.hf_token = hf_token
+        # A job that generates data has to load a finished model, which means
+        # fetching it from the controller exactly as the playground does.
+        self.controller_url = controller_url
+        self.runner_token = runner_token
         self._outbox = outbox
         self._cancel = threading.Event()
+        # Set alongside the cancel flag, never after it: a training loop that
+        # reads "should I stop" and "should I keep it" as two separate events
+        # can see the first before the second is written, and quietly throw
+        # away a model the user asked to keep. Written first, read second.
+        self._save_on_stop = False
         self._last_metric_step = -1
 
-    def cancel(self) -> None:
+    def cancel(self, save: bool = False) -> None:
+        self._save_on_stop = bool(save)
         self._cancel.set()
 
     def should_cancel(self) -> bool:
         return self._cancel.is_set()
+
+    def should_save(self) -> bool:
+        """Whether a stop was asked to keep the half-trained model."""
+        return self._save_on_stop
 
     def _put(self, msg: dict) -> None:
         msg["job_id"] = self.job_id
@@ -96,6 +138,7 @@ class Runner:
         # a run in progress rather than competing with it for memory.
         self.host: inference.ModelHost | None = None
         self.generating = False
+        self.generating_since = 0.0
 
     def _stable_id(self) -> str:
         """Reuse the same identity across restarts so the controller shows one
@@ -119,6 +162,9 @@ class Runner:
         return base + "/api/runner/ws"
 
     async def start(self) -> None:
+        if dropped := checkpoints.prune():
+            print("[runner] forgot %d checkpoint(s) nobody came back for: %s"
+                  % (len(dropped), ", ".join(dropped)))
         print("[runner] probing hardware, this takes a moment...")
         self.caps = await asyncio.get_event_loop().run_in_executor(None, capabilities.probe)
         print("[runner] %s | %s | %s" % (
@@ -137,18 +183,52 @@ class Runner:
                 print("[runner] disconnected (%s); retrying in %ss" % (type(e).__name__, backoff))
             except Exception as e:  # noqa: BLE001 - never let the agent die
                 print("[runner] unexpected error: %r; retrying in %ss" % (e, backoff))
+            # Also while reconnecting, not only while connected. The liveness
+            # file answers "is this process alive", and a runner between
+            # sockets is very much alive -- usually it is halfway through a
+            # merge, which is exactly why the socket dropped. Touched only in
+            # the heartbeat, the file went stale after two minutes of
+            # reconnecting and the container reported unhealthy for a machine
+            # doing the most useful work on the box.
+            self._touch_liveness()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, RECONNECT_MAX_S)
 
     async def _session(self) -> None:
+        # Ninety seconds to answer a ping, not twenty. A runner is not a web
+        # browser: it is the machine doing the work, and the work is a merge
+        # writing fourteen gigabytes or a training step that owns every core.
+        # When the box is oversubscribed -- one runner training on the GPU, one
+        # merging on the CPU, four cores between them -- this event loop can go
+        # twenty seconds without a time slice while nothing at all is wrong.
+        # The old timeout read that as a dead connection and reconnected, on
+        # both ends, every couple of minutes for the length of the job.
+        #
+        # A genuinely lost machine is still noticed: silence past that shows it
+        # offline, and the scheduler stops handing it work.
         async with websockets.connect(self.ws_url, max_size=8 * 1024 * 1024,
-                                      ping_interval=20, ping_timeout=20) as ws:
+                                      ping_interval=30, ping_timeout=90,
+                                      close_timeout=10) as ws:
             await ws.send(json.dumps({
                 "type": "register",
                 "token": self.token,
                 "runner_id": self.runner_id,
                 "name": self.name,
                 "capabilities": self.caps,
+                # Which interrupted runs this machine can carry on. Sent on
+                # every connect, because the controller has no other way to
+                # know: a checkpoint is a directory on this disk, and sending
+                # the work to a machine that does not have it means starting
+                # from noise.
+                "checkpoints": checkpoints.list_ids(),
+                # And what it is training right now, which on a fresh start is
+                # nothing. The controller needs this at connect time, not at
+                # the next heartbeat: a container that restarts and dials back
+                # in within the heartbeat deadline is never silent long enough
+                # to be noticed any other way, and its job would sit marked
+                # "running" on a machine that has forgotten it.
+                "busy": self.current is not None,
+                "job_id": self.current.job_id if self.current else None,
             }))
             first = json.loads(await ws.recv())
             if first.get("type") == "error":
@@ -171,7 +251,12 @@ class Runner:
                 self._start_job(msg["job"])
             elif kind == "job_cancel":
                 if self.current and self.current.job_id == msg.get("job_id"):
-                    self.current.cancel()
+                    self.current.cancel(save=bool(msg.get("save")))
+            elif kind == "job_kill":
+                # Off the socket thread: this blocks, and may end the process.
+                threading.Thread(target=self._force_kill,
+                                 args=(msg.get("job_id"),), daemon=True,
+                                 name="force-kill").start()
             elif kind == "reprobe":
                 self.caps = await asyncio.get_event_loop().run_in_executor(
                     None, capabilities.probe)
@@ -183,7 +268,20 @@ class Runner:
                     self.host.cancel()
             elif kind == "unload_model":
                 if self.host and not self.generating:
-                    self.host.unload()
+                    self.host.unload(msg.get("job_id"))
+            elif kind == "purge_model":
+                # The run was deleted. Drop the cached copy so the disk space
+                # actually comes back, and let go of it first if it happens to
+                # be the model currently loaded. Its checkpoint goes too --
+                # keeping the ability to resume a run that no longer exists
+                # would be several gigabytes held for nothing.
+                if gone := msg.get("job_id"):
+                    if self.host:
+                        self.host.unload(gone)
+                    inference.clear_cache(gone)
+                checkpoints.discard(msg.get("job_id") or "")
+            elif kind == "discard_checkpoint":
+                checkpoints.discard(msg.get("job_id") or "")
 
     async def _send_loop(self, ws) -> None:
         """Drain the training thread's outbox onto the socket.
@@ -205,22 +303,40 @@ class Runner:
             msg = await loop.run_in_executor(None, _next)
             if msg is None:
                 continue
-            await ws.send(json.dumps(msg))
+            try:
+                await ws.send(json.dumps(msg))
+            except Exception:
+                # The socket died with this message already off the queue.
+                # Without this it is simply gone -- which is how restarting
+                # the controller during a run punched a single-step hole in
+                # that run's loss curve, found by counting the rows rather
+                # than by anything going wrong at the time.
+                #
+                # Re-queued at the tail, so it can arrive after messages that
+                # were produced later. Harmless here: metrics are stored
+                # against their own step number, and log lines carry their own
+                # timestamp, so neither depends on arrival order.
+                self.outbox.put(msg)
+                raise
 
     async def _heartbeat(self, ws) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
-            if self.host and not self.generating:
-                # Release the GPU if nobody has spoken to the model in a while;
-                # otherwise a finished conversation would keep memory reserved
-                # against the next training run.
-                if self.host.maybe_unload_idle():
-                    print("[runner] unloaded idle model")
+            # What this machine is holding, so the controller can send a
+            # conversation to the runner that already has the model instead of
+            # to the one that happened to train it. `loaded` is on the card and
+            # answers immediately; `cached` is on disk and needs no network.
+            # Nothing is unloaded on a timer: a model stays until the card
+            # needs the room, because throwing it away is what made the
+            # playground slow.
             await ws.send(json.dumps({
                 "type": "heartbeat",
                 "busy": self.current is not None,
                 "job_id": self.current.job_id if self.current else None,
-                "serving": self.host.loaded_id if self.host else None,
+                "loaded": self.host.loaded_ids() if self.host else [],
+                "cached": artifacts.cached_ids(),
+                "disk": artifacts.usage(),
+                "checkpoints": checkpoints.list_ids(),
             }))
             self._touch_liveness()
 
@@ -243,15 +359,31 @@ class Runner:
     def _start_job(self, job: dict) -> None:
         if self.current is not None:
             self.outbox.put({"type": "job_rejected", "job_id": job["id"],
-                             "reason": "runner already busy"})
+                             "reason": "runner already busy",
+                             "current_job": self.current.job_id})
             return
+        if self.host and not self.generating:
+            # A model kept resident for the playground is holding VRAM the run
+            # about to start has been sized to use. Letting both sit on the
+            # card is how a plan that fitted becomes an out-of-memory crash
+            # two minutes in.
+            #
+            # Done whether or not one is resident: with nothing loaded this
+            # still collects and returns what an earlier run left behind, and
+            # the run about to start was sized against an empty card.
+            #
+            # Everything, not the least recently used one: a training run is
+            # the single case where the whole card is wanted, and it is the
+            # reason the playground is allowed to keep models otherwise.
+            self.host.unload_all()
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders
         # an unset HF_TOKEN as an empty string, and passing "" to huggingface_hub
         # builds the header "Bearer " and fails every download with
         # "Illegal header value". Absent must mean None, not "".
         token = (job.get("hf_token") or os.environ.get("HF_TOKEN") or "").strip() or None
-        ctx = JobContext(job["id"], self.outbox, workdir, self.caps, token)
+        ctx = JobContext(job["id"], self.outbox, workdir, self.caps, token,
+                         self.controller_url, self.token)
         self.current = ctx
         threading.Thread(target=self._run_job, args=(job, ctx, workdir),
                          daemon=True, name="job-%s" % job["id"]).start()
@@ -267,12 +399,19 @@ class Runner:
             })
             return
         if self.generating:
+            # How long, not just "busy". This machine answers one message at a
+            # time and a long reply takes minutes on it, so "still answering"
+            # without a number reads as a hang rather than as a queue.
+            waited = int(time.time() - (self.generating_since or time.time()))
             self.outbox.put({
                 "type": "generate_error", "request_id": rid,
-                "error": "Still answering the previous message.",
+                "error": "This machine is still writing the previous reply "
+                         "(%ds so far). It answers one message at a time; wait "
+                         "for it, or press Stop on that one." % waited,
             })
             return
         self.generating = True
+        self.generating_since = time.time()
         threading.Thread(target=self._generate, args=(msg,), daemon=True,
                          name="gen-%s" % rid).start()
 
@@ -285,36 +424,150 @@ class Runner:
             self.outbox.put({"type": "generate_status", "request_id": rid,
                              "status": line})
 
-        def on_token(delta: str) -> None:
+        def on_token(delta: str, channel: str = "content") -> None:
+            # Which half of the reply this belongs to, decided by the runner
+            # where the format is known. The browser shows a model's working
+            # in the reasoning panel from the first token rather than typing
+            # it into the answer and taking it back at the end.
             self.outbox.put({"type": "generate_delta", "request_id": rid,
-                             "delta": delta})
+                             "delta": delta, "channel": channel})
 
         try:
-            result = self.host.generate(spec, msg.get("prompt", ""),
+            messages = msg.get("messages")
+            if not messages:
+                messages = [{"role": "user", "content": msg.get("prompt", "")}]
+            result = self.host.generate(spec, messages,
                                         msg.get("params") or {}, on_token, log)
+            if result.get("off_template"):
+                # Not an error -- the answer is complete and was kept. But a
+                # model that closes its reasoning block twice learned to from
+                # somewhere, and that somewhere is its training data.
+                print("[runner] %s left its reasoning format and was cut short; "
+                      "check the dataset for reasoning fields containing their "
+                      "own </think> tags." % spec.get("job_id"), flush=True)
             self.outbox.put({"type": "generate_done", "request_id": rid, **result})
         except Exception as e:  # noqa: BLE001
+            # A chat is deliberately never written down, which until now meant
+            # a failed one left nothing at all behind: the reader got a
+            # sentence and everybody else got a 502 with no traceback, no
+            # sizes, and no way to tell an out-of-memory from a broken
+            # template. The reply still is not stored -- the *failure* is.
+            facts = {}
+            try:
+                facts = self.host.diagnostics() if self.host else {}
+            except Exception:  # noqa: BLE001 - never fail while failing
+                pass
+            trace = traceback.format_exc()
+            print("[runner] generation failed (%s): %s" % (
+                ", ".join("%s=%s" % kv for kv in sorted(facts.items())) or "-", e))
+            print(trace[-2000:], flush=True)
             self.outbox.put({"type": "generate_error", "request_id": rid,
-                             "error": _friendly_error(e)})
+                             "job_id": spec.get("job_id"),
+                             "error": _friendly_error(e, "serve"),
+                             "detail": ("%s: %s" % (type(e).__name__, e))[:400],
+                             "diagnostics": facts})
         finally:
             self.generating = False
+
+    def _force_kill(self, job_id: str) -> None:
+        """Stop a job that will not stop being asked.
+
+        Cancelling is cooperative: the trainer checks `should_cancel` between
+        steps, which is right, because a step that is allowed to finish leaves
+        a model worth keeping. It only works while steps finish. A run wedged
+        *inside* one -- a model too large for the card, spilling to host memory
+        with the allocator at 99% -- never reaches the check, so the button did
+        nothing and went on doing nothing, twice.
+
+        Python cannot kill a thread. The honest option is to end the process:
+        one job runs per runner, the container is restarted by the supervisor
+        within seconds, and everything it had in flight is lost. That is what
+        force means, and it is why it is a separate button.
+
+        The controller has already written the job off by the time this
+        arrives, so nothing here needs to report anything -- and nothing here
+        could, since the socket goes with the process.
+        """
+        ctx = self.current
+        if ctx and ctx.job_id == job_id:
+            # Ask nicely first and give it a moment. A run between steps stops
+            # on its own, keeps whatever it was told to keep, and the process
+            # survives -- which is much better than restarting it.
+            ctx.cancel(save=False)
+        deadline = time.time() + FORCE_GRACE_S
+        while time.time() < deadline:
+            if self.current is None or self.current.job_id != job_id:
+                print("[runner] force stop: the job ended on its own.", flush=True)
+                return
+            time.sleep(0.5)
+        print("[runner] force stop: job %s did not respond in %ds, so this "
+              "runner is restarting to end it. Anything in flight is lost."
+              % (job_id, FORCE_GRACE_S), flush=True)
+        # Flushed, then straight out. sys.exit only raises in this thread, and
+        # this thread is not the one that is stuck.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(9)
 
     def _run_job(self, job: dict, ctx: JobContext, workdir: str) -> None:
         jid = job["id"]
         try:
-            self.outbox.put({"type": "job_started", "job_id": jid})
+            # The step this attempt begins at travels with the "started"
+            # message, before any of the heavy machinery is imported. The
+            # controller uses it to decide whether the measurements already on
+            # the chart describe this run or an abandoned one, and it has to
+            # know that before the first new metric arrives.
+            state = checkpoints.peek(jid) or {}
+            self.outbox.put({"type": "job_started", "job_id": jid,
+                             "resume_step": int(state.get("step") or 0)})
             handler = JOB_HANDLERS.get(job["kind"])
             if handler is None:
                 raise ValueError("this runner cannot handle job type %r" % job["kind"])
             result = handler(job["config"], ctx)
 
+            # One run can leave two things now: a fine-tune keeps the merged
+            # model *and* the adapter it was merged from. The merged model
+            # travels under no kind at all -- it is the primary artifact, the
+            # one every existing reader on the controller already expects.
+            paths = result.pop("artifact_paths", None) or {}
             if path := result.pop("artifact_path", None):
-                ctx.log("Uploading result to the controller...")
-                self._upload(jid, path)
-            self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
+                paths.setdefault("model", path)
+            for artifact_kind, path in paths.items():
+                if not path:
+                    continue
+                ctx.log("Uploading %s to the controller..."
+                        % ("result" if artifact_kind == "model" else artifact_kind))
+                self._upload(jid, path, kind=artifact_kind)
+            # A run that was stopped and saved returns normally and has a real
+            # model behind it, but it is not a run that finished. Reporting it
+            # as "succeeded" would put a half-trained model beside fully
+            # trained ones with nothing to tell them apart, so it keeps the
+            # stopped status and carries its summary with it.
+            # The result is uploaded and the run is over, so the safety net
+            # is now the largest thing on this disk with no purpose.
+            checkpoints.discard(jid)
+            if result.get("stopped_early"):
+                self.outbox.put({"type": "job_cancelled", "job_id": jid,
+                                 "summary": result, "saved": True})
+            else:
+                self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
         except lora_llm.Cancelled:
-            self.outbox.put({"type": "job_cancelled", "job_id": jid})
+            checkpoints.discard(jid)
+            self.outbox.put({"type": "job_cancelled", "job_id": jid, "saved": False})
         except Exception as e:  # noqa: BLE001
+            # Deliberately kept. A failure is the case a checkpoint is most
+            # worth having: an out-of-memory crash six hours in, a disk that
+            # filled, a library that raised on one bad batch. Throwing the
+            # checkpoint away here would make the one recoverable failure mode
+            # unrecoverable.
+            state = checkpoints.peek(jid)
+            if state:
+                self.outbox.put({
+                    "type": "job_log", "job_id": jid, "level": "warn",
+                    "line": "There is a checkpoint from step %d on this "
+                            "machine. Fix what went wrong and start the run "
+                            "again to carry on from there rather than from "
+                            "the beginning." % int(state.get("step") or 0)})
             self.outbox.put({
                 "type": "job_failed", "job_id": jid,
                 "error": _friendly_error(e, job.get("kind")),
@@ -323,12 +576,40 @@ class Runner:
         finally:
             self.current = None
             shutil.rmtree(workdir, ignore_errors=True)
+            # Give the card back before anything else asks for it. A finished
+            # run's model is unreachable but not yet collected, and until it is
+            # the allocator holds every block it was using -- which is how the
+            # playground came to run out of memory on a machine that was doing
+            # nothing at all.
+            if self.host:
+                self.host.unload_all()
 
-    def _upload(self, job_id: str, path: str) -> None:
+    def _upload(self, job_id: str, path: str, kind: str = "model") -> None:
+        """Send the finished thing to the controller.
+
+        Two things here are deliberate, and both are scars.
+
+        A raw PUT rather than a multipart POST, because multipart makes the
+        controller buffer the whole body to a temp file before it can write it
+        anywhere -- see put_artifact. And a read timeout of hours rather than
+        ten minutes, because the deadline has to cover the far end writing
+        fourteen gigabytes to disk before it can answer, on a machine that is
+        also busy. When that took longer than ten minutes the upload was
+        abandoned and the run was marked failed, having produced a perfectly
+        good model that was then deleted with the working directory.
+        """
         url = "%s/api/jobs/%s/artifact" % (self.controller_url, job_id)
+        # No parameter for the primary artifact, so an older controller -- one
+        # that has never heard of a second one -- still stores the model.
+        params = None if kind in (None, "", "model") else {"kind": kind}
+        timeout = httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=7200.0)
         with open(path, "rb") as fh:
-            r = httpx.post(url, files={"file": (Path(path).name, fh, "application/zip")},
-                           headers={"X-Runner-Token": self.token}, timeout=600)
+            # httpx reads the handle in 64 KB chunks and sets Content-Length
+            # itself from the file's size, so this streams rather than loading
+            # the model into memory to send it.
+            r = httpx.put(url, content=fh, params=params, timeout=timeout,
+                          headers={"X-Runner-Token": self.token,
+                                   "Content-Type": "application/zip"})
             r.raise_for_status()
 
 
@@ -336,7 +617,19 @@ def _friendly_error(e: Exception, kind: str | None = None) -> str:
     """Translate the errors beginners actually hit into plain language."""
     text = str(e)
     low = text.lower()
+    # Something closer to the failure has already said this better than the
+    # rules below can -- it knows what was tried. See inference.OutOfRoom.
+    if getattr(e, "already_explained", False):
+        return text
     if "out of memory" in low or "hip out of memory" in low:
+        if kind == "serve":
+            # Nothing this person can change is on the training screen. What
+            # they *can* do is ask for less at once.
+            return ("The GPU ran out of memory while the model was answering. "
+                    "The conversation's history is held on the card as it "
+                    "runs, so a long exchange costs more than a short one: "
+                    "start a new conversation, or lower the length limit in "
+                    "the generation settings.")
         if kind == "pretrain_llm":
             return ("The GPU ran out of memory. Training every parameter needs "
                     "far more memory than fine-tuning does. Choose a smaller "

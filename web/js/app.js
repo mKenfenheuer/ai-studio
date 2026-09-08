@@ -1,5 +1,7 @@
-import { api, events } from "./api.js";
-import { $, $$, toast } from "./util.js";
+import { api, events, handleUnauthorized, NotSignedIn } from "./api.js";
+import { $, $$, toast, takeSsoError, skeleton, resetDelegated, modal, esc } from "./util.js";
+import { initGate, showGate, hideGate } from "./views/gate.js";
+import { openSearch, wireSearchKey } from "./search.js";
 
 import { dashboardView } from "./views/dashboard.js";
 import { wizardView } from "./views/wizard.js";
@@ -8,36 +10,104 @@ import { jobView } from "./views/job.js";
 import { playView } from "./views/play.js";
 import { runnersView } from "./views/runners.js";
 import { settingsView } from "./views/settings.js";
+import { accountView } from "./views/account.js";
+import { usersView } from "./views/users.js";
+import { ssoView } from "./views/sso.js";
+import { dataView } from "./views/data.js";
+import { datasetView } from "./views/dataset.js";
+import { generateView } from "./views/generate.js";
+import { rerunView } from "./views/rerun.js";
+import { evalsView } from "./views/evals.js";
+import { evalView } from "./views/evalview.js";
+import { compareView } from "./views/compare.js";
+import { sweepView } from "./views/sweep.js";
 
 const routes = [
   [/^\/$/,             dashboardView, "dashboard"],
   [/^\/new$/,          wizardView,    "new"],
   [/^\/jobs$/,         jobsView,      "jobs"],
+  // Before the catch-all below, which would otherwise swallow it and open the
+  // run's own page with "<id>/again" as the id.
+  [/^\/jobs\/([\w-]+)\/again$/, rerunView, "jobs"],
   [/^\/jobs\/(.+)$/,   jobView,       "jobs"],
   [/^\/play$/,         playView,      "play"],
   [/^\/play\/(.+)$/,   playView,      "play"],
   [/^\/runners$/,      runnersView,   "runners"],
   [/^\/settings$/,     settingsView,  "settings"],
+  [/^\/account$/,      accountView,   "account"],
+  [/^\/users$/,        usersView,     "settings"],
+  [/^\/sso$/,          ssoView,       "settings"],
+  [/^\/data$/,         dataView,      "data"],
+  [/^\/data\/(.+)$/,   datasetView,   "data"],
+  [/^\/generate$/,     generateView,  "data"],
+  // The same page, opened on an earlier run's settings.
+  [/^\/generate\/from\/([\w-]+)$/, generateView, "data"],
+  [/^\/evals$/,        evalsView,     "evals"],
+  [/^\/evals\/(.+)$/,  evalView,      "evals"],
+  [/^\/compare$/,      compareView,   "evals"],
+  [/^\/sweeps\/(.+)$/, sweepView,     "jobs"],
 ];
+
+// Who is signed in. Views read it rather than each fetching /api/me.
+export const session = { user: null };
 
 let teardown = null;
 
+// Which render is the current one. Views are async -- most fetch something
+// before they draw -- so two can be in flight at once when a route changes
+// while the first is still loading. Unguarded, whichever finishes LAST wins,
+// which is often the one you navigated away from, and its teardown is never
+// called so its event subscription keeps redrawing the page you did navigate
+// to. Both were real: the wizard would intermittently come up as the previous
+// page, more often the slower the machine.
+let renderSeq = 0;
+
 async function render() {
+  const mine = ++renderSeq;
   const path = (location.hash.slice(1) || "/").split("?")[0];
   const main = $("#main");
 
   if (typeof teardown === "function") { try { teardown(); } catch { /* ignore */ } }
   teardown = null;
+  // Delegated listeners live on #main, which every route shares. They are kept
+  // one-per-selector and re-pointed at each redraw, which is right within a
+  // page and wrong between two: a control the next page draws would otherwise
+  // run the previous page's handler, closed over the previous page's state.
+  // Cleared here so that can never happen again -- see resetDelegated.
+  resetDelegated(main);
 
   for (const [re, view, nav] of routes) {
     const m = path.match(re);
     if (!m) continue;
-    $$(".nav a").forEach((a) =>
-      a.classList.toggle("active", a.dataset.nav === nav));
-    main.innerHTML = `<div class="loading">Loading…</div>`;
+    $$(".nav a, #whoami, #whoamiMobile").forEach((a) => {
+      const on = a.dataset.nav === nav;
+      a.classList.toggle("active", on);
+      // Class alone says nothing to a screen reader, which is how a nav with
+      // a highlighted item reads as a nav with no current page at all.
+      if (on) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
+    });
+    // The tab bar shows five; the rest are behind More, which highlights when
+    // the page you are on is one of them.
+    const spilled = $$(".nav-spill").some((a) => a.dataset.nav === nav);
+    $("#navMore")?.classList.toggle("active", spilled);
+    // Shaped like the page that is coming rather than a word in the corner,
+    // so the layout settles once instead of twice.
+    main.innerHTML = skeleton({ cards: 3, rows: 2 });
     try {
-      teardown = await view(main, m.slice(1));
+      const stop = await view(main, m.slice(1));
+      if (mine !== renderSeq) {
+        // Somebody navigated while this was loading. Whatever it built is
+        // already off screen; unsubscribe it rather than leaving it running.
+        if (typeof stop === "function") { try { stop(); } catch { /* gone */ } }
+        return;
+      }
+      teardown = stop;
     } catch (err) {
+      if (mine !== renderSeq) return;
+      // A session that expired mid-render is not an error to display; the
+      // gate is already going up in front of it.
+      if (err instanceof NotSignedIn) return;
       console.error(err);
       main.innerHTML =
         `<div class="callout callout-err"><strong>Something went wrong</strong>${
@@ -61,12 +131,20 @@ function setFleet(dotClass, text) {
 async function refreshFleet() {
   try {
     const s = await api.status();
-    if (s.runners_online === 0) {
+    if (s.runners_online === 0 && s.runners_total > 0) {
+      // Known machines, none answering. Almost always a restart in progress,
+      // and "no machines connected" reads as "you have not set one up" --
+      // which sends people off to fix something that is not broken.
+      setFleet("dot-idle", "Reconnecting\u2026");
+    } else if (s.runners_online === 0) {
       setFleet("dot-err", "No machines connected");
     } else {
       setFleet(s.jobs_running ? "dot-busy" : "dot-ok",
         `${s.runners_online} machine${s.runners_online > 1 ? "s" : ""}` +
-        (s.jobs_running ? ` · ${s.jobs_running} training` : " ready"));
+        // "training" was wrong for four of the six kinds of run: a machine
+        // writing a dataset, scoring one, merging, or uploading to the Hub is
+        // busy, and is not training.
+        (s.jobs_running ? ` · ${s.jobs_running} running` : " ready"));
     }
   } catch {
     setFleet("dot-err", "Controller unreachable");
@@ -75,6 +153,56 @@ async function refreshFleet() {
 
 events.subscribe((msg) => {
   if (["runners_changed", "jobs_changed", "_connected"].includes(msg.type)) refreshFleet();
+  if (msg.type === "job_finished") announce(msg);
+});
+
+// ---- "your run has finished" --------------------------------------------
+// Only when this tab is not the one being looked at. A notification for
+// something already visible on screen is noise, and the surest way to get
+// somebody to turn notifications off is to send them one they did not need.
+function announce(msg) {
+  const finished = msg.status === "succeeded";
+  const s = msg.summary || {};
+  const detail = msg.status === "failed"
+    ? String(msg.error || "It failed.").slice(0, 140)
+    : [s.best_val_loss != null ? `held-out loss ${s.best_val_loss.toFixed(4)}` : null,
+       s.steps ? `${s.steps.toLocaleString()} steps` : null,
+       s.early_stopped ? "stopped early, at its best point" : null,
+      ].filter(Boolean).join(" · ");
+
+  toast(`${msg.name}: ${finished ? "finished" : msg.status}`,
+        msg.status === "failed" ? "err" : "ok");
+
+  if (document.visibilityState === "visible") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(
+      `${finished ? "✓" : msg.status === "failed" ? "✕" : "■"} ${msg.name}`,
+      { body: detail || `The run ${msg.status}.`, tag: msg.job_id });
+    n.onclick = () => {
+      window.focus();
+      location.hash = `#/jobs/${msg.job_id}`;
+      n.close();
+    };
+  } catch { /* the browser may refuse; the toast already happened */ }
+}
+
+// ---- find anything ------------------------------------------------------
+$$("#omniOpen, #omniOpenMobile").forEach((b) =>
+  b.addEventListener("click", () => openSearch()));
+wireSearchKey();
+
+// ---- the tab bar's overflow ---------------------------------------------
+// Eight nav items, or nine for an administrator, on a 390px screen is 43px
+// per tab against the 44px floor the layout was written to hold. Five stay;
+// the rest are one press away.
+$("#navMore")?.addEventListener("click", () => {
+  const links = $$(".nav-spill").map((a) => `
+    <a class="more-link" href="${a.getAttribute("href")}">
+      <span class="ico">${a.querySelector(".ico").textContent}</span>
+      <span>${esc(a.querySelector(".lbl").textContent)}</span></a>`).join("");
+  const dlg = modal({ title: "More", width: 360, body: `<div class="more-sheet">${links}</div>` });
+  dlg.addEventListener("click", (e) => { if (e.target.closest(".more-link")) dlg.close(); });
 });
 
 // ---- help drawer --------------------------------------------------------
@@ -91,6 +219,95 @@ document.addEventListener("keydown", (e) => {
 window.addEventListener("hashchange", render);
 window.addEventListener("error", (e) => toast(e.message, "err"));
 
-refreshFleet();
-setInterval(refreshFleet, 20000);
-render();
+// ---- appearance ---------------------------------------------------------
+// The stylesheet has always had the hook -- every dark rule is written as
+// `:root:not([data-theme="light"])`, and `[data-theme="dark"]` overrides in
+// the other direction -- and nothing ever set the attribute, so the escape
+// hatch existed and could not be reached. A studio is a thing people leave
+// open all day; which end of the day it is, is theirs to say.
+export function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "light" || mode === "dark") root.dataset.theme = mode;
+  else delete root.dataset.theme;
+  try {
+    if (mode === "system") localStorage.removeItem("aistudio.theme");
+    else localStorage.setItem("aistudio.theme", mode);
+  } catch { /* private browsing; it lasts for this page either way */ }
+}
+export const currentTheme = () => {
+  try { return localStorage.getItem("aistudio.theme") || "system"; }
+  catch { return "system"; }
+};
+applyTheme(currentTheme());
+
+// ---- identity -----------------------------------------------------------
+
+function paintWho(user) {
+  const box = $("#whoami");
+  if (!box) return;
+  box.hidden = !user;
+  if (!user) return;
+  $("#whoName").textContent = user.display_name || user.username;
+  $("#whoRole").textContent = user.role === "admin" ? "administrator" : "member";
+  const initial = (user.display_name || user.username || "?").trim()[0].toUpperCase();
+  $("#whoAvatar").textContent = initial;
+  // The same link on the phone's top bar, where the sidebar foot is hidden
+  // and this was the only way to the page that holds every credential.
+  const mobile = $("#whoamiMobile");
+  if (mobile) { mobile.textContent = initial; mobile.hidden = false; }
+  // The user administration link only exists for people who can use it.
+  const nav = $(".nav");
+  const existing = $("#navUsers");
+  if (user.role === "admin" && !existing) {
+    const a = document.createElement("a");
+    a.id = "navUsers";
+    a.href = "#/users";
+    a.dataset.nav = "settings";
+    a.innerHTML = `<span class="ico">◍</span><span class="lbl">People</span>`;
+    nav.appendChild(a);
+  } else if (user.role !== "admin" && existing) {
+    existing.remove();
+  }
+}
+
+let fleetTimer = null;
+
+async function start() {
+  let state;
+  try {
+    state = await api.authState();
+  } catch {
+    setFleet("dot-err", "Controller unreachable");
+    return;
+  }
+  if (!state.authenticated || state.setup_required || state.must_change) {
+    clearInterval(fleetTimer);
+    events.stop?.();
+    showGate(state);
+    return;
+  }
+  hideGate();
+  // A sign-in that failed while a session was already open has no login
+  // screen to be shown on, and used to vanish silently -- the browser landed
+  // on the dashboard as if nothing had been attempted. It is the same message
+  // either way; only where it goes differs.
+  const ssoError = takeSsoError();
+  if (ssoError) toast(ssoError, "err");
+  session.user = state.user;
+  paintWho(state.user);
+  events.start?.();
+  refreshFleet();
+  clearInterval(fleetTimer);
+  fleetTimer = setInterval(refreshFleet, 20000);
+  await render();
+}
+
+initGate(start);
+// Any 401 from anywhere puts the gate back, whichever view was on screen.
+handleUnauthorized((body) => {
+  session.user = null;
+  showGate({ authenticated: false, setup_required: !!body.setup_required,
+             must_change: !!body.must_change });
+});
+
+start();

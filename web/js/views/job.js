@@ -1,24 +1,47 @@
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtNum, fmtDuration, statusBadge, toast } from "../util.js";
+import { html, raw, esc, $, $$, on, fmtNum, fmtDuration, fmtAgo, statusBadge,
+         toast, modal, skeletonValue, inlineRename } from "../util.js";
 import { LineChart } from "../chart.js";
-
-const STAGES = {
-  loading_model: "Downloading and loading the model…",
-  loading_dataset: "Downloading and preparing your data…",
-  training_tokenizer: "Building a vocabulary from your text…",
-  tokenizing: "Reading and tokenizing the text…",
-  building_model: "Creating the model from random weights…",
-  training: "Training",
-  saving: "Saving the result…",
-};
+import { shareButton, wireShareBox } from "./share.js";
+import { publishCard, wirePublish } from "./publish.js";
+import { kindOf, subjectOf, stagesFor } from "../kinds.js";
+import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
+import { breadcrumb, confirmDestructive } from "../components.js";
 
 export async function jobView(mount, [jobId]) {
   let job = await api.job(jobId);
   const metrics = await api.jobMetrics(jobId);
   const logs = await api.jobLogs(jobId);
   const scratch = job.kind === "pretrain_llm";
+  const experts = +(job.config.arch?.num_local_experts || 0);
 
-  mount.innerHTML = layout(job, scratch);
+  // Only two of the six kinds of run are training, and the other four were all
+  // being drawn through the training layout: an empty "this should go down"
+  // loss chart, a learning rate that does not exist, and three paragraphs of
+  // advice about what to do when the loss jumps -- above a run that was
+  // writing rows with a hosted model, or sending files to Hugging Face, or
+  // adding two tensors together. Each kind gets the page its own work needs.
+  const OWN_PAGE = {
+    // Writing a dataset has no loss and no held-out set. It has rows, and how
+    // many of them were worth keeping.
+    generate_dataset: [writingLayout, (m, j) => writingView(m, j, jobId, metrics, logs)],
+    // An upload has a destination and a byte count, and produces nothing here
+    // at all -- what it produces is on the Hub.
+    upload: [uploadLayout, (m, j) => uploadView(m, j, jobId, logs)],
+    // A merge has no steps to plot. It has an adapter, a base, and a complete
+    // model at the end of it, which is the thing most worth publishing in the
+    // studio and had nowhere to be published from.
+    merge_adapter: [mergeLayout, (m, j) => mergeView(m, j, jobId, logs)],
+    // A scoring run's result is the comparison, not a curve.
+    evaluate: [evalLayout, (m, j) => evalView(m, j, jobId, logs)],
+  };
+  if (OWN_PAGE[job.kind]) {
+    const [layoutFor, view] = OWN_PAGE[job.kind];
+    mount.innerHTML = layoutFor(job);
+    return view(mount, job);
+  }
+
+  mount.innerHTML = layout(job, scratch, experts);
 
   // Held-out loss shares the loss chart because it is the same measurement on
   // different data. That is the only case where a second series belongs on one
@@ -41,6 +64,17 @@ export async function jobView(mount, [jobId]) {
     format: (v) => v.toExponential(1),
   });
 
+  // Only built for a mixture of experts, because for anything else it would
+  // be a chart of a constant.
+  const expertChart = experts > 1 ? new LineChart($("#expertChart", mount), {
+    title: "Busiest expert's share of the tokens",
+    height: 150,
+    color: "var(--warn)",
+    format: (v) => (v * 100).toFixed(0) + "%",
+  }) : null;
+  expertChart?.setData(metrics.filter((m) => m.expert_balance != null)
+    .map((m) => ({ x: m.step, y: m.expert_balance })));
+
   lossChart.setSeries("train",
     metrics.filter((m) => m.loss != null).map((m) => ({ x: m.step, y: m.loss })));
   lossChart.setSeries("val",
@@ -56,11 +90,27 @@ export async function jobView(mount, [jobId]) {
   logs.forEach((l) => appendLog(logBox, l));
   logBox.scrollTop = logBox.scrollHeight;
 
+  // The last step a checkpoint exists for. Shown live rather than only on
+  // reload, because the question it answers -- "how much would I lose if this
+  // machine restarted right now" -- is only interesting while it is running.
+  let checkpointStep = job.checkpoint_step || 0;
   let latest = metrics[metrics.length - 1] || {};
+  // Held-out loss is measured every `eval_every` steps, not every step, so
+  // the newest metric row almost never carries one -- 96 rows in 97 on a
+  // typical run. Reading it off `latest` therefore showed a dash almost
+  // always, and once dashes started shimmering it pulsed forever, promising
+  // a number that was hours away. It is a fact that stays true until the next
+  // evaluation replaces it, so it is kept rather than re-read.
+  let lastEval = [...metrics].reverse().find((m) => m.val_loss != null) || null;
   // The stage the runner last reported. paintStats runs on every metric and
   // must not claim "training" while the tokenizer is still being built.
   let stage = job.status === "running" ? "" : "training";
-  paintStats(mount, job, latest, scratch, stage);
+  const getTab = wireRunTabs(mount, job, () => stats());
+  const stats = () => {
+    paintHeader(mount, job, getTab());
+    paintStats(mount, job, latest, scratch, stage, checkpointStep, lastEval);
+  };
+  stats();
 
   const unsub = events.subscribe(async (msg) => {
     if (msg.job_id && msg.job_id !== jobId) return;
@@ -69,10 +119,15 @@ export async function jobView(mount, [jobId]) {
       if (msg.data.sample_text) return;   // samples arrive as job_sample
       latest = { step: msg.step, ...msg.data };
       if (msg.data.loss != null) lossChart.pushSeries("train", { x: msg.step, y: msg.data.loss });
-      if (msg.data.val_loss != null) lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
+      if (msg.data.val_loss != null) {
+        lossChart.pushSeries("val", { x: msg.step, y: msg.data.val_loss });
+        lastEval = { step: msg.step, val_loss: msg.data.val_loss };
+      }
       if (msg.data.learning_rate != null)
         lrChart.push({ x: msg.step, y: msg.data.learning_rate });
-      paintStats(mount, job, latest, scratch, stage);
+      if (msg.data.expert_balance != null)
+        expertChart?.push({ x: msg.step, y: msg.data.expert_balance });
+      stats();
     } else if (msg.type === "job_sample") {
       samples.push({ step: msg.step, text: msg.text, prompt: msg.prompt });
       paintSamples(mount, samples);
@@ -80,54 +135,891 @@ export async function jobView(mount, [jobId]) {
       const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
       appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
       if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_checkpoint") {
+      checkpointStep = msg.step;
+      paintProgress(mount, job, stage, null, null, checkpointStep);
     } else if (msg.type === "job_progress") {
       stage = msg.stage;
       if (stage === "training") { job.step = msg.step; job.total_steps = msg.total; }
       paintProgress(mount, job, stage, msg.step, msg.total);
     } else if (msg.type === "jobs_changed") {
       job = await api.job(jobId);
-      paintHeader(mount, job);
-      paintStats(mount, job, latest, scratch, stage);
+      paintHeader(mount, job, getTab());
+      stats();
+      // A run that just finished has a model to build on, and one that just
+      // failed has a checkpoint to carry on from. Both change this panel.
+      paintFurther();
+      paintReport();
+      // And a run that just finished has a card, written from numbers that
+      // did not exist a second ago.
+      paintCard();
     }
   });
 
-  // Delegated, not bound directly: paintHeader() replaces the button element
-  // every time a metric arrives, which would silently discard a direct listener.
-  on(mount, "click", "#cancelBtn", async () => {
-    if (!confirm("Stop this training run? Progress so far will be lost.")) return;
-    try { await api.cancelJob(jobId); toast("Stopping…"); }
-    catch (e) { toast(e.message, "err"); }
+  const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
+    job = await api.job(jobId);
+    paintHeader(mount, job, getTab());
+  });
+  paintOwnerRow();
+
+  // Datasets are only needed by the "train this further" panel, which most
+  // visits never open, so the list is fetched after the page is on screen.
+  // The report only exists once a run has ended; asking for it while it is
+  // still training would be diagnosing a curve that has not finished.
+  const paintReport = async () => {
+    const box = $("#reportCard", mount);
+    if (!box) return;
+    if (!["succeeded", "failed", "cancelled"].includes(job.status)) {
+      box.innerHTML = "";
+      return;
+    }
+    try { box.innerHTML = reportCard(await api.jobReport(jobId)); }
+    catch { box.innerHTML = ""; }
+  };
+  paintReport();
+
+  const paintCard = wireModelCard(mount, jobId, () => job);
+  paintCard();
+
+  let datasets = [];
+  const paintFurther = () => {
+    const box = $("#furtherRow", mount);
+    if (box) box.innerHTML = artifactsCard(job) + furtherCard(job, datasets);
+  };
+  paintFurther();
+  if (job.artifacts?.length) {
+    api.datasets().then((d) => { datasets = d; paintFurther(); }).catch(() => {});
+  }
+
+  on(mount, "click", "#resumeBtn", async (_e, t) => {
+    t.disabled = true;
+    t.textContent = "Queueing…";
+    try {
+      const r = await api.resumeJob(jobId);
+      toast(`Carrying on from step ${r.from_step}.`, "ok");
+      job = await api.job(jobId);
+      stats();
+    } catch (e) { toast(e.message, "err"); t.disabled = false; }
   });
 
-  return () => { unsub(); lossChart.destroy(); lrChart.destroy(); };
+  on(mount, "submit", "#furtherForm", async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target).entries());
+    const btn = $("#furtherGo", mount);
+    btn.disabled = true;
+    btn.textContent = "Creating…";
+    try {
+      const { id } = await api.createJob(furtherJob(job, f));
+      toast("Queued.", "ok");
+      location.hash = `#/jobs/${id}`;
+    } catch (ex) {
+      toast(ex.message, "err");
+      btn.disabled = false;
+      btn.textContent = "Start the follow-on run";
+    }
+  });
+
+  wireRunControls(mount, jobId, () => job, () => latest, () => stage);
+
+  return () => {
+    unsub(); lossChart.destroy(); lrChart.destroy(); expertChart?.destroy();
+  };
 }
 
 // ---------------------------------------------------------------------------
 
-function layout(job, scratch) {
-  const subtitle = scratch
-    ? `from scratch · ${job.config.dataset}`
-    : `${job.config.base_model} → ${job.config.dataset}`;
-  return html`
-    <div class="page-head">
-      <a href="#/jobs" class="tiny">← All runs</a>
-      <div class="row-between" style="flex-wrap:wrap;gap:8px;margin-top:6px">
-        <h1 style="margin:0">${job.name}</h1>
-        <div class="row" id="headerActions"></div>
-      </div>
-      <p class="sub mono tiny" style="margin-top:4px">${subtitle}</p>
-    </div>
+/** Stop and Delete, wired once for every kind of run.
+ *
+ *  These were registered inside the training path, and the generation branch
+ *  returns before reaching it. Delegated listeners are kept one-per-selector
+ *  on the shared mount, so the buttons a generation run drew went on running
+ *  the handler from whichever training run had been open last -- stopping that
+ *  one instead, and leaving the generation run with no way to stop at all.
+ *
+ *  The state is read through getters rather than captured, because both
+ *  callers redraw on every metric and a captured `job` would go stale within
+ *  seconds of the page opening.
+ */
+/** The ribbon's tabs, wired to whatever the page repaints with.
+ *
+ *  Remembered per kind of run rather than per run: which tab you want on a
+ *  training run is a habit, and it is a different habit from the one you want
+ *  on a scoring run. */
+function wireRunTabs(mount, job, repaint) {
+  const tabs = tabState(`run.${kindOf(job).page}`, RUN_TABS(job), "home");
+  let tab = tabs.get();
+  wireRibbon(mount, (key) => { tab = key; tabs.set(key); repaint(); });
+  return () => tab;
+}
 
-    <div id="errorCard"></div>
+function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
+  // A run is named when it is created, from the model and the dataset -- a
+  // decent guess and a poor label once there are six of them. Both layouts on
+  // this page draw the same heading, so it is wired once here.
+  on(mount, "click", "[data-rename]", () => {
+    inlineRename($("#runTitle", mount), async (name) => {
+      await api.renameJob(jobId, name);
+      const job = getJob?.();
+      if (job) job.name = name;
+    });
+  });
+
+  // Delegated, not bound directly: paintHeader() replaces the button element
+  // every time a metric arrives, which would silently discard a direct
+  // listener. Stopping is two different actions wearing one button, and the
+  // difference between them is hours of GPU time. A yes/no confirm can only
+  // ask the question it was written with, so it is replaced by the actual
+  // choice.
+  on(mount, "click", "#cancelBtn", () => {
+    $("#stopPanel", mount).innerHTML =
+      stopPanel(getJob(), getLatest(), getStage());
+  });
+  on(mount, "click", "#stopCancel", () => {
+    $("#stopPanel", mount).innerHTML = "";
+  });
+
+  on(mount, "click", "[data-stop]", async (_e, t) => {
+    const how = t.dataset.stop;
+    const save = how === "keep";
+    if (how === "force" && !confirm(
+      "Force stop this run?\n\n"
+      + "The machine will be told to end it and will restart itself if the "
+      + "run will not let go. Nothing is kept, and anything else that machine "
+      + "is doing stops too.\n\n"
+      + "Use this when an ordinary stop has already been tried and the run is "
+      + "not responding.")) return;
+    $("#stopPanel", mount).innerHTML = "";
+    try {
+      await api.cancelJob(jobId, save, how === "force");
+      toast(how === "force" ? "Force-stopping. The machine may restart."
+        : getJob().kind === "generate_dataset"
+          ? "Stopping, and keeping the rows written so far…"
+          : save ? "Stopping, and keeping the model…" : "Stopping…",
+        how === "force" ? "err" : "");
+    } catch (e) { toast(e.message, "err"); }
+  });
+
+  // "Score it" had no home on this page at all: the question a finished run
+  // raises is whether it is better than what you started with, and answering
+  // it meant navigating to Evaluate and finding the run again in a list of
+  // every model in the studio.
+  on(mount, "click", "#scoreRun", async () => {
+    const job = getJob();
+    let sets = [];
+    try { sets = await api.evals(); }
+    catch (e) { return toast(e.message, "err"); }
+    if (!sets.length) {
+      toast("No prompt sets yet — write one first.", "", { href: "#/evals", label: "Prompt sets" });
+      return;
+    }
+    const dlg = modal({ title: `Score "${job.name}"`, width: 480, body: html`
+      <p class="muted tiny">Every model you put the same prompts to can be
+        compared. Pick the set to ask.</p>
+      <div class="field">
+        <label for="scoreSet">Prompt set</label>
+        <select id="scoreSet">${raw(sets.map((e) => html`
+          <option value="${e.id}">${e.name} · ${(e.items || []).length} prompts</option>`).join(""))}</select>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="scoreGo">Score it</button>
+      </div>` });
+    on(dlg, "click", "#scoreGo", async (_e, btn) => {
+      btn.disabled = true;
+      const evalId = $("#scoreSet", dlg).value;
+      try {
+        const r = await api.runEval(evalId, { model_job_ids: [job.id] });
+        dlg.close();
+        toast("Scoring queued.", "ok",
+              r.job_id ? { href: `#/jobs/${r.job_id}`, label: "Watch it" } : null);
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  });
+
+  // The publish form lives in the Model section, which may not be the tab you
+  // are looking at.
+  on(mount, "click", "#goPublish", () => {
+    const tab = $('[data-tab="model"]', mount);
+    if (tab) tab.click();
+    requestAnimationFrame(() =>
+      $("#ownerRow", mount)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  });
+
+  on(mount, "click", "#deleteBtn", async () => {
+    const job = getJob();
+    const hasModel = job.artifacts?.length;
+    if (!await confirmDestructive({
+      title: `Delete "${job.name}"?`,
+      consequences: [
+        job.kind === "generate_dataset"
+          ? "Its log and measurements go. Any dataset it already produced stays."
+          : hasModel
+            ? "Its trained model file goes with it, and cannot be recovered."
+            : "Its logs and measurements go.",
+        "Cached copies on the machines that ran it are removed too.",
+        "Scores already recorded against a prompt set are kept.",
+      ],
+      confirmLabel: "Delete the run",
+      confirmWord: hasModel ? job.name : null })) return;
+    try {
+      await api.deleteJob(jobId);
+      toast("Run deleted.", "ok");
+      location.hash = "#/jobs";
+    } catch (e) { toast(e.message, "err"); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Writing a dataset
+// ---------------------------------------------------------------------------
+//
+// A generation run shares almost nothing with a training run except that both
+// are jobs. It has no loss, no learning rate, no held-out set and no model at
+// the end of it -- it has rows, and the interesting question is how many of
+// them were worth keeping. Given the training layout it rendered an empty
+// chart captioned "this should go down" above a paragraph explaining what to
+// do when your learning rate is too high, which is advice about a number this
+// run does not have.
+
+const WRITING_MODES = {
+  from_prompts: "answering your questions",
+  from_topics: "covering your topics",
+  from_seeds: "writing variations on your seeds",
+  extend_conversations: "adding turns to existing conversations",
+};
+
+function writingLayout(job) {
+  const cfg = job.config || {};
+  const model = cfg.model || {};
+  const who = model.model || model.base_model
+    || (model.provider ? `a model at ${model.provider}` : "your own model");
+  const what = WRITING_MODES[cfg.mode] || "writing rows";
+  const extending = cfg.mode === "extend_conversations";
+  return html`
+    ${raw(runHead(job))}
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
     <div id="progressCard"></div>
     <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
 
-    <div class="card" style="margin-bottom:14px"><div id="lossChart"></div></div>
-
-    ${raw(scratch ? html`
-      <div class="card" id="samplesCard" style="margin-bottom:14px"></div>` : "")}
+    <div class="card" style="margin-bottom:14px"><div id="rowsChart"></div></div>
 
     <div class="grid grid-2" style="margin-bottom:14px">
+      <div class="card">
+        <h3>What am I looking at?</h3>
+        <p class="muted tiny">This run is not training anything. It calls a
+          model over and over and keeps what comes back, so there is no loss
+          curve — the number that matters is how many rows survived.</p>
+        <ul class="muted tiny" style="margin:0;padding-left:18px;line-height:1.7">
+          ${raw(extending ? html`
+            <li><strong>Lengthened</strong> — conversations that actually grew.
+              A row the provider refused is still written out, unchanged, so
+              the dataset does not quietly shrink.</li>
+            <li><strong>Invented results</strong> — no tool actually ran, so the
+              model made up what each one returned. Plausible, and not true.
+              Right for teaching the shape of a tool conversation, wrong for
+              teaching facts about your systems.</li>` : html`
+            <li><strong>Repeats</strong> — the same row written twice. A model
+              asked the same thing twice answers it the same way; if this
+              climbs, the prompts are not varied enough or the temperature is
+              too low.</li>
+            <li><strong>Empty</strong> — nothing usable came back. A few is
+              normal; a lot means the instructions are not landing.</li>`)}
+          <li>Nothing here can be better than the model that wrote it. Read the
+            rows on the dataset page before you train on them.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>The data it wrote</h3>
+        <div id="datasetCard"></div>
+      </div>
+    </div>
+
+    <div class="card" data-sec="log">
+      <div class="row-between" style="align-items:center">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">what the run said as it went</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+/** The live half of a generation run: rows over time, and the log. */
+function writingView(mount, job, jobId, metrics, logs) {
+  const extending = job.config?.mode === "extend_conversations";
+  const rowsChart = new LineChart($("#rowsChart", mount), {
+    title: "Rows kept — this should climb steadily",
+    height: 260,
+    format: (v) => fmtNum(v),
+    series: [
+      { key: "kept", label: "Kept" },
+      { key: "lost", label: extending ? "Could not be extended"
+                                      : "Repeats and empties", dashed: true },
+    ],
+  });
+  const lost = (m) => (m.duplicates || 0) + (m.empty || 0) + (m.failed || 0);
+  const withRows = metrics.filter((m) => m.rows != null);
+  rowsChart.setSeries("kept", withRows.map((m) => ({ x: m.step, y: m.rows })));
+  rowsChart.setSeries("lost", withRows.map((m) => ({ x: m.step, y: lost(m) })));
+
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let latest = metrics[metrics.length - 1] || {};
+  // A writing run that is already going is writing; it is never training.
+  let stage = job.status === "running" ? "writing" : "";
+  wireRunControls(mount, jobId, () => job, () => latest, () => stage);
+
+  const getTab = wireRunTabs(mount, job, () => paint());
+  const paint = () => {
+    paintHeader(mount, job, getTab());
+    paintProgress(mount, job, stage, null, null, 0);
+    const q = $("#queueCard", mount);
+    if (q) q.innerHTML = queueCard(job);
+    paintWritingStats(mount, job, latest, extending);
+    const dc = $("#datasetCard", mount);
+    if (dc) dc.innerHTML = writtenDatasetCard(job);
+  };
+  paint();
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_metric") {
+      latest = { step: msg.step, ...msg.data };
+      if (msg.data.rows != null) {
+        rowsChart.pushSeries("kept", { x: msg.step, y: msg.data.rows });
+        rowsChart.pushSeries("lost", { x: msg.step, y: lost(msg.data) });
+      }
+      paint();
+    } else if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      paintProgress(mount, job, stage, msg.step, msg.total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+
+  return () => { unsub(); rowsChart.destroy(); };
+}
+
+function paintWritingStats(mount, job, m, extending) {
+  const running = job.status === "running";
+  const cards = extending ? [
+    ["Conversations", m.rows != null ? fmtNum(m.rows) : "—", "written out"],
+    ["Lengthened", m.extended != null ? fmtNum(m.extended) : "—",
+     "rows that actually grew"],
+    ["Invented results", m.invented_results != null
+      ? fmtNum(m.invented_results) : "—", "no tool actually ran"],
+    ["Could not be extended", m.failed != null ? fmtNum(m.failed) : "—",
+     "kept unchanged"],
+    ["Speed", m.rows_per_sec != null ? `${m.rows_per_sec.toFixed(2)}/s` : "—",
+     "rows per second"],
+    ["Time left", m.eta_s != null && running ? fmtDuration(m.eta_s) : "—",
+     "estimate"],
+  ] : [
+    ["Rows kept", m.rows != null ? fmtNum(m.rows) : "—", "written so far"],
+    ["Repeats dropped", m.duplicates != null ? fmtNum(m.duplicates) : "—",
+     "identical to an earlier row"],
+    ["Empty replies", m.empty != null ? fmtNum(m.empty) : "—",
+     "nothing usable came back"],
+    ["Speed", m.rows_per_sec != null ? `${m.rows_per_sec.toFixed(2)}/s` : "—",
+     "rows per second"],
+    ["Model speed", m.tokens_per_sec != null
+      ? `${fmtNum(m.tokens_per_sec)}/s` : "—", "tokens per second"],
+    ["Time left", m.eta_s != null && running ? fmtDuration(m.eta_s) : "—",
+     "estimate"],
+  ];
+
+  const coming = ["queued", "assigned", "running"].includes(job.status);
+  $("#statCards", mount).innerHTML = cards.map(([k, v, sub]) => html`
+    <div class="card stat">
+      <span class="k">${k}</span>
+      <span class="v">${v === "—" && coming ? skeletonValue("4em") : v}</span>
+      <span class="tiny muted">${sub}</span>
+    </div>`).join("");
+}
+
+/** Stopping a generation run, which has nothing half-finished in it.
+ *
+ *  Unlike training, there is no partly-built thing to weigh up: every row
+ *  already written is a complete row and is kept whatever you choose. So this
+ *  asks one question instead of offering a trade-off that does not exist here.
+ */
+function writingStopPanel(job, latest) {
+  const rows = latest?.rows || 0;
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop writing?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        ${raw(rows ? html`
+          <strong>${fmtNum(rows)}</strong> row${rows === 1 ? "" : "s"} have been
+          written and every one of them is finished. They are kept and
+          registered as a dataset — there is no half-written row to lose.`
+          : html`Nothing has been written yet, so stopping now leaves nothing
+          behind.`)}</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button class="btn-primary btn-sm" data-stop="keep">
+          ${raw(rows ? `Stop and keep the ${fmtNum(rows)} rows` : "Stop the run")}</button>
+        <button class="btn-sm" id="stopCancel">Carry on writing</button>
+      </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Sending something to Hugging Face
+// ---------------------------------------------------------------------------
+//
+// The plainest run there is: no loss, no rows, no model at the end. One
+// destination, a list of files, and a bar that moves. It gets its own layout
+// for the same reason a generation run does -- given the training one it would
+// draw two empty charts and a paragraph about learning rates.
+
+function uploadLayout(job) {
+  const cfg = job.config || {};
+  const dataset = cfg.target === "dataset";
+  return html`
+    ${raw(runHead(job))}
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>Where it is going</h3>
+      <dl class="kv">
+        <dt>Repository</dt>
+        <dd class="mono"><a href="https://huggingface.co/${
+          dataset ? "datasets/" : ""}${cfg.repo_id}"
+          target="_blank" rel="noopener">${cfg.repo_id}</a></dd>
+        <dt>Visibility</dt>
+        <dd>${cfg.private === false ? "Public — anyone can download it"
+                                    : "Private"}
+          <span class="muted tiny">— only applied if the repository is
+            new</span></dd>
+        <dt>What</dt>
+        <dd>${dataset ? cfg.dataset_label || "a dataset from this studio"
+                      : cfg.source_run_name || cfg.source_job
+                        || "a run in this studio"}</dd>
+        <dt>Already there</dt>
+        <dd>${cfg.replace
+          ? "Removed in the same commit as this upload"
+          : "Left alone; files with the same name are overwritten"}</dd>
+      </dl>
+      <div id="uploadResult" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" data-sec="log">
+      <div class="row-between" style="align-items:center">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">file by file</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function uploadView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "uploading" : "";
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const getTab = wireRunTabs(mount, job, () => paint());
+  const paint = () => {
+    paintHeader(mount, job, getTab());
+    paintProgress(mount, job, stage, job.step, job.total_steps);
+    const q = $("#queueCard", mount);
+    if (q) q.innerHTML = queueCard(job);
+    $("#uploadResult", mount).innerHTML = uploadResult(job);
+  };
+  paint();
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      paintProgress(mount, job, stage, msg.step, msg.total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+function uploadResult(job) {
+  const s = job.summary || {};
+  if (job.status !== "succeeded" || !s.url) return "";
+  return html`
+    <div class="callout callout-ok">
+      <strong>Published</strong>
+      <a href="${s.url}" target="_blank" rel="noopener">${s.url}</a>
+      <div class="tiny muted" style="margin-top:4px">
+        ${fmtNum(s.files || 0)} file${s.files === 1 ? "" : "s"}, ${
+          fmtNum(Math.round((s.bytes || 0) / 1048576))} MB${
+          s.replaced ? `, ${fmtNum(s.replaced)} older file${
+            s.replaced === 1 ? "" : "s"} removed` : ""}${
+          s.created_repo ? ", into a repository this run created" : ""}.</div>
+    </div>`;
+}
+
+/** Stopping an upload, which leaves nothing behind at all.
+ *
+ *  Files are sent first and committed once at the end, so a stop before the
+ *  commit changes nothing on the Hub. Saying so is the whole point of the
+ *  panel: the fear is that half a model is now sitting in a public repository.
+ */
+function uploadStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop the upload?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        Nothing is committed until every file has been sent, so stopping now
+        leaves the repository exactly as it is. What has already gone over the
+        wire is unreferenced and Hugging Face clears it up.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop the upload</button>
+        <button class="btn-sm" id="stopCancel">Carry on uploading</button>
+      </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// A merge
+//
+// No steps, no loss, no learning rate: it loads an adapter and the weights it
+// was trained against, adds one to the other, and writes the result. What
+// somebody watching it wants to know is what is being folded into what, how
+// big the answer will be, and -- when it lands -- how to get at it, because
+// this is the artifact that leaves the studio.
+// ---------------------------------------------------------------------------
+
+function mergeLayout(job) {
+  const cfg = job.config || {};
+  const into = cfg.base_model_label || cfg.base_model || "its base model";
+  return html`
+    ${raw(runHead(job))}
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>What this makes</h3>
+      <p class="muted tiny" style="margin:0 0 10px">
+        A LoRA fine-tune produces an <em>adapter</em>: a few megabytes that
+        mean nothing without the exact weights they were trained against.
+        Folding it in writes a complete model that loads on its own — which is
+        what Ollama, llama.cpp and everything else outside this studio want.
+        <strong>It is the size of the base model</strong>, not of the adapter,
+        and the adapter is kept as well.</p>
+      <dl class="kv">
+        <dt>From</dt>
+        <dd>${raw(cfg.source_job
+          ? `<a href="#/jobs/${esc(cfg.source_job)}">${
+               esc(cfg.source_run_name || "the fine-tune")}</a>`
+          : esc(cfg.source_run_name || "a fine-tune"))}</dd>
+        <dt>Into</dt>
+        <dd class="mono">${into}</dd>
+        <dt>Written in</dt>
+        <dd>${cfg.dtype || "float16"}
+          <span class="muted tiny">— the arithmetic is done in full precision
+            either way</span></dd>
+      </dl>
+      <div id="mergeResult" style="margin-top:10px"></div>
+    </div>
+
+    <div id="cardRow" data-sec="model"></div>
+
+    <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
+
+    <div class="card" data-sec="log">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">Newest at the bottom</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function mergeView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "loading_model" : "";
+  let step = job.step, total = job.total_steps;
+
+  const paintCard = wireModelCard(mount, jobId, () => job);
+  const paintOwnerRow = wireOwnerRow(mount, jobId, () => job, async () => {
+    job = await api.job(jobId);
+    paint();
+  });
+
+  const getTab = wireRunTabs(mount, job, () => paint());
+  const paint = () => {
+    paintHeader(mount, job, getTab());
+    paintProgress(mount, job, stage, step, total);
+    $("#queueCard", mount).innerHTML = queueCard(job);
+    $("#mergeResult", mount).innerHTML = mergeResult(job);
+    paintOwnerRow();
+    paintCard();
+  };
+  paint();
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      step = msg.step;
+      total = msg.total;
+      paintProgress(mount, job, stage, step, total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+/** Stopping a merge, which leaves the adapter exactly where it was.
+ *
+ *  There is nothing to keep half of: a model is written in one pass at the
+ *  end, and until then what exists is the adapter that already existed. Saying
+ *  so is the point -- the fear is that stopping has damaged the run this was
+ *  folding.
+ */
+function mergeStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop the merge?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        Nothing is kept: a merged model is written in one pass at the end, so
+        stopping leaves no half-model behind. The fine-tune and its adapter are
+        untouched, and the merge can be started again from that run's page.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop the merge</button>
+        <button class="btn-sm" id="stopCancel">Carry on merging</button>
+      </div>
+    </div>`;
+}
+
+/** Stopping a scoring run. The models are read, never written. */
+function evalStopPanel() {
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop scoring?</h3>
+      <p class="muted tiny" style="margin:0 0 12px">
+        The scores are recorded together when every model has answered every
+        prompt, so stopping now records none of them. Nothing is changed about
+        the models themselves — they are only being read.</p>
+      <div class="row" style="gap:8px">
+        <button class="btn-danger btn-sm" data-stop="discard">Stop scoring</button>
+        <button class="btn-sm" id="stopCancel">Carry on</button>
+      </div>
+    </div>`;
+}
+
+function mergeResult(job) {
+  const s = job.summary || {};
+  if (!job.artifacts?.length) return "";
+  const size = s.artifact_size
+    ? `${(s.artifact_size / 1073741824).toFixed(1)} GB` : null;
+  return html`
+    <div class="callout callout-ok">
+      <strong>A complete model.</strong>
+      ${s.params_total ? `${fmtNum(s.params_total)} parameters` : ""}${
+        size ? `, ${size} on disk` : ""}${
+        s.duration_s ? `, merged in ${fmtDuration(s.duration_s)}` : ""}.
+      It loads with <code>from_pretrained</code> and needs nothing downloaded
+      alongside it.
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// A scoring run
+//
+// Its result is a comparison, and the comparison has a page of its own that
+// keeps every scoring of the same prompt set side by side. This page is what
+// happens while it runs, and the way to that one afterwards.
+// ---------------------------------------------------------------------------
+
+function evalLayout(job) {
+  const cfg = job.config || {};
+  const models = (cfg.models || []).length;
+  return html`
+    ${raw(runHead(job))}
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+    <div id="evalResult"></div>
+
+    <div class="card" data-sec="log">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">Log</h3>
+        <span class="tiny muted">One line per model, as each finishes</span>
+      </div>
+      <div class="logbox" id="logBox"></div>
+    </div>`;
+}
+
+function evalView(mount, job, jobId, logs) {
+  const logBox = $("#logBox", mount);
+  logs.forEach((l) => appendLog(logBox, l));
+  logBox.scrollTop = logBox.scrollHeight;
+
+  let stage = job.status === "running" ? "evaluating" : "";
+  let step = job.step, total = job.total_steps;
+
+  const getTab = wireRunTabs(mount, job, () => paint());
+  const paint = () => {
+    paintHeader(mount, job, getTab());
+    paintProgress(mount, job, stage, step, total);
+    $("#queueCard", mount).innerHTML = queueCard(job);
+    $("#evalResult", mount).innerHTML = evalResult(job);
+  };
+  paint();
+  wireRunControls(mount, jobId, () => job, () => ({}), () => stage);
+
+  const unsub = events.subscribe(async (msg) => {
+    if (msg.job_id && msg.job_id !== jobId) return;
+    if (msg.type === "job_log") {
+      const atBottom = logBox.scrollHeight - logBox.scrollTop
+        - logBox.clientHeight < 40;
+      appendLog(logBox, { ts: Date.now() / 1000, level: msg.level, line: msg.line });
+      if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+    } else if (msg.type === "job_progress") {
+      stage = msg.stage;
+      step = msg.step;
+      total = msg.total;
+      paintProgress(mount, job, stage, step, total);
+    } else if (msg.type === "jobs_changed") {
+      job = await api.job(jobId);
+      paint();
+    }
+  });
+  return () => unsub();
+}
+
+function evalResult(job) {
+  const s = job.summary || {};
+  const scores = s.scores || [];
+  if (!scores.length) return "";
+  // Loss on the expected answer is the column that decides it, so it leads.
+  // The rest are shown because a model can be right and score badly on one of
+  // them -- "contains" in particular is generous and "exact" is merciless.
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="align-items:center;margin-bottom:8px">
+        <h3 style="margin:0">How they did</h3>
+        ${raw(s.eval_id
+          ? `<a class="btn btn-sm" href="#/evals/${esc(s.eval_id)}">
+               Every scoring of this set →</a>` : "")}
+      </div>
+      ${raw(s.verdict ? html`
+        <div class="callout ${s.decisive ? "callout-ok" : "callout-warn"}"
+             style="margin-bottom:10px">${s.verdict}</div>` : "")}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Model</th><th>Loss</th>
+          <th class="hide-sm">Token overlap</th><th class="hide-sm">Exact</th>
+        </tr></thead>
+        <tbody>${raw(scores.map((sc) => {
+          const m = sc.metrics || {};
+          return html`
+            <tr>
+              <td>${raw(sc.model_job_id
+                ? `<a href="#/jobs/${esc(sc.model_job_id)}">${esc(sc.name)}</a>`
+                : esc(sc.name))}${raw(m.error
+                ? ` <span class="badge badge-err">could not be scored</span>` : "")}</td>
+              <td class="mono">${m.expected_loss != null
+                ? m.expected_loss.toFixed(4) : "—"}</td>
+              <td class="mono hide-sm">${m.f1 != null
+                ? (m.f1 * 100).toFixed(0) + "%" : "—"}</td>
+              <td class="mono hide-sm">${m.exact != null
+                ? (m.exact * 100).toFixed(0) + "%" : "—"}</td>
+            </tr>`;
+        }).join(""))}</tbody>
+      </table></div>
+      <p class="muted tiny" style="margin:8px 0 0">
+        Only meaningful where the models were not trained on these prompts —
+        a set built from a held-out split is. Loss is the one to compare
+        between runs; the others reward answers that happen to be worded like
+        the expected one.</p>
+    </div>`;
+}
+
+/** Where the rows went, once there are any. */
+function writtenDatasetCard(job) {
+  const made = job.summary?.dataset_id || job.dataset_id;
+  if (made) {
+    return html`
+      <p class="muted tiny">Registered as a dataset in this studio. Look at the
+        rows before you train on them — a generated dataset can be fluent and
+        wrong at the same time.</p>
+      <a class="btn btn-primary btn-sm" href="#/data/${esc(made)}">Open it</a>`;
+  }
+  if (["running", "queued", "assigned"].includes(job.status)) {
+    return html`<p class="muted tiny">The dataset is registered when the run
+      finishes. Stopping early keeps every row written so far.</p>`;
+  }
+  if (job.status === "failed") {
+    return html`<p class="muted tiny">This run did not get far enough to leave
+      one behind.</p>`;
+  }
+  return html`<p class="muted tiny">Look for it on the
+    <a href="#/data">datasets page</a>.</p>`;
+}
+
+function layout(job, scratch, experts = 0) {
+  const source = job.config.dataset_label || job.config.dataset;
+  const subtitle = job.kind === "generate_dataset"
+    ? `writing data with ${job.config.model?.base_model || "your own model"}`
+    : scratch ? `from scratch · ${source}`
+              : `${job.config.base_model} → ${source}`;
+  return html`
+    ${raw(runHead(job))}
+    <div id="reportCard"></div>
+    <div id="resumeCard"></div>
+    <div id="queueCard"></div>
+    <div id="stopPanel"></div>
+    <div id="progressCard"></div>
+    <div class="grid grid-3" id="statCards" style="margin-bottom:16px"></div>
+
+    <div class="card" data-sec="home charts" style="margin-bottom:14px"><div id="lossChart"></div></div>
+
+    ${raw(experts > 1 ? html`
+      <div class="card" data-sec="charts" style="margin-bottom:14px">
+        <div id="expertChart"></div>
+        <p class="muted tiny" style="margin:8px 0 0">
+          The share of tokens going to the single busiest of the
+          ${experts} experts. An even router gives
+          <strong>${(100 / experts).toFixed(0)}%</strong>; a line climbing well
+          above that means the router has picked favourites and the remaining
+          experts are being starved of the text they need. The loss curve will
+          not show you this — a collapsed mixture still learns, it just carries
+          most of its parameters dead.</p>
+      </div>` : "")}
+
+    ${raw(scratch ? html`
+      <div class="card" id="samplesCard" data-sec="home charts" style="margin-bottom:14px"></div>` : "")}
+
+    <div class="grid grid-2" data-sec="charts" style="margin-bottom:14px">
       <div class="card"><div id="lrChart"></div></div>
       <div class="card">
         <h3>What am I looking at?</h3>
@@ -138,17 +1030,23 @@ function layout(job, scratch) {
           <li><strong>Flat from the start</strong> — the learning rate may be too
             low, or the data may not be read correctly.</li>
           <li><strong>Jumping wildly</strong> — the learning rate is too high.</li>
-          ${raw(scratch ? html`
           <li><strong>Held-out rising while training falls</strong> — it has
-            started memorising the text instead of learning from it. Use more
-            data, or stop here.</li>` : html`
-          <li><strong>Falling to near zero</strong> — it is memorising rather than
-            learning. Use fewer passes.</li>`)}
+            started memorising ${scratch ? "the text" : "your examples"} instead
+            of learning from ${scratch ? "it" : "them"}. The best model was at
+            the low point; more data or fewer passes would help.</li>
+          <li>The held-out line is also the only loss worth comparing with
+            another run — <a href="#/compare">side by side here</a>.</li>
         </ul>
       </div>
     </div>
 
-    <div class="card">
+    <div id="furtherRow" data-sec="model"></div>
+
+    <div id="cardRow" data-sec="model"></div>
+
+    <div class="grid grid-2" data-sec="model" style="margin-bottom:14px" id="ownerRow"></div>
+
+    <div class="card" data-sec="log">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">Log</h3>
         <span class="tiny muted">Newest at the bottom</span>
@@ -157,56 +1055,682 @@ function layout(job, scratch) {
     </div>`;
 }
 
-function paintHeader(mount, job) {
-  const box = $("#headerActions", mount);
-  const done = ["succeeded", "failed", "cancelled"].includes(job.status);
-  const usable = job.status === "succeeded" && job.artifacts?.length;
-  box.innerHTML = html`
-    ${statusBadge(job.status)}
-    ${raw(usable
-      ? `<a class="btn btn-primary btn-sm" href="#/play/${esc(job.id)}">▷ Try it out</a>` : "")}
-    ${raw(done && job.artifacts?.length
-      ? `<a class="btn btn-sm" href="/api/jobs/${esc(job.id)}/download">
-           ↓ Download</a>` : "")}
-    ${raw(!done ? `<button class="btn-danger btn-sm" id="cancelBtn">Stop</button>` : "")}`;
+const REPORT_ICON = { ok: "✓", warn: "!", error: "✕" };
 
-  // Assigned, not prepended: paintHeader runs on every metric tick, and
-  // prepending would stack a fresh copy of the error on each one.
-  $("#errorCard", mount).innerHTML = job.error
-    ? html`<div class="callout callout-err">
-        <strong>This run failed</strong>${job.error}</div>`
-    : "";
+/** What the run says about itself. Findings first, numbers second: the
+ *  numbers are only interesting once you know which of them to look at. */
+function reportCard(r) {
+  const findings = r.findings || [];
+  if (!findings.length && !(r.facts || []).length) return "";
+  const worst = findings.some((f) => f.level === "error") ? "error"
+    : findings.some((f) => f.level === "warn") ? "warn" : "ok";
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">What happened in this run</h3>
+        <span class="badge ${worst === "error" ? "badge-err"
+          : worst === "warn" ? "badge-warn" : "badge-ok"}">${
+          worst === "error" ? "something went wrong"
+            : worst === "warn" ? "worth a look" : "healthy"}</span>
+      </div>
+
+      ${raw((r.facts || []).length ? html`
+        <div class="factrow">
+          ${raw(r.facts.map((f) => html`
+            <div class="fact">
+              <span class="k">${f.label}</span>
+              <span class="v">${f.value}</span>
+              ${raw(f.note ? `<span class="n">${esc(f.note)}</span>` : "")}
+            </div>`).join(""))}
+        </div>` : "")}
+
+      ${raw(findings.map((f) => html`
+        <div class="finding lv-${f.level}">
+          <span class="mark">${REPORT_ICON[f.level] || "·"}</span>
+          <div>
+            <strong>${f.title}</strong>
+            <p class="saw">${f.saw}</p>
+            <p class="means">${f.means}</p>
+            <p class="do"><span class="lbl">What to do</span> ${f.do}</p>
+          </div>
+        </div>`).join(""))}
+    </div>`;
 }
 
-function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null) {
-  const training = stage === "training" || stage === "";
+function furtherCard(job, datasets) {
+  const usable = job.artifacts?.length
+    && ["succeeded", "cancelled"].includes(job.status);
+  if (!usable) return "";
+  const scratch = job.kind === "pretrain_llm";
+  if (!scratch && job.kind !== "finetune_llm") return "";
+
+  const cfg = job.config || {};
+  const arch = cfg.arch || {};
+  const perStep = scratch
+    ? (cfg.batch_size || 1) * (cfg.grad_accum || 1)
+      * (arch.max_position_embeddings || 0)
+    : 0;
+  const defaultSteps = job.total_steps || cfg.max_steps || 300;
+
+  return html`
+    <details class="card" style="margin-bottom:14px">
+      <summary><strong>Train this further</strong>
+        <span class="muted tiny"> — carry on from what it already knows</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        ${raw(scratch ? html`
+          This starts from the weights this run produced rather than from
+          noise, keeping its vocabulary and its shape — width, depth and
+          vocabulary are fixed once a model has been trained. More text, or
+          another pass over the same text, makes it better at the same job.`
+        : html`
+          This keeps the adapter this run produced and carries on training it
+          on new data. Everything it already learned stays; the new examples
+          are added on top. Its base model, <code>${cfg.base_model || "—"}</code>,
+          stays the same.`)}</p>
+
+      <form id="furtherForm" style="margin-top:12px">
+        <div class="field">
+          <label for="furtherData">Text to learn from</label>
+          <select id="furtherData" name="studio_dataset">
+            <option value="">Keep the same source (${
+              cfg.dataset_label || String(cfg.dataset || "").split("/").pop() || "—"})</option>
+            ${raw(datasets.map((d) => html`
+              <option value="${d.id}">${d.name} · ${fmtNum(d.rows)} rows</option>`).join(""))}
+          </select>
+          <div class="hint">Reading the same text again is a real option — a
+            model that has only seen its corpus once is undertrained — but new
+            text teaches it more.</div>
+        </div>
+        ${raw(scratch ? html`
+          <div class="field">
+            <label for="furtherSteps">How many more steps</label>
+            <input id="furtherSteps" name="max_steps" type="number"
+                   value="${defaultSteps}" min="10">
+            <div class="hint">${perStep
+              ? `About ${fmtNum(perStep)} tokens per step on this model.` : ""}
+              The learning rate starts high again and decays over these steps,
+              so a short follow-on run disturbs the model before it settles.</div>
+          </div>` : "")}
+        <div class="field">
+          <label for="furtherName">Name</label>
+          <input id="furtherName" name="name" type="text"
+                 value="${job.name} (continued)">
+        </div>
+        <button class="btn-primary btn-sm" type="submit" id="furtherGo">
+          Start the follow-on run</button>
+      </form>
+    </details>`;
+}
+
+/** The job body for a follow-on run. Copies the settings that must not change
+ *  and drops the ones that must be worked out again. */
+function furtherJob(job, form) {
+  const cfg = { ...(job.config || {}) };
+  // Recomputed for the new data, never inherited: a step budget worked out
+  // for one corpus is meaningless for another, and an inherited one would
+  // silently cap the new run.
+  delete cfg.max_steps;
+  delete cfg.token_budget;
+  delete cfg.studio_dataset;
+  delete cfg.source_run_name;
+  // Not inherited either: the follow-on is its own run, not a sweep member
+  // and not on the Hub.
+  delete cfg.sweep_id;
+  delete cfg.sweep_name;
+  delete cfg.sweep_values;
+  delete cfg.published;
+
+  if (form.studio_dataset) {
+    cfg.studio_dataset = form.studio_dataset;
+    delete cfg.dataset;
+    delete cfg.dataset_config;
+    delete cfg.dataset_split;
+    delete cfg.dataset_label;
+    delete cfg.dataset_is_local;
+  }
+
+  if (job.kind === "pretrain_llm") {
+    cfg.continue_from = job.id;
+    cfg.max_steps = +form.max_steps || job.total_steps || 300;
+    const arch = cfg.arch || {};
+    const perStep = (cfg.batch_size || 1) * (cfg.grad_accum || 1)
+      * (arch.max_position_embeddings || 0);
+    if (perStep) cfg.token_budget = cfg.max_steps * perStep;
+  } else {
+    cfg.base_model_job = job.id;
+  }
+  return { name: form.name || undefined, kind: job.kind, config: cfg };
+}
+
+/** A fine-tune produces an adapter, which is the right thing to produce and
+ *  the wrong thing to hand somebody. */
+/** The model card: the README this model goes to Hugging Face with.
+ *
+ *  Shown as the file rather than as a rendered preview, because the file is
+ *  the thing being edited and the front matter -- the half that decides how
+ *  the Hub files the model -- disappears from any rendering of it. It is also
+ *  the half most worth checking before publishing.
+ *
+ *  Editing is one-way on purpose. The generator rewrites this card whenever
+ *  the run is evaluated or published, which is right up until somebody has
+ *  written something the generator could not know; from then on it is theirs
+ *  and "reset" is the only way back.
+ */
+function modelCardPanel(card) {
+  const chars = (card.markdown || "").length;
+  return html`
+    <details class="card" style="margin-bottom:14px" id="cardBox">
+      <summary class="row-between" style="cursor:pointer">
+        <span><strong>Model card</strong>
+          <span class="muted tiny"> — the README that goes to Hugging
+            Face</span></span>
+        <span class="badge ${card.edited ? "badge-ok" : ""}">${
+          card.edited ? "edited by you" : "generated"}</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 8px">
+        ${raw(card.edited
+          ? `Yours. Nothing regenerates it — not evaluating this model, not
+             merging it, not publishing it. Reset it to hand it back.`
+          : `Written from this run and kept up to date: it is rewritten when
+             the run finishes and again every time the model is evaluated.
+             Save an edit and it stops being regenerated.`)}
+        It is the file itself, front matter included, exactly as Hugging Face
+        will receive it.</p>
+      <form id="cardForm">
+        <textarea id="cardText" class="mono" rows="22" spellcheck="false"
+          style="width:100%;font-size:12px;line-height:1.5">${card.markdown || ""}</textarea>
+        <div class="row-between" style="margin-top:8px;gap:8px;flex-wrap:wrap">
+          <span class="muted tiny">${fmtNum(chars)} characters${
+            card.updated_at ? ` · saved ${new Date(card.updated_at * 1000)
+              .toLocaleString()}` : ""}</span>
+          <span class="row" style="gap:6px">
+            <button type="button" class="btn-sm btn-quiet" id="cardCopy">
+              Copy</button>
+            <button type="button" class="btn-sm btn-quiet" id="cardReset"
+              ${card.edited ? "" : "disabled"}>Back to generated</button>
+            <button type="submit" class="btn-sm" id="cardSave">Save</button>
+          </span>
+        </div>
+      </form>
+    </details>`;
+}
+
+/** What this run left behind, when it left more than one thing.
+ *
+ *  This used to be a form that queued a merge as a second run. Merging is the
+ *  last step of the training run now -- it happens on the machine that still
+ *  has the weights in memory, instead of downloading the base again onto
+ *  whichever box was free -- so by the time this page is drawn the standalone
+ *  model either exists or could not be made, and there is nothing left to ask.
+ *  What remains worth saying is which of the two to reach for.
+ */
+function artifactsCard(job) {
+  if (job.kind !== "finetune_llm" || !job.artifacts?.length) return "";
+  const kinds = new Set(job.artifacts.map((a) => a.kind));
+  if (!kinds.has("model") || !kinds.has("adapter")) return "";
+  return html`
+    <details class="card" style="margin-bottom:14px">
+      <summary><strong>This run kept two things</strong>
+        <span class="muted tiny"> — the adapter, and a standalone model</span>
+      </summary>
+      <p class="muted tiny" style="margin:10px 0 0">
+        The <em>adapter</em> is a few megabytes and means nothing without
+        <code>${job.config.base_model || "its base model"}</code>. The
+        <em>merged model</em> is that adapter folded into the base: the size of
+        the base, and it loads on its own — which is what you need to run it in
+        Ollama, llama.cpp, or anywhere outside this studio.</p>
+      <p class="muted tiny" style="margin:6px 0 0">
+        Inside the studio the adapter is still the better thing to use, and
+        it is what a further fine-tune of this run carries on training.
+        Publishing lets you send either, or both.</p>
+    </details>`;
+}
+
+// ---------------------------------------------------------------------------
+// The panels every run that produces a model gets
+//
+// Publishing, sharing and the model card belong to a *model*, not to training.
+// They lived inside the training view, so a merge -- the run whose whole
+// purpose is to produce the standalone model people publish -- was the one
+// page that offered none of them.
+// ---------------------------------------------------------------------------
+
+/** Where this run has already been published.
+ *
+ *  Recorded when the upload finishes, not when it is queued, so what is listed
+ *  here is what is actually on the Hub. It is also what a fine-tune *of* this
+ *  run will name as its `base_model:`, which is the reason for keeping it at
+ *  all -- and the reason for showing it: somebody who cannot see it has no way
+ *  of knowing whether the lineage will come out right.
+ */
+function publishedCard(job) {
+  const rows = job.config?.published || [];
+  if (!rows.length) return "";
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <h3>On Hugging Face</h3>
+      <ul class="tiny" style="margin:8px 0 0;padding-left:18px">
+        ${raw(rows.map((p) => html`
+          <li><a href="${p.url || `https://huggingface.co/${p.repo_id}`}"
+                 target="_blank" rel="noopener" class="mono">${p.repo_id}</a>
+            <span class="muted"> — ${
+              p.artifact_kind === "adapter" ? "the adapter" : "the model"}${
+              p.at ? `, ${fmtAgo(p.at)}` : ""}</span></li>`).join(""))}
+      </ul>
+    </div>`;
+}
+
+/** Publish and share, painted into `#ownerRow`. Returns the repaint. */
+function wireOwnerRow(mount, jobId, getJob, onChange) {
+  const paint = () => {
+    const box = $("#ownerRow", mount);
+    if (!box) return;
+    const job = getJob();
+    // What this run actually kept, read off its artifact rows rather than
+    // guessed from its kind: a fine-tune normally holds both the merged model
+    // and the adapter, but a machine with too little memory to merge keeps
+    // only the adapter, and offering a choice it cannot honour is worse than
+    // offering none.
+    const targets = [...new Set((job.artifacts || []).map((a) => a.kind))];
+    box.innerHTML = publishedCard(job) + (job.artifacts?.length ? publishCard({
+      kind: "model", slug: repoSlug(job), targets,
+      blurb: targets.includes("model") && targets.includes("adapter")
+        ? `Uploads a model card and whichever of this run's two artifacts you
+           choose — the merged model, which loads anywhere on its own, or the
+           adapter, which is small and needs its base — to your own account.`
+        : targets.includes("adapter")
+          ? `Uploads the adapter and a model card to your own account. It names
+             the base model it was fitted to, so the Hub shows it as a
+             fine-tune of it.`
+          : `Uploads the model and a model card to your own account.`,
+    }) : "");
+    wireShareBox(mount, "job", job, async () => { await onChange(); paint(); });
+  };
+  wirePublish(mount, "model", (body) => api.publishJob(jobId, body),
+              () => api.publishInfo(jobId));
+  return paint;
+}
+
+/** The model card editor, painted into `#cardRow`. Returns the repaint.
+ *
+ *  The card is fetched rather than derived: generating it needs the run's
+ *  evaluation history, which no page here has ever had a reason to load.
+ */
+function wireModelCard(mount, jobId, getJob) {
+  let card = null;
+  const paint = async (refetch = true) => {
+    const box = $("#cardRow", mount);
+    if (!box) return;
+    if (!getJob().artifacts?.length) { box.innerHTML = ""; return; }
+    if (refetch || !card) {
+      try { card = await api.jobCard(jobId); }
+      catch { box.innerHTML = ""; return; }
+    }
+    const open = $("#cardBox", mount)?.open;
+    box.innerHTML = modelCardPanel(card);
+    if (open) $("#cardBox", mount).open = true;
+  };
+
+  on(mount, "submit", "#cardForm", async (e) => {
+    e.preventDefault();
+    const btn = $("#cardSave", mount);
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    try {
+      card = await api.saveJobCard(jobId, $("#cardText", mount).value);
+      toast("Saved. This card is yours now.", "ok");
+      paint(false);
+    } catch (ex) {
+      toast(ex.message, "err");
+      btn.disabled = false;
+      btn.textContent = "Save";
+    }
+  });
+
+  on(mount, "click", "#cardReset", async () => {
+    // Deliberately without a confirmation dialog: what is being discarded is
+    // recoverable by anyone who kept the text, and the button says plainly
+    // what it does. What it must not do is silently keep the edits.
+    try {
+      card = await api.resetJobCard(jobId);
+      toast("Back to the generated card.", "ok");
+      paint(false);
+    } catch (ex) { toast(ex.message, "err"); }
+  });
+
+  on(mount, "click", "#cardCopy", async () => {
+    try {
+      await navigator.clipboard.writeText($("#cardText", mount).value);
+      toast("Copied.", "ok");
+    } catch { toast("The browser would not allow copying.", "err"); }
+  });
+
+  return paint;
+}
+
+/** The repository name to suggest for this run's model. */
+function repoSlug(job) {
+  const base = (job.kind === "pretrain_llm"
+    ? job.name : (job.config.base_model || "model").split("/").pop() + "-tuned");
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "").slice(0, 60) || "my-model";
+}
+
+/** The last resort, offered only where the ordinary stop has visibly failed.
+ *
+ *  Stopping is cooperative: the trainer checks between steps, which is what
+ *  lets a stop keep the model built so far. It only works while steps finish.
+ *  A run wedged inside one -- a model too large for the card, thrashing the
+ *  allocator -- never reaches the check, and the button does nothing however
+ *  many times it is pressed.
+ *
+ *  Not shown by default, because it is worse in every case where the ordinary
+ *  stop works: it keeps nothing, and it takes the machine down with it. It
+ *  appears once a stop has already been asked for and the run carried on
+ *  regardless, which is exactly the situation it is for.
+ */
+function forceOption(job, latest) {
+  const asked = job.status === "running" && (job.error || "").length === 0
+    && (job.cancel_requested || wasAskedToStop(job));
+  if (!asked) {
+    return html`
+      <details class="adv" style="margin-top:10px">
+        <summary>It is not stopping</summary>
+        <p class="muted tiny" style="margin:8px 0 10px">Stopping waits for the
+          current step to finish, so that whatever has been built can be kept.
+          A run that is stuck inside a step never gets that far — the request
+          is received and never acted on. Forcing ends the machine's process
+          instead: nothing is kept, anything else it is doing stops too, and it
+          restarts by itself within seconds.</p>
+        <button class="btn-danger btn-sm" data-stop="force">
+          Force stop, losing everything</button>
+      </details>`;
+  }
+  return html`
+    <div class="callout callout-warn" style="margin-top:10px">
+      <strong>Already asked to stop</strong>
+      This run was asked to stop and has not. That happens when it is stuck
+      inside a step rather than between two, which is where the request is
+      read. Forcing ends the machine's process: nothing is kept, and it
+      restarts by itself.
+      <div style="margin-top:8px">
+        <button class="btn-danger btn-sm" data-stop="force">
+          Force stop, losing everything</button>
+      </div>
+    </div>`;
+}
+
+/** Whether a stop has already been asked for, read from the run's own log. */
+function wasAskedToStop(job) {
+  return !!(job.summary && job.summary.stop_requested);
+}
+
+function stopPanel(job, latest, stage) {
+  if (job.kind === "generate_dataset") return writingStopPanel(job, latest);
+  if (job.kind === "upload") return uploadStopPanel();
+  if (job.kind === "merge_adapter") return mergeStopPanel();
+  if (job.kind === "evaluate") return evalStopPanel();
+  const kind = job.kind === "pretrain_llm" ? "model" : "adapter";
+  // There is only something to keep once training has actually begun.
+  // Before that the runner is still downloading text or building a
+  // vocabulary, and "keep the model" would be an offer of nothing.
+  const started = (latest?.step || job.step || 0) > 0
+    && (stage === "training" || stage === "");
+  const done = latest?.step || job.step || 0;
+  const total = job.total_steps || 0;
+
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">Stop this run?</h3>
+      ${raw(started ? html`
+        <p class="muted tiny" style="margin:0 0 12px">
+          It has trained for <strong>${fmtNum(done)}</strong>${total
+            ? ` of ${fmtNum(total)}` : ""} steps. That work does not have to be
+          thrown away — a partly trained ${kind} is a real one, just less
+          practised than it would have been. Its learning rate never finished
+          decaying, so expect it to be a little rougher than the same run
+          taken to the end.</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="btn-primary btn-sm" data-stop="keep">
+            Stop and keep the ${kind}</button>
+          <button class="btn-danger btn-sm" data-stop="discard">
+            Stop and discard it</button>
+          <button class="btn-sm" id="stopCancel">Keep training</button>
+        </div>
+        ${raw(forceOption(job, latest))}` : html`
+        <p class="muted tiny" style="margin:0 0 12px">
+          Training has not started yet — the runner is still preparing your
+          data, so there is no ${kind} to keep. Stopping now leaves nothing
+          behind.</p>
+        <div class="row" style="gap:8px">
+          <button class="btn-danger btn-sm" data-stop="discard">Stop the run</button>
+          <button class="btn-sm" id="stopCancel">Carry on</button>
+        </div>`)}
+      ${raw(forceOption(job, latest))}
+    </div>`;
+}
+
+/**
+ * The run's own ribbon.
+ *
+ * This page had an action row of up to eight buttons, five separate layouts
+ * that each re-emitted their own back link, and one very long scroll holding
+ * charts, a log, an artifact explainer, a model card editor, a publish form
+ * and a "train this further" form. Which of those you wanted depended entirely
+ * on whether the run was still going.
+ *
+ * So: verbs on the ribbon, and the page in sections the tabs switch between.
+ * The sections are hidden rather than removed, because every live paint on
+ * this page writes into an element by id — a tab that removed the log box
+ * would silently stop the log.
+ */
+const RUN_TABS = (job) => {
+  const k = kindOf(job);
+  const tabs = [{ key: "home", label: "Overview" }];
+  if (k.page === "training") tabs.push({ key: "charts", label: "Charts" });
+  tabs.push({ key: "log", label: "Log" });
+  if (k.leavesModel) tabs.push({ key: "model", label: "Model" });
+  return tabs;
+};
+
+function runRibbon(job, tab) {
+  const k = kindOf(job);
+  const done = ["succeeded", "failed", "cancelled"].includes(job.status);
+  const usable = job.artifacts?.length && k.leavesModel
+    && ["succeeded", "cancelled"].includes(job.status);
+  // "Run again with changes" opens the form the run was started from, and two
+  // kinds have no such form: a scoring run comes from the prompt set it
+  // scores, and a merge -- which can no longer be created at all, merging
+  // being part of training now -- came from the fine-tune it folded.
+  const repeatable = job.kind !== "evaluate" && job.kind !== "merge_adapter"
+    && job.kind !== "upload";
+  const writing = job.kind === "generate_dataset";
+  const madeRows = writing && (job.summary?.dataset_id || job.dataset_id);
+
+  const body = group("This run", [
+    !done ? rb("cancelBtn", "■", "Stop", { cls: "danger" })
+          : rb("deleteBtn", "🗑", "Delete", { cls: "danger" }),
+    rb(null, "⟳", "Run again", { disabled: !done || !repeatable,
+      href: done && repeatable
+        ? (writing ? `#/generate/from/${esc(job.id)}` : `#/jobs/${esc(job.id)}/again`) : "",
+      title: "Start a new run from this one's settings" }),
+    rb(null, "✎", "Rename", { data: 'data-rename="1"' }),
+  ]) + group("Use it", [
+    rb(null, "▷", "Try it out", { cls: "primary", disabled: !usable,
+      href: usable ? `#/play/${esc(job.id)}` : "" }),
+    // The question a finished run actually raises -- is this better than what
+    // I started with -- had no button anywhere on this page. It does now.
+    rb("scoreRun", "◎", "Score it", { disabled: !usable,
+      title: "Put a saved set of prompts to it" }),
+    rb(null, "⚖", "Compare", { disabled: !usable, href: "#/compare",
+      title: "Held-out loss beside other runs" }),
+    // A fine-tune writing the next dataset is the loop this studio is built
+    // around, and it was reachable only by going to the generator and finding
+    // the run in a dropdown.
+    rb(null, "✦", "Write data with it", { disabled: !usable, href: "#/generate",
+      title: "Have this model write a dataset" }),
+    rb(null, "▤", "Open the rows", { disabled: !madeRows,
+      cls: "primary", href: madeRows ? `#/data/${esc(madeRows)}` : "" }),
+  ]) + group("Share it", [
+    rb(null, "↓", "Download", { disabled: !(done && job.artifacts?.length),
+      href: done && job.artifacts?.length ? `/api/jobs/${esc(job.id)}/download` : "" }),
+    rb("goPublish", "☁", "Publish", { disabled: !usable,
+      title: "Send it to Hugging Face" }),
+    job.summary?.url
+      ? rb(null, "↗", "On the Hub", { href: job.summary.url }) : "",
+  ]);
+
+  return ribbon({
+    tabs: RUN_TABS(job), active: tab, body,
+    right: `${statusBadge(job.status, job.kind).value || ""}
+            ${job.status === "cancelled" && job.artifacts?.length
+              ? `<span class="badge badge-ok">${writing ? "rows kept" : "model kept"}</span>` : ""}
+            ${shareButton("job", job)}`,
+  });
+}
+
+/** Draw the ribbon and show only the section it selects. */
+function paintHeader(mount, job, tab = "home") {
+  const box = $("#runRibbon", mount);
+  if (box) box.innerHTML = runRibbon(job, tab);
+  // Sections are marked in the layouts. Anything unmarked belongs to the
+  // overview, which keeps the four smaller layouts working without each of
+  // them having to label every card.
+  const tabs = RUN_TABS(job).map((t) => t.key);
+  $$("[data-sec]", mount).forEach((el) => {
+    const wanted = el.dataset.sec.split(" ");
+    // A section belonging to a tab this kind does not have is always shown,
+    // rather than being unreachable.
+    el.hidden = wanted.some((w) => tabs.includes(w)) && !wanted.includes(tab);
+  });
+
+  // Assigned, not prepended: this runs on every metric tick, and prepending
+  // would stack a fresh copy of the error on each one.
+  const err = $("#errorCard", mount);
+  if (err) {
+    err.innerHTML = job.error
+      ? html`<div class="callout callout-err">
+          <strong>This run failed</strong>${job.error}</div>`
+      : "";
+  }
+}
+
+/** The head of every run page, whatever kind it is. */
+function runHead(job) {
+  document.title = `${job.name} · Runs · AI Studio`;
+  return html`
+    <div class="page-head">
+      ${raw(breadcrumb({ href: "#/jobs", label: "Runs" }))}
+      <div class="row title-row" style="gap:4px;min-width:0;margin-top:6px">
+        <h1 style="margin:0" id="runTitle">${job.name}</h1>
+        <button class="btn-sm btn-quiet" data-rename="1" title="Rename this run"
+          aria-label="Rename this run">&#9998;</button>
+      </div>
+      <p class="sub mono tiny" style="margin-top:4px">${subjectOf(job)}</p>
+      ${raw(job.config.sweep_id ? html`
+        <p class="tiny" style="margin:4px 0 0">One of several variants —
+          <a href="#/sweeps/${job.config.sweep_id}">see them side by
+          side</a>.</p>` : "")}
+    </div>
+    <div id="runRibbon"></div>
+    <div id="errorCard"></div>`;
+}
+
+function paintProgress(mount, job, stage = "", rawStep = null, rawTotal = null,
+                       checkpointStep = 0) {
+  // A merge reports its stages as one of four, and a run that is not training
+  // has no `job.step` to fall back on -- an empty stage there means "has not
+  // said yet", not "is training".
+  const trains = ["finetune_llm", "pretrain_llm"].includes(job.kind);
+  const training = trains && (stage === "training" || stage === "");
+  const writing = stage === "writing";
+  const uploading = stage === "uploading";
+  const scoring = stage === "evaluating";
   // Preparation stages count their own units -- documents scanned, tokens
-  // collected -- so the bar follows those while they run, and the step counter
-  // is only shown once those units really are training steps.
+  // collected -- so the bar follows those while they run, and the counter is
+  // only shown once those units are something a person can count: training
+  // steps, rows written, megabytes sent, or prompts put to a model. A merge is
+  // four coarse stages, and "stage 3 of 4" tells nobody anything, so it gets
+  // the bar and no counter.
   const step = training ? job.step : (rawStep ?? 0);
   const total = training ? job.total_steps : (rawTotal ?? 0);
   const pct = total ? Math.min(100, (step / total) * 100) : 0;
   const running = ["running", "assigned"].includes(job.status);
-  const stageText = STAGES[stage] || (running ? "Working…" : "");
-  const counted = total > 0 && training;
+  const stageText = stagesFor(job)[stage] || (running ? "Working…" : "");
+  const counted = total > 0 && (training || writing || uploading || scoring);
+  const count = writing ? `row ${step} of ${total}`
+    : uploading ? `${fmtNum(step)} MB of ${fmtNum(total)}`
+    : scoring ? `${fmtNum(step)} of ${fmtNum(total)} answers`
+    : `step ${step} of ${total}`;
 
   $("#progressCard", mount).innerHTML = running ? html`
     <div class="card" style="margin-bottom:16px">
       <div class="row-between" style="margin-bottom:8px">
         <strong class="tiny">${stageText}</strong>
-        <span class="tiny muted">${counted
-          ? `step ${step} of ${total}` : ""}</span>
+        <span class="tiny muted">${counted ? count : ""}</span>
       </div>
       <div class="progress"><i style="width:${pct}%"></i></div>
+      ${raw(checkpointStep ? html`
+        <p class="muted tiny" style="margin:8px 0 0">
+          Saved at step ${checkpointStep}. If this machine restarts, the run
+          carries on from there rather than starting over.</p>` : "")}
     </div>` : "";
 }
 
-function paintStats(mount, job, m, scratch, stage = "training") {
-  paintHeader(mount, job);
-  paintProgress(mount, job, stage);
+function queueCard(job) {
+  if (job.status !== "queued") return "";
+  const pos = job.queue_position;
+  return html`
+    <div class="card callout" style="margin-bottom:16px">
+      <strong class="tiny">Waiting for a free machine</strong>
+      ${raw(pos ? html`
+        <p class="muted tiny" style="margin:6px 0 0">
+          ${pos === 1 ? "Next in line" : `Number ${pos}`} of
+          ${job.queue_length} waiting. The queue is dealt out between people
+          rather than strictly in the order runs were created, so one person
+          queueing several long runs does not hold up everyone else.</p>`
+        : html`<p class="muted tiny" style="margin:6px 0 0">
+          No machine that can run this is connected yet.</p>`)}
+    </div>`;
+}
+
+function resumeCard(job) {
+  const r = job.resumable;
+  if (!r) return "";
+  const lost = Math.max(0, (job.step || 0) - r.step);
+  return html`
+    <div class="card callout-warn" style="margin-bottom:14px">
+      <h3 style="margin:0 0 6px">This run can carry on</h3>
+      <p class="muted tiny" style="margin:0 0 10px">
+        There is a checkpoint at <strong>step ${fmtNum(r.step)}</strong>${
+          r.total ? ` of ${fmtNum(r.total)}` : ""} on
+        <strong>${r.runner || "its machine"}</strong>${
+          lost ? `, so ${fmtNum(lost)} steps would be redone` : ""}.
+        Starting it again picks up the weights and the optimiser exactly where
+        they were, rather than beginning from noise.</p>
+      ${raw(r.online
+        ? html`<button class="btn-primary btn-sm" id="resumeBtn">
+                 Carry on from step ${fmtNum(r.step)}</button>`
+        : html`<p class="muted tiny" style="margin:0">
+            <strong>${r.runner || "That machine"}</strong> is not
+            connected, and the checkpoint is on its disk. Bring it back and
+            this button appears.</p>`)}
+    </div>`;
+}
+
+function paintStats(mount, job, m, scratch, stage = "training",
+                   checkpointStep = 0, lastEval = null) {
+  paintProgress(mount, job, stage, null, null,
+                checkpointStep || job.checkpoint_step || 0);
+  const q = $("#queueCard", mount);
+  if (q) q.innerHTML = queueCard(job);
+  const rc = $("#resumeCard", mount);
+  if (rc) rc.innerHTML = resumeCard(job);
+  const held = heldOutCard(job, m, lastEval);
   const cards = scratch ? [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
-    ["Held-out loss", m.val_loss != null ? m.val_loss.toFixed(4) : "—", "on unseen text"],
+    held,
     ["Text read", m.tokens_seen != null ? fmtNum(m.tokens_seen) : "—", "tokens so far"],
     ["Speed", m.tokens_per_sec != null ? fmtNum(m.tokens_per_sec) + "/s" : "—", "tokens per second"],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
@@ -214,16 +1738,54 @@ function paintStats(mount, job, m, scratch, stage = "training") {
       ? fmtDuration(m.eta_s) : "—", "estimate"],
   ] : [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
+    held,
     ["Speed", m.steps_per_sec != null ? m.steps_per_sec.toFixed(2) + "/s" : "—", "steps per second"],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
     ["Time left", m.eta_s != null && job.status === "running"
       ? fmtDuration(m.eta_s) : "—", "estimate"],
   ];
+  // A dash means "there is no such number"; a shimmer means "it is on its
+  // way". Those are different states and the page used to show both as "—",
+  // so a run that had just started looked broken for its first few seconds.
+  // Only for numbers that arrive with the very first step. Anything on a
+  // slower schedule says when it is due instead -- a placeholder that pulses
+  // for an hour is a lie about how long you are waiting.
+  const NEVER_SHIMMER = new Set(["Held-out loss"]);
+  const coming = ["queued", "assigned", "running"].includes(job.status);
   $("#statCards", mount).innerHTML = cards.map(([k, v, sub]) => html`
     <div class="card stat">
-      <span class="k">${k}</span><span class="v">${v}</span>
+      <span class="k">${k}</span>
+      <span class="v">${v === "—" && coming && !NEVER_SHIMMER.has(k)
+        ? skeletonValue("4em") : v}</span>
       <span class="tiny muted">${sub}</span>
     </div>`).join("");
+}
+
+/** Held-out loss, which happens on its own schedule.
+ *
+ *  It is checked every `eval_every` steps, so between checks there is no new
+ *  number -- but the last one is still the truth, and saying when the next is
+ *  due is more use than a placeholder that pulses in the meantime.
+ */
+function heldOutCard(job, m, lastEval) {
+  // Where the rows came from, when the run said. "On unseen examples" covers
+  // both a split somebody deliberately held back and 5% of the training data
+  // taken at random, and only the first is a fair test of anything.
+  const from = job.summary?.held_out_from;
+  const sub = from ? `on ${from}`
+    : job.kind === "pretrain_llm" ? "on unseen text" : "on unseen examples";
+  const value = m.val_loss ?? lastEval?.val_loss;
+  const at = m.val_loss != null ? m.step : lastEval?.step;
+  if (value != null) {
+    return ["Held-out loss", value.toFixed(4),
+            at ? `${sub} · step ${fmtNum(at)}` : sub];
+  }
+  const every = job.config?.eval_every;
+  const live = ["queued", "assigned", "running"].includes(job.status);
+  if (live && every) {
+    return ["Held-out loss", "—", `${sub} · first check at step ${fmtNum(every)}`];
+  }
+  return ["Held-out loss", "—", live ? sub : `${sub} · never measured`];
 }
 
 function paintSamples(mount, samples) {

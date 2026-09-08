@@ -23,8 +23,14 @@ def main() -> None:
     print("  Join token :  %s" % token)
     print("=" * 66)
 
+    # The websocket keepalive is set on both ends and has to agree, or the
+    # patient end waits while the impatient one hangs up. Uvicorn's default is
+    # twenty seconds, which is a sensible figure for a browser and the wrong
+    # one for a runner: see the matching note in runner/agent.py about what a
+    # machine that is mid-merge can do to its own event loop.
     uvicorn.run("controller.app:app", host=args.host, port=args.port,
-                reload=args.reload, log_level="info")
+                reload=args.reload, log_level="info",
+                ws_ping_interval=30, ws_ping_timeout=90)
 
 
 if __name__ == "__main__":

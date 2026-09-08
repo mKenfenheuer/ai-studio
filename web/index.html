@@ -8,6 +8,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎛️</text></svg>">
 </head>
 <body>
+<div id="gate" class="gate" hidden></div>
 <div id="app">
   <aside class="sidebar">
     <div class="brand">
@@ -19,22 +20,40 @@
     </div>
 
     <nav class="nav">
-      <a href="#/" data-nav="dashboard"><span class="ico">▤</span><span class="lbl">Dashboard</span></a>
+      <!-- U+2302, not the ▤ that Datasets uses: at 17px with a truncated label
+           under it, two identical glyphs are two tabs nobody can tell apart. -->
+      <a href="#/" data-nav="dashboard"><span class="ico">⌂</span><span class="lbl">Dashboard</span></a>
       <a href="#/new" data-nav="new" class="nav-cta"><span class="ico">✦</span><span class="lbl">New training run</span></a>
       <a href="#/jobs" data-nav="jobs"><span class="ico">≡</span><span class="lbl">Runs</span></a>
       <!-- U+25B7, not U+25B6: the filled triangle has an emoji presentation and
            renders as a colour glyph on most phones, which is out of place in a
            row of monochrome marks. This one has no emoji variant. -->
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
-      <a href="#/runners" data-nav="runners"><span class="ico">▦</span><span class="lbl">Machines</span></a>
-      <a href="#/settings" data-nav="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
+      <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
+      <!-- Below this line the tab bar on a 390px screen is out of room, so
+           these fold into "More" there and stay in the sidebar on a desktop. -->
+      <a href="#/evals" data-nav="evals" class="nav-spill"><span class="ico">◎</span><span class="lbl">Evaluate</span></a>
+      <a href="#/runners" data-nav="runners" class="nav-spill"><span class="ico">▦</span><span class="lbl">Machines</span></a>
+      <a href="#/settings" data-nav="settings" class="nav-spill"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
+      <button type="button" class="nav-more" id="navMore">
+        <span class="ico">⋯</span><span class="lbl">More</span></button>
     </nav>
 
     <div class="sidebar-foot">
+      <a class="who" href="#/account" id="whoami" hidden data-nav="account">
+        <span class="who-avatar" id="whoAvatar">?</span>
+        <span class="who-text">
+          <span class="who-name" id="whoName">…</span>
+          <span class="who-role" id="whoRole"></span>
+        </span>
+      </a>
       <div class="fleet-pill">
         <span class="dot dot-idle" data-fleet-dot></span>
         <span data-fleet-text>connecting…</span>
       </div>
+      <button class="link-btn" id="omniOpen" type="button">
+        <span aria-hidden="true">⌕</span> Find anything <kbd>/</kbd>
+      </button>
       <button class="link-btn" id="helpToggle" type="button">
         New to this? Start here →
       </button>
@@ -51,8 +70,12 @@
       <span class="dot dot-idle" data-fleet-dot></span>
       <span data-fleet-text>connecting…</span>
     </div>
+    <button class="icon-btn" id="omniOpenMobile" type="button"
+            aria-label="Find anything">⌕</button>
     <button class="icon-btn" id="helpToggleMobile" type="button"
             aria-label="Help for beginners">?</button>
+    <a class="who-avatar" id="whoamiMobile" href="#/account" hidden
+       aria-label="Your account" data-nav="account">?</a>
   </header>
 
   <main class="main" id="main"><div class="loading">Loading…</div></main>
@@ -78,15 +101,19 @@
         language. Bigger ones are smarter but need more memory.</p></div></div>
       <div class="help-step"><span class="n">2</span>
         <div><h4>Pick your examples</h4><p>A dataset of questions and good
-        answers. The model learns the pattern in them.</p></div></div>
+        answers. The model learns the pattern in them — then you choose the
+        <strong>format</strong> they are written in, normally the model's
+        own.</p></div></div>
       <div class="help-step"><span class="n">3</span>
         <div><h4>Train</h4><p>Your GPU repeatedly shows the model examples and
         nudges it toward better answers. You watch the error go down.</p></div></div>
       <div class="help-step"><span class="n">4</span>
         <div><h4>Use the result</h4><p>Chat with it in the
-        <a href="#/play">Playground</a>, or download it. A fine-tune gives you a
-        small <em>adapter</em> file; a model built from scratch is a complete
-        model of its own.</p></div></div>
+        <a href="#/play">Playground</a>, score it against
+        <a href="#/evals">a set of prompts</a>, download it, or point other
+        software at it — this studio speaks the OpenAI API, so anything with a
+        &ldquo;base URL&rdquo; field can use your model. Get a key from
+        <a href="#/account">your account</a>.</p></div></div>
     </div>
 
     <h3>Building from scratch</h3>
@@ -124,7 +151,21 @@
         noise, rather than adjusting one that already works.</dd>
       <dt>Held-out loss</dt><dd>The loss measured on text the model was never
         trained on. The honest number: if it rises while training loss falls,
-        the model is memorising.</dd>
+        the model is memorising. It is also the only loss that means anything
+        when comparing two different runs.</dd>
+      <dt>Checkpoint</dt><dd>A snapshot of a run, saved every few minutes. If
+        the machine restarts, training carries on from the last one instead of
+        starting again from noise.</dd>
+      <dt>Prompt set</dt><dd>A saved list of questions, kept so that every
+        model you train can be asked the same ones. The only way to answer
+        &ldquo;is this better than last week's?&rdquo;</dd>
+      <dt>Adapter vs merged model</dt><dd>A fine-tune produces a small
+        <em>adapter</em> that only works alongside the model it was trained on.
+        <em>Merging</em> folds it in and gives you one complete model — bigger,
+        but it runs anywhere on its own.</dd>
+      <dt>Sweep</dt><dd>The same run launched several times with one setting
+        changed, so you can see which value was actually better instead of
+        guessing.</dd>
       <dt>Base model</dt><dd>A model that only continues text. It has not been
         taught to answer questions — that is what fine-tuning adds.</dd>
     </dl>

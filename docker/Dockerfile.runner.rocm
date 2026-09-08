@@ -59,6 +59,7 @@ ENV MIOPEN_USER_DB_PATH=/data/miopen \
     TRITON_CACHE_DIR=/data/triton
 
 COPY runner /app/runner
+COPY common /app/common
 COPY pyproject.toml /app/
 WORKDIR /app
 
