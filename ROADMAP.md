@@ -426,6 +426,19 @@ Then, in a second pass:
   pinned to a tag in the CPU runner image. Verified on the lab: SmolLM2-135M
   converts and quantises to 105 MB at Q4_K_M in under four seconds.
 
+Done since: full fine-tuning, layer freezing and DoRA (6.6) -- `method` is
+lora, dora or full, and `train_layers` trains only the last N layers, for an
+adapter (`layers_to_transform`) or for every weight (the rest frozen); the
+fit check knows full fine-tuning costs sixteen bytes a parameter and refuses
+a card that cannot hold it; a full fine-tune saves the whole model and
+declines checkpoint-resume, plainly. Estimate calibration (6.6): the estimate
+that decided a dispatch is kept on the run, the run reports its measured
+peak, and the fit check scales future estimates by the median ratio over
+this studio's last twenty runs, clamped. And a regression found on the way:
+the Phase 3 "dynamic padding" commit referenced a `collate` it never
+defined, so every fine-tune since had failed with a NameError -- unnoticed
+because no GPU runner had run one; both halves landed this time, verified
+on LoRA, DoRA and full runs.
 Still to do: splitting wizard.js per step (6.1); and the larger training
 features — full fine-tuning, layer
 freezing, DoRA, preference tuning (DPO/ORPO), multi-GPU, and estimate

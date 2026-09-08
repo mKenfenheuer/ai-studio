@@ -261,6 +261,27 @@ def _check_room_to_train(model, device: str, use_4bit: bool, ctx: Any) -> None:
         % (used / gb, total / gb, share * 100, advice))
 
 
+def _last_layers(model, n: int) -> list[int] | None:
+    """Indexes of the last `n` decoder layers, or None for all of them."""
+    if not n or n <= 0:
+        return None
+    total = None
+    for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+        total = getattr(getattr(model, "config", None), attr, None)
+        if total:
+            break
+    if not total or n >= total:
+        return None
+    return list(range(total - n, total))
+
+
+def _in_layers(param_name: str, layers: list[int]) -> bool:
+    """Whether a parameter belongs to one of these decoder layers."""
+    import re as _re
+    m = _re.search(r"\.(?:layers|h|blocks)\.(\d+)\.", param_name)
+    return bool(m) and int(m.group(1)) in layers
+
+
 def _versions() -> dict:
     """What this run was trained with.
 
@@ -429,6 +450,25 @@ def run(cfg: dict, ctx: Any) -> dict:
                     "alone -- moving it sends tokens to experts that were "
                     "never trained on them.")
 
+    # How the weights change: an adapter (LoRA, the default), an adapter that
+    # also learns magnitudes (DoRA), or every weight (full). And how much of
+    # the model: everything, or only the last N layers -- the layers nearest
+    # the output are where a task lives, and freezing the rest is how a
+    # large model is fine-tuned on a small card.
+    method = str(cfg.get("method") or "lora").lower()
+    if method not in ("lora", "dora", "full"):
+        raise ValueError("The method is lora, dora or full, not %r." % method)
+    train_layers = int(cfg.get("train_layers") or 0)   # 0: all of them
+    if method == "full" and cfg.get("checkpointing_enabled", True):
+        # A checkpoint here is an adapter directory and a resume loads it as
+        # one; a full fine-tune has no adapter, and a checkpoint of the
+        # whole model is a second copy of it every few hundred steps. Off,
+        # and said, rather than a resume that fails an hour in.
+        cfg["checkpointing_enabled"] = False
+        ctx.log("Checkpoints are not kept for a full fine-tune yet: a stop "
+                "keeps what was trained, but the run cannot be resumed from "
+                "partway.")
+
     if load_adapter is not None and (load_adapter / "adapter_config.json").exists():
         from peft import PeftModel
         # is_trainable is the whole difference between continuing a fine-tune
@@ -441,10 +481,33 @@ def run(cfg: dict, ctx: Any) -> dict:
                                "target_modules", []) or [])
         ctx.log("Continuing an existing adapter on: %s"
                 % (", ".join(sorted(targets)) or "its recorded layers"))
+    elif method == "full":
+        # Every weight trains. Sixteen bytes a parameter with AdamW in mixed
+        # precision -- the weights, their gradients, and two optimiser states
+        # in fp32 -- against two for a LoRA run, which is why the fit check
+        # asks about the method. Only worth it with a lot of data and a card
+        # to match; the wizard says so.
+        if use_4bit:
+            raise ValueError(
+                "Full fine-tuning cannot train a 4-bit base: the quantised "
+                "weights have no gradient. Choose LoRA, or 16-bit.")
+        targets = ["every weight"]
+        last_n = _last_layers(model, train_layers)
+        frozen = 0
+        for name, p in model.named_parameters():
+            p.requires_grad = last_n is None or _in_layers(name, last_n) \
+                or "lm_head" in name or name.endswith("norm.weight")
+            frozen += 0 if p.requires_grad else 1
+        ctx.log("Full fine-tuning%s." % (
+            " of the last %d layers; the rest is frozen" % train_layers
+            if last_n is not None else ""))
     else:
         targets = cfg.get("target_modules") or _pick_target_modules(
             model, moe, adapt_experts)
-        ctx.log("Applying LoRA to: %s" % ", ".join(targets))
+        last_n = _last_layers(model, train_layers)
+        ctx.log("Applying %s to: %s%s" % (
+            "DoRA" if method == "dora" else "LoRA", ", ".join(targets),
+            " in the last %d layers only" % train_layers if last_n is not None else ""))
         lconf = LoraConfig(
             r=int(cfg.get("lora_r", 16)),
             lora_alpha=int(cfg.get("lora_alpha", 32)),
@@ -452,6 +515,11 @@ def run(cfg: dict, ctx: Any) -> dict:
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=targets,
+            # DoRA: the adapter learns a direction and the magnitude is
+            # learned separately, which closes most of the gap to full
+            # fine-tuning at the same rank. Costs a little more per step.
+            use_dora=(method == "dora"),
+            layers_to_transform=last_n,
         )
         model = get_peft_model(model, lconf)
     trainable = param_count(p for p in model.parameters() if p.requires_grad)
@@ -661,8 +729,13 @@ def run(cfg: dict, ctx: Any) -> dict:
                 texts.append("")
             keep.append(spans)
 
+        # No padding here. Every example used to be padded to the full
+        # context, so a short instruction trained on a batch that was seven
+        # eighths padding -- paid for in memory and arithmetic, then discarded
+        # by the attention mask. Each batch is padded to its own longest row
+        # in `collate` below, at load time.
         enc = tok(texts, truncation=True, max_length=max_seq,
-                  padding="max_length", return_tensors=None,
+                  padding=False, return_tensors=None,
                   return_offsets_mapping=can_mask)
         offsets = enc.pop("offset_mapping", None)
 
@@ -752,6 +825,30 @@ def run(cfg: dict, ctx: Any) -> dict:
     accum = int(cfg.get("grad_accum", 8))
     epochs = float(cfg.get("epochs", 1))
     lr = float(cfg.get("learning_rate", 2e-4))
+
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else (tok.eos_token_id or 0)
+
+    def collate(rows: list) -> dict:
+        """One batch, padded to its own longest row and no further.
+
+        Padding is not data: the mask hides it from attention and -100
+        hides it from the loss, so the only thing a padded position ever
+        costs is the arithmetic spent on it -- which, padded to the full
+        context, was most of every step.
+        """
+        def as_list(v):
+            return v.tolist() if hasattr(v, "tolist") else list(v)
+        width = max(len(as_list(r["input_ids"])) for r in rows)
+        out = {"input_ids": [], "attention_mask": [], "labels": []}
+        for r in rows:
+            ids = as_list(r["input_ids"])
+            mask = as_list(r["attention_mask"])
+            labels = as_list(r["labels"])
+            gap = width - len(ids)
+            out["input_ids"].append(ids + [pad_id] * gap)
+            out["attention_mask"].append(mask + [0] * gap)
+            out["labels"].append(labels + [-100] * gap)
+        return {k: torch.tensor(v, dtype=torch.long) for k, v in out.items()}
 
     # Seeded, so the batches come in the same order on a second run.
     _gen = torch.Generator()
@@ -1064,6 +1161,13 @@ def run(cfg: dict, ctx: Any) -> dict:
         "dtype": dtype_name,
         "quantized": use_4bit,
         "moe": moe,
+        "method": method,
+        "train_layers": train_layers or None,
+        # The most memory the card held at once, so the estimate that put
+        # this run on this card can be checked against what it actually
+        # took. The fit check learns from the pair.
+        "peak_vram_gb": (round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+                         if torch.cuda.is_available() else None),
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
     adapter_zip = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
@@ -1087,7 +1191,9 @@ def run(cfg: dict, ctx: Any) -> dict:
     # weight it was trying to free. Nothing below uses the model.
     model_box = [model]
     del model
-    merged_zip = _merge_here(model_box, tok, cfg, ctx, summary, out_dir,
+    # A full fine-tune saved the whole model above; there is no adapter
+    # to fold into anything, and the saved directory is the model.
+    merged_zip = None if method == "full" else _merge_here(model_box, tok, cfg, ctx, summary, out_dir,
                              base_model, dtype_name, use_4bit, torch)
 
     # The merged model is the primary artifact when there is one -- it is what

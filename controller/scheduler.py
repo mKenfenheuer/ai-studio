@@ -207,9 +207,17 @@ class Fleet:
         params_b = job["config"].get("params_b") \
             or hub.params_from_name(job["config"].get("base_model") or "")
         if params_b and caps.get("vram_gb"):
-            fit = hub.fit_report(params_b, caps)
+            fit = hub.fit_report(params_b, caps, job["config"].get("method") or "lora")
             if fit["verdict"] in ("too_big", "needs_quantization"):
                 return False, fit["message"]
+            # What was estimated, kept with the run, so the measured peak can
+            # be compared to it when the run finishes -- see
+            # hub.record_calibration. The estimate that decided the dispatch
+            # is the one worth checking, not one recomputed later under a
+            # different calibration.
+            if fit.get("needed_gb") and not job["config"].get("estimated_vram_gb"):
+                job["config"]["estimated_vram_gb"] = fit["needed_gb"]
+                db.update_job_config(job["id"], job["config"])
             # `fits_quantized` means "only in 4-bit". Treating it as a pass
             # regardless of what the run actually asked for was the whole bug:
             # a 7B needs 19.6 GB in 16-bit and 4.9 GB in 4-bit, and a run
@@ -838,6 +846,13 @@ class Fleet:
                     and summary.get("target") == "model":
                 self._record_publication(jid, summary)
             db.set_job_summary(jid, summary)
+            # The estimate against the measurement. Every finished training
+            # run teaches the fit check a little about this studio's cards.
+            job_row = db.get_job(jid) or {}
+            est = (job_row.get("config") or {}).get("estimated_vram_gb")
+            peak = summary.get("peak_vram_gb")
+            if est and peak and summary.get("kind") in ("finetune_llm", "pretrain_llm"):
+                hub.record_calibration(float(est), float(peak))
             self._refresh_cards(jid, summary)
             db.clear_checkpoint(jid)
             self.checkpoints.get(runner_id, set()).discard(jid)

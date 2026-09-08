@@ -6,6 +6,8 @@ the model's real file sizes and comparing them against each runner's VRAM.
 """
 from __future__ import annotations
 
+import json
+
 import contextvars
 import re
 from typing import Any
@@ -408,25 +410,75 @@ async def model_detail(model_id: str) -> dict:
     }
 
 
-def estimate_memory(params_b: float | None) -> dict | None:
-    """VRAM needed to LoRA fine-tune a model of this size.
+# How far this studio's own runs have landed from the estimate. A list of
+# (estimated, measured) pairs from finished runs, kept in the settings table
+# and read as a median ratio. The 1.35x below was calibrated against somebody
+# else's card; this is calibrated against yours, from the moment the second
+# run finishes.
+CALIBRATION_KEY = "fit_calibration"
+CALIBRATION_KEEP = 20
+
+
+def calibration() -> float:
+    """The multiplier this studio's measured runs say the estimate needs."""
+    from . import db
+    try:
+        pairs = json.loads(db.get_setting(CALIBRATION_KEY) or "[]")
+    except (TypeError, ValueError):
+        return 1.0
+    ratios = sorted(m / e for e, m in pairs if e and m and 0.2 < m / e < 5)
+    if len(ratios) < 2:
+        return 1.0
+    mid = ratios[len(ratios) // 2]
+    # Clamped: a single strange run must not turn every estimate absurd.
+    return max(0.5, min(2.0, round(mid, 3)))
+
+
+def record_calibration(estimated_gb: float, measured_gb: float) -> None:
+    from . import db
+    try:
+        pairs = json.loads(db.get_setting(CALIBRATION_KEY) or "[]")
+    except (TypeError, ValueError):
+        pairs = []
+    pairs = (pairs + [[round(estimated_gb, 2), round(measured_gb, 2)]])[-CALIBRATION_KEEP:]
+    db.set_setting(CALIBRATION_KEY, json.dumps(pairs))
+
+
+def estimate_memory(params_b: float | None, method: str = "lora") -> dict | None:
+    """VRAM needed to fine-tune a model of this size.
 
     LoRA freezes the base weights, so the frozen copy dominates. The 1.35x
     multiplier covers activations, LoRA gradients, optimiser state and
-    allocator fragmentation -- calibrated against measured runs.
+    allocator fragmentation, and is then scaled by what this studio's own
+    finished runs have measured -- see `calibration`.
+
+    Full fine-tuning is a different sum: the weights, their gradients and two
+    optimiser states, sixteen bytes a parameter in mixed precision, eight
+    with an 8-bit optimiser. Eight times a LoRA run, which is why the method
+    is asked for.
     """
     if not params_b:
         return None
-    return {
-        "fp16_gb": round(params_b * 2 * 1.35, 1),
-        "int8_gb": round(params_b * 1 * 1.35, 1),
-        "int4_gb": round(params_b * 0.5 * 1.35, 1),
+    k = calibration()
+    out = {
+        "fp16_gb": round(params_b * 2 * 1.35 * k, 1),
+        "int8_gb": round(params_b * 1 * 1.35 * k, 1),
+        "int4_gb": round(params_b * 0.5 * 1.35 * k, 1),
+        "full_fp16_gb": round(params_b * 16 * 1.1 * k, 1),
+        "full_8bit_optim_gb": round(params_b * 8 * 1.1 * k, 1),
+        "calibration": k,
         "inference_fp16_gb": round(params_b * 2 * 1.1, 1),
         # Serving the same model compressed. Only the weights shrink -- the
         # key/value cache a conversation grows does not -- so this is the
         # weights at half a byte each with the same overhead allowance.
         "inference_int4_gb": round(params_b * 0.5 * 1.1, 1),
     }
+    if method == "full":
+        # The number the fit check compares is the full one.
+        out["fp16_gb"] = out["full_fp16_gb"]
+        out["int8_gb"] = out["full_8bit_optim_gb"]
+        out["int4_gb"] = out["full_fp16_gb"]     # a 4-bit base cannot train
+    return out
 
 
 def recommend_models(runner_caps: dict) -> dict:
@@ -492,9 +544,10 @@ def _recommendation_note(best: dict | None, usable: list, vram, has_4bit) -> str
                                       best["precision"], best["spare_gb"]))
 
 
-def fit_report(params_b: float | None, runner_caps: dict) -> dict:
+def fit_report(params_b: float | None, runner_caps: dict,
+               method: str = "lora") -> dict:
     """Can this runner train this model? Returns a plain-language verdict."""
-    mem = estimate_memory(params_b)
+    mem = estimate_memory(params_b, method)
     vram = runner_caps.get("vram_gb")
     has_4bit = bool(runner_caps.get("quantization", {}).get("4bit"))
     if not mem or not vram:

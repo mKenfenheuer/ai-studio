@@ -2506,6 +2506,10 @@ function finetuneReview(state, runner, caps) {
              "Longer examples are cut to this length."],
             ["lora_r", "LoRA rank", s.lora_r, "number",
              "Size of the trained adapter. Higher learns more and risks more."],
+            ["train_layers", "Layers to train", s.train_layers ?? 0, "number",
+             "0 trains every layer. A number trains only that many layers "
+             + "nearest the output, where a task lives — how a large model is "
+             + "fine-tuned on a small card, and a fair amount faster."],
             ["max_steps", "Maximum steps", s.max_steps, "number",
              "Training stops here even if the data has not run out."],
             ["seed", "Seed", s.seed ?? 1234, "number",
@@ -2513,6 +2517,19 @@ function finetuneReview(state, runner, caps) {
              + "the order of the batches. Change it to find out how much of a "
              + "difference between two runs was luck."],
           ]))}
+          <div class="field">
+            <label for="f_method">How the weights change</label>
+            <select id="f_method" data-setting="method">
+              <option value="lora"${(s.method || "lora") === "lora" ? " selected" : ""}>LoRA — a small adapter (the default)</option>
+              <option value="dora"${s.method === "dora" ? " selected" : ""}>DoRA — an adapter that also learns magnitudes</option>
+              <option value="full"${s.method === "full" ? " selected" : ""}>Full — every weight</option>
+            </select>
+            <div class="hint">${s.method === "full"
+              ? "Sixteen bytes a parameter for the weights, gradients and optimiser — eight times a LoRA run. Needs a lot of data and a card to match, and a 4-bit base cannot be trained this way."
+              : s.method === "dora"
+                ? "Closes most of the gap to full fine-tuning at the same rank, for a little more time per step."
+                : "Freezes the base model and trains a few percent of it. Right for nearly everything."}</div>
+          </div>
           <div class="field">
             <label for="f_dtype">Number precision</label>
             <select id="f_dtype" data-setting="dtype">
