@@ -125,8 +125,17 @@ const FIXTURES = [
       rendered: [{ status: "ok", ok: true, text: "### Instruction\nSay hi\n\n### Response\nHi", length: 42 }] }],
   [/\/api\/datasets\/[^/]+\/rows/, { rows: [
       { index: 0, split: "train", row: { instruction: "Say hi", output: "Hi" },
-        rendered: "### Instruction\nSay hi\n\n### Response\nHi" }],
-      offset: 0, total: 52002, columns: ["instruction", "output", "split"] }],
+        rendered: "### Instruction\nSay hi\n\n### Response\nHi" },
+      // A row that points at stored files, so the thumbnail and the player
+      // are drawn. The page says what each one is; the browser never guesses.
+      { index: 1, split: "train", row: { instruction: "What is this?", output: "A cat",
+          image: "asset:ast_000000000001", clip: "asset:ast_000000000002" },
+        rendered: "### Instruction\nWhat is this?\n\n### Response\nA cat" }],
+      assets: { ast_000000000001: { kind: "image", mime: "image/png", filename: "cat.png",
+                                    bytes: 1200, url: "/api/assets/ast_000000000001" },
+                ast_000000000002: { kind: "audio", mime: "audio/wav", filename: "meow.wav",
+                                    bytes: 4000, url: "/api/assets/ast_000000000002" } },
+      offset: 0, total: 52002, columns: ["instruction", "output", "image", "clip", "split"] }],
   [/\/api\/datasets\/[^/]+$/, dataset()],
   [/\/api\/datasets/, [dataset(), dataset({ id: "ds_2", name: "alpaca (cleaned)",
                                             parent_id: "ds_1", source: "derived", rows: 48000 })]],

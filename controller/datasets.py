@@ -39,7 +39,7 @@ import httpx
 
 from common import conversation, formatting
 
-from . import config, db
+from . import assets, config, db
 
 DATASET_DIR = config.DATA_DIR / "datasets"
 DATASETS_SERVER = "https://datasets-server.huggingface.co"
@@ -176,13 +176,27 @@ def iter_indexed(dataset_id: str,
         yield i, row
 
 
-def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
+def write_rows(dataset_id: str, rows: Iterator[dict],
+               owner_id: str | None = None) -> dict:
     """Write rows out, describing what was written.
 
     The split counts are taken here, while every row is already in hand.
     Counting them afterwards would mean reading the whole file again on every
     page that wants to say how big the validation slice is.
+
+    Any asset a row points at is adopted by this dataset on the way past --
+    see `assets.Adopter`. That is here rather than in each of the six things
+    that derive a dataset, because a filter that quietly detached its images
+    from their files would not show up until the parent was deleted weeks
+    later.
     """
+    # Whose references the adopted assets become. The transform path does not
+    # know, and a reference with no owner is one nobody can delete and that
+    # counts against nobody's quota -- found when a derived dataset's usage
+    # read as zero.
+    if owner_id is None:
+        owner_id = (db.get_dataset(dataset_id) or {}).get("owner_id")
+    adopt = assets.Adopter(dataset_id, owner_id)
     p = path_for(dataset_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     columns: list[str] = []
@@ -191,7 +205,7 @@ def write_rows(dataset_id: str, rows: Iterator[dict]) -> dict:
     n = 0
     dropped = 0
     with p.open("w", encoding="utf-8") as fh:
-        for row in stamp_ids(rows):
+        for row in stamp_ids(adopt(r) for r in rows):
             if n >= MAX_ROWS:
                 # Count what did not fit rather than stopping quietly: a merge
                 # of three large datasets used to lose rows with no sign of it
@@ -285,8 +299,10 @@ def append_rows(dataset: dict, rows: list[dict], split: str) -> dict:
     columns = list(dataset.get("columns") or [])
     splits = dict(dataset.get("splits") or {})
     added = 0
+    adopt = assets.Adopter(dataset["id"], dataset.get("owner_id"))
     with path.open("a", encoding="utf-8") as fh:
-        for row in stamp_ids(stamp_split(iter(rows), split or DEFAULT_SPLIT)):
+        for row in stamp_ids(stamp_split(
+                (adopt(r) for r in rows), split or DEFAULT_SPLIT)):
             for k in row:
                 if k not in columns and k != ROW_ID_FIELD:
                     columns.append(k)
@@ -784,6 +800,16 @@ def rows_from_upload(filename: str, blob: bytes, options: dict | None = None,
     """
     opts = options or {}
     name = (filename or "").lower()
+
+    # A picture or a recording is a row, not a file to read text out of. It
+    # goes into the store and the row points at it; the column is named for
+    # what it is, and a folder above it -- `cats/0001.jpg` -- becomes the
+    # label, because a folder of folders is how every image-classification
+    # set anybody has ever assembled by hand is laid out.
+    if assets.is_media(filename or ""):
+        yield _media_row(filename or "", blob, opts, source)
+        return
+
     kind = _looks_like(name, blob)
 
     if kind == "zip":
@@ -828,6 +854,24 @@ def rows_from_upload(filename: str, blob: bytes, options: dict | None = None,
         raise ValueError("no text could be read out of %s"
                          % (filename or "that file"))
     yield from _text_rows(text, opts, source)
+
+
+def _media_row(filename: str, blob: bytes, opts: dict,
+               source: str | None) -> dict:
+    """One stored file, as the row that points at it."""
+    mime = assets.guess_mime(filename)
+    stored = assets.store([blob], filename, mime,
+                          owner_id=opts.get("owner_id"))
+    kind = assets.kind_of(mime) or "file"
+    row: dict[str, Any] = {kind: assets.ref(stored["id"]),
+                           "filename": Path(filename).name}
+    parts = [p for p in Path(filename).parts[:-1]
+             if p and p not in (".", "__MACOSX")]
+    if parts:
+        row["label"] = parts[-1]
+    if source and len(parts) == 0:
+        row["source"] = source
+    return row
 
 
 def _zip_rows(blob: bytes, opts: dict,

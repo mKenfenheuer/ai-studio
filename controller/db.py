@@ -299,6 +299,28 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, ts);
+
+-- Bytes that are not text. See controller/assets.py for the three decisions
+-- behind this shape; the one this table encodes is that a row is a
+-- *reference* and `sha256` is the file. Several rows may name one file, the
+-- file goes when the last of them does, and no row ever holds a path -- the
+-- path is derived from the hash, so a store that is moved or re-mounted does
+-- not need every row rewriting.
+CREATE TABLE IF NOT EXISTS assets (
+    id          TEXT PRIMARY KEY,
+    sha256      TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    owner_id    TEXT,
+    dataset_id  TEXT,
+    job_id      TEXT,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(sha256);
+CREATE INDEX IF NOT EXISTS idx_assets_dataset ON assets(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_assets_owner ON assets(owner_id);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -367,6 +389,10 @@ _ADDED_COLUMNS = [
     ("eval_scores", "model_ref", "TEXT"),
     ("eval_scores", "model_label", "TEXT"),
     ("eval_scores", "settings", "TEXT"),
+    # What is actually in the archive, so a download can be checked against
+    # the thing that was uploaded. Null on every artifact made before this
+    # existed, which is why nothing is allowed to require it.
+    ("artifacts", "sha256", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -721,10 +747,12 @@ def get_logs(job_id: str, limit: int = 500) -> list[dict]:
     return list(reversed(rows))
 
 
-def add_artifact(job_id: str, kind: str, filename: str, size: int) -> str:
+def add_artifact(job_id: str, kind: str, filename: str, size: int,
+                 sha256: str | None = None) -> str:
     aid = new_id("art")
-    ex("INSERT INTO artifacts (id,job_id,kind,filename,size_bytes,created_at)"
-       " VALUES (?,?,?,?,?,?)", (aid, job_id, kind, filename, size, now()))
+    ex("INSERT INTO artifacts (id,job_id,kind,filename,size_bytes,created_at,"
+       "sha256) VALUES (?,?,?,?,?,?,?)",
+       (aid, job_id, kind, filename, size, now(), sha256))
     return aid
 
 
@@ -1735,3 +1763,93 @@ def usage_daily(user_id: str | None = None, days: int = 30) -> list[dict]:
     return q("SELECT CAST(ts / 86400 AS INTEGER) AS day, COUNT(*) AS calls,"
              " SUM(prompt_tokens + completion_tokens) AS tokens"
              " FROM usage%s GROUP BY day ORDER BY day" % clause, args)
+
+
+# ===========================================================================
+# Assets
+# ===========================================================================
+#
+# A row is a reference to some bytes, not the bytes. `controller/assets.py`
+# owns the files and the reasoning; this owns the rows.
+
+
+def create_asset(sha: str, mime: str, size: int, filename: str,
+                 owner_id: str | None, dataset_id: str | None = None,
+                 job_id: str | None = None, kind: str = "") -> str:
+    aid = new_id("ast")
+    ex("INSERT INTO assets (id,sha256,mime,kind,filename,size_bytes,owner_id,"
+       "dataset_id,job_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+       (aid, sha, mime, kind, filename, int(size), owner_id, dataset_id,
+        job_id, now()))
+    return aid
+
+
+def get_asset(asset_id: str) -> dict | None:
+    return q1("SELECT * FROM assets WHERE id=?", (asset_id,))
+
+
+def get_assets(asset_ids: list[str]) -> list[dict]:
+    """Several at once. A page of a hundred image cells would otherwise be a
+    hundred round trips to answer one question."""
+    ids = [a for a in dict.fromkeys(asset_ids) if a]
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    return q("SELECT * FROM assets WHERE id IN (%s)" % marks, ids)
+
+
+def find_asset(sha: str, owner_id: str | None, dataset_id: str | None,
+               job_id: str | None) -> dict | None:
+    """An existing reference to these bytes, in the same place, by the same
+    person -- which makes storing the same file twice a no-op and an
+    interrupted ingest safe to restart."""
+    return q1("SELECT * FROM assets WHERE sha256=?"
+              " AND owner_id IS ? AND dataset_id IS ? AND job_id IS ?",
+              (sha, owner_id, dataset_id, job_id))
+
+
+def claim_asset(asset_id: str, dataset_id: str) -> None:
+    """A loose upload becomes part of a dataset."""
+    ex("UPDATE assets SET dataset_id=? WHERE id=? AND dataset_id IS NULL",
+       (dataset_id, asset_id))
+
+
+def assets_with_sha(sha: str) -> int:
+    row = q1("SELECT COUNT(*) AS n FROM assets WHERE sha256=?", (sha,))
+    return int((row or {}).get("n") or 0)
+
+
+def assets_of_dataset(dataset_id: str) -> list[dict]:
+    return q("SELECT * FROM assets WHERE dataset_id=?", (dataset_id,))
+
+
+def all_asset_shas() -> list[dict]:
+    return q("SELECT DISTINCT sha256 FROM assets")
+
+
+def delete_assets(asset_ids: list[str]) -> int:
+    ids = [a for a in dict.fromkeys(asset_ids) if a]
+    if not ids:
+        return 0
+    c = connect()
+    marks = ",".join("?" * len(ids))
+    cur = c.execute("DELETE FROM assets WHERE id IN (%s)" % marks, ids)
+    c.commit()
+    return cur.rowcount
+
+
+def asset_usage(owner_id: str | None = None) -> dict:
+    """How much room this is taking, counting shared bytes once.
+
+    The distinct-hash subquery is the whole point: two datasets referencing
+    the same ten thousand images occupy ten thousand files, and a report that
+    added the rows up would say twenty thousand and send somebody looking for
+    space that was never used.
+    """
+    where, args = ("WHERE owner_id=?", [owner_id]) if owner_id else ("", [])
+    row = q1("SELECT COUNT(*) AS files, SUM(size_bytes) AS bytes FROM"
+             " (SELECT sha256, MAX(size_bytes) AS size_bytes FROM assets %s"
+             "  GROUP BY sha256)" % where, args) or {}
+    refs = q1("SELECT COUNT(*) AS n FROM assets %s" % where, args) or {}
+    return {"files": row.get("files") or 0, "bytes": row.get("bytes") or 0,
+            "references": refs.get("n") or 0}

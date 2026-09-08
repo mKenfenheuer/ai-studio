@@ -11,6 +11,7 @@ from starlette.concurrency import run_in_threadpool
 
 from common import conversation, formatting
 
+from .. import assets
 from .. import datasets as ds
 from .. import cards, db, hfaccount, hub
 from .security import current_user, require_edit, require_owner, require_view
@@ -97,7 +98,8 @@ def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
                 break
         return {"rows": rows, "offset": offset, "total": d.get("rows") or 0,
                 "matched": in_split or 0, "query": "", "split": want or "",
-                "columns": d.get("columns") or []}
+                "columns": d.get("columns") or [],
+                "assets": _assets_in(rows)}
 
     matched = 0
     scanned = 0
@@ -115,7 +117,24 @@ def dataset_rows(request: Request, dataset_id: str, offset: int = 0,
     return {"rows": rows, "offset": offset, "total": d.get("rows") or 0,
             "matched": matched, "query": q, "split": want or "",
             "columns": d.get("columns") or [],
-            "scanned": scanned, "capped": scanned >= SEARCH_SCAN}
+            "scanned": scanned, "capped": scanned >= SEARCH_SCAN,
+            "assets": _assets_in(rows)}
+
+
+def _assets_in(page: list[dict]) -> dict:
+    """What each asset on this page is, so the browser can draw it.
+
+    Told rather than guessed: a cell holding `asset:ast_...` says nothing
+    about whether it is a photograph or a recording, and the browser cannot
+    find out without fetching it. One query for the whole page.
+    """
+    ids: list[str] = []
+    for entry in page:
+        ids += assets.ids_in_row(entry.get("row") or {})
+    return {a["id"]: {"kind": a["kind"], "mime": a["mime"],
+                      "filename": a["filename"], "bytes": a["size_bytes"],
+                      "url": "/api/assets/%s" % a["id"]}
+            for a in db.get_assets(ids)}
 
 
 @router.get("/{dataset_id}/conversations")
@@ -252,9 +271,19 @@ async def upload_dataset(request: Request,
     if not files:
         raise HTTPException(400, "No file was uploaded.")
     options = {"text_split": text_split, "chunk_chars": chunk_chars,
-               "overlap": overlap, "delimiter": delimiter, "header": header}
+               "overlap": overlap, "delimiter": delimiter, "header": header,
+               # Whose store an image or a recording in this upload goes
+               # into. The parser has no other way to know.
+               "owner_id": user["id"]}
     split = (split or "").strip() or ds.DEFAULT_SPLIT
     target = _get(request, into, "edit") if into else None
+    # Every file has to fit the account's quota before any of it is parsed;
+    # finding out at file eighty of ninety is the annoying way to find out.
+    try:
+        assets.check_quota(user["id"], sum((f.size or 0) for f in files
+                                          if assets.is_media(f.filename or "")))
+    except ValueError as e:
+        raise HTTPException(413, str(e)) from e
 
     rows: list[dict] = []
     failures: list[str] = []
@@ -591,12 +620,31 @@ def merge_datasets(request: Request, payload: dict = Body(...)) -> dict:
 async def delete_dataset(request: Request, dataset_id: str) -> dict:
     _get(request, dataset_id, "own")     # permission check; the row is not needed
     children = db.q("SELECT id, name FROM datasets WHERE parent_id=?", (dataset_id,))
+    # The files this dataset brought with it. Only the bytes nothing else
+    # points at actually go: a dataset derived from this one holds its own
+    # references to the same images, so deleting the original leaves them
+    # working. See controller/assets.py.
+    freed = assets.release_dataset(dataset_id)
     ds.delete_files(dataset_id)
     db.clear_shares("dataset", dataset_id)
     db.delete_dataset(dataset_id)
-    return {"ok": True,
-            "note": ("%d dataset(s) made from this one were kept."
-                     % len(children)) if children else None}
+    notes = []
+    if children:
+        notes.append("%d dataset(s) made from this one were kept."
+                     % len(children))
+    if freed["rows"]:
+        notes.append("%d stored file(s) released, %s freed."
+                     % (freed["rows"], _size(freed["bytes"])))
+    return {"ok": True, "note": " ".join(notes) or None}
+
+
+def _size(n: int) -> str:
+    value = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return "%.1f %s" % (value, unit)
+        value /= 1024
+    return "%.1f GB" % value
 
 
 @router.post("/{dataset_id}/publish")

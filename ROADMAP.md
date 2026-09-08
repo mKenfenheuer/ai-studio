@@ -587,20 +587,33 @@ Remaining in this phase:
 Nothing below the UI can hold a byte that is not JSON text. Five pieces, in
 this order, before any audio or vision trainer:
 
-**P1. Binary asset store (XL).** `assets` table
-(`id, owner, job_id?, dataset_id?, mime, bytes, sha256, path, created_at`),
-content-addressed files under `DATA_DIR/assets/`, `PUT /api/assets` and an
-ACL'd `GET`. Datasets reference assets by id in a column, which keeps the
-one-JSONL-per-dataset property and the split column untouched. Derived
-datasets share assets by reference; delete is reference-counted. While there,
-add `sha256` to `artifacts`.
+**P1. Binary asset store (XL). Done.** `assets` is a table of *references*:
+one row per (owner, bytes, home), the file itself content-addressed under
+`DATA_DIR/assets/<sha>` and shared by every row naming it, released when the
+last one goes. A dataset points at an asset in an ordinary column
+(`"image": "asset:ast_…"`), so splits, filters, downloads and publishing
+keep working without knowing assets exist. Every derivation adopts the
+assets it copies -- `assets.Adopter`, inside `write_rows` -- so deleting the
+original leaves the derived dataset's pictures where they are. `POST/GET/
+DELETE /api/assets`, access decided by what the asset belongs to; the type is
+an allowlist (no HTML, no SVG) and every response carries `nosniff` and a
+content policy, because these bytes are served from the studio's own origin.
+Per-file and per-account limits, env-overridable (`AI_STUDIO_ASSET_MAX_MB`,
+`AI_STUDIO_ASSET_QUOTA_GB`); usage counts shared bytes once. `sha256` on
+artifacts. `scripts/check-assets.py` guards the three promises.
 
-**P2. Media in the workbench (L).** Cell renderers for image thumbnails and
-audio players keyed off mime; a lightbox; ingest for zip-of-images,
-zip-of-wavs and manifest-plus-folder; Hub image/audio datasets fetched as
-assets rather than as dead viewer URLs; `inspect` reports dimensions,
-duration, decode failures and missing files; `drop_empty` and `format_example`
-learn that an asset is not nothing.
+**P2. Media in the workbench (L). First slice done.** An image or a
+recording in an upload -- loose, or inside a zip -- becomes a row pointing at
+a stored file, with the column named for what it is and the folder above it
+as the label (`cats/0001.jpg` → `label: cats`), which is how every
+hand-assembled classification set is laid out. The rows page says what each
+asset on it is, and the workbench draws a thumbnail or a player and opens the
+file in full on a click. *Still to do:* a manifest beside the files
+(`metadata.jsonl` with a `file_name` column, the Hub's imagefolder
+convention); Hub image/audio datasets fetched as assets rather than as dead
+viewer URLs; `inspect` reporting dimensions, duration, decode failures and
+files that have gone missing from disk; `drop_empty` and `format_example`
+learning that an asset is not nothing.
 
 **P3. Typed samples and metrics (M).** `job_meta.sample` becomes
 `{step, kind: text|image_grid|audio|table, asset_id?, text?}`; a

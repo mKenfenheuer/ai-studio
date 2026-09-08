@@ -20,7 +20,7 @@ from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
-from .api import (accounts, data, evals, providers, security,
+from .api import (accounts, data, evals, media, providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
 
@@ -80,6 +80,7 @@ app.middleware("http")(security.authenticate)
 
 app.include_router(accounts.router)
 app.include_router(data.router)
+app.include_router(media.router)
 app.include_router(evals.router)
 app.include_router(providers.router)
 app.include_router(serving_api.router)
@@ -1041,6 +1042,19 @@ def _artifact_kind(dest: Path, job: dict | None) -> str:
             "merge_adapter": "model"}.get((job or {}).get("kind"), "adapter")
 
 
+def _sha256_of(path: Path) -> str | None:
+    """The hash of a file, read a megabyte at a time. None if it cannot be."""
+    import hashlib
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            while chunk := fh.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 async def _artifact_stored(job_id: str, dest: Path, size: int) -> dict:
     """Everything that happens once the bytes are on disk, however they came.
 
@@ -1051,7 +1065,11 @@ async def _artifact_stored(job_id: str, dest: Path, size: int) -> dict:
     """
     job = db.get_job(job_id)
     kind = _artifact_kind(dest, job)
-    db.add_artifact(job_id, kind, dest.name, size)
+    # What is actually in the archive. Recorded so a download can be checked
+    # against what the runner sent -- a truncated upload and a complete one
+    # look identical in a directory listing, and a model that will not load
+    # is the first anybody hears of it.
+    db.add_artifact(job_id, kind, dest.name, size, _sha256_of(dest))
 
     if kind == "dataset" and job:
         # Rows written by a model are only useful once they are a dataset you

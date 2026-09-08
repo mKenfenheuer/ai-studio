@@ -496,6 +496,17 @@ export async function datasetView(mount, [id]) {
       const source = inSource() ? (rows?.rows || []) : (preview?.rows || []).map((row, n) => ({ index: n, row }));
       const found = source.find((r) => r.index === +t.dataset.cell);
       if (!found) return;
+      const media = assetOf(found.row[t.dataset.col], rows?.assets);
+      if (media) {
+        modal({ title: `${media.filename} — row ${t.dataset.cell}`, width: 820,
+                body: media.kind === "image"
+                  ? `<img src="${esc(media.url)}" alt="${esc(media.filename)}"
+                          style="max-width:100%;max-height:70vh;display:block;margin:0 auto">`
+                  : media.kind === "audio"
+                    ? `<audio controls src="${esc(media.url)}" style="width:100%"></audio>`
+                    : `<p><a class="btn" href="${esc(media.url)}?download=1">Download ${esc(media.filename)}</a></p>` });
+        return;
+      }
       modal({ title: `${t.dataset.col} — row ${t.dataset.cell}`, width: 700,
               body: `<p class="mono tiny" style="white-space:pre-wrap;max-height:60vh;overflow:auto">${
                 esc(JSON.stringify(found.row[t.dataset.col], null, 2))}</p>` });
@@ -1351,7 +1362,7 @@ function sourceGrid(d, rows, view, picked, loading) {
   const columns = columnsOf(d, rows);
   return bar + html`
     <div class="pq-grid ${loading ? "stale" : ""}">
-      ${raw(view === "text" ? renderedList(rows.rows) : table(columns, rows.rows, picked))}
+      ${raw(view === "text" ? renderedList(rows.rows) : table(columns, rows.rows, picked, rows.assets))}
     </div>`;
 }
 
@@ -1362,8 +1373,8 @@ function sourceGrid(d, rows, view, picked, loading) {
  *  the wrong shape for a nested object but the right shape for knowing one is
  *  there. `picked` is null for a preview, where rows are not addressable.
  */
-function table(columns, items, picked) {
-  const types = Object.fromEntries(columns.map((c) => [c, typeOf(items, c)]));
+function table(columns, items, picked, assets = {}) {
+  const types = Object.fromEntries(columns.map((c) => [c, typeOf(items, c, assets)]));
   return html`
     <table>
       <thead><tr>
@@ -1383,8 +1394,9 @@ function table(columns, items, picked) {
               : String(r.label ?? r.index))}</td>
             ${raw(columns.map((c) => {
               const v = r.row[c];
+              const media = assetOf(v, assets);
               return html`<td data-cell="${r.index}" data-col="${c}"
-                class="${scalar(v) ? (typeof v === "number" ? "num" : "") : "clickable"}">${raw(cell(v))}</td>`;
+                class="${media ? "clickable media" : scalar(v) ? (typeof v === "number" ? "num" : "") : "clickable"}">${raw(cell(v, assets))}</td>`;
             }).join(""))}
           </tr>`).join(""))}
       </tbody>
@@ -1392,10 +1404,18 @@ function table(columns, items, picked) {
 }
 
 /** What kind of thing a column holds, from the first value that is not empty. */
-function typeOf(items, c) {
+function typeOf(items, c, assets = {}) {
   for (const r of items) {
     const v = r.row[c];
     if (v === null || v === undefined || v === "") continue;
+    // A column of stored files is a column of pictures or recordings, not
+    // of text, whatever the JSON says.
+    const a = assetOf(v, assets);
+    if (a) {
+      return a.kind === "image" ? { mark: "IMG", name: "picture" }
+        : a.kind === "audio" ? { mark: "♪", name: "recording" }
+        : { mark: "FILE", name: "stored file" };
+    }
     if (typeof v === "number") return { mark: "123", name: "number" };
     if (typeof v === "boolean") return { mark: "✓✗", name: "true/false" };
     if (Array.isArray(v)) {
@@ -1722,8 +1742,33 @@ function summarise(value) {
   return String(value ?? "");
 }
 
-function cell(value) {
+/** The stored file a cell points at, if the page said what it is. */
+function assetOf(value, assets) {
+  const m = typeof value === "string" && /^asset:(ast_[0-9a-f]{12})$/.exec(value);
+  return m && assets ? assets[m[1]] || null : null;
+}
+
+/** A stored file, drawn as what it is rather than as its id.
+ *
+ *  A thumbnail for a picture and a player for a recording, because a column
+ *  of `asset:ast_3f2a…` is a column of nothing anybody can check -- and
+ *  checking the data is what the workbench is for. The kind comes from the
+ *  page, not from guessing at the id: the browser cannot tell a photograph
+ *  from a recording without fetching it. */
+function mediaCell(a) {
+  if (a.kind === "image") {
+    return `<img class="thumb" src="${esc(a.url)}" alt="${esc(a.filename)}" loading="lazy">`;
+  }
+  if (a.kind === "audio") {
+    return `<audio class="clip" controls preload="none" src="${esc(a.url)}"></audio>`;
+  }
+  return `<span class="badge" title="${esc(a.filename)}">${esc(a.kind || "file")} · ${esc(a.filename)}</span>`;
+}
+
+function cell(value, assets) {
   if (value === null || value === undefined || value === "") return `<span class="muted tiny">—</span>`;
+  const media = assetOf(value, assets);
+  if (media) return mediaCell(media);
   if (!scalar(value)) return `<span class="badge">${esc(summarise(value))}</span>`;
   const text = String(value);
   return esc(text.length > CELL ? text.slice(0, CELL) + "…" : text);
