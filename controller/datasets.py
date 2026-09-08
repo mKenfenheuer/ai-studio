@@ -1025,29 +1025,37 @@ def _problems(stats: dict, dataset: dict) -> list[dict]:
 # what a step actually did -- and the alternative is a destructive operation
 # on the only copy of somebody's data.
 
-def transform(dataset: dict, ops: dict, owner_id: str | None,
+def transform(dataset: dict, ops: dict | list, owner_id: str | None,
               name: str | None = None) -> dict:
-    rows, steps, out_fmt, before, report = apply_ops(dataset, ops)
+    run = apply_ops(dataset, ops)
+    rows = run["rows"]
     if not rows:
         raise ValueError(
             "Those settings would leave the dataset empty. Loosen them and "
             "try again -- nothing has been changed.")
 
     label = name or "%s (cleaned)" % dataset["name"]
+    notes = (ops.get("notes") if isinstance(ops, dict) else None)
     created = register(
         owner_id, label, "derived", iter(rows),
         origin=dataset["id"], parent_id=dataset["id"],
-        columns=sorted({k for r in rows[:200] for k in r}),
-        format=out_fmt,
+        columns=_columns_of(rows),
+        format=run["format"],
         recipe={"from": dataset["id"], "from_name": dataset["name"],
-                "steps": steps, "rows_before": before, "rows_after": len(rows),
-                "report": report or None},
-        notes=ops.get("notes"))
-    created["report"] = report
+                "steps": run["steps"], "rows_before": run["before"],
+                "rows_after": len(rows),
+                # The operations themselves, in the order they ran, so the
+                # editor can reopen this recipe on the source and change it --
+                # a list of sentences describes a pipeline; this one *is* it.
+                "ops": ops,
+                "report": run["report"] or None},
+        notes=notes)
+    created["report"] = run["report"]
     return created
 
 
-def preview_transform(dataset: dict, ops: dict, sample: int = 2000) -> dict:
+def preview_transform(dataset: dict, ops: dict | list, sample: int | None = 2000,
+                      limit: int = 5, upto: int | None = None) -> dict:
     """What these settings would do, without doing it.
 
     A transform that writes a new dataset is cheap to undo and expensive to
@@ -1059,25 +1067,48 @@ def preview_transform(dataset: dict, ops: dict, sample: int = 2000) -> dict:
     rehearsal would take longer than the real thing anyone is trying to avoid.
     Dedupe and sampling behave differently on a slice, which is exactly why
     the answer is labelled rather than presented as a count.
+
+    `ops` may be an ordered list of steps. Then `stages` reports what each
+    step did, and `upto` picks which step's output the rows are taken from --
+    the whole pipeline still runs, so the counts of the later steps are known
+    while an earlier one is being looked at.
     """
-    rows, steps, out_fmt, before, report = apply_ops(dataset, ops, sample)
-    fmt = formatting.resolve_format(out_fmt or {})
-    shown = rows[:5]
+    run = apply_ops(dataset, ops, sample, snapshot_at=upto)
+    rows = run["snapshot"]
+    fmt = formatting.resolve_format(run["snapshot_format"] or {})
+    shown = rows[:max(int(limit), 1)]
     return {
-        "sampled": before,
+        "sampled": run["before"],
         "kept": len(rows),
+        "final_kept": len(run["rows"]),
         "total_rows": dataset.get("rows") or 0,
-        "partial": before < (dataset.get("rows") or 0),
-        "steps": steps,
-        "format": out_fmt,
-        "columns": sorted({k for r in rows[:200] for k in r}),
+        "partial": run["before"] < (dataset.get("rows") or 0),
+        "steps": run["steps"],
+        "stages": run["stages"],
+        "upto": run["snapshot_index"],
+        "format": run["snapshot_format"],
+        "columns": _columns_of(rows),
         "rows": shown,
         "rendered": [formatting.format_example(r, fmt) or "" for r in shown],
         "splits": _count_splits(rows),
         # What the conversion had to infer and what it could not make sense
         # of. Empty for every transform that is not a conversion.
-        "report": report,
+        "report": run["report"],
     }
+
+
+def _columns_of(rows: list[dict]) -> list[str]:
+    """The columns, in the order the rows introduce them.
+
+    Not sorted: a file whose columns are question, answer, name should be
+    shown as question, answer, name, and a column built last should appear
+    last. Alphabetical order is nobody's order.
+    """
+    seen: dict[str, None] = {}
+    for r in rows[:200]:
+        for k in r:
+            seen.setdefault(k, None)
+    return list(seen)
 
 
 def _count_splits(rows: list[dict]) -> dict:
@@ -1088,19 +1119,64 @@ def _count_splits(rows: list[dict]) -> dict:
     return out
 
 
-def apply_ops(dataset: dict, ops: dict, sample: int | None = None
-              ) -> tuple[list[dict], list[str], dict, int, dict]:
-    """Run a set of operations over the rows. Reads; never writes.
+def apply_ops(dataset: dict, ops: dict | list, sample: int | None = None,
+              snapshot_at: int | None = None) -> dict:
+    """Run operations over the rows, in order. Reads; never writes.
 
     Shared by the real transform and by the preview of one, so that what the
     preview shows and what the transform does cannot be two different pieces
     of code that drift.
-    """
-    fmt = formatting.resolve_format(dataset.get("format") or {})
-    steps: list[str] = []
 
+    `ops` is one options dict, or a list of them. A list is a pipeline: each
+    entry runs on what the one before it produced, reading the rows the way
+    the previous step left them -- so a column built in step two is what step
+    three's length filter measures. `stages` records what every step did,
+    and `snapshot_at` keeps a copy of the rows as they stood after that step,
+    which is how an editor shows the table at any point in its history
+    without running the pipeline once per step.
+    """
+    steps_list = ops if isinstance(ops, list) else [ops]
     rows = list(iter_rows(dataset["id"], sample))
     before = len(rows)
+    fmt_now: dict = dataset.get("format") or {}
+
+    stages: list[dict] = []
+    all_steps: list[str] = []
+    report: dict = {}
+    snapshot, snapshot_fmt, snapshot_index = rows, fmt_now, -1
+    for i, step in enumerate(steps_list):
+        n0 = len(rows)
+        rows, said, fmt_now, rep = _run_step(rows, fmt_now, step or {})
+        all_steps.extend(said)
+        if rep:
+            report = rep
+        stages.append({
+            "kept": len(rows), "removed": n0 - len(rows), "steps": said,
+            "columns": _columns_of(rows),
+            "report": rep or None,
+        })
+        if snapshot_at is not None and i == snapshot_at:
+            snapshot, snapshot_fmt, snapshot_index = rows, fmt_now, i
+    if snapshot_at is None or snapshot_at >= len(steps_list):
+        snapshot, snapshot_fmt = rows, fmt_now
+        snapshot_index = len(steps_list) - 1
+    return {"rows": rows, "steps": all_steps, "format": fmt_now or {},
+            "before": before, "report": report, "stages": stages,
+            "snapshot": snapshot, "snapshot_format": snapshot_fmt or {},
+            "snapshot_index": snapshot_index}
+
+
+def _run_step(rows: list[dict], fmt_in: dict, ops: dict
+              ) -> tuple[list[dict], list[str], dict, dict]:
+    """One options dict applied to rows already in hand.
+
+    Returns the rows, a sentence per thing done, the format the rows should be
+    read with from now on, and the conversion report (empty unless this step
+    converted). Nothing here mutates the rows it was given: a snapshot taken
+    before this step must still describe the rows before this step.
+    """
+    fmt = formatting.resolve_format(fmt_in or {})
+    steps: list[str] = []
 
     # ---- the columns first ------------------------------------------------
     #
@@ -1124,12 +1200,16 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
         sep = spec.get("by")
         if not source or not into:
             continue
+        out = []
         for r in rows:
             value = r.get(source)
             text = "" if value is None else str(value)
             parts = text.split(sep) if sep else text.split()
+            r = dict(r)
             for n, name in enumerate(into):
                 r[name] = parts[n].strip() if n < len(parts) else ""
+            out.append(r)
+        rows = out
         steps.append("Split \"%s\" on %s into %s"
                      % (source, ("%r" % sep) if sep else "whitespace",
                         ", ".join(into)))
@@ -1195,9 +1275,10 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
             return not turns or any((m.get("content") or "").strip()
                                     or m.get("tool_calls") for m in turns)
 
+        n0 = len(rows)
         rows = [r for r in rows if says_something(r)]
         steps.append("Dropped rows that say nothing (%d removed)"
-                     % (before - len(rows)))
+                     % (n0 - len(rows)))
 
     if ops.get("dedupe"):
         n0 = len(rows)
@@ -1351,8 +1432,8 @@ def apply_ops(dataset: dict, ops: dict, sample: int | None = None
         # just built, and the calculation would have done nothing.
         out_fmt = {"mode": "text", "text_field": built[-1][0]}
     else:
-        out_fmt = dataset.get("format")
-    return rows, steps, out_fmt or {}, before, report
+        out_fmt = fmt_in
+    return rows, steps, out_fmt or {}, report
 
 
 # `{column}`, `{column|filter}`, `{column|slice:0:80}`, `{a|trim|lower}`.
@@ -1618,7 +1699,7 @@ def merge(datasets: list[dict], owner_id: str | None, name: str,
     if shuffle:
         random.Random(seed).shuffle(rows)
         steps.append("Shuffled together")
-    columns = sorted({k for r in rows[:200] for k in r})
+    columns = _columns_of(rows)
     # Sampled ACROSS the merged rows rather than off the front of them. With
     # shuffling off the front is entirely the first dataset, which is how the
     # facts came to describe only the first dataset in the first place -- and

@@ -399,11 +399,24 @@ async def transform_dataset(request: Request, dataset_id: str,
 @router.post("/{dataset_id}/transform/preview")
 async def preview_transform(request: Request, dataset_id: str,
                             payload: dict = Body(...)) -> dict:
-    """What a transform would do, without doing it."""
+    """What a transform would do, without doing it.
+
+    `ops` is one options dict or an ordered list of them. `sample` is how many
+    rows to rehearse on -- 0 or "all" means the whole file, which is the
+    caller's choice to make and to wait for. `limit` is how many resulting
+    rows to send back, and `upto` which step's output they are taken from.
+    """
     d = _get(request, dataset_id)
+    raw_sample = payload.get("sample", 2000)
+    sample = None if raw_sample in (0, "0", "all", None) else int(raw_sample)
+    if sample is not None:
+        sample = max(sample, 1)
+    upto = payload.get("upto")
     try:
-        return ds.preview_transform(d, payload.get("ops") or {},
-                                    int(payload.get("sample") or 2000))
+        return ds.preview_transform(
+            d, payload.get("ops") or {}, sample,
+            limit=min(int(payload.get("limit") or 5), 200),
+            upto=None if upto is None else int(upto))
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
