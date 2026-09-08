@@ -191,11 +191,20 @@ def run(cfg: dict, ctx: Any) -> dict:
             if key in seen:
                 duplicates += 1
                 if duplicates in (25, 100, 400):
-                    ctx.log("%d generated rows so far were exact repeats of "
-                            "earlier ones. A model asked the same thing twice "
-                            "tends to answer it the same way -- raise the "
-                            "temperature, or give it more varied prompts."
-                            % duplicates, "warn")
+                    # Two different things wear the same counter. Inventing
+                    # the same example twice is a model repeating itself;
+                    # answering the same question twice is a split that holds
+                    # it twice, and telling somebody to raise the temperature
+                    # would be advice about a problem they do not have.
+                    ctx.log(
+                        ("%d prompts so far were already in this run -- the "
+                         "split holds them more than once, and only the first "
+                         "answer is kept." if mode == "from_dataset" else
+                         "%d generated rows so far were exact repeats of "
+                         "earlier ones. A model asked the same thing twice "
+                         "tends to answer it the same way -- raise the "
+                         "temperature, or give it more varied prompts.")
+                        % duplicates, "warn")
                 continue
             seen.add(key)
 
@@ -487,6 +496,44 @@ def _sources(cfg: dict, mode: str, ctx: Any,
             msgs = ([{"role": "system", "content": system}] if system else [])
             msgs.append({"role": "user", "content": p})
             yield msgs, {"prompt": p}
+
+    elif mode == "from_dataset":
+        # Batch inference: answer prompts that already exist rather than
+        # inventing them. This is the mode for distilling a capable model's
+        # answers onto questions you already have, and for producing a model's
+        # own answers to a split so they can be read, corrected and trained
+        # on -- both of which meant exporting the prompts, running a script,
+        # and importing the result.
+        #
+        # Finite, unlike every other source here: it stops when the split runs
+        # out, and the run reports fewer rows than it was asked for rather
+        # than looping over the same prompts again.
+        field = (cfg.get("prompt_field") or "").strip()
+        from common import formatting
+        fmt = formatting.resolve_format(cfg.get("source_format") or {})
+        seen_any = False
+        for row in _source_rows(cfg, ctx):
+            prompt = _prompt_of(row, field, fmt)
+            if not prompt:
+                continue
+            seen_any = True
+            msgs = ([{"role": "system", "content": system}] if system else [])
+            if instruction:
+                # An instruction wraps the prompt rather than replacing it:
+                # "answer this as a support agent would" over the question the
+                # data already holds.
+                msgs.append({"role": "user",
+                             "content": instruction.replace("{prompt}", prompt)
+                             if "{prompt}" in instruction
+                             else "%s\n\n%s" % (instruction, prompt)})
+            else:
+                msgs.append({"role": "user", "content": prompt})
+            yield msgs, {"prompt": prompt}
+        if not seen_any:
+            raise ValueError(
+                "No prompts could be read from that split. Name the column "
+                "the question is in, or choose a dataset of conversations.")
+        return
 
     elif mode == "from_topics":
         topics = _lines(cfg.get("topics"))
@@ -967,6 +1014,29 @@ def _split_pair(text: str) -> tuple[str, str] | None:
 def _clip(text: str, n: int = 110) -> str:
     one = " ".join(text.split())
     return one if len(one) <= n else one[:n] + "…"
+
+
+def _prompt_of(row: dict, field: str, fmt: dict) -> str:
+    """The question in one row of the source split.
+
+    A named column wins. Failing that, a conversation's last user turn, and
+    failing that the first column that looks like a question -- the same order
+    the prompt-set builder uses, so a dataset that can become a prompt set can
+    also be answered in bulk.
+    """
+    if field:
+        return str(row.get(field) or "").strip()
+    if isinstance(row.get("messages"), list):
+        from common import conversation as C
+        conv, _ = C.repair(C.from_row(row, fmt))
+        for m in reversed(conv[C.MESSAGES_KEY]):
+            if m.get("role") == "user" and (m.get("content") or "").strip():
+                return m["content"].strip()
+        return ""
+    for name in ("instruction", "prompt", "question", "input", "text"):
+        if value := str(row.get(name) or "").strip():
+            return value
+    return ""
 
 
 def _dedupe_key(row: dict) -> str:

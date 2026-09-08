@@ -59,7 +59,12 @@ export class LineChart {
     this.mount = mount;
     this.o = {
       title: "", yLabel: "", xLabel: "Step", height: 240,
-      color: "var(--series-1)", format: fmtTick, ...opts,
+      color: "var(--series-1)", format: fmtTick,
+      // How to print a value on the x axis. A step number by default, which
+      // is what nearly every chart here plots -- but a chart whose x is a
+      // date needs its own, or the axis reads 1788874349.
+      xFormat: (v) => String(Math.round(v)),
+      ...opts,
     };
     // A single unnamed series is the common case and stays the default, so
     // every existing call site keeps working unchanged.
@@ -177,7 +182,13 @@ export class LineChart {
     // Room on the right for end-of-line labels, which carry identity when
     // more than one series shares the plot.
     const labelled = live.length > 1 && !narrow;
-    if (labelled) pad.r = 46;
+    // Measured from the longest label rather than fixed at 46px, which fit
+    // "Held-out" and clipped anything longer to "Each sc". A label cut in
+    // half is worse than no label: it names nothing and looks like a bug.
+    if (labelled) {
+      const longest = Math.max(...live.map((s) => s.label.length));
+      pad.r = Math.min(Math.round(W * 0.25), Math.max(46, longest * 6 + 16));
+    }
     const iw = Math.max(10, W - pad.l - pad.r);
     this._geom = { W, H, pad, iw, ih };
 
@@ -196,11 +207,20 @@ export class LineChart {
       lab.textContent = this.o.format(t);
       this.svg.appendChild(lab);
     }
+    // A repeated label is worse than a missing one: an axis reading
+    // "8 Sept · 8 Sept · 8 Sept" says the chart cannot tell its own points
+    // apart. Ticks are spaced by value, and a formatter coarser than that
+    // spacing -- a date over a span of hours -- collapses several onto the
+    // same string, so the duplicates are dropped rather than drawn.
+    let lastLabel = null;
     for (const t of niceTicks(x0, x1, 5)) {
       if (t < x0 || t > x1) continue;
+      const text = this.o.xFormat(t);
+      if (text === lastLabel) continue;
+      lastLabel = text;
       const lab = el("text", { x: sx(t), y: H - 8, "text-anchor": "middle",
                                fill: "var(--text-3)", "font-size": 11 });
-      lab.textContent = String(Math.round(t));
+      lab.textContent = text;
       this.svg.appendChild(lab);
     }
 
@@ -225,6 +245,11 @@ export class LineChart {
         fill: `url(#${gid})`, stroke: "none" }));
     }
 
+    // Where each end-of-line label has been put, so two series that finish at
+    // the same value do not print one on top of the other -- which happens
+    // whenever the second series is derived from the first, as a running best
+    // is, and reads as a rendering fault rather than as two equal numbers.
+    const labelYs = [];
     for (const s of live) {
       const d = s.points.map((p, i) =>
         `${i ? "L" : "M"}${sx(p.x).toFixed(2)},${sy(p.y).toFixed(2)}`).join("");
@@ -241,7 +266,10 @@ export class LineChart {
         stroke: "var(--surface)", "stroke-width": 2 }));
 
       if (labelled) {
-        const t = el("text", { x: sx(last.x) + 9, y: sy(last.y) + 3.5,
+        let y = sy(last.y) + 3.5;
+        while (labelYs.some((used) => Math.abs(used - y) < 12)) y += 12;
+        labelYs.push(y);
+        const t = el("text", { x: sx(last.x) + 9, y,
                                fill: "var(--text-2)", "font-size": 10.5,
                                "font-weight": 600 });
         t.textContent = s.label;
@@ -289,7 +317,8 @@ export class LineChart {
         ? `<span style="color:var(--text-3)">${s.label}</span> <strong>${
             this.o.format(best.y)}</strong>`
         : `<strong>${this.o.format(best.y)}</strong>` +
-          `<span style="color:var(--text-3)"> · step ${best.x}</span>`);
+          `<span style="color:var(--text-3)"> · ${
+            this.o.xLabel.toLowerCase()} ${this.o.xFormat(best.x)}</span>`);
     });
 
     this._cross.setAttribute("x1", px);

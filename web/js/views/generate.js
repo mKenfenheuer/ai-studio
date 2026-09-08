@@ -43,6 +43,16 @@ const MODES = [
     brief: true,
   },
   {
+    id: "from_dataset",
+    title: "Answer a dataset I already have",
+    blurb: "You supply a dataset of questions; the model answers every one of "
+         + "them. Distillation onto prompts you already collected, or your "
+         + "own model's answers to a split, written down where they can be "
+         + "read, corrected and trained on.",
+    dataset: true,
+    answers: true,
+  },
+  {
     id: "extend_conversations",
     title: "Carry these conversations further",
     blurb: "You supply a dataset; the model adds more turns to every "
@@ -177,6 +187,18 @@ export async function generateView(mount, [fromJob] = []) {
       if (state.mode === "from_prompts") cfg.prompts = f.body;
       if (state.mode === "from_topics") cfg.topics = f.body;
       if (state.mode === "from_seeds") cfg.seeds = f.body;
+      if (state.mode === "from_dataset") {
+        if (!f.source_dataset_id) {
+          return toast("Which dataset holds the questions?", "err");
+        }
+        cfg.source_dataset_id = f.source_dataset_id;
+        cfg.source_split = f.source_split || "";
+        cfg.prompt_field = f.prompt_field || "";
+        cfg.instruction = f.instruction || "";
+        // Blank means every row in the split, which the controller fills in
+        // from the split's own size. A number here is a sample of it.
+        cfg.count = +f.count || 0;
+      }
       if (state.mode === "extend_conversations") {
         if (!f.source_dataset_id) {
           return toast("Which dataset should get the extra turns?", "err");
@@ -218,6 +240,53 @@ export async function generateView(mount, [fromJob] = []) {
  *  multi-step conversation and the wrong one for teaching facts, and which of
  *  those you are doing is not something this page can work out for you.
  */
+/** Answering questions that already exist, rather than inventing them. */
+function answerPanel(datasets, p = {}) {
+  const rows = (datasets || []).filter((d) => (d.rows || 0) > 0);
+  return html`
+    <div class="field">
+      <label for="srcDs">Dataset holding the questions</label>
+      <select id="srcDs" name="source_dataset_id" required>
+        <option value="">Choose a dataset…</option>
+        ${raw(rows.map((d) => `<option value="${esc(d.id)}"${
+          sel(d.id, val(p, "source_dataset_id"))}>${esc(d.name)} — ${
+          fmtNum(d.rows)} rows</option>`).join(""))}
+      </select>
+      <div class="hint">One answer per row. The original is not touched — this
+        writes a new dataset, like every other transformation here.</div>
+    </div>
+    <div class="grid grid-2">
+      <div class="field">
+        <label for="srcSplit">Split</label>
+        <input id="srcSplit" name="source_split" class="mono"
+               value="${val(p, "source_split")}" placeholder="every row">
+        <div class="hint">A held-out split is the interesting one: those are
+          the questions nothing was trained on.</div>
+      </div>
+      <div class="field">
+        <label for="promptField">Which column holds the question</label>
+        <input id="promptField" name="prompt_field" class="mono"
+               value="${val(p, "prompt_field")}" placeholder="work it out">
+        <div class="hint">Left blank: the last thing the user said, for a
+          dataset of conversations, or the first column that looks like a
+          question.</div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="genInstr">Say something about how to answer (optional)</label>
+      <textarea id="genInstr" name="instruction" rows="3" class="mono"
+                placeholder="Answer as a support agent would: two sentences, no apology.">${
+                  val(p, "instruction")}</textarea>
+      <div class="hint">Put <code>{prompt}</code> where the question should go,
+        or leave it out and the question follows on its own line.</div>
+    </div>
+    <div class="callout" style="margin-top:10px">
+      <strong>The answers are the model's, not the truth</strong>
+      A dataset written this way teaches a smaller model to imitate this one,
+      including where it is wrong. If the source split already has expected
+      answers, score against them instead of training on these.</div>`;
+}
+
 function extendPanel(datasets, p = {}) {
   const rows = (datasets || []).filter((d) => (d.rows || 0) > 0);
   return html`
@@ -440,7 +509,8 @@ function layout(state, online, playable, connected = [], labelOf = {},
       <div class="grid grid-2" style="align-items:start">
         <div class="card">
           <h3>${mode.title}</h3>
-          ${raw(mode.dataset ? extendPanel(datasets, p)
+          ${raw(mode.answers ? answerPanel(datasets, p)
+                : mode.dataset ? extendPanel(datasets, p)
                 : mode.brief ? conversationPanel(p) : html`
           <div class="field">
             <label for="genBody">${bodyLabel(state.mode)}</label>
@@ -531,8 +601,16 @@ function layout(state, online, playable, connected = [], labelOf = {},
             <div class="grid grid-2">
               <div class="field">
                 <label for="genCount">How many rows</label>
-                <input id="genCount" name="count" type="number" value="${state.count}"
-                       min="1" max="100000" required>
+                ${raw(mode.answers ? html`
+                  <input id="genCount" name="count" type="number"
+                         value="${val(p, "count") || ""}" min="1" max="100000"
+                         placeholder="every row in the split">
+                  <div class="hint">There is one answer per row, so this is a
+                    sample rather than a target. Blank answers all of
+                    them.</div>`
+                  : html`
+                  <input id="genCount" name="count" type="number" value="${state.count}"
+                         min="1" max="100000" required>`)}
               </div>
               ${raw(mode.brief ? "" : html`
               <div class="field">

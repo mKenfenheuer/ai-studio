@@ -526,16 +526,22 @@ Remaining in this phase:
   (name, arguments); LLM-as-judge using the hosted providers that already
   exist in `common/apimodels.py`; pass@k with `n>1` sampling for code sets
   (sandboxed on a CPU runner).
-- **Regression view**: one prompt set over time per model lineage, with a
-  pinned champion.
+- **Regression view.** *Done:* an "Over time" tab on a prompt set draws every
+  scoring in the order it happened with the best-so-far beside it, names the
+  champion, and offers to serve it under a registered name -- which is the
+  promotion path the registry needed. Still to do: splitting the line per
+  model lineage when a set has been used by several.
 - **Playground**: side-by-side (the runner already holds several models,
   `inference.py:120-152`); saved conversations. *Done:* "keep this exchange"
   writes the conversation up to one assistant turn into a dataset's `review`
   split, with the answer editable first, mapped into the dataset's own shape
   when it is not a conversation dataset (`api/data._shaped`). That is the link
   that turns the playground into the source of the next training run.
-- **Batch inference**: run a model over a dataset split and save the answers
-  as a new dataset (the eval job already does the loop).
+- **Batch inference.** *Done:* a `from_dataset` mode in the generator answers
+  every row of a split and writes the answers as a new dataset -- distillation
+  onto prompts you already have, or a model's own answers to a held-out split
+  written down where they can be read, corrected and trained on. Unlike every
+  other generation source it is finite: it stops when the split runs out.
 - **Registry.** *Done:* `model_aliases` maps a name to a run, with a stage, a
   note and the last twenty things it pointed at; `_resolve` checks aliases
   before run ids and names; `/v1/models` lists them as models in their own

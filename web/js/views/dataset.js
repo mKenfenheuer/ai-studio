@@ -855,6 +855,11 @@ function ribbonFor(s) {
       rb("holdBack", "◫", "Hold back a split"),
     ]) + group("Use", [
       rb("useForTraining", "✦", "Train on this", { cls: "primary" }),
+      // The other thing to do with a set of questions: have a model answer
+      // them. Reachable only from the generator until now, where you had to
+      // remember the dataset's name.
+      rb(null, "▷", "Answer it with a model", { href: "#/generate",
+        title: "Write a new dataset of a model's answers to these rows" }),
       rb(null, "↓", "Download", { href: `/api/datasets/${esc(d.id)}/dataset-file`,
                                   title: "The whole file, as JSONL" }),
       rb("publishBtn", "☁", "Publish"),

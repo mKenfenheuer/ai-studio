@@ -437,7 +437,10 @@ async def _create_job(request: Request, payload: dict) -> str:
         if not model.get("job_id") and not model.get("base_model") \
                 and not model.get("provider"):
             raise HTTPException(400, "Choose a model to write the data with.")
-        if not int(cfg.get("count") or 0):
+        # Answering an existing split needs no count: there is one answer per
+        # row, and the number of rows is the size of the split. Everything
+        # else is inventing rows, and how many is the whole question.
+        if cfg.get("mode") != "from_dataset" and not int(cfg.get("count") or 0):
             raise HTTPException(400, "How many rows should it write?")
         # Extending conversations reads an existing dataset. It travels the
         # same way a training dataset does -- as a URL the runner fetches with
@@ -460,11 +463,18 @@ async def _create_job(request: Request, payload: dict) -> str:
                     raise HTTPException(
                         400, "The tools must be a JSON array of function "
                              "definitions.")
-        if cfg.get("mode") == "extend_conversations":
+        # Two modes read an existing dataset: lengthening its conversations,
+        # and answering the questions already in it. The dataset travels the
+        # same way a training one does -- as a URL the runner fetches with its
+        # join token -- so a private dataset is never made public in order to
+        # be read.
+        if cfg.get("mode") in ("extend_conversations", "from_dataset"):
+            answering = cfg["mode"] == "from_dataset"
             src_id = (cfg.get("source_dataset_id") or "").strip()
             if not src_id:
                 raise HTTPException(
-                    400, "Which dataset should the extra turns be added to?")
+                    400, "Which dataset holds the questions?" if answering
+                    else "Which dataset should the extra turns be added to?")
             d = db.get_dataset(src_id)
             if not d:
                 raise HTTPException(404, "No such dataset.")
@@ -472,7 +482,29 @@ async def _create_job(request: Request, payload: dict) -> str:
             cfg["source_dataset"] = "%s/api/datasets/%s/dataset-file" % (
                 str(request.base_url).rstrip("/"), src_id)
             cfg["source_label"] = d["name"]
-            cfg.setdefault("count", d.get("rows") or 0)
+            # How the runner should read a row of it. Sent rather than guessed
+            # again on the far side: the studio already knows this dataset's
+            # format, and two guesses that disagree is a run that answers the
+            # wrong column.
+            cfg["source_format"] = d.get("format") or {}
+            split = (cfg.get("source_split") or "").strip()
+            splits = d.get("splits") or {}
+            if split and splits and split not in splits:
+                raise HTTPException(
+                    400, "That dataset has no split called %r. It has: %s."
+                         % (split, ", ".join(splits) or "none"))
+            # One answer per row, so the count is the size of the split rather
+            # than a number somebody has to guess. Asking for fewer is a
+            # sample of it; asking for more would just run out.
+            available = splits.get(split) if split else (d.get("rows") or 0)
+            if answering:
+                asked = int(cfg.get("count") or 0)
+                cfg["count"] = min(asked, available) if asked else available
+                if not cfg["count"]:
+                    raise HTTPException(
+                        400, "That split has no rows to answer.")
+            else:
+                cfg.setdefault("count", d.get("rows") or 0)
         if model.get("provider"):
             _attach_provider(user, cfg)
         else:

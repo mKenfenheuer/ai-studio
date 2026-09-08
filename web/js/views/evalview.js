@@ -12,13 +12,15 @@
  * across eight models is a magnitude question anyway.
  */
 import { api, events } from "../api.js";
-import { html, raw, esc, $, $$, on, toast, fmtAgo, fmtDuration } from "../util.js";
+import { LineChart } from "../chart.js";
+import { html, raw, esc, $, $$, on, toast, modal, fmtAgo, fmtDuration } from "../util.js";
 import { shareButton, wireShareBox } from "./share.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
-import { breadcrumb, confirmDestructive } from "../components.js";
+import { breadcrumb, confirmDestructive, emptyState } from "../components.js";
 
 const TABS = [
   { key: "scores", label: "Scores" },
+  { key: "trend", label: "Over time" },
   { key: "run", label: "Score models" },
   { key: "prompts", label: "The prompts" },
 ];
@@ -54,6 +56,7 @@ export async function evalView(mount, [evalId]) {
 
   function wire() {
     wireShareBox(mount, "eval", ev, refresh);
+    drawTrend(mount, ev, tab);
     wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
 
     // A prompt set with no scores yet opens on the tab that does something
@@ -153,6 +156,44 @@ export async function evalView(mount, [evalId]) {
       catch (ex) { toast(ex.message, "err"); }
     });
 
+    // Promotion from the eval page: the run that won this prompt set is
+    // exactly the one that should answer to the name other software uses, and
+    // getting there meant remembering which run it was and finding it again.
+    on(mount, "click", "#promoteBest", async (_e, t) => {
+      const jobId = t.dataset.job;
+      let existing = [];
+      try { existing = await api.registeredModels(); } catch { /* offer anyway */ }
+      const dlg = modal({ title: "Serve the best model under a name", width: 500,
+        body: html`
+        <p class="muted tiny">A name other software is configured with. Point
+          it here and every client follows, with nothing out there to edit.</p>
+        <div class="field">
+          <label for="promName">Name</label>
+          <input id="promName" type="text" class="mono" placeholder="assistant-prod"
+                 list="promNames" value="${esc(existing[0]?.alias || "")}">
+          <datalist id="promNames">${raw(existing.map((n) =>
+            `<option value="${esc(n.alias)}"></option>`).join(""))}</datalist>
+          <div class="hint">An existing name is repointed; a new one is
+            created.</div>
+        </div>
+        <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+          <button type="button" class="btn" data-modal-close>Cancel</button>
+          <button type="button" class="btn btn-primary" id="promGo">Serve it</button>
+        </div>` });
+      on(dlg, "click", "#promGo", async (_e2, btn) => {
+        const alias = ($("#promName", dlg).value || "").trim().toLowerCase();
+        if (!alias) return toast("Give it a name.", "err");
+        btn.disabled = true;
+        try {
+          const r = await api.registerModel(alias, { job_id: jobId });
+          dlg.close();
+          toast(r.moved ? `"${alias}" now answers with this model.`
+                        : `Serving as "${alias}".`, "ok",
+                { href: "#/serving", label: "Served models" });
+        } catch (ex) { toast(ex.message, "err"); btn.disabled = false; }
+      });
+    });
+
     on(mount, "click", "#copyEval", async () => {
       try {
         const copy = await api.copyEval(evalId, {});
@@ -169,6 +210,43 @@ export async function evalView(mount, [evalId]) {
   return () => unsub();
 }
 
+/** Fill the trend chart, once its element exists in the page. */
+function drawTrend(mount, ev, tab) {
+  const el = tab === "trend" ? $("#trendChart", mount) : null;
+  if (!el) return;
+  const key = el.dataset.trend;
+  const measure = MEASURES[key] || MEASURES.expected_loss;
+  const scores = (ev.scores || []).slice()
+    .sort((a, b) => a.created_at - b.created_at)
+    .filter((s) => s.metrics[key] != null);
+
+  const each = scores.map((s) => ({ x: s.created_at, y: s.metrics[key] }));
+  let running = null;
+  const frontier = scores.map((s) => {
+    const v = s.metrics[key];
+    running = running === null ? v
+      : (measure.lower ? Math.min(running, v) : Math.max(running, v));
+    return { x: s.created_at, y: running };
+  });
+
+  const chart = new LineChart(el, {
+    title: `${measure.label} on this set${measure.lower ? " — lower is better"
+                                                       : " — higher is better"}`,
+    height: 260,
+    xLabel: "Scored",
+    format: (v) => measure.fmt(v),
+    // Seconds since the epoch on the axis would read as a nine-digit number.
+    xFormat: (v) => new Date(v * 1000).toLocaleDateString(undefined,
+      { month: "short", day: "numeric" }),
+    series: [
+      { key: "each", label: "Each scoring" },
+      { key: "best", label: "Best so far", dashed: true },
+    ],
+  });
+  chart.setSeries("each", each);
+  chart.setSeries("best", frontier);
+}
+
 // ---------------------------------------------------------------------------
 
 function layout(ev, candidates, openScore, tab, state) {
@@ -177,7 +255,8 @@ function layout(ev, candidates, openScore, tab, state) {
   const answered = items.filter((i) => i.expected).length;
   document.title = `${ev.name} · Evaluate · AI Studio`;
 
-  const body = tab === "run" ? runPanel(ev, candidates, state)
+  const body = tab === "trend" ? trendPanel(ev)
+    : tab === "run" ? runPanel(ev, candidates, state)
     : tab === "prompts" ? promptsPanel(items, answered)
     : html`${raw(scoreTable(scores, answered, items.length))}
            ${raw(openScore ? scoreDetail(openScore) : "")}`;
@@ -361,6 +440,71 @@ function baselinePanel(candidates, picked, baselines, hosted) {
         : html`<p class="muted tiny" style="margin-top:8px">
           <a href="#/account">Connect a provider</a> to compare against a
           hosted model too.</p>`)}
+    </div>`;
+}
+
+/** Is this prompt set's best model getting better?
+ *
+ *  The table answers "which of these won". It cannot answer the question a
+ *  prompt set exists for, which is whether three months of work moved the
+ *  number at all -- for that the scorings have to be read in the order they
+ *  happened, with the best-so-far drawn beside them. Two series, one unit,
+ *  which is the only condition under which this chart puts two lines on one
+ *  plot.
+ */
+function trendPanel(ev) {
+  const scores = (ev.scores || []).slice()
+    .sort((a, b) => a.created_at - b.created_at);
+  const key = (ev.scores?.[0]?.metrics || {}).ranked_by || "expected_loss";
+  const measure = MEASURES[key] || MEASURES.expected_loss;
+  const usable = scores.filter((s) => s.metrics[key] != null);
+  if (usable.length < 2) {
+    return emptyState({
+      icon: "📉",
+      title: "Not enough scorings yet",
+      body: "Two of them, and this is where the line goes. It is the question "
+          + "a prompt set exists to answer: not which model won today, but "
+          + "whether the best one is better than the best one last month.",
+    });
+  }
+
+  const best = usable.reduce((a, b) =>
+    (measure.lower ? b.metrics[key] < a.metrics[key]
+                   : b.metrics[key] > a.metrics[key]) ? b : a);
+  const first = usable[0];
+  const moved = measure.lower ? first.metrics[key] - best.metrics[key]
+                              : best.metrics[key] - first.metrics[key];
+
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div id="trendChart" data-trend="${esc(key)}"></div>
+      <p class="muted tiny" style="margin:8px 0 0">Every scoring of this set,
+        in the order it happened. The second line is the best result so far,
+        which is the one that answers whether the work is going anywhere —
+        a single bad scoring is a bad model, not a regression.</p>
+    </div>
+    <div class="card">
+      <div class="row-between" style="flex-wrap:wrap;gap:10px">
+        <div>
+          <h3 style="margin:0 0 4px">Best on this set</h3>
+          <div>${raw(best.is_run
+            ? `<a href="#/jobs/${esc(best.model_job_id)}">${esc(best.model_name)}</a>`
+            : `<span>${esc(best.model_name)}</span>`)}
+            ${raw(baselineBadge(best))}
+            <span class="muted tiny">· ${measure.label.toLowerCase()}
+              ${measure.fmt(best.metrics[key])} · scored ${fmtAgo(best.created_at)}</span>
+          </div>
+          <div class="muted tiny" style="margin-top:4px">
+            ${moved > 0
+              ? `${measure.fmt(Math.abs(moved))} better than the first scoring on this set.`
+              : "No better than the first scoring on this set."}</div>
+        </div>
+        ${raw(best.is_run ? html`
+          <button class="btn btn-primary btn-sm" id="promoteBest"
+                  data-job="${esc(best.model_job_id)}">Serve it under a name</button>`
+          : `<span class="muted tiny">A baseline, not a run here — there is
+             nothing of yours to serve.</span>`)}
+      </div>
     </div>`;
 }
 

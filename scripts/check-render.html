@@ -132,7 +132,28 @@ const FIXTURES = [
                                             parent_id: "ds_1", source: "derived", rows: 48000 })]],
   [/\/api\/evals\/[^/]+$/, { id: "ev_1", name: "Support questions", notes: "", items: [
       { prompt: "Where is my order?", expected: "I will check.", note: "" }],
-      scores: [], access: "edit", mine: true, shares: [], created_at: now, updated_at: now }],
+      // Three scorings, newest first, so the table, the verdict and the trend
+      // chart all have something real to draw. One of them is a baseline off
+      // the Hub, which is the row shape a run does not cover.
+      scores: [
+        { id: "scr_3", model_job_id: "job_1", model_name: "SmolLM2 on alpaca",
+          model_ref: "job:job_1", is_run: true, model_gone: false,
+          created_at: now - 100, settings: { temperature: 0, system_prompt: "" },
+          metrics: { expected_loss: 1.11, expected_perplexity: 3.03, f1: 0.42,
+                     chrf: 0.51, exact: 0.1, tokens_per_sec: 30, seconds: 12,
+                     scored: 1, ranked_by: "expected_loss",
+                     ranking_decisive: true, verdict: "Lowest loss: SmolLM2 on alpaca." } },
+        { id: "scr_2", model_job_id: "", model_name: "HuggingFaceTB/SmolLM2-135M",
+          model_ref: "hub:HuggingFaceTB/SmolLM2-135M", is_run: false, model_gone: false,
+          created_at: now - 5000, settings: null,
+          metrics: { expected_loss: 1.55, expected_perplexity: 4.71, f1: 0.3,
+                     chrf: 0.36, exact: 0, tokens_per_sec: 28, seconds: 12, scored: 1 } },
+        { id: "scr_1", model_job_id: "job_1", model_name: "SmolLM2 on alpaca",
+          model_ref: "job:job_1", is_run: true, model_gone: false,
+          created_at: now - 90000, settings: null,
+          metrics: { expected_loss: 1.4, expected_perplexity: 4.05, f1: 0.35,
+                     chrf: 0.4, exact: 0, tokens_per_sec: 29, seconds: 12, scored: 1 } }],
+      access: "edit", mine: true, shares: [], created_at: now, updated_at: now }],
   [/\/api\/evals/, [{ id: "ev_1", name: "Support questions", items: [{ prompt: "a", expected: "b" }],
                      scores: [], mine: true, access: "edit", shares: [], updated_at: now }]],
   [/\/api\/playground/, [
