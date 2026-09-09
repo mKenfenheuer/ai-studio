@@ -925,3 +925,77 @@ The loop itself works: 40 steps in 8m 11s, loss 2.08 to 0.135, held-out 0.1398;
 the fine-tune calls the right tool 25% against the base's 0%; ARC-Challenge on
 60 questions puts the base ahead with overlapping intervals, and says so.
 
+---
+
+## 15. What to optimise next
+
+Written down after the end-to-end run in section 14, from what that run and a
+walk through the live UI actually showed. Ordered by what somebody using this
+every day would feel first.
+
+### 15.1 The interface
+
+1. **Projects are invisible in the libraries.** The dataset list and the run
+   list both carry an *Owner* column repeating the same name on every row of a
+   single-account studio, and no project at all -- the thing that now
+   organises the work. Owner becomes a project link; a filter beside it.
+2. **A project's runs are one flat list.** A training run sits buried under
+   its own scorings and benchmarks; at fifty scorings the model is
+   unfindable. Group the section the way the stage map is grouped --
+   training, scoring, exports.
+3. **Repeated scorings are indistinguishable**: three rows of "X on 2 models",
+   same set, same settings. Collapse repeats into one row with a count, or
+   label each with what changed.
+4. **The playground lists every finished run in the studio**, newest first, no
+   grouping and no search. Scope it to a project the way the wizard now is.
+5. **"Do the next thing" ignores the state.** The stage map computes the real
+   next step; the ribbon offers the same three buttons regardless, and offers
+   them on the unfiled pile, which is not a project.
+6. **The Models glyph reads as a bullet** at sidebar size. A distinct mark,
+   as was done for Dashboard and Datasets.
+
+Done: the playground no longer introduces a model as "null fine-tuned on
+http://…/dataset-file"; grids wrap on a phone instead of honouring a minimum
+wider than the screen.
+
+### 15.2 The workflow the app enforces
+
+1. **Nothing sequences the held-out split.** A dataset with one `train` split
+   is trained on, and then a prompt set is built from rows the model may have
+   trained on -- warned about in the set's notes, and nowhere else. The Data
+   stage should want a split held back before Train is offered; Evaluate
+   should default to it. `split()` and `_held_out_split` both exist already.
+2. **A result does not carry forward.** The winning run is known and nothing
+   is done with it: Publish does not name it, a first result does not suggest
+   varying one setting, and the map that computes the next step cannot take
+   it.
+3. **Re-scoring is undisciplined.** The same set can be run three times with
+   the same settings and produce three identical rows. Scoring every new run
+   against the project's set belongs to the project, not to somebody's memory.
+4. **A project has a goal but not a target.** `goal` is free text. As a set, a
+   measure and a threshold it could say *finished* instead of *five stages
+   touched*, and a benchmark result would be judged against something.
+5. **Publishing is two buttons in two places** -- the library from the run
+   ribbon, the Hub from the Model tab. One "Publish…", with the destination
+   as a choice inside it.
+6. **"What changed between these two runs" has no home.** Compare ranks
+   metrics; a project wants settings and data versions beside them.
+
+### 15.3 How the work is done
+
+1. **A smoke path.** Every defect in section 14 came from real data on real
+   machines; the checks are strong on pure functions and rendering and
+   structurally cannot see "the wizard pins a machine, so creating a run
+   returns 500". One command: throwaway data directory, project, twenty rows,
+   a tiny pinned run, a scoring, a publish. It catches two of the six on its
+   own.
+2. **Runner images drift silently.** A runner was a week stale -- reporting no
+   `kinds`, no `modalities` -- and the studio dispatched to it regardless. The
+   controller knows the agent version; Machines should say so, and a deploy
+   should not leave a fleet mismatched without saying it has. (Ops item 4.)
+3. **Deploys are unverified.** rsync and ssh work until a container recreate
+   stalls half way and nothing notices. The deploy script should wait for
+   what it deployed to come back at the version it deployed.
+4. **No CI.** The three check scripts and the render harness are what a push
+   should run. (Ops item 5.)
+
