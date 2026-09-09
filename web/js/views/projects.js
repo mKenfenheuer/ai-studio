@@ -416,16 +416,25 @@ function projectLayout(p) {
 const q = (p, sep = "") => (p.unfiled || !p.id ? "" : `?project=${encodeURIComponent(p.id)}${sep}`);
 
 function stageCard(s, p) {
-  const cls = { done: "stage-done", active: "stage-active", todo: "stage-todo" }[s.state];
+  const cls = { done: "stage-done", active: "stage-active", todo: "stage-todo",
+                warn: "stage-warn" }[s.state];
   const href = {
-    data: "#/data" + q(p), train: "#/new" + q(p), evaluate: "#/evals" + q(p),
+    // Straight to the dataset that needs splitting, when that is the step:
+    // the alternative is a library and a search for the name you just read.
+    data: s.split_target ? `#/data/${s.split_target}` : "#/data" + q(p),
+    train: "#/new" + q(p), evaluate: "#/evals" + q(p),
     benchmark: "#/evals" + q(p), publish: "#/models",
   }[s.key];
+  // A stage that is warning about something says so where the count goes:
+  // "1" and a green edge is exactly what a project with unsplit data should
+  // not look like.
+  const note = s.key === "data" && s.state === "warn" ? "no held-out split" : "";
   return html`
     <a class="stage ${cls}" href="${href}">
       <span class="stage-ico" aria-hidden="true">${STAGE_ICON[s.key]}</span>
       <span class="stage-label">${s.label}</span>
       <span class="stage-count">${s.count ? fmtNum(s.count) : "—"}</span>
+      ${raw(note ? `<span class="stage-warn-note">${esc(note)}</span>` : "")}
       ${raw(s.best ? html`
         <span class="stage-best">best ${s.best.metric.label || "score"}:
           <strong>${typeof s.best.metric.value === "number"

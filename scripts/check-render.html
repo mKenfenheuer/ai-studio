@@ -298,7 +298,9 @@ const FIXTURES = [
                   job_id: "job_1", published_at: now - 3000 }],
       conversations: [] },
     map: [
-      { key: "data", label: "Data", state: "done", count: 1, next: "Check the data" },
+      { key: "data", label: "Data", state: "warn", count: 1, held_out: 0,
+        split_target: "ds_1",
+        next: "Hold back a split — without one there is nothing to score on that the model has not already seen" },
       { key: "train", label: "Train", state: "done", count: 1,
         best: { job_id: "job_1", name: "SmolLM2 on alpaca",
                 metric: { label: "Held-out loss", value: 1.23, lower_better: true } },

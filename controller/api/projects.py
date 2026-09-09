@@ -137,14 +137,34 @@ def _stage_map(c: dict) -> list[dict]:
                 best = (r, pm["value"], pm)
     scored = [e for e in c["prompt_sets"] if e["scorings"]]
     benched = [e for e in c["benchmarks"] if e["scorings"]]
+
+    # Whether any of this project's data has a part held back. It is the
+    # difference between measuring a model and measuring its memory, and it
+    # has to be done *before* training -- afterwards the model has seen the
+    # rows and no amount of splitting brings back a fair test. So the Data
+    # stage asks for it rather than mentioning it in a note nobody reads at
+    # the point it still matters.
+    all_data = (c["datasets"] or []) + (c["borrowed_datasets"] or [])
+    held = [d for d in all_data
+            if any(name in (d.get("splits") or {})
+                   for name in ("validation", "test", "eval", "dev", "val",
+                                "holdout"))]
     return [
         {"key": "data", "label": "Data",
-         "state": "done" if c["datasets"] or c["borrowed_datasets"] else "todo",
-         "count": len(c["datasets"]) + len(c["borrowed_datasets"]),
+         # Data with nothing held back is not finished data. Amber rather
+         # than green, and the next step says the one thing to do about it.
+         "state": ("todo" if not all_data else "done" if held else "warn"),
+         "count": len(all_data),
          "borrowed": len(c["borrowed_datasets"]),
-         "next": ("Upload or import a dataset" if not (c["datasets"]
-                                                       or c["borrowed_datasets"])
-                  else "Check the data, hold back a split")},
+         "held_out": len(held),
+         # The dataset to do it to, so the card can go straight there rather
+         # than to a library the reader then has to search.
+         "split_target": next((d["id"] for d in all_data if d not in held), None),
+         "next": ("Upload or import a dataset" if not all_data
+                  else "Hold back a split — without one there is nothing to "
+                       "score on that the model has not already seen"
+                  if not held else
+                  "Check the data, or add more")},
         {"key": "train", "label": "Train",
          "state": "active" if any(r["kind"] != "evaluate" for r in active)
                   else "done" if done_runs else "todo",
@@ -156,7 +176,9 @@ def _stage_map(c: dict) -> list[dict]:
         {"key": "evaluate", "label": "Evaluate",
          "state": "done" if scored else "todo",
          "count": len(c["prompt_sets"]),
-         "next": ("Write a prompt set, or take one from a held-out split"
+         "next": (("Take a prompt set from the held-out split — the rows "
+                   "nothing trained on" if held else
+                   "Hold a split back first, then take a prompt set from it")
                   if not c["prompt_sets"] else
                   "Score the latest run against its base" if not scored else
                   "Score the next run on the same set")},

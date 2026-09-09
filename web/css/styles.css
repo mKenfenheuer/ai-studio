@@ -1655,6 +1655,10 @@ textarea.turn-edit {
 .stage-best { font-size: 11.5px; color: var(--text-2); }
 .stage-next { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
 .stage-done { border-left-color: var(--ok, #3fa06a); }
+/* Something is there but it is not finished: data with nothing held back,
+   which reads as done and is the one thing that makes a later score a lie. */
+.stage-warn { border-left-color: var(--warn); }
+.stage-warn-note { font-size: 11px; color: var(--warn); font-weight: 600; }
 .stage-active { border-left-color: var(--accent); }
 .stage-todo .stage-count { color: var(--text-3); }
 
