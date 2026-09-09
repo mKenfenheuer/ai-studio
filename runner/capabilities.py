@@ -24,6 +24,7 @@ import platform
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # GPU architectures with no usable flash/memory-efficient attention kernels.
 # On these, attention falls back to the O(n^2)-memory math path, which caps
@@ -218,12 +219,35 @@ def _sync(torch, device: str) -> None:
         torch.mps.synchronize()
 
 
+def _agent_version() -> str:
+    """The version in pyproject.toml, read from the installed tree."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        for line in (root / "pyproject.toml").read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("version"):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return "unknown"
+
+
+AGENT_VERSION = _agent_version()
+
+
 def probe(quick: bool = False) -> dict:
     """Build the capability report this runner advertises to the controller."""
     caps: dict = {
         "hostname": platform.node(),
         "os": platform.system(),
         "python": platform.python_version(),
+        # Which build of the agent this is. A runner whose image is a month
+        # old reports a capability set a month old -- no `kinds`, no
+        # `modalities`, none of the libraries -- and the controller, which
+        # deliberately does not refuse a machine for saying nothing, hands it
+        # work it cannot do. Saying the version out loud is what lets the
+        # Machines page point at the actual problem instead of leaving
+        # somebody to infer it from a missing field.
+        "agent_version": AGENT_VERSION,
         "probed_at": time.time(),
         "backend": "cpu",
         "device_name": platform.processor() or "CPU",

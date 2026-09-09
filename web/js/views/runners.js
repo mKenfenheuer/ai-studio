@@ -237,10 +237,21 @@ function card(r, admin, dense = false) {
     <div class="card">
       <div class="row-between" style="flex-wrap:wrap;gap:6px">
         <h3 style="margin:0"><span class="dot ${dot}"></span> ${r.name}</h3>
-        <span class="badge ${offline ? "badge-err" : r.status === "busy"
-          ? "badge-accent" : "badge-ok"}">${offline ? "offline"
-          : r.status === "busy" ? (trains ? "training" : "busy") : "ready"}</span>
+        <div class="row" style="gap:6px">
+          ${raw(r.up_to_date === false
+            ? `<span class="badge badge-warn" title="${esc(r.version_note || "")}"
+                 >out of date</span>` : "")}
+          <span class="badge ${offline ? "badge-err" : r.status === "busy"
+            ? "badge-accent" : "badge-ok"}">${offline ? "offline"
+            : r.status === "busy" ? (trains ? "training" : "busy") : "ready"}</span>
+        </div>
       </div>
+      ${raw(r.up_to_date === false && !offline ? html`
+        <div class="callout callout-warn" style="margin:8px 0 0">
+          <strong>This machine is running an older build</strong>
+          ${r.version_note} Rebuild and restart its runner image; the deploy
+          script does it for a machine this controller can reach.
+        </div>` : "")}
       <p class="muted tiny mono" style="margin:6px 0 10px">
         ${c.device_name || "unknown device"}${c.arch ? " · " + c.arch : ""}</p>
 

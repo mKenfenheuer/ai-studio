@@ -78,6 +78,8 @@ const FIXTURES = [
   [/\/api\/status/, { version: "0.1.0", join_token: "tok", hf_token_set: true,
                       runners_online: 1, runners_total: 1, jobs_running: 0, jobs_queued: 0 }],
   [/\/api\/runners$/, [{ id: "r1", name: "lab-box", status: "online", connected: true,
+      agent_version: "0.1.0", up_to_date: false,
+      version_note: "This machine runs 0.0.9; the controller is 0.1.0. Rebuild its image.",
       last_seen: now, current_job: null, checkpoints: [], disk: { free_gb: 120, total_gb: 500, models_gb: 40 },
       capabilities: { device_name: "RX 6900 XT", arch: "gfx1030", vram_gb: 16, backend: "rocm",
         dtypes: { float16: 31.6, bfloat16: 12.7 }, recommended_dtype: "float16",

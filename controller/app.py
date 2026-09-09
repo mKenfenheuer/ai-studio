@@ -114,7 +114,9 @@ async def _backup_loop() -> None:
         await asyncio.sleep(600)
 
 
-app = FastAPI(title="AI Studio", version="0.1.0", lifespan=lifespan)
+VERSION = "0.1.0"
+
+app = FastAPI(title="AI Studio", version=VERSION, lifespan=lifespan)
 
 # Registered before anything else so that no route can be reached without
 # passing it. Order matters here: middleware added later runs first, and the
@@ -248,7 +250,7 @@ async def health() -> dict:
     controller that was working perfectly. A liveness probe must not need a
     credential, so it must not carry anything worth protecting.
     """
-    return {"ok": True, "version": "0.1.0"}
+    return {"ok": True, "version": VERSION}
 
 
 @app.get("/api/fleet/in-flight")
@@ -276,7 +278,7 @@ async def status(request: Request) -> dict:
     runners = db.list_runners()
     user = security.current_user(request)
     return {
-        "version": "0.1.0",
+        "version": VERSION,
         # The join token lets a machine attach to the studio and read the work
         # on it. Members can see that machines exist; only an administrator
         # gets the credential that adds one.
@@ -387,6 +389,26 @@ async def get_runners() -> list[dict]:
         # The heartbeat has always carried this; the page never got it.
         r["disk"] = fleet.disk.get(r["id"])
         r["checkpoint_detail"] = fleet.checkpoint_detail.get(r["id"]) or []
+        # Whether this machine is running the same build as the controller.
+        # An image left behind reports a capability set from the month it was
+        # built -- no `kinds`, no `modalities`, none of the libraries -- and
+        # the controller deliberately does not refuse a machine for saying
+        # nothing, so it keeps handing it work it can no longer do. The fault
+        # is invisible unless somebody says it out loud.
+        caps = r.get("capabilities") or {}
+        r["agent_version"] = caps.get("agent_version")
+        # A missing version is not "unknown" -- every current agent sends one,
+        # so its absence proves the image predates the field. That is exactly
+        # the machine this is here to find.
+        r["up_to_date"] = r["agent_version"] == VERSION
+        r["version_note"] = (
+            "" if r["up_to_date"] else
+            "This machine's image is older than the field that reports a "
+            "version, so it is at least several releases behind. It will "
+            "report fewer capabilities than it has and may be handed work it "
+            "cannot do." if not r["agent_version"] else
+            "This machine runs %s; the controller is %s. Rebuild its image."
+            % (r["agent_version"], VERSION))
         out.append(r)
     return out
 
