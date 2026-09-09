@@ -84,7 +84,11 @@ export function projectGraph(data) {
                  * (NODE_H + GAP_Y) - GAP_Y;
   const at = Object.fromEntries(nodes.map((n) => [n.id, n]));
 
-  // Edges first, so a line never sits on top of a box.
+  // Edges first, so a line never sits on top of a box. Several edges often
+  // leave the same column for the same one -- three scorings of one model --
+  // and a caption placed halfway along every one of them lands in the same
+  // spot three times. Each is nudged along its own curve instead.
+  const perGutter = new Map();
   const wires = edges.map((e) => {
     const a = at[e.from];
     const b = at[e.to];
@@ -101,8 +105,20 @@ export function projectGraph(data) {
     // long hop across three columns passes over other work; a caption laid on
     // top of that is worse than no caption.
     const room = Math.abs(x2 - x1) <= NODE_W + GAP_X + 4;
+    const gutter = Math.round(x1);
+    const nth = (perGutter.get(gutter) || 0);
+    perGutter.set(gutter, nth + 1);
+    // A point on the curve itself, a third to two thirds along depending on
+    // how many captions this gutter is already carrying.
+    const t = 0.34 + 0.16 * (nth % 3);
+    const at = (a, b, c, d) => {
+      const u = 1 - t;
+      return u * u * u * a + 3 * u * u * t * b + 3 * u * t * t * c + t * t * t * d;
+    };
+    const lx = at(x1, mid, mid, x2);
+    const ly = at(y1, y1, y2, y2);
     const label = room && e.label
-      ? `<text class="g-edge-label" x="${mid}" y="${(y1 + y2) / 2 - 6}"
+      ? `<text class="g-edge-label" x="${lx.toFixed(1)}" y="${(ly - 6).toFixed(1)}"
              text-anchor="middle">${esc(clip(e.label, 15))}<title>${
                esc(e.label)}</title></text>`
       : "";
@@ -117,10 +133,10 @@ export function projectGraph(data) {
         esc(clip(n.label, 20))}</text>
       <text class="g-sub" x="${n._x + 12}" y="${n._y + 41}">${
         esc(clip(n.sub || "", 30))}</text>
-      ${raw(n.warn ? `<text class="g-warn" x="${n._x + 12}" y="${
-        n._y + 58}">${esc(clip(n.warn, 26))}</text>` : "")}
-      ${raw(n.borrowed ? `<text class="g-sub" x="${n._x + 12}" y="${
-        n._y + 58}">from another project</text>` : "")}
+      ${raw(n.warn || n.borrowed ? `<text class="g-${n.warn ? "warn" : "sub"}"
+        x="${n._x + 12}" y="${n._y + 58}">${esc(clip(
+          [n.borrowed ? "from another project" : "", n.warn || ""]
+            .filter(Boolean).join(" · "), 30))}</text>` : "")}
       <title>${esc(n.label)}${n.sub ? " — " + esc(n.sub) : ""}</title>
     </a>`).join("");
 
