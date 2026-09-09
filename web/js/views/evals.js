@@ -45,11 +45,36 @@ export async function evalsView(mount) {
     draw();
   };
 
-  /** Which models, at what sample size, on one benchmark. */
+  /** Which benchmarks, on which models, at what sample size.
+   *
+   *  Several at once because that is how a model is reported -- nobody quotes
+   *  MMLU on its own -- and because the decisions that surround them (which
+   *  models, how many questions) are the same decisions for all of them.
+   */
   function benchDialog(b) {
     const runs = models || [];
-    const dlg = modal({ title: `Run ${b.label}`, width: 620, body: html`
-      <p class="muted tiny">${b.what}</p>
+    const all = bench.benchmarks || [];
+    const dlg = modal({
+      title: b ? `Run ${b.label}` : "Run benchmarks", width: 620, body: html`
+      <p class="muted tiny">${b ? b.what
+        : "Pick the ones you want. Each is queued as its own run against its "
+        + "own questions, and they take their turn on the machine."}</p>
+      <div class="field">
+        <label>Benchmarks</label>
+        <div class="picklist">
+          ${raw(all.map((x) => html`
+            <label class="check">
+              <input type="checkbox" data-bm-pick value="${x.id}"${
+                b && x.id === b.id ? " checked" : ""}>
+              <span>${x.label}
+                <span class="muted tiny">· ${fmtNum(x.size)} questions ·
+                  ${x.shots}-shot as published</span></span>
+            </label>`).join(""))}
+        </div>
+        <div class="hint">The number of questions below applies to each of
+          them; the worked examples are each benchmark's own unless you say
+          otherwise.</div>
+      </div>
       <div class="callout callout-warn">
         <strong>This is not the number on the model card</strong>
         ${bench.caveat}
@@ -78,17 +103,22 @@ export async function evalsView(mount) {
       </div>
       <div class="row" style="gap:10px">
         <div class="field" style="flex:1">
-          <label for="bmSample">How many questions</label>
-          <input id="bmSample" type="number" min="20" max="${b.size}"
-                 value="${Math.min(bench.default_sample, b.size)}">
-          <div class="hint">Out of ${fmtNum(b.size)}. Fewer is faster and
-            wider: a sample cannot separate two models a couple of points
-            apart, and every result says by how much.</div>
+          <label for="bmSample">How many questions each</label>
+          <input id="bmSample" type="number" min="20" max="${bench.max_sample || 2000}"
+                 value="${b ? Math.min(bench.default_sample, b.size)
+                            : bench.default_sample}">
+          <div class="hint">Fewer is faster and wider: a sample cannot
+            separate two models a couple of points apart, and every result
+            says by how much. A benchmark smaller than this is asked in
+            full.</div>
         </div>
         <div class="field" style="flex:1">
           <label for="bmShots">Worked examples</label>
-          <input id="bmShots" type="number" min="0" max="25" value="${b.shots}">
-          <div class="hint">${b.shots} is what this one is published at.
+          <input id="bmShots" type="number" min="0" max="25"
+                 placeholder="${b ? b.shots : "as published"}"
+                 value="${b ? b.shots : ""}">
+          <div class="hint">${b ? `${b.shots} is what this one is published at.`
+            : "Blank leaves each benchmark at what it is published with."}
             Changing it changes the number.</div>
         </div>
       </div>
@@ -104,23 +134,35 @@ export async function evalsView(mount) {
     on(dlg, "click", "#bmGo", async (_e, btn) => {
       const chosen = [...dlg.querySelectorAll("[data-bm-run]:checked")]
         .map((c) => c.value);
+      const picked = [...dlg.querySelectorAll("[data-bm-pick]:checked")]
+        .map((c) => c.value);
       const hub = ($("#bmBase", dlg).value || "").trim();
+      if (!picked.length) return toast("Choose at least one benchmark.", "err");
       if (!chosen.length && !hub) {
         return toast("Choose at least one model.", "err");
       }
+      const shots = ($("#bmShots", dlg).value || "").trim();
       btn.disabled = true;
+      btn.textContent = "Queueing…";
       try {
         const r = await api.runBenchmark({
-          benchmark: b.id,
+          benchmarks: picked,
           model_job_ids: chosen,
           baselines: hub ? [{ source: "hub", model: hub }] : [],
           sample: +$("#bmSample", dlg).value || undefined,
-          shots: +$("#bmShots", dlg).value,
+          shots: shots === "" ? null : +shots,
+          project_id: hashParam("project"),
         });
         dlg.close();
-        toast("Queued.", "ok", { href: `#/jobs/${r.id}`, label: "Watch it" });
-        location.hash = `#/jobs/${r.id}`;
-      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+        const n = (r.jobs || []).length || 1;
+        toast(n === 1 ? "Queued." : `${n} benchmarks queued.`, "ok",
+              { href: `#/jobs/${r.id}`, label: "Watch the first" });
+        location.hash = n === 1 ? `#/jobs/${r.id}` : "#/jobs";
+      } catch (e) {
+        toast(e.message, "err");
+        btn.disabled = false;
+        btn.textContent = "Run it";
+      }
     });
   }
 
@@ -246,6 +288,7 @@ Write a haiku about rain"></textarea>
     });
     on(mount, "click", "[data-run-bm]", (_e, t) =>
       benchDialog((bench.benchmarks || []).find((b) => b.id === t.dataset.runBm)));
+    on(mount, "click", "#runSeveral", () => benchDialog(null));
     on(mount, "click", "#newSet", newSetDialog);
     on(mount, "click", "#fromDataset", fromDatasetDialog);
     on(mount, "input", "#evFilter", (_e, t) => {
@@ -375,6 +418,11 @@ function benchmarkPanel(bench) {
       <strong>These will not match a model card, and cannot be made to</strong>
       ${bench.caveat}
     </div>
+    <p style="margin:0 0 14px">
+      <button class="btn btn-primary" id="runSeveral">Run several at once</button>
+      <span class="muted tiny" style="margin-left:8px">One decision about
+        which models and how many questions, and each benchmark queued as its
+        own run.</span></p>
     <div class="card" style="padding:0;margin-bottom:14px">
       <div class="table-wrap"><table>
         <thead><tr>

@@ -687,6 +687,7 @@ async def list_benchmarks(request: Request) -> dict:
         # as a decision, which it is.
         "unavailable": [{"name": k, "why": v} for k, v in bm.UNAVAILABLE.items()],
         "default_sample": bm.DEFAULT_SAMPLE,
+        "max_sample": bm.MAX_SAMPLE,
         "caveat": (
             "These are this studio's own measurements. A published score is "
             "the output of one particular harness with its own wording, its "
@@ -715,11 +716,34 @@ def _existing_set(user: dict, recipe: dict) -> dict | None:
 
 @router.post("/benchmarks/run")
 async def run_benchmark(request: Request, payload: dict = Body(...)) -> dict:
-    """Queue a published benchmark against one or more models."""
+    """Queue one or more published benchmarks against one or more models.
+
+    Several at once because that is how a model is actually reported: nobody
+    quotes MMLU alone. Each becomes its own run against its own prompt set --
+    they ask different questions, are scored differently and are read
+    separately -- but they are queued together, from one decision about which
+    models and how many questions, and they take their turn on the machine.
+    """
+    wanted = payload.get("benchmarks") or (
+        [payload["benchmark"]] if payload.get("benchmark") else [])
+    if not wanted:
+        raise HTTPException(400, "Choose at least one benchmark.")
+    if len(wanted) > 8:
+        raise HTTPException(400, "Run at most eight benchmarks at a time.")
+
+    queued = []
+    for name in wanted:
+        queued.append({"benchmark": name,
+                       **await _run_one_benchmark(request, payload, name)})
+    return {"jobs": queued, "id": queued[0]["id"]}
+
+
+async def _run_one_benchmark(request: Request, payload: dict,
+                             name: str) -> dict:
     user = current_user(request)
-    bench = bm.get(payload.get("benchmark") or "")
+    bench = bm.get(name or "")
     if not bench:
-        raise HTTPException(404, "No benchmark by that name.")
+        raise HTTPException(404, "No benchmark called %r." % name)
 
     shots = payload.get("shots")
     shots = bench["shots"] if shots is None else max(0, min(int(shots), 25))
