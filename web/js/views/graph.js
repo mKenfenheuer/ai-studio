@@ -112,6 +112,7 @@ export function projectGraphStrip(data) {
            role="img" aria-label="What this project was made of, in miniature">
         ${raw(wires)}${raw(dots)}
       </svg>
+      <span class="g-strip-key">${raw(countsByKind(nodes))}</span>
       <span class="g-strip-hint">what it was made of →</span>
     </button>`;
 }
@@ -238,14 +239,37 @@ export function projectGraph(data) {
 const clip = (s, n) => (String(s || "").length > n
   ? String(s).slice(0, n - 1) + "…" : String(s || ""));
 
+// Singular and plural, because "1 datasets" is the kind of thing that makes a
+// page look like nobody read it.
+const KIND_WORDS = {
+  dataset: ["dataset", "datasets"],
+  training: ["model trained", "models trained"],
+  writing: ["data-writing run", "data-writing runs"],
+  scoring: ["scoring", "scorings"],
+  eval: ["prompt set", "prompt sets"],
+  benchmark: ["benchmark", "benchmarks"],
+  export: ["export", "exports"],
+  published: ["published", "published"],
+  run: ["other run", "other runs"],
+};
+
+/** What the dots are, in words. A shape with no key is decoration. */
+function countsByKind(nodes) {
+  const order = ["dataset", "training", "writing", "eval", "benchmark",
+                 "scoring", "export", "published", "run"];
+  const count = new Map();
+  nodes.forEach((n) => count.set(n.kind, (count.get(n.kind) || 0) + 1));
+  return order.filter((k) => count.has(k)).map((k) => {
+    const n = count.get(k);
+    const [one, many] = KIND_WORDS[k] || [k, k];
+    return `<span class="g-key ${TONE[k] || "n-run"}">${n} ${
+      esc(n === 1 ? one : many)}</span>`;
+  }).join("");
+}
+
 function legend(nodes) {
-  const seen = [...new Set(nodes.map((n) => n.kind))];
-  const NAMES = { dataset: "data", training: "trained", writing: "wrote data",
-                  scoring: "scored", eval: "prompt set", benchmark: "benchmark",
-                  export: "exported", published: "published", run: "other" };
   return html`
-    <div class="row" style="gap:12px;flex-wrap:wrap;margin-top:10px">
-      ${raw(seen.map((k) => `<span class="g-key ${TONE[k] || "n-run"}">${
-        esc(NAMES[k] || k)}</span>`).join(""))}
+    <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
+      ${raw(countsByKind(nodes))}
     </div>`;
 }

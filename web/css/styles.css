@@ -1683,6 +1683,9 @@ textarea.turn-edit {
 .g-strip-hint {
   font-size: 11px; color: var(--text-3); white-space: nowrap; margin-left: auto;
 }
+/* What the dots are. A shape with no key is decoration. */
+.g-strip-key { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.g-strip .g-key { font-size: 10.5px; padding: 1px 8px; }
 .g-dot rect { fill: var(--surface-2); stroke-width: 2; }
 .g-strip .g-edge { stroke-width: 1.2; }
 .stage-active { border-left-color: var(--accent); }
