@@ -6,6 +6,7 @@ import { shareButton, wireShareBox } from "./share.js";
 import { openScoreDialog } from "../scoring.js";
 import { publishCard, wirePublish } from "./publish.js";
 import { publishDialog, fileIntoDialog } from "./projects.js";
+import { mountCardEditor } from "./cardeditor.js";
 import { kindOf, subjectOf, stagesFor } from "../kinds.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive } from "../components.js";
@@ -1478,45 +1479,6 @@ function furtherJob(job, form) {
  *  written something the generator could not know; from then on it is theirs
  *  and "reset" is the only way back.
  */
-function modelCardPanel(card) {
-  const chars = (card.markdown || "").length;
-  return html`
-    <details class="card" style="margin-bottom:14px" id="cardBox">
-      <summary class="row-between" style="cursor:pointer">
-        <span><strong>Model card</strong>
-          <span class="muted tiny"> — the README that goes to Hugging
-            Face</span></span>
-        <span class="badge ${card.edited ? "badge-ok" : ""}">${
-          card.edited ? "edited by you" : "generated"}</span>
-      </summary>
-      <p class="muted tiny" style="margin:10px 0 8px">
-        ${raw(card.edited
-          ? `Yours. Nothing regenerates it — not evaluating this model, not
-             merging it, not publishing it. Reset it to hand it back.`
-          : `Written from this run and kept up to date: it is rewritten when
-             the run finishes and again every time the model is evaluated.
-             Save an edit and it stops being regenerated.`)}
-        It is the file itself, front matter included, exactly as Hugging Face
-        will receive it.</p>
-      <form id="cardForm">
-        <textarea id="cardText" class="mono" rows="22" spellcheck="false"
-          style="width:100%;font-size:12px;line-height:1.5">${card.markdown || ""}</textarea>
-        <div class="row-between" style="margin-top:8px;gap:8px;flex-wrap:wrap">
-          <span class="muted tiny">${fmtNum(chars)} characters${
-            card.updated_at ? ` · saved ${new Date(card.updated_at * 1000)
-              .toLocaleString()}` : ""}</span>
-          <span class="row" style="gap:6px">
-            <button type="button" class="btn-sm btn-quiet" id="cardCopy">
-              Copy</button>
-            <button type="button" class="btn-sm btn-quiet" id="cardReset"
-              ${card.edited ? "" : "disabled"}>Back to generated</button>
-            <button type="submit" class="btn-sm" id="cardSave">Save</button>
-          </span>
-        </div>
-      </form>
-    </details>`;
-}
-
 /** What this run left behind, when it left more than one thing.
  *
  *  This used to be a form that queued a merge as a second run. Merging is the
@@ -1629,56 +1591,20 @@ function wireOwnerRow(mount, jobId, getJob, onChange) {
  *  The card is fetched rather than derived: generating it needs the run's
  *  evaluation history, which no page here has ever had a reason to load.
  */
+/** The card editor, painted into `#cardRow`. Returns the repaint.
+ *
+ *  A run with nothing to publish has no card to write, so the row stays
+ *  empty until there is an artifact.
+ */
 function wireModelCard(mount, jobId, getJob) {
-  let card = null;
-  const paint = async (refetch = true) => {
+  let refresh = null;
+  return async () => {
     const box = $("#cardRow", mount);
     if (!box) return;
     if (!getJob().artifacts?.length) { box.innerHTML = ""; return; }
-    if (refetch || !card) {
-      try { card = await api.jobCard(jobId); }
-      catch { box.innerHTML = ""; return; }
-    }
-    const open = $("#cardBox", mount)?.open;
-    box.innerHTML = modelCardPanel(card);
-    if (open) $("#cardBox", mount).open = true;
+    if (!refresh) refresh = mountCardEditor(box, { jobId });
+    else await refresh();
   };
-
-  on(mount, "submit", "#cardForm", async (e) => {
-    e.preventDefault();
-    const btn = $("#cardSave", mount);
-    btn.disabled = true;
-    btn.textContent = "Saving…";
-    try {
-      card = await api.saveJobCard(jobId, $("#cardText", mount).value);
-      toast("Saved. This card is yours now.", "ok");
-      paint(false);
-    } catch (ex) {
-      toast(ex.message, "err");
-      btn.disabled = false;
-      btn.textContent = "Save";
-    }
-  });
-
-  on(mount, "click", "#cardReset", async () => {
-    // Deliberately without a confirmation dialog: what is being discarded is
-    // recoverable by anyone who kept the text, and the button says plainly
-    // what it does. What it must not do is silently keep the edits.
-    try {
-      card = await api.resetJobCard(jobId);
-      toast("Back to the generated card.", "ok");
-      paint(false);
-    } catch (ex) { toast(ex.message, "err"); }
-  });
-
-  on(mount, "click", "#cardCopy", async () => {
-    try {
-      await navigator.clipboard.writeText($("#cardText", mount).value);
-      toast("Copied.", "ok");
-    } catch { toast("The browser would not allow copying.", "err"); }
-  });
-
-  return paint;
 }
 
 /** The repository name to suggest for this run's model. */

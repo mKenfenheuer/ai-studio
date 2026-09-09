@@ -97,6 +97,13 @@ const FIXTURES = [
                                      sample_caption: "the eight it got most wrong" },
                                    { step: 20, sample_kind: "table",
                                      sample_text: "label   predicted   n\ncat     dog         3" }]],
+  [/\/api\/jobs\/[^/]+\/card/, { markdown:
+      "---\nlibrary_name: peft\ntags:\n  - ai-studio\n  - lora\n"
+      + "base_model: HuggingFaceTB/SmolLM2-135M\n---\n\n"
+      + "# SmolLM2 on alpaca\n\nFine-tuned with **AI Studio**.\n\n"
+      + "| | |\n|---|---|\n| Base model | SmolLM2-135M |\n| Method | LoRA |\n\n"
+      + "## Use it\n\n```python\nprint(\"hello\")\n```\n",
+    edited: false, updated_at: now - 500 }],
   [/\/api\/jobs\/[^/]+\/logs/, [{ ts: now, level: "info", line: "training" }]],
   [/\/api\/jobs\/[^/]+$/, job()],
   [/\/api\/jobs/, [job(), job({ id: "job_2", kind: "pretrain_llm", name: "Nano from scratch",
@@ -529,6 +536,36 @@ if (!only) {
     say("library scoped", heads.includes("In this project") && folded,
         folded ? "the rest is folded away" : "no fold for the rest");
     localStorage.removeItem("aistudio.wizard");
+
+    // The card editor: the form writes into the source, the preview renders
+    // it, and the metadata that is generated rather than typed survives both.
+    const cardBox = document.createElement("div");
+    main.innerHTML = "";
+    main.appendChild(cardBox);
+    const { mountCardEditor } = await import("/static/js/views/cardeditor.js");
+    mountCardEditor(cardBox, { jobId: "job_1" });
+    await new Promise((r) => setTimeout(r, 400));
+    const licence = cardBox.querySelector("#cardLicence");
+    say("the card editor draws", !!licence && !!cardBox.querySelector("#cardText"),
+        cardBox.textContent.replace(/\s+/g, " ").slice(0, 60));
+    if (licence) {
+      licence.value = "apache-2.0";
+      licence.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 150));
+      const text = cardBox.querySelector("#cardText").value;
+      say("a licence is written into the front matter",
+          /license: apache-2\.0/.test(text), text.split("\n").slice(0, 3).join(" / "));
+      say("and what was already there is kept",
+          text.includes("base_model: HuggingFaceTB/SmolLM2-135M")
+          && text.includes("- lora"));
+      cardBox.querySelector('[data-card-tab="preview"]').click();
+      await new Promise((r) => setTimeout(r, 150));
+      const md = cardBox.querySelector(".md-preview");
+      say("the preview renders the card",
+          !!md && md.querySelector("table") && md.querySelector("pre.md-code")
+          && !md.textContent.includes("library_name"),
+          md ? md.textContent.replace(/\s+/g, " ").slice(0, 50) : "no preview");
+    }
 
     // The graph tab has to draw, not merely leave a card behind. A view that
     // throws mid-render leaves whatever was there before -- which for this
