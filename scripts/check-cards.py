@@ -75,10 +75,19 @@ def main() -> int:
         db.add_artifact(job, "adapter", "%s.zip" % job, 58_249_247)
 
         # A benchmark, a tool-calling set scored twice, and a set that errored.
-        score(job, "ev_arc", "ARC-Challenge · 0-shot · 60 questions",
-              {"accuracy": 0.4333, "accuracy_low": 0.3157, "items": 60},
-              {"benchmark": "arc_challenge",
-               "recipe": {"benchmark": "arc_challenge", "sample": 60}}, now - 300)
+        score(job, "ev_arc", "ARC-Challenge · 25-shot · all 1,172 questions",
+              {"accuracy": 0.4333, "accuracy_low": 0.3157, "items": 1172},
+              {"benchmark": "arc_challenge", "deviations": [],
+               "recipe": {"benchmark": "arc_challenge", "shots": 25,
+                          "sample": 1172, "metric": "acc_norm"}}, now - 300)
+        score(job, "ev_mmlu", "MMLU · 5-shot · 400 of 14,042 questions",
+              {"accuracy": 0.31, "items": 400},
+              {"benchmark": "mmlu",
+               "deviations": ["400 of the 14,042 questions, chosen at random "
+                              "with seed 1234 -- a published score is the "
+                              "whole set."],
+               "recipe": {"benchmark": "mmlu", "shots": 5, "sample": 400,
+                          "metric": "acc"}}, now - 250)
         score(job, "ev_tools", "House questions",
               {"tool_name_ok": 0.25, "tool_args_ok": 0.33, "items": 12},
               {"dataset_id": ds, "split": "train"}, now - 200)
@@ -103,9 +112,11 @@ def main() -> int:
         check("so is the tool-calling measure", "25%" in table)
         check("the columns nothing measured are left out",
               "Token overlap" not in table and "Exact" not in table.split("\n")[5])
-        check("a benchmark is named, not called hand-written",
-              "ARC-CHALLENGE, 60 asked" in table and "hand-written" not in table,
-              table[:300])
+        check("a whole benchmark run says so",
+              "25-shot · all 1,172" in table and "hand-written" not in table,
+              table[:400])
+        check("and a sampled one says that instead",
+              "400 of 14,042, sampled" in table, table[:400])
         check("a set scored twice appears once",
               table.count("| House questions |"), 1)
         check("and the warning about the training split survives",
@@ -117,6 +128,10 @@ def main() -> int:
         check("with the accuracy in it", "value: 0.4333" in head, head[-400:])
         check("a failed scoring contributes nothing",
               "A scoring that failed" not in head)
+        check("so does a benchmark that departed from its recipe",
+              "MMLU" not in head, head[-500:])
+        check("but the whole run is in it",
+              "ARC-Challenge" in head, head[-500:])
 
         print("\nA generated card is never stale")
         db.set_job_card(job, "# From an older generator\n", edited=False)

@@ -630,6 +630,30 @@ const MEASURES = {
 };
 
 /** A published benchmark's results: one number, and how wide it is. */
+/** How this run departs from the number a model card quotes, if it does.
+ *
+ *  The interesting case is the empty one: a run of the published recipe, over
+ *  the whole set, says nothing here -- and the absence is the claim. A run
+ *  that sampled, or changed the worked examples, says so where the number is,
+ *  not in a footnote somewhere else.
+ */
+function departures(ev, recipe) {
+  const off = (ev.source || {}).deviations || [];
+  if (!off.length) {
+    return html`
+      <div class="callout callout-ok" style="margin:0 16px 12px">
+        <strong>The published recipe, run as published</strong>
+        The whole set, ${recipe.shots} worked examples, the metric that gets
+        quoted. This number belongs beside the one on a model card.
+      </div>`;
+  }
+  return html`
+    <div class="callout callout-warn" style="margin:0 16px 12px">
+      <strong>This is not the number a card would quote</strong>
+      ${raw(off.map((line) => `<div>· ${esc(line)}</div>`).join(""))}
+    </div>`;
+}
+
 function benchmarkTable(ev, scores) {
   const recipe = (ev.source || {}).recipe || {};
   if (!scores.length) {
@@ -702,16 +726,17 @@ function benchmarkTable(ev, scores) {
                              : "This sample could not separate them"}</strong>
           ${latest.verdict}
         </div>` : "")}
+      ${raw(departures(ev, recipe))}
       <p class="muted tiny" style="padding:10px 16px 14px;margin:0">
         Measured here, not copied from anywhere: ${esc(recipe.dataset)},
         ${esc(recipe.split)} split, ${recipe.shots}-shot,
         ${recipe.protocol === "multiple_choice"
           ? (recipe.style === "letter"
              ? "scored on the probability of each answer's letter"
-             : "scored on the probability of each answer, normalised by its length")
-          : "scored on the last number in what the model wrote"}.
-        A published score uses a different harness and will differ by
-        several points; these are exactly comparable to each other.</p>
+             : "scored on the probability of each answer, normalised by its "
+               + "length — the acc_norm that gets quoted")
+          : `read out of the model's own working${
+              recipe.extract === "strict" ? ' as "#### 42"' : ""}`}.</p>
     </div>`;
 }
 

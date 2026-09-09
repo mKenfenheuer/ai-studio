@@ -593,6 +593,16 @@ class ModelHost:
         fmt.setdefault("specials", self.specials)
         if reasoning:
             fmt["reasoning"] = True
+        # A prompt that is already the exact text the model should continue.
+        #
+        # Only one caller asks for this and it is worth naming: a published
+        # benchmark score is measured on a raw completion -- five worked
+        # examples and an unfinished sixth -- and wrapping that in a chat turn
+        # is a different prompt with a different number. Everything else goes
+        # through the template, which is the whole point of this method.
+        if spec.get("raw_prompt"):
+            text = "\n\n".join(str(m.get("content") or "") for m in messages)
+            return fmt, text
         return fmt, formatting.render_prompt(messages, fmt,
                                              tools=spec.get("tools"),
                                              reasoning=reasoning)

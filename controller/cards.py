@@ -280,6 +280,12 @@ def _model_index(f: dict) -> list[str]:
                 if isinstance(metrics.get(key), (int, float))]
         if not rows:
             continue
+        # A benchmark run that departed from its published recipe is not the
+        # number the Hub's readers will take it for. It stays in the table
+        # below, where the departure is written beside it; it does not go in
+        # the block that leaderboards read.
+        if (score.get("eval_source") or {}).get("deviations"):
+            continue
         block = ["    - task:", "        type: text-generation",
                  "        name: Text Generation", "      dataset:",
                  "        name: %s" % _yaml(score.get("eval_name")
@@ -513,6 +519,14 @@ def _evaluations(f: dict) -> list[str]:
     return out
 
 
+# Enough to tell a whole run from a sampled one without importing the
+# catalogue into the card writer: the card is generated on the controller,
+# where benchmarks live, but a card written for a benchmark that has since
+# been removed still has to render.
+_BENCHMARK_SIZES = {"mmlu": 14042, "mmlu_pro": 12032, "arc_challenge": 1172,
+                    "hellaswag": 10042, "gsm8k": 1319}
+
+
 def _provenance(f: dict, score: dict) -> str:
     """Whether this model could have seen these prompts, said plainly.
 
@@ -527,8 +541,16 @@ def _provenance(f: dict, score: dict) -> str:
     if src.get("benchmark"):
         recipe = src.get("recipe") or {}
         asked = recipe.get("sample")
-        return "%s%s" % (src["benchmark"].upper().replace("_", "-"),
-                         ", %s asked" % f"{asked:,}" if asked else "")
+        shots = recipe.get("shots")
+        how = "%s-shot" % shots if shots is not None else ""
+        # A sampled run is a different measurement and has to say so here,
+        # where the number is, rather than in a note under the table.
+        size = _BENCHMARK_SIZES.get(src["benchmark"])
+        whole = size and asked and asked >= size
+        count = ("all %s" % f"{asked:,}" if whole
+                 else "%s of %s, sampled" % (f"{asked:,}", f"{size:,}")
+                 if size and asked else "%s asked" % f"{asked:,}" if asked else "")
+        return " · ".join(x for x in (how, count) if x) or "a benchmark"
     if not src or not src.get("dataset_id"):
         return "hand-written"
     same_data = src["dataset_id"] == cfg.get("studio_dataset")

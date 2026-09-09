@@ -11,21 +11,29 @@ So: a benchmark is a prompt set whose questions come from a public dataset
 instead of from you, scored the way the people who publish those numbers
 score them.
 
-## The warning that has to come first
+## Comparable to a model card, on purpose
 
-**These numbers will not match a model card's, and cannot be made to.** A
-published MMLU score is the output of one particular harness at one particular
-version, with its own prompt wording, its own few-shot examples, its own
-answer normalisation and its own opinion about whether the model is asked for
-a letter or scored on the answer text. Those choices move the number by
-several points -- more than the gap between most models. Anybody who has
-tried to reproduce a leaderboard has found this out.
+The number on a card is a *recipe*, not a measurement: MMLU at five worked
+examples over all 14,042 questions, scored on the letter; ARC-Challenge at
+twenty-five, length-normalised; HellaSwag at ten; GSM8K at five with the
+answer read out of "#### 42". Change any one of those and the number moves by
+more than the gap between most models -- which is why reproducing a
+leaderboard is famously annoying, and why this module implements those
+recipes exactly rather than something near them.
 
-What this *can* do is measure every model the same way, with the recipe
-written down beside the result, so the studio's own numbers are exactly
-comparable to each other and roughly comparable to the world. That is the
-honest offer, and it is made in those words in the interface rather than in a
-footnote.
+So each benchmark here carries the published recipe as its default: the whole
+set, the conventional number of worked examples, the metric that gets quoted.
+Run it that way and the result belongs beside a model card.
+
+Departing is still allowed -- four hundred questions is two minutes and
+answers "has this fine-tune fallen off a cliff" -- but a run that departs
+says how, in `deviations()`, on its result and in its title. The two states
+are kept apart deliberately: a sampled score sitting unlabelled next to a
+published one is the single most misleading thing this could produce.
+
+One benchmark cannot be run as published, and says so rather than pretending:
+MMLU-Pro is quoted with chain-of-thought, and this scores the letter
+directly.
 
 ## How each one is scored
 
@@ -70,6 +78,9 @@ BENCHMARKS: dict[str, dict] = {
         "fewshot_split": "dev",
         "protocol": "multiple_choice", "style": "letter",
         "shots": 5, "size": 14042,
+        # What the number on a card is: MMLU quotes plain accuracy at 5-shot,
+        # over all 14,042 questions, scored on the letter.
+        "metric": "acc", "card_shots": 5, "faithful": True,
         "fields": {"question": "question", "choices": "choices",
                    "answer": "answer", "group": "subject"},
         "preamble": "The following are multiple choice questions (with "
@@ -87,6 +98,13 @@ BENCHMARKS: dict[str, dict] = {
         "fewshot_split": "validation",
         "protocol": "multiple_choice", "style": "letter",
         "shots": 5, "size": 12032,
+        "metric": "acc", "card_shots": 5, "faithful": False,
+        # The one benchmark here that cannot be run the way it is published.
+        "deviation": "Published MMLU-Pro numbers are produced by asking the "
+                     "model to reason and then extracting a letter from what "
+                     "it wrote. This scores the letter directly, which is a "
+                     "different measurement and lands several points lower on "
+                     "every model.",
         "fields": {"question": "question", "choices": "options",
                    "answer": "answer_index", "group": "category"},
         "preamble": "The following are multiple choice questions (with "
@@ -102,11 +120,16 @@ BENCHMARKS: dict[str, dict] = {
         "dataset": "allenai/ai2_arc", "config": "ARC-Challenge", "split": "test",
         "fewshot_split": "train",
         "protocol": "multiple_choice", "style": "cloze",
-        "shots": 0, "size": 1172,
+        # 25-shot, length-normalised accuracy: the recipe the numbers on model
+        # cards come from. The harness's own default is 0-shot, which is a
+        # different number and several points lower.
+        "shots": 25, "size": 1172,
+        "metric": "acc_norm", "card_shots": 25, "faithful": True,
         "fields": {"question": "question", "choices": "choices",
                    "answer": "answerKey"},
-        "published": "Leaderboards have quoted it at 0-shot and at 25-shot; "
-                     "the two differ by several points.",
+        "published": "Quoted at 25-shot, length-normalised. Run at 0-shot it "
+                     "is several points lower, and that is a different number "
+                     "rather than a worse model.",
     },
     "hellaswag": {
         "label": "HellaSwag",
@@ -115,7 +138,8 @@ BENCHMARKS: dict[str, dict] = {
         "dataset": "Rowan/hellaswag", "config": "default", "split": "validation",
         "fewshot_split": "train",
         "protocol": "multiple_choice", "style": "cloze",
-        "shots": 0, "size": 10042,
+        "shots": 10, "size": 10042,
+        "metric": "acc_norm", "card_shots": 10, "faithful": True,
         "fields": {"question": "ctx", "choices": "endings", "answer": "label",
                    "group": "activity_label"},
         "preprocess": "hellaswag",
@@ -132,6 +156,11 @@ BENCHMARKS: dict[str, dict] = {
         "fewshot_split": "train",
         "protocol": "generate_extract",
         "shots": 5, "size": 1319,
+        # Strict match: the answer has to arrive as "#### 42", which is what
+        # the five worked examples demonstrate and what the published number
+        # measures. The looser "last number in the reply" is kept beside it.
+        "metric": "acc", "card_shots": 5, "faithful": True,
+        "extract": "strict",
         "fields": {"question": "question", "answer": "answer"},
         "max_new_tokens": 256,
         "published": "Quoted 5-shot or 8-shot. A model that cannot follow the "
@@ -159,12 +188,53 @@ UNAVAILABLE: dict[str, str] = {
                   "tuned for it and are no longer published.",
 }
 
-# A benchmark run is a sample unless somebody asks for the whole thing. 400
-# questions is a couple of minutes on a small model and tells you whether a
-# fine-tune has fallen off a cliff; it cannot tell 61% from 63%, which is
-# what the confidence interval on every result is there to say.
-DEFAULT_SAMPLE = 400
+# The whole benchmark, unless somebody asks for less. A published number is
+# every question in the set; a sample of them is a different measurement --
+# 400 questions cannot tell 61% from 63%, which is what the confidence
+# interval on every result is there to say -- and quoting one beside a model
+# card is exactly the mistake this module exists to prevent.
+#
+# Sampling is still offered, because "has this fine-tune fallen off a cliff"
+# is a real question worth two minutes rather than two hours. A sampled run
+# says so on its face, in its title and in its result.
+FULL = 0                    # what `sample` means when it is not a sample
+DEFAULT_SAMPLE = FULL
 MAX_SAMPLE = 20000
+
+
+def sample_size(b: dict, asked: int | None) -> int:
+    """How many questions to ask: all of them unless a smaller number is."""
+    if not asked or asked <= 0 or asked >= b["size"]:
+        return b["size"]
+    return max(20, asked)
+
+
+def deviations(b: dict, recipe: dict) -> list[str]:
+    """Every way this run departs from the number a model card quotes.
+
+    Written out rather than summarised, because each of these moves the
+    result by more than the gap between two models, and a reader comparing
+    against a card needs to know which of them applies. An empty list is the
+    interesting case: it means the number can be quoted beside the card's.
+    """
+    out = []
+    asked = int(recipe.get("sample") or 0)
+    if asked and asked < b["size"]:
+        out.append("%s of the %s questions, chosen at random with seed %s -- "
+                   "a published score is the whole set."
+                   % (f"{asked:,}", f"{b['size']:,}", recipe.get("seed")))
+    shots = recipe.get("shots")
+    if shots is not None and b.get("card_shots") is not None \
+            and int(shots) != int(b["card_shots"]):
+        out.append("%d worked examples rather than the %d this benchmark is "
+                   "published with." % (int(shots), int(b["card_shots"])))
+    if recipe.get("chat_template"):
+        out.append("Asked through the model's chat template. Published "
+                   "numbers are measured on raw completions, and for a "
+                   "chat model the two differ.")
+    if b.get("deviation"):
+        out.append(b["deviation"])
+    return out
 
 
 def get(name: str) -> dict | None:
@@ -204,12 +274,19 @@ def recipe(b: dict, shots: int, sample: int, seed: int) -> dict:
         "style": b.get("style") or "", "shots": shots,
         "sample": sample, "seed": seed,
         "fewshot_split": b.get("fewshot_split"),
+        # Which of the two accuracies is *the* number for this benchmark, and
+        # how a written answer is read out of the reply. Recorded because a
+        # result compared against a card has to have been measured the same
+        # way, and "accuracy" alone does not say that.
+        "metric": b.get("metric") or ("acc_norm" if b.get("style") == "cloze"
+                                      else "acc"),
+        "extract": b.get("extract") or "flexible",
     }
 
 
 def title(b: dict, shots: int, sample: int) -> str:
-    whole = sample >= b["size"]
+    whole = not sample or sample >= b["size"]
     return "%s · %d-shot · %s" % (
         b["label"], shots,
         "all %s questions" % f"{b['size']:,}" if whole
-        else "%s questions" % f"{sample:,}")
+        else "%s of %s questions" % (f"{sample:,}", f"{b['size']:,}"))

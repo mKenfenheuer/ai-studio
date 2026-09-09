@@ -689,13 +689,15 @@ async def list_benchmarks(request: Request) -> dict:
         "default_sample": bm.DEFAULT_SAMPLE,
         "max_sample": bm.MAX_SAMPLE,
         "caveat": (
-            "These are this studio's own measurements. A published score is "
-            "the output of one particular harness with its own wording, its "
-            "own worked examples and its own normalisation, and those choices "
-            "move a benchmark by several points -- more than the gap between "
-            "most models. The recipe used here is recorded with every result, "
-            "so these numbers are exactly comparable to each other and only "
-            "roughly comparable to a model card."),
+            "Each of these runs the recipe its published number comes from: "
+            "the whole set, the conventional number of worked examples, and "
+            "the metric that gets quoted -- MMLU on the letter at 5-shot, "
+            "ARC-Challenge and HellaSwag length-normalised at 25- and "
+            "10-shot, GSM8K read out of \"#### 42\" at 5-shot. Run as they "
+            "come, the results belong beside a model card. Change the sample "
+            "size or the worked examples and the result says so, because a "
+            "sampled score sitting unlabelled next to a published one is the "
+            "most misleading thing this page could produce."),
     }
 
 
@@ -747,8 +749,10 @@ async def _run_one_benchmark(request: Request, payload: dict,
 
     shots = payload.get("shots")
     shots = bench["shots"] if shots is None else max(0, min(int(shots), 25))
-    sample = int(payload.get("sample") or bm.DEFAULT_SAMPLE)
-    sample = max(20, min(sample, min(bm.MAX_SAMPLE, bench["size"])))
+    # No sample size, or one at least as large as the set, means the whole
+    # benchmark -- which is what a published number is.
+    sample = bm.sample_size(bench, int(payload.get("sample") or 0))
+    sample = min(sample, bm.MAX_SAMPLE)
     seed = int(payload.get("seed") or 1234)
     recipe = bm.recipe(bench, shots, sample, seed)
 
@@ -768,7 +772,11 @@ async def _run_one_benchmark(request: Request, payload: dict,
             "same %s are asked every time this recipe is run."
             % (bench["what"], bench.get("published") or "",
                bench["dataset"], f"{sample:,}"),
-            {"benchmark": bench["id"], "recipe": recipe},
+            {"benchmark": bench["id"], "recipe": recipe,
+             # Written down at the moment the set is made, so a result read
+             # next year says how it was measured without anybody having to
+             # remember what the defaults were then.
+             "deviations": bm.deviations(bench, recipe)},
             project_id=_project_of(request, payload))
         row = db.get_eval(eid)
 

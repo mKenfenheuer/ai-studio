@@ -326,6 +326,21 @@ def _extract(text: str) -> str | None:
     return found[-1].replace(",", "").replace("$", "").rstrip(".")
 
 
+_STRICT = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+
+
+def _extract_strict(text: str) -> str | None:
+    """The answer in the form the worked examples demonstrate.
+
+    GSM8K's own answers end "#### 42", the five examples in the prompt all
+    end that way, and the published number counts a reply correct only when
+    it does too. It is a stricter test than "the last number in the reply"
+    and it is the one on the model cards, so it is the one reported.
+    """
+    found = _STRICT.findall(text or "")
+    return found[-1].replace(",", "").rstrip(".") if found else None
+
+
 def _gold(answer: str) -> str | None:
     if "####" in answer:
         return answer.split("####")[-1].strip().replace(",", "")
@@ -398,23 +413,31 @@ def score(bench: dict, recipe: dict, host: Any, spec: dict, local: bool,
                 ["Question: %s\nAnswer: %s" % (s["question"], s["answer"])
                  for s in picked]
                 + ["Question: %s\nAnswer:" % item["question"]])
-            # Asked as one message in the model's own format rather than as
-            # raw text. A chat fine-tune given a bare completion prompt
-            # answers badly for a reason that has nothing to do with
-            # arithmetic -- and the published numbers for instruct models are
-            # measured with their chat template applied too.
+            # As a raw completion, which is how the published number is
+            # measured: the five worked examples above it are the format, and
+            # wrapping them in a chat turn is a different prompt that scores
+            # differently. `chat_template` in the recipe asks for the other
+            # one, and a run that does is marked as departing.
             out = host.generate(
-                {**spec, "stop": ["\nQuestion:", "Question:"]},
+                {**spec, "stop": ["\nQuestion:", "Question:"],
+                 "raw_prompt": not recipe.get("chat_template")},
                 [{"role": "user", "content": prompt}],
                 {**params, "max_new_tokens": bench.get("max_new_tokens", 256),
                  "temperature": 0.0},
                 lambda *_: None, lambda _l: None)
             text = (out.get("text") or "")
             gold = _gold(item["answer"])
-            hit = _same_number(_extract(text), gold)
-            hit_norm = hit
+            # Both readings, every time. Strict is the published one; the
+            # looser "last number in the reply" is kept beside it because the
+            # gap between them says whether a model knows the arithmetic and
+            # not the format, which is a different problem from being wrong.
+            strict = _same_number(_extract_strict(text), gold)
+            flexible = _same_number(_extract(text), gold)
+            hit = strict if (recipe.get("extract") or "flexible") == "strict" \
+                else flexible
+            hit_norm = flexible
             correct += hit
-            correct_norm += hit
+            correct_norm += flexible
             if len(kept) < KEEP_ROWS:
                 kept.append({
                     "prompt": item["question"][:MAX_STORED_CHARS],
@@ -435,13 +458,20 @@ def score(bench: dict, recipe: dict, host: Any, spec: dict, local: bool,
 
     from common.stats import wilson
 
-    headline = correct_norm if style == "cloze" else correct
+    # Which of the two numbers is *the* number is the benchmark's own
+    # convention, recorded in the recipe: MMLU and GSM8K quote plain
+    # accuracy, ARC and HellaSwag quote the length-normalised one. Reading it
+    # off the prompt style instead was right by accident and would have gone
+    # wrong the moment a letter-style benchmark quoted acc_norm.
+    metric = recipe.get("metric") or ("acc_norm" if style == "cloze" else "acc")
+    headline = correct_norm if metric == "acc_norm" else correct
     low, high = wilson(headline, asked)
     return kept, {
         "items": asked, "scored": asked,
         "accuracy": round(headline / max(asked, 1), 4),
         "accuracy_raw": round(correct / max(asked, 1), 4),
         "accuracy_norm": round(correct_norm / max(asked, 1), 4),
+        "accuracy_metric": metric,
         "correct": headline,
         # The margin, always. A benchmark result quoted without one invites
         # exactly the comparison it cannot support.

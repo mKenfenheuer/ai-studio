@@ -59,6 +59,10 @@ export async function evalsView(mount) {
       <p class="muted tiny">${b ? b.what
         : "Pick the ones you want. Each is queued as its own run against its "
         + "own questions, and they take their turn on the machine."}</p>
+      <p class="muted tiny">Each runs the recipe its published number comes
+        from — the whole set, the worked examples it is quoted with, the
+        metric that gets quoted. Change either box below and the result says
+        how it departed.</p>
       <div class="field">
         <label>Benchmarks</label>
         <div class="picklist">
@@ -104,13 +108,12 @@ export async function evalsView(mount) {
       <div class="row" style="gap:10px">
         <div class="field" style="flex:1">
           <label for="bmSample">How many questions each</label>
-          <input id="bmSample" type="number" min="20" max="${bench.max_sample || 2000}"
-                 value="${b ? Math.min(bench.default_sample, b.size)
-                            : bench.default_sample}">
-          <div class="hint">Fewer is faster and wider: a sample cannot
-            separate two models a couple of points apart, and every result
-            says by how much. A benchmark smaller than this is asked in
-            full.</div>
+          <input id="bmSample" type="number" min="20" max="${bench.max_sample || 20000}"
+                 placeholder="all of them" value="">
+          <div class="hint">Blank asks the whole set, which is what a
+            published number is measured on. A smaller number is faster and
+            is a different measurement: it cannot separate two models a
+            couple of points apart, and the result says so on its face.</div>
         </div>
         <div class="field" style="flex:1">
           <label for="bmShots">Worked examples</label>
@@ -153,7 +156,8 @@ export async function evalsView(mount) {
           benchmarks: picked,
           model_job_ids: chosen,
           baselines: hub ? [{ source: "hub", model: hub }] : [],
-          sample: +$("#bmSample", dlg).value || undefined,
+          // Blank, or anything not a number, means the whole benchmark.
+          sample: +($("#bmSample", dlg).value || 0) || 0,
           shots: shots === "" ? null : +shots,
           project_id: hashParam("project"),
         });
