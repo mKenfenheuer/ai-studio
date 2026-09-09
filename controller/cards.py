@@ -75,12 +75,23 @@ def card_for(job: dict, *, artifact_job: dict | None = None,
     before any of this existed shows a real card instead of an empty box and
     an invitation to write one from nothing.
     """
-    if row := db.get_job_card(job["id"]):
-        return {"markdown": row["markdown"], "edited": bool(row["edited"]),
+    row = db.get_job_card(job["id"])
+    if row and row["edited"]:
+        return {"markdown": row["markdown"], "edited": True,
                 "updated_at": row["updated_at"], "saved": True}
-    return {"markdown": generate(job, artifact_job=artifact_job,
-                                 repo_id=repo_id),
-            "edited": False, "updated_at": None, "saved": False}
+    # A generated card is a view of what is known right now, so it is written
+    # again here rather than served from store. The stored copy goes stale in
+    # a way nothing else notices: not only when the run's facts change -- that
+    # is what refresh() is for -- but when the generator itself is improved,
+    # and a card written by last month's generator would keep its mistakes
+    # until something happened to the run.
+    fresh = generate(job, artifact_job=artifact_job, repo_id=repo_id)
+    if row and row["markdown"] != fresh:
+        db.set_job_card(job["id"], fresh, edited=False)
+        row = db.get_job_card(job["id"])
+    return {"markdown": fresh, "edited": False,
+            "updated_at": row["updated_at"] if row else None,
+            "saved": bool(row)}
 
 
 def refresh(job_id: str, *, artifact_job: dict | None = None,

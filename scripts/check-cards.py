@@ -118,6 +118,14 @@ def main() -> int:
         check("a failed scoring contributes nothing",
               "A scoring that failed" not in head)
 
+        print("\nA generated card is never stale")
+        db.set_job_card(job, "# From an older generator\n", edited=False)
+        served = cards.card_for(db.get_job(job))
+        check("reading it rewrites it from what is known now",
+              "How it scored" in served["markdown"], served["markdown"][:80])
+        check("and stores what it served",
+              db.get_job_card(job)["markdown"], served["markdown"])
+
         print("\nAn edit is the author's")
         db.set_job_card(job, "# Mine\n\nHands off.", edited=True)
         kept = cards.for_publish(db.get_job(job), db.get_job(job), "me/model")
