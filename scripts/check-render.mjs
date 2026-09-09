@@ -87,13 +87,20 @@ function serve() {
   return new Promise((ok) => server.listen(PORT, () => ok(server)));
 }
 
+// Chrome is noisy about GPUs it cannot have, so its stderr is not printed --
+// but it is kept, because when Chrome dies instead of rendering, that stream is
+// the only thing that says why. Throwing it away turned a crash into "the
+// harness did not report", which is true and useless, and is why a CI failure
+// here once could not be diagnosed from the log at all.
 function run(bin, args) {
   return new Promise((ok) => {
     const p = spawn(bin, args);
     let out = "";
+    let err = "";
     p.stdout.on("data", (d) => { out += d; });
-    p.stderr.on("data", () => { /* Chrome is noisy about GPUs it cannot have */ });
-    p.on("close", () => ok(out));
+    p.stderr.on("data", (d) => { err += d; });
+    p.on("error", (e) => { err += `\nfailed to start ${bin}: ${e.message}`; });
+    p.on("close", (code) => ok({ out, err, code }));
   });
 }
 
@@ -116,7 +123,8 @@ const server = await serve();
 if (shot) {
   const out = join(process.cwd(), `${shot}-${width}.png`);
   await run(chrome, [
-    "--headless", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+    "--headless", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+    "--hide-scrollbars",
     `--window-size=${width},${height}`, "--virtual-time-budget=8000",
     `--screenshot=${out}`,
     `http://localhost:${PORT}/check-render.html?only=${encodeURIComponent(shot)}`
@@ -128,8 +136,11 @@ if (shot) {
   process.exit(0);
 }
 
-const dom = await run(chrome, [
-  "--headless", "--disable-gpu", "--no-sandbox",
+// --disable-dev-shm-usage: a container gives /dev/shm 64 MB by default, which
+// Chrome exhausts and then dies partway through a render. Harmless everywhere
+// else, so it is not conditional on being in one.
+const { out: dom, err: chromeErr, code: chromeCode } = await run(chrome, [
+  "--headless", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
   "--virtual-time-budget=20000", "--dump-dom",
   `http://localhost:${PORT}/check-render.html`,
 ]);
@@ -145,6 +156,16 @@ const results = /<pre id="results"[^>]*>(.*?)<\/pre>/s.exec(dom)?.[1] || "";
 if (!results) {
   console.error("The harness did not report. Chrome may have failed to load "
     + "the page, or a module failed to import at all.");
+  console.error(`\n${chrome} exited ${chromeCode}, wrote ${dom.length} bytes.`);
+  if (chromeErr.trim()) {
+    console.error("\nWhat Chrome said:\n" + chromeErr.trim());
+  }
+  // The dump is the other half of the answer: an empty one is a browser that
+  // never got there, a full one with no <pre id="results"> is a harness that
+  // threw before it could write its report.
+  if (dom.trim()) {
+    console.error("\nFirst 2000 characters of the dump:\n" + dom.slice(0, 2000));
+  }
   process.exit(1);
 }
 console.log(unescape(results));
