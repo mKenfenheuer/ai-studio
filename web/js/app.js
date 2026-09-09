@@ -26,6 +26,8 @@ import { visionView } from "./views/vision.js";
 import { projectsView, projectView } from "./views/projects.js";
 import { modelsView } from "./views/models.js";
 import { adminView } from "./views/admin.js";
+import { opsView } from "./views/ops.js";
+import { chatView } from "./views/chat.js";
 
 const routes = [
   // Home is the projects list: what you are making, not what the machine has
@@ -62,6 +64,14 @@ const routes = [
   [/^\/evals\/(.+)$/,  evalView,      "projects"],
   [/^\/compare$/,      compareView,   "projects"],
   [/^\/serving$/,      servingView,   "admin"],
+  // Running the models, as opposed to running the studio: what is deployed
+  // where, how fast it is answering and what is failing. Its own top-level
+  // item rather than a tab under Admin, because a member deploys a model they
+  // trained and never sees the admin section.
+  [/^\/ops$/,          opsView,       "ops"],
+  // The other door onto the models: no runs, no settings, just the question
+  // and the answer. See views/chat.js.
+  [/^\/chat$/,         chatView,      "chat"],
   [/^\/sweeps$/,       sweepsView,    "projects"],
   [/^\/sweeps\/(.+)$/, sweepView,     "projects"],
 ];
@@ -83,8 +93,18 @@ let renderSeq = 0;
 
 async function render() {
   const mine = ++renderSeq;
-  const path = (location.hash.slice(1) || "/").split("?")[0];
+  let path = (location.hash.slice(1) || "/").split("?")[0];
   const main = $("#main");
+
+  // An account that is only here to talk to the models has exactly one page,
+  // and every other address in this table would fail on the way in: the server
+  // refuses the calls those pages make, so they would draw an error card
+  // rather than a page. Sent to the one that works instead. The server is the
+  // authority either way -- this is the courtesy, not the enforcement.
+  if (session.user?.role === "chat" && path !== "/chat") {
+    if (location.hash !== "#/chat") { location.hash = "#/chat"; return; }
+    path = "/chat";
+  }
 
   if (typeof teardown === "function") { try { teardown(); } catch { /* ignore */ } }
   teardown = null;
@@ -267,7 +287,12 @@ function paintWho(user) {
   box.hidden = !user;
   if (!user) return;
   $("#whoName").textContent = user.display_name || user.username;
-  $("#whoRole").textContent = user.role === "admin" ? "administrator" : "member";
+  $("#whoRole").textContent = user.role === "admin" ? "administrator"
+    : user.role === "chat" ? "chat" : "member";
+  // Everything the studio is for is hidden from an account that cannot reach
+  // any of it. One attribute, and the stylesheet does the rest -- a nav full
+  // of links that all 403 is worse than no nav.
+  document.documentElement.dataset.role = user.role || "member";
   const initial = (user.display_name || user.username || "?").trim()[0].toUpperCase();
   $("#whoAvatar").textContent = initial;
   // The same link on the phone's top bar, where the sidebar foot is hidden

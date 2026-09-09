@@ -21,7 +21,7 @@ from . import architectures as arch
 from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
-from .api import (accounts, conversations, data, evals, library, media, projects,
+from .api import (accounts, conversations, data, evals, library, media, ops, projects,
                   providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
@@ -131,6 +131,7 @@ app.include_router(projects.router)
 app.include_router(library.router)
 app.include_router(evals.router)
 app.include_router(providers.router)
+app.include_router(ops.router)
 app.include_router(serving_api.router)
 app.include_router(serving_api.registry)
 app.include_router(sharing.router)
@@ -141,6 +142,7 @@ app.include_router(sso.router)
 # in this module and an import back into it would be a cycle.
 evals.FLEET = fleet
 serving_api.FLEET = fleet
+ops.FLEET = fleet
 
 
 # ===========================================================================
@@ -389,6 +391,17 @@ async def get_runners() -> list[dict]:
         # The heartbeat has always carried this; the page never got it.
         r["disk"] = fleet.disk.get(r["id"])
         r["checkpoint_detail"] = fleet.checkpoint_detail.get(r["id"]) or []
+        # What this machine is set aside for, and why. NULL in the column for
+        # every machine that has never been given one, which `runner_role`
+        # reads as "both" -- see its note.
+        r["role"] = db.runner_role(r)
+        r["note"] = r.get("note") or ""
+        # What is on the card this second, and which of that is there because
+        # somebody deployed it. Operations reads both: a model that is loaded
+        # but not pinned is a warm cache, and a deployment that is pinned but
+        # not loaded is one the machine has not managed to put back yet.
+        r["loaded"] = fleet.loaded.get(r["id"]) or []
+        r["pinned"] = fleet.pinned.get(r["id"]) or []
         # Whether this machine is running the same build as the controller.
         # An image left behind reports a capability set from the month it was
         # built -- no `kinds`, no `modalities`, none of the libraries -- and
@@ -1636,6 +1649,18 @@ async def job_chat_template(request: Request, job_id: str) -> dict:
             "eos_token": conf.get("eos_token")}
 
 
+class _BigFileResponse(FileResponse):
+    """A file response that reads a megabyte at a time instead of 64 KB.
+
+    Starlette's default chunk is 64 KB, chosen for pages and images. A model
+    is fourteen gigabytes, which at that size is a quarter of a million reads
+    handed one at a time to a thread pool -- and the per-chunk overhead, not
+    the disk and not the network, becomes what limits the transfer. The bytes
+    are identical; there are simply far fewer trips to fetch them.
+    """
+    chunk_size = 1 << 20
+
+
 @app.get("/api/jobs/{job_id}/download")
 async def download_artifact(request: Request, job_id: str, kind: str = ""):
     """A run's result. `kind=adapter` asks for the second one, where there is
@@ -1652,9 +1677,9 @@ async def download_artifact(request: Request, job_id: str, kind: str = ""):
     safe = "".join(c for c in (job["name"] if job else job_id)
                    if c.isalnum() or c in "-_ ").strip().replace(" ", "-")
     # Named for what is in it, which is now something the file itself knows.
-    return FileResponse(path, media_type="application/zip",
-                        filename="%s-%s.zip" % (safe or job_id,
-                                                _artifact_kind(path, job)))
+    return _BigFileResponse(path, media_type="application/zip",
+                            filename="%s-%s.zip" % (safe or job_id,
+                                                    _artifact_kind(path, job)))
 
 
 # ===========================================================================
@@ -2390,6 +2415,11 @@ def _serves_models(r: dict) -> bool:
     caps = r.get("capabilities") or {}
     if caps.get("backend") not in ("cuda", "rocm", "mps"):
         return False
+    # A machine reserved for training is one somebody set aside for runs. It
+    # can serve and will not be asked to: a conversation landing on it is the
+    # arrangement working backwards.
+    if db.runner_role(r) == "training":
+        return False
     kinds = {k.strip() for k in (caps.get("kinds") or []) if k}
     return not kinds or bool(kinds & _SERVING_KINDS)
 
@@ -2438,9 +2468,20 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
 
     trained_on = job.get("runner_id")
 
+    deployed = {d["runner_id"] for d in db.deployments_of_job(job["id"])
+                if d["state"] == "ready"}
+
     def preference(r: dict) -> tuple:
         rid = r["id"]
         return (
+            # Somebody deployed this model to this machine and it is holding
+            # it. That is not a preference, it is an instruction: the model is
+            # on that card because a person said it should be, and the whole
+            # value of having said so is that requests go there.
+            rid not in deployed,
+            # A machine reserved for serving next, ahead of a general-purpose
+            # one that might start training a minute from now.
+            db.runner_role(r) != "serving",
             # A GPU box meant for models, before anything else. False sorts
             # first, so each of these reads as "not this" costing a place.
             not _serves_models(r),

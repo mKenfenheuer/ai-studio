@@ -264,7 +264,7 @@ def _tools(payload: dict) -> list[dict]:
 
 
 async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
-    """Send the request to a runner and return (request_id, queue)."""
+    """Send the request to a runner and return (request_id, queue, runner_id)."""
     from ..app import _pick_chat_runner        # local: avoids an import cycle
 
     runner_id, _runner = _pick_chat_runner(job)
@@ -304,7 +304,7 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
         FLEET.waiters.pop(rid, None)
         raise HTTPException(503, "That machine dropped off just now. Try again.")
     FLEET.generations[rid] = runner_id
-    return rid, queue
+    return rid, queue, runner_id
 
 
 @router.post("/chat/completions")
@@ -358,9 +358,15 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
     except HTTPException as e:
         return _error(e.status_code, e.detail)
 
+    started = time.time()
     try:
-        rid, queue = await _dispatch(job, messages, payload)
+        rid, queue, who["runner_id"] = await _dispatch(job, messages, payload)
     except HTTPException as e:
+        # A request that never reached a machine is still a request that
+        # failed, and it is the failure most worth seeing: it means the fleet
+        # had nothing free, which no count of successful replies would show.
+        _record(job, who, {}, started, stream=bool(payload.get("stream")),
+                failed=str(e.detail))
         return _error(e.status_code, e.detail)
 
     created = int(time.time())
@@ -406,21 +412,35 @@ def _tool_calls(msg: dict) -> list[dict]:
 
 
 def _record(job: dict, who: dict, msg: dict, started: float,
-            stream: bool) -> None:
-    """File what this reply cost.
+            stream: bool, failed: str = "") -> None:
+    """File what this reply cost, or that it did not happen.
+
+    `failed` carries the reason when there was no reply. A failure is a row
+    like any other, with no tokens and a status: a table of successes says a
+    studio in which nothing goes wrong, and "is it erroring" is the first
+    question anybody asks of something other software depends on.
 
     Never raises. A ledger entry that fails must not turn a reply the model
     has already produced into a 500 -- the numbers are worth having and they
     are not worth that.
     """
     try:
-        db.record_usage(job["id"], msg.get("prompt_tokens") or 0,
-                        msg.get("tokens") or 0,
+        db.record_usage(job["id"],
+                        0 if failed else (msg.get("prompt_tokens") or 0),
+                        0 if failed else (msg.get("tokens") or 0),
                         user_id=who.get("user_id"),
                         api_key_id=who.get("api_key_id"),
                         alias=who.get("alias"),
-                        seconds=round(time.time() - started, 3),
-                        stream=stream)
+                        # The runner's own measure of time on the card where it
+                        # sent one, so the rate quoted is the model's speed and
+                        # not the network's. Wall clock is the fallback.
+                        seconds=msg.get("seconds")
+                                or round(time.time() - started, 3),
+                        stream=stream,
+                        status="error" if failed else "ok",
+                        error=failed or None,
+                        source="api",
+                        runner_id=who.get("runner_id"))
     except Exception:  # noqa: BLE001 - see the docstring
         pass
 
@@ -443,9 +463,10 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 # that did it is not something anybody can act on.
                 facts = msg.get("diagnostics") or {}
                 where = ", ".join("%s=%s" % kv for kv in sorted(facts.items()))
+                why = msg.get("error") or "Generation failed."
+                _record(job, who, msg, started, stream=False, failed=why)
                 return _error(502, "%s%s" % (
-                    msg.get("error") or "Generation failed.",
-                    (" (%s)" % where) if where else ""), "upstream_error")
+                    why, (" (%s)" % where) if where else ""), "upstream_error")
             elif kind == "generate_done":
                 _record(job, who, msg, started, stream=False)
                 calls = _tool_calls(msg)
@@ -490,6 +511,8 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
                     },
                 }
     except asyncio.TimeoutError:
+        why = "No reply within %d seconds." % GENERATE_TIMEOUT_S
+        _record(job, who, {}, started, stream=False, failed=why)
         return _error(504, "The model did not finish in %d seconds."
                       % GENERATE_TIMEOUT_S, "timeout")
     finally:
@@ -518,8 +541,9 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 # There is no error frame in this protocol once the stream has
                 # started, so the failure is delivered as the reply -- silence
                 # would look like a model with nothing to say.
-                yield chunk({"content": "\n\n[error: %s]"
-                             % (msg.get("error") or "generation failed")})
+                why = msg.get("error") or "generation failed"
+                _record(job, who, msg, started, stream=True, failed=why)
+                yield chunk({"content": "\n\n[error: %s]" % why})
                 yield chunk({}, "stop")
                 yield "data: [DONE]\n\n"
                 return
@@ -543,6 +567,8 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 yield "data: [DONE]\n\n"
                 return
     except asyncio.TimeoutError:
+        _record(job, who, {}, started, stream=True,
+                failed="No reply within %d seconds." % GENERATE_TIMEOUT_S)
         yield chunk({"content": "\n\n[error: timed out]"})
         yield chunk({}, "stop")
         yield "data: [DONE]\n\n"

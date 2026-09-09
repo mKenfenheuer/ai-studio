@@ -828,11 +828,57 @@ Cheap now, expensive once there are five modalities:
 7. **HTTPS and proxy** documented; `AI_STUDIO_PUBLIC_URL` explained on the
    SSO page where it is needed.
 8. **Structured logs** and a `/metrics` endpoint (queue depth, runner
-   utilisation, GPU use from the heartbeat).
+   utilisation, GPU use from the heartbeat). *Partly done:* `/api/ops/metrics`
+   answers the serving half -- replies, tokens, tokens per second, failures
+   with their reasons, grouped by model, machine, name and key, over a window
+   in hours. Queue depth and GPU use from the heartbeat are still only on the
+   Machines page, and nothing is exported in Prometheus's shape.
+
 9. **Multi-GPU**: probe every device; one runner per device by default with
    a shared-host marker; DDP for from-scratch later.
 10. **Job isolation**: run a job in a subprocess so a segfault or a leak does
     not take the agent with it.
+
+11. **Operations, deployments and the chat role. Done.** The serving side had
+    no page: the token counts were the runner's own and were thrown away, the
+    residency was in every heartbeat and never read. Now --
+
+    - **Deployments** (`deployments` table, `Fleet.reconcile_deployments`,
+      `runner/inference.py` pinning): a model held on a named machine's card
+      and kept there, reconciled rather than fired once, so a restart, a
+      training run or an afternoon offline all end in the same state. Exempt
+      from eviction by a passing conversation; not exempt from a training run,
+      which is sized against an empty card.
+    - **Reservations** (`runners.role`): both, serving, or training. Honoured
+      by the dispatcher *and* by `why_waiting`, which disagreed before.
+    - **The ledger counts failures** and the playground (`usage.status`,
+      `error`, `source`, `runner_id`). Every row used to be a success, so "is
+      it erroring" was unanswerable and every rate was flattered.
+    - **The chat role**: an account that reaches the assistant and nothing
+      else, enforced as an allowlist in `api/security.py`.
+    - `scripts/check-ops.py` covers all four.
+
+    Not done: no autoscaling, no request queueing or concurrency limit per
+    model, no alerting -- the page shows a failure rate, nothing acts on it.
+    Deployments are one model per machine per row with no notion of how many
+    will fit; the runner's eviction arbitrates, and a card with three
+    deployments on it that cannot hold three will fail the third with an
+    out-of-memory that says so.
+
+12. **Loading a model got faster, and the wire did not.** Two real fixes and
+    one thing that is probably not software:
+
+    - Weights load straight onto the card with a device map instead of being
+      built in host memory and copied across. The old path allocated the model
+      twice and, on a host without the room, went to swap.
+    - `_make_room` no longer clears the whole card when a model's size is
+      unknown. Two models that both fit were evicting each other in turn, each
+      paying a full load.
+    - Artifacts move in megabyte chunks in both directions rather than 64 KB
+      (`_BigFileResponse`, and a generator in the runner's upload). This is
+      worth having and does **not** explain a transfer sitting at 100 Mbit on
+      a gigabit link -- that number is suspiciously exactly 100BASE-TX, and the
+      next step is `ethtool` on both ends rather than more code.
 
 ---
 

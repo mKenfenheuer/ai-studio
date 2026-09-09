@@ -183,7 +183,11 @@ function layout(page, view) {
           <select id="nr" name="role">
             <option value="member">Member</option>
             <option value="admin">Administrator</option>
+            <option value="chat">Chat only</option>
           </select>
+          <div class="hint">A chat account reaches the assistant and nothing
+            else — no runs, no datasets, no machines. For colleagues who use
+            the models without working on them.</div>
         </div>
       </form>
       <button class="btn-primary btn-sm" type="submit" form="newUser"
@@ -230,6 +234,7 @@ function row(u) {
                 title="${me ? "You cannot change your own role." : ""}">
           <option value="member"${u.role === "member" ? " selected" : ""}>Member</option>
           <option value="admin"${u.role === "admin" ? " selected" : ""}>Administrator</option>
+          <option value="chat"${u.role === "chat" ? " selected" : ""}>Chat only</option>
         </select>
       </td>
       <td class="tiny muted hide-sm">${raw(u.sso

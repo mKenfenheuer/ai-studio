@@ -410,6 +410,99 @@ and the second turn does not pay for the first turn's load.
 
 ---
 
+## Operations
+
+Training a model and *running* one are different jobs, and the second had no
+page. The studio could serve a model over an OpenAI-compatible API and then
+had nothing to say about whether it was up, how fast it was answering, how
+often it failed, or which key was doing all the work. Those facts existed --
+the token counts were the runner's own and were thrown away, the residency was
+in every heartbeat and was never read. **Operations** is where they are put.
+
+### Deploying a model to a machine
+
+A model is fetched and loaded the first time somebody talks to it, which for a
+7B is a minute or two, and it is dropped again when the card is needed for
+something else. That is right for a playground and wrong for the thing a piece
+of home automation is pointed at, which pays that minute at random intervals
+forever.
+
+A **deployment** pins one model to one machine's card and keeps it there. It
+is a row in the database rather than a one-off request, because the interesting
+cases are all the ones where "load it once and hope" fails: video memory does
+not survive a restart, a training run takes the whole card, and a machine can
+simply be away for an afternoon. A reconciler compares what each connected
+machine says it is holding against what should be there and loads what is
+missing. Nothing is ever unloaded automatically -- a model on a card that
+nobody asked for is a warm cache, not a fault.
+
+A deployed model is exempt from the eviction that a passing conversation would
+otherwise cause. It is *not* exempt from a training run, which is sized against
+an empty card and takes the whole thing; the controller notices and puts the
+deployment back when the run is over. If that matters, reserve the machine.
+
+### Reserving a machine
+
+A studio with two cards usually wants one of them answering messages and the
+other training, and there was no way to say so: the scheduler handed a run to
+whichever machine was idle, which is reliably the machine that was about to be
+asked a question. Each machine is now **both** (the default), **reserved for
+serving** -- the scheduler skips it and only conversations reach it -- or
+**reserved for training**, which is never picked to answer a message.
+
+The reservation is honoured in two places on purpose: the dispatcher skips the
+machine, *and* the "why is this run waiting" explanation says that is why. They
+disagreed once, and a run sat in a queue in front of a card the page reported
+as free.
+
+### What is measured
+
+Every reply is one row in a ledger -- over the API and in the playground alike,
+because both are the same cards and the same seconds and only one of them used
+to be counted. **Failures are rows too.** Every row used to be a success,
+because a failure returned before anything was written, so "is it erroring"
+could not be answered at all and every rate computed from the table was
+flattered by the calls that never happened.
+
+Tokens per second is a sum divided by a sum, not an average of per-reply rates:
+averaging those weights a two-token reply the same as a two-thousand-token one
+and reports a fleet considerably faster than it has ever been. Time spent
+failing is not time spent generating and is left out of the divisor. Where
+there is nothing to divide, the interface draws a dash rather than a zero.
+
+### Keys
+
+Everyone makes their own from their account page. An administrator sees every
+key in the studio, whose it is, what it has cost and the button that turns one
+off -- which is the part that was missing, because the key hammering a model
+at three in the morning is rarely your own.
+
+---
+
+## The assistant, and the chat role
+
+The Playground is a workbench. It lists every run, compares two side by side,
+exposes temperature and top-p and the system prompt, and assumes you know what
+a fine-tune is. That is right for the person who trained the model and wrong
+for the person the model was trained *for* -- the colleague who has been told
+"ask the assistant" and has no business seeing four hundred runs, somebody's
+dataset, or the button that deletes a machine.
+
+**Assistant** is the other door: the models somebody deliberately published
+under a name, a message box, the reasoning shown when the model produces any,
+and text files you can attach and ask about. It talks to
+`/v1/chat/completions` -- the same endpoint any outside client uses, with the
+session cookie instead of a key -- so it cannot drift from what everything else
+gets, its usage is counted the same way, and a bug found here is a bug an
+integration would have hit too.
+
+A third role, **chat**, is an account that has that page and nothing else. It
+is enforced on the server as an *allowlist* of paths rather than a list of
+things to forbid: written the other way round, every endpoint added from now on
+would be reachable by a chat account until somebody remembered to exclude it.
+
+---
+
 ## Hardware support
 
 The runner **measures** the machine rather than trusting its spec sheet, and

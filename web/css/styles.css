@@ -1759,3 +1759,130 @@ textarea.turn-edit {
 }
 .md-preview hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 .md-preview a { color: var(--accent); }
+
+/* ===========================================================================
+   Operations, and the plain chat page.
+
+   Two pages that arrived together and share almost nothing visually: one is a
+   dense table of numbers somebody reads when something is wrong, the other is
+   a conversation somebody reads all day. What they do share is that both are
+   read by people who are not looking at the studio's other pages -- an
+   operator during an incident, and a colleague who only ever sees the
+   assistant -- so neither leans on context from anywhere else.
+   =========================================================================== */
+
+/* A value that is bad news. Used on the count of failed replies, which is the
+   one number on the overview that should catch the eye when it is not zero. */
+.stat .v.bad { color: var(--err); }
+
+/* Replies per hour, with the failed share marked inside each bar rather than
+   drawn as a second chart beside it. Two charts make "traffic rose and so did
+   errors" and "traffic rose and errors did not" look the same. */
+.opschart {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 90px; padding: 4px 0;
+}
+.opsbar {
+  flex: 1 1 0; min-width: 2px; position: relative;
+  background: var(--accent); border-radius: 2px 2px 0 0; opacity: .85;
+}
+.opsbar:hover { opacity: 1; }
+.opsbar-bad {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: var(--err); border-radius: 0 0 2px 2px;
+}
+
+/* One choice in a list of them, in a dialog: the radio and its explanation as
+   a single click target. Used for what a machine is set aside for, where the
+   explanation matters more than the label and a bare radio list hides it. */
+.choice {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 9px 11px; margin-bottom: 6px;
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.choice:hover { background: var(--surface-2); }
+.choice input { margin-top: 2px; }
+
+/* A small removable token: an attached file, mostly. */
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; margin: 0 4px 4px 0;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 999px; font-size: 12px;
+}
+.chip-x {
+  border: 0; background: none; cursor: pointer; padding: 0 0 0 2px;
+  color: var(--text-3); font-size: 12px; line-height: 1;
+}
+.chip-x:hover { color: var(--err); }
+
+/* ---- the assistant page ------------------------------------------------
+   A column that fills the height it is given, with the log scrolling and the
+   composer pinned under it. The composer must not move as the conversation
+   grows: a send button that walks down the screen is one people miss. */
+.chatpage {
+  display: flex; flex-direction: column;
+  height: calc(100vh - 48px); max-width: 860px; margin: 0 auto;
+}
+.chathead {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; padding-bottom: 10px; border-bottom: 1px solid var(--border);
+}
+.chathead h1 { margin: 0; font-size: 20px; }
+.chathead p { margin: 2px 0 0; }
+.chatpick { display: flex; flex-direction: column; gap: 3px; }
+
+.chatlog { flex: 1 1 auto; overflow-y: auto; padding: 16px 2px; }
+
+.chatturn { display: flex; gap: 10px; margin-bottom: 18px; }
+.chatturn.me { justify-content: flex-end; }
+.chatturn.me .bubble {
+  max-width: 74%; padding: 9px 13px;
+  background: var(--accent-bg); border-radius: 14px 14px 3px 14px;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.chatturn.it .chatmark { color: var(--accent); flex: 0 0 auto; line-height: 1.6; }
+/* The model's turn is full width and unboxed: it is the text people actually
+   read, and a bubble around four paragraphs reads as a quotation. */
+.chatbody { flex: 1 1 auto; min-width: 0; }
+.chatturn.failed .chatbody { color: var(--err); }
+.chatanswer { overflow-wrap: anywhere; }
+.chatanswer > :first-child { margin-top: 0; }
+.chatanswer > :last-child { margin-bottom: 0; }
+.chatwait { color: var(--text-3); font-style: italic; }
+.chatattach { margin-top: 6px; }
+
+.chatbar { padding: 10px 0 14px; border-top: 1px solid var(--border); }
+.chatfiles:empty { display: none; }
+.chatfiles { margin-bottom: 6px; }
+.chatrow { display: flex; align-items: flex-end; gap: 8px; }
+.chatrow textarea {
+  flex: 1 1 auto; resize: none; min-height: 40px; max-height: 200px;
+  padding: 10px 12px; border: 1px solid var(--border-2); border-radius: 10px;
+  background: var(--surface); color: var(--text); font: inherit;
+}
+.chatrow textarea:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+/* The paperclip is a label wrapping a hidden input, so it needs the shape of
+   a button without being one. */
+.chatrow label.icon-btn { cursor: pointer; }
+.chatfoot { margin: 6px 0 0; text-align: center; }
+
+/* ---- a chat account's shell --------------------------------------------
+   It has one page and cannot reach any other, so the navigation, the fleet
+   indicator and the beginner's primer are all noise pointing at doors that
+   are locked. The attribute is set on <html> at sign-in; see paintWho. */
+:root[data-role="chat"] .nav,
+:root[data-role="chat"] .fleet-pill,
+:root[data-role="chat"] #omniOpen,
+:root[data-role="chat"] #helpToggle,
+:root[data-role="chat"] #omniOpenMobile,
+:root[data-role="chat"] #helpToggleMobile { display: none; }
+:root[data-role="chat"] .sidebar { justify-content: space-between; }
+
+@media (max-width: 720px) {
+  .chatpage { height: calc(100vh - 108px); }
+  .chathead { flex-direction: column; align-items: stretch; gap: 8px; }
+}

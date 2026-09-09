@@ -234,6 +234,50 @@ const FIXTURES = [
   [/\/api\/users/, { users: [{ id: "usr_1", username: "max", display_name: "Max",
       role: "admin", active: true, created_at: now, last_login: now }],
       total: 1, shown: 1, pending_total: 0 }],
+  // ---- operations, and the plain chat page
+  [/\/api\/ops\/metrics/, { hours: 24, scope: "studio", kept_days: 90,
+      totals: { calls: 412, prompt_tokens: 91000, completion_tokens: 38000,
+                errors: 3, seconds: 640, rate: 59.4, error_rate: 0.7,
+                last_used: now, first_used: now - 86400 },
+      series: [{ t: now - 7200, calls: 120, errors: 0, completion_tokens: 9000, seconds: 150 },
+               { t: now - 3600, calls: 190, errors: 3, completion_tokens: 17000, seconds: 300 },
+               { t: now, calls: 102, errors: 0, completion_tokens: 12000, seconds: 190 }],
+      by_model: [{ key: "job_1", name: "SmolLM2 on alpaca", job_id: "job_1",
+                   gone: false, calls: 412, prompt_tokens: 91000,
+                   completion_tokens: 38000, errors: 3, seconds: 640,
+                   rate: 59.4, last_used: now }],
+      by_runner: [{ key: "run_1", name: "workstation", calls: 412,
+                    completion_tokens: 38000, errors: 3, rate: 59.4,
+                    last_used: now }],
+      by_key: [{ key: "key_1", name: "home assistant", prefix: "ais_ab12",
+                 calls: 400, completion_tokens: 37000, errors: 3, rate: 59.1,
+                 last_used: now }],
+      by_alias: [{ key: "assistant-prod", name: "assistant-prod", calls: 400,
+                   completion_tokens: 37000, errors: 3, rate: 59.1,
+                   last_used: now }],
+      recent_errors: [{ ts: now - 600, job_id: "job_1", alias: "assistant-prod",
+                        source: "api", error: "The GPU ran out of memory." }] }],
+  [/\/api\/ops\/deployments/, [
+    { id: "dep_1", job_id: "job_1", job_name: "SmolLM2 on alpaca",
+      job_gone: false, runner_id: "run_1", runner_name: "workstation",
+      runner_online: true, state: "ready", detail: "On the card, and held there.",
+      resident: true, created_at: now - 7200, updated_at: now - 7000,
+      ready_at: now - 7000, load_s: 74, aliases: ["assistant-prod"] },
+    { id: "dep_2", job_id: "job_2", job_name: "Nano from scratch",
+      job_gone: false, runner_id: "run_2", runner_name: "the CPU box",
+      runner_online: false, state: "failed",
+      detail: "The GPU ran out of memory loading this model.",
+      resident: false, created_at: now - 600, updated_at: now - 500,
+      aliases: [] }]],
+  [/\/api\/ops\/keys/, [{ id: "key_1", name: "home assistant",
+      prefix: "ais_ab12", calls: 400, created_at: now - 86400,
+      last_used: now, expires_at: null, expired: false, scope: null,
+      owner: { id: "usr_1", username: "max", display_name: "Max" } }]],
+  [/\/api\/models\b/, [{ alias: "assistant-prod", stage: "production",
+      notes: "The model Home Assistant talks to", job_id: "job_1",
+      job_name: "SmolLM2 on alpaca", job_status: "succeeded", job_gone: false,
+      visible: true, mine: true, history: [], created_at: now - 86400,
+      updated_at: now - 86400 }]],
   [/\/api\/sso\/providers/, []],
   [/\/api\/idp\/presets/, []],
   [/\/api\/idp/, []],
@@ -427,6 +471,8 @@ const VIEWS = [
   ["admin", "./views/admin.js", "adminView", []],
   ["admin-storage", "./views/admin.js", "adminView", ["storage"]],
   ["admin-backups", "./views/admin.js", "adminView", ["backups"]],
+  ["ops", "./views/ops.js", "opsView", []],
+  ["chat", "./views/chat.js", "chatView", []],
 ];
 
 const main = document.getElementById("main");
@@ -440,7 +486,15 @@ for (const [label, path, fn, args, hash] of RUN) {
     // Some pages read the address: the wizard, the generator and the vision
     // page all ask which project they are working in and stop if they are not
     // told, which is the point of them -- so the harness has to say.
-    location.hash = hash || "#/";
+    // replaceState, not `location.hash = ...`. Assigning the hash fires a
+    // hashchange, and app.js -- which every view drags in for `session` --
+    // listens for it and redraws #main with whatever route matches. That
+    // render is async, so it lands a few milliseconds later, in the middle of
+    // this scene, and replaces the view under test with the projects page.
+    // It only bites when the previous scene left a different address behind
+    // (the admin page rewrites its own), which is why it stayed hidden until
+    // a new scene was added directly after that one.
+    history.replaceState(null, "", hash || "#/");
     main.innerHTML = "";
     const stop = await mod[fn](main, args);
     // A view that draws nothing is a view that failed quietly, which is the

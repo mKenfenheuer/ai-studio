@@ -330,6 +330,13 @@ class Runner:
                 # call fetches the model.
                 threading.Thread(target=self._classify, args=(msg,),
                                  daemon=True, name="classify").start()
+            elif kind == "preload":
+                # Put a model on the card and keep it there. Off the socket
+                # thread: this fetches gigabytes and then loads them, and a
+                # socket that stops reading for four minutes is a socket the
+                # controller decides is dead.
+                threading.Thread(target=self._preload, args=(msg,), daemon=True,
+                                 name="preload-%s" % msg.get("deployment_id")).start()
             elif kind == "generate":
                 self._start_generation(msg)
             elif kind == "generate_cancel":
@@ -450,6 +457,11 @@ class Runner:
                 "busy": self.current is not None,
                 "job_id": self.current.job_id if self.current else None,
                 "loaded": self.host.loaded_ids() if self.host else [],
+                # Which of those are here because somebody deployed them, as
+                # opposed to being left over from a conversation. The
+                # controller reconciles against this: anything it believes is
+                # deployed and this list does not mention is put back.
+                "pinned": self.host.pinned_ids() if self.host else [],
                 "cached": artifacts.cached_ids(),
                 "disk": artifacts.usage(),
                 "checkpoints": checkpoints.list_ids(),
@@ -496,7 +508,10 @@ class Runner:
             # Everything, not the least recently used one: a training run is
             # the single case where the whole card is wanted, and it is the
             # reason the playground is allowed to keep models otherwise.
-            self.host.unload_all()
+            # `force` takes deployed models too, for the same reason -- the run
+            # was sized against an empty card. The controller notices the
+            # deployment is gone and puts it back when the run is over.
+            self.host.unload_all(force=True)
         workdir = tempfile.mkdtemp(prefix="aistudio_%s_" % job["id"])
         # Trailing `or None` is required, not decorative: docker-compose renders
         # an unset HF_TOKEN as an empty string, and passing "" to huggingface_hub
@@ -536,6 +551,46 @@ class Runner:
         threading.Thread(target=self._generate, args=(msg,), daemon=True,
                          name="gen-%s" % rid).start()
 
+    def _preload(self, msg: dict) -> None:
+        """Load a model and hold it, reporting each stage as it happens.
+
+        A deployment is minutes of fetching and loading and there is a person
+        watching it, so this says where it has got to rather than going quiet
+        and then announcing an outcome. The states it reports are the ones the
+        controller stores: loading, then ready or failed.
+        """
+        did = msg.get("deployment_id")
+        spec = msg.get("spec") or {}
+        spec.setdefault("hf_token", os.environ.get("HF_TOKEN") or None)
+        job_id = spec.get("job_id") or ""
+        started = time.time()
+
+        def say(state: str, detail: str) -> None:
+            self.outbox.put({"type": "deployment_state", "deployment_id": did,
+                             "job_id": job_id, "state": state, "detail": detail,
+                             "load_s": round(time.time() - started, 1)})
+
+        if self.current is not None:
+            say("failed", "This machine is training right now. Deploy to it "
+                          "once the run has finished, or reserve it for "
+                          "serving so runs stop being sent here.")
+            return
+        if not self.host:
+            say("failed", "This machine has no model host -- it is not one "
+                          "that can serve.")
+            return
+        say("loading", "Fetching and loading the model.")
+        try:
+            self.host.ensure_loaded(spec, lambda line: say("loading", line))
+            # Pinned after the load, not before: a failed load that left a pin
+            # behind would protect a model that is not on the card from an
+            # eviction that would never happen to it.
+            self.host.pin(job_id)
+            say("ready", "On the card, and held there.")
+        except Exception as e:  # noqa: BLE001 - the reason is the whole point
+            self.host.unpin(job_id)
+            say("failed", _friendly_error(e))
+
     def _generate(self, msg: dict) -> None:
         rid = msg.get("request_id")
         spec = msg.get("spec") or {}
@@ -566,7 +621,12 @@ class Runner:
                 print("[runner] %s left its reasoning format and was cut short; "
                       "check the dataset for reasoning fields containing their "
                       "own </think> tags." % spec.get("job_id"), flush=True)
-            self.outbox.put({"type": "generate_done", "request_id": rid, **result})
+            # `job_id` is on the frame as well as inside the spec because the
+            # controller files what the reply cost against the run, and had to
+            # guess which run that was from a request id it may no longer be
+            # holding.
+            self.outbox.put({"type": "generate_done", "request_id": rid,
+                             "job_id": spec.get("job_id"), **result})
         except Exception as e:  # noqa: BLE001
             # A chat is deliberately never written down, which until now meant
             # a failed one left nothing at all behind: the reader got a
@@ -724,14 +784,28 @@ class Runner:
         # that has never heard of a second one -- still stores the model.
         params = None if kind in (None, "", "model") else {"kind": kind}
         timeout = httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=7200.0)
-        with open(path, "rb") as fh:
-            # httpx reads the handle in 64 KB chunks and sets Content-Length
-            # itself from the file's size, so this streams rather than loading
-            # the model into memory to send it.
-            r = httpx.put(url, content=fh, params=params, timeout=timeout,
-                          headers={"X-Runner-Token": self.token,
-                                   "Content-Type": "application/zip"})
-            r.raise_for_status()
+        total = os.path.getsize(path)
+
+        # Read in megabytes rather than in the 64 KB httpx uses when it is
+        # handed a file object. Fourteen gigabytes at 64 KB is two hundred and
+        # twenty thousand read-and-send round trips, and on a busy box the
+        # syscall overhead alone is a measurable fraction of the transfer --
+        # the CPU spends its time in the kernel instead of on the wire. The
+        # chunk size is the one knob here that costs nothing to turn.
+        def chunks():
+            with open(path, "rb") as fh:
+                while block := fh.read(1 << 20):
+                    yield block
+
+        # Content-Length stated explicitly, which keeps this a plain sized
+        # body. Handed a generator and no length, httpx would switch to
+        # chunked transfer-encoding -- which works, but means every proxy in
+        # between re-frames the stream and none of them can report progress.
+        r = httpx.put(url, content=chunks(), params=params, timeout=timeout,
+                      headers={"X-Runner-Token": self.token,
+                               "Content-Type": "application/zip",
+                               "Content-Length": str(total)})
+        r.raise_for_status()
 
 
 def _friendly_error(e: Exception, kind: str | None = None) -> str:

@@ -34,6 +34,16 @@
       <a href="#/play" data-nav="play"><span class="ico">▷</span><span class="lbl">Playground</span></a>
       <a href="#/data" data-nav="data"><span class="ico">▤</span><span class="lbl">Datasets</span></a>
       <a href="#/models" data-nav="models"><span class="ico">⬢</span><span class="lbl">Models</span></a>
+      <!-- Running the models, which is a different job from making them: what
+           is held on which card, how fast it answers, what is failing, and
+           who holds a key. Top level rather than inside Admin, because
+           deploying a model you trained is not an administrator's errand. -->
+      <a href="#/ops" data-nav="ops" class="nav-spill"><span class="ico">◎</span><span class="lbl">Operations</span></a>
+      <!-- The plain way in: ask a question, read the answer. It is the only
+           page a chat account has, and it is on the sidebar for everybody
+           else because a member who just wants to ask something should not
+           have to drive the playground. -->
+      <a href="#/chat" data-nav="chat"><span class="ico">💬</span><span class="lbl">Assistant</span></a>
       <!-- Below this line the tab bar on a 390px screen is out of room, so
            these fold into "More" there and stay in the sidebar on a desktop.
            Running the studio is a different job from using it: it is one item

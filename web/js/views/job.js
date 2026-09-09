@@ -396,6 +396,58 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
     } catch (e) { toast(e.message, "err"); }
   });
 
+  on(mount, "click", "#deployIt", async () => {
+    const job = getJob();
+    let runners = [], deployments = [];
+    try {
+      [runners, deployments] = await Promise.all([
+        api.runners(), api.deployments().catch(() => [])]);
+    } catch (e) { return toast(e.message, "err"); }
+    // A machine with no card would answer at a word every few seconds, and a
+    // machine reserved for training is somebody's arrangement. Neither is
+    // offered rather than being offered and then refused by the server.
+    const servers = runners.filter((r) =>
+      ["cuda", "rocm", "mps"].includes((r.capabilities || {}).backend)
+      && r.role !== "training");
+    const already = deployments.filter((d) => d.job_id === job.id);
+
+    const dlg = modal({ title: `Hold "${job.name}" on a machine`, width: 520,
+      body: html`
+      <p class="muted tiny">The model is loaded now and kept there, so the
+        first message does not wait for a fetch and a load. It goes back by
+        itself after a restart, and nothing else pushes it off the card.</p>
+      ${raw(already.length ? html`
+        <div class="callout callout-ok">
+          <strong>Already held on</strong>
+          ${already.map((d) => esc(d.runner_name)).join(", ")}.
+        </div>` : "")}
+      <div class="field">
+        <label for="dpTo">Machine</label>
+        <select id="dpTo">${raw(servers.length
+          ? servers.filter((r) => !already.some((d) => d.runner_id === r.id))
+              .map((r) => html`<option value="${r.id}">${r.name}${
+                r.role === "serving" ? " · reserved for serving" : ""}${
+                r.connected ? "" : " · offline"}</option>`).join("")
+          : `<option value="">No machine here can serve a model</option>`)}</select>
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="dpGo">Deploy it</button>
+      </div>` });
+
+    on(dlg, "click", "#dpGo", async (_e, btn) => {
+      const runnerId = $("#dpTo", dlg).value;
+      if (!runnerId) return toast("Choose a machine.", "err");
+      btn.disabled = true;
+      try {
+        await api.deploy({ job_id: job.id, runner_id: runnerId });
+        dlg.close();
+        toast("Loading it onto the card. This takes a minute or two.", "ok",
+              { href: "#/ops", label: "Operations" });
+      } catch (e) { toast(e.message, "err"); btn.disabled = false; }
+    });
+  });
+
   on(mount, "click", "#serveAs", async () => {
     const job = getJob();
     let names = [];
@@ -1789,6 +1841,11 @@ function runRibbon(job, tab) {
     // breaks the next time somebody renames it.
     rb("serveAs", "🏷", "Serve as…", { disabled: !usable,
       title: "Give it a name other software can be pointed at" }),
+    // A name says what to call it; a deployment says where it lives. Both
+    // belong here, because "I have finished training this and want other
+    // things to use it" is one thought and it was previously two pages.
+    rb("deployIt", "📌", "Deploy…", { disabled: !usable,
+      title: "Hold it on a machine's card so the first message is not slow" }),
     // The usual reason to delete a run is the space its model takes, and
     // deleting the run threw away the record of what was tried with it.
     rb("dropModel", "⌫", "Remove model", { disabled: !(done && job.artifacts?.length) || !job.mine,

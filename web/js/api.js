@@ -392,6 +392,27 @@ export const api = {
     req(`/api/jobs/${encodeURIComponent(id)}/system-prompt`),
   chatCancel:  (requestId) =>
     req(`/api/chat/${encodeURIComponent(requestId)}/cancel`, { method: "POST" }),
+
+  // ---- operations ------------------------------------------------------
+  // Deploying is asking for a model to be held on a machine's card. It
+  // returns as soon as the row is written, not when the model is loaded --
+  // loading is minutes, and the page follows it through `deployments_changed`
+  // on the event stream rather than holding a request open for it.
+  deployments: () => req("/api/ops/deployments"),
+  deploy: (body) =>
+    req("/api/ops/deployments", { method: "POST", body: JSON.stringify(body) }),
+  undeploy: (id) =>
+    req(`/api/ops/deployments/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  retryDeployment: (id) =>
+    req(`/api/ops/deployments/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  setRunnerRole: (id, body) =>
+    req(`/api/ops/runners/${encodeURIComponent(id)}/role`,
+        { method: "PUT", body: JSON.stringify(body) }),
+  opsMetrics: (hours = 24) =>
+    req(`/api/ops/metrics?hours=${encodeURIComponent(hours)}`),
+  studioKeys: () => req("/api/ops/keys"),
+  revokeStudioKey: (id) =>
+    req(`/api/ops/keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 
 /** Live updates from the controller, with automatic reconnect.

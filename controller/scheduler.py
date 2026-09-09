@@ -80,6 +80,15 @@ class Fleet:
         # runner_id -> [{job_id, step, bytes, at}]. What each machine is
         # holding, so a run can say how much of it exists and where.
         self.checkpoint_detail: dict[str, list] = {}
+        # runner_id -> the job ids that machine says are deployed to it. What
+        # the controller *believes* is deployed lives in the database; this is
+        # what is actually on the card, and the difference between the two is
+        # what reconcile_deployments acts on.
+        self.pinned: dict[str, list[str]] = {}
+        # Deployments a preload has been sent for and no answer received yet,
+        # so the reconciler does not send a second one every five seconds
+        # while the first is still fetching fourteen gigabytes.
+        self.deploying: dict[str, float] = {}   # deployment_id -> sent at
         self.gave_up_waiting: set[str] = set()
         self._wake = asyncio.Event()
 
@@ -101,6 +110,10 @@ class Fleet:
         # not survive a restart, so a machine that comes back has an empty card
         # and a full disk. Its next heartbeat says so either way.
         self.loaded.pop(runner_id, None)
+        # And with it whatever was deployed there. The deployment rows stay --
+        # they are the intent, not the state -- and are put back on the card
+        # by the reconciler when the machine reconnects.
+        self.pinned.pop(runner_id, None)
 
     def wake(self) -> None:
         self._wake.set()
@@ -349,6 +362,7 @@ class Fleet:
         while True:
             try:
                 await self.reconcile_orphans()
+                await self.reconcile_deployments()
                 await self._dispatch_once()
             except asyncio.CancelledError:
                 raise
@@ -359,6 +373,86 @@ class Fleet:
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
+
+    # How long a preload is given before the reconciler assumes it was lost
+    # and sends it again. Generous: it covers a download of the whole model
+    # over a domestic uplink followed by a load, and sending a second preload
+    # while the first is still working means two copies of the same fourteen
+    # gigabytes arriving at one machine.
+    PRELOAD_PATIENCE_S = 1800.0
+
+    async def reconcile_deployments(self) -> None:
+        """Put back what is supposed to be on each card, and only that.
+
+        This is the part that makes a deployment a deployment rather than a
+        one-off request to load something. Video memory does not survive a
+        restart, a training run takes the whole card, and a machine can simply
+        be away for an afternoon -- so "load it once and hope" would mean a
+        deployment that quietly stops being one and a served name that goes
+        back to taking a minute to answer its first message.
+
+        Every pass compares what each connected machine says it is holding
+        against what the database says it should be, and closes the gap in the
+        one direction that is safe to close automatically: loading what is
+        missing. Nothing is unloaded here -- a model on the card that nobody
+        asked for is a warm cache, not a fault.
+        """
+        rows = db.list_deployments()
+        if not rows:
+            return
+        for row in rows:
+            rid = row["runner_id"]
+            if rid not in self.connections:
+                # Not a failure, and deliberately not recorded as one: the
+                # machine is away, and the deployment is waiting for it. Only
+                # a deployment that thought it was ready is corrected, so the
+                # page does not claim a model is resident on a machine that is
+                # not even connected.
+                if row["state"] == "ready":
+                    db.set_deployment_state(
+                        row["id"], "pending",
+                        "Waiting for the machine to come back.")
+                    await self.broadcast_ui({"type": "deployments_changed",
+                                             "deployment_id": row["id"]})
+                continue
+            if row["state"] == "failed":
+                continue          # somebody has to look at it and ask again
+            if self.busy.get(rid):
+                continue          # the card is training; after it, not during
+            sent_at = self.deploying.get(row["id"])
+            if sent_at and time.time() - sent_at < self.PRELOAD_PATIENCE_S:
+                continue
+            if row["job_id"] in (self.pinned.get(rid) or []):
+                if row["state"] != "ready":
+                    db.set_deployment_state(row["id"], "ready",
+                                            "On the card, and held there.")
+                    await self.broadcast_ui({"type": "deployments_changed",
+                                             "deployment_id": row["id"]})
+                self.deploying.pop(row["id"], None)
+                continue
+            await self.send_deployment(row)
+
+    async def send_deployment(self, row: dict) -> bool:
+        """Ask a machine to hold this model. Returns whether it was asked."""
+        from . import config, serving          # local: avoids an import cycle
+        job = db.get_job(row["job_id"])
+        if not job:
+            db.set_deployment_state(row["id"], "failed",
+                                    "The run behind this deployment is gone.")
+            return False
+        spec = serving.chat_spec(job)
+        if config.HF_TOKEN:
+            spec["hf_token"] = config.HF_TOKEN
+        sent = await self.send_to_runner(row["runner_id"], {
+            "type": "preload", "deployment_id": row["id"], "spec": spec})
+        if not sent:
+            return False
+        self.deploying[row["id"]] = time.time()
+        db.set_deployment_state(row["id"], "loading",
+                                "Asked the machine to load it.")
+        await self.broadcast_ui({"type": "deployments_changed",
+                                 "deployment_id": row["id"]})
+        return True
 
     def fair_order(self, queued: list[dict]) -> list[dict]:
         """The queue, rearranged so one person cannot hold up everyone else.
@@ -452,7 +546,12 @@ class Fleet:
         queued = db.queued_jobs()
         if not queued:
             return
-        idle = [rid for rid in self.connections if rid not in self.busy]
+        # A machine reserved for serving is idle on purpose. It is kept idle:
+        # the point of reserving it is that it is free to answer the moment
+        # somebody asks, and a twenty-minute fine-tune on it makes the thing it
+        # was reserved for impossible for twenty minutes.
+        idle = [rid for rid in self.connections if rid not in self.busy
+                and db.runner_role(db.get_runner(rid)) != "serving"]
         if not idle:
             return
 
@@ -602,6 +701,14 @@ class Fleet:
             caps = runner.get("capabilities") or {}
             ok, reason = self.can_run(job, caps)
             busy = self.busy.get(runner["id"])
+            # A machine somebody reserved for serving can run this perfectly
+            # well and will never be offered it. Saying "it fits" about a
+            # machine that will never take the job is how a run waits all
+            # afternoon in front of a card that reads as available.
+            if ok and db.runner_role(runner) == "serving":
+                ok, reason = False, ("reserved for serving models"
+                                     + (" -- %s" % runner["note"]
+                                        if runner.get("note") else ""))
             out.append({
                 "runner": runner["name"], "runner_id": runner["id"],
                 "can": bool(ok),
@@ -629,6 +736,41 @@ class Fleet:
         return out
 
     # ----------------------------------------------------- runner messages
+    def _record_chat(self, runner_id: str, rid: str, msg: dict,
+                     kind: str) -> None:
+        """File what a playground reply cost, successful or not.
+
+        The playground was invisible to every number the studio kept. It is
+        the same fleet, the same cards and the same seconds as a request over
+        the API -- so a page reporting "12 replies today" while four people
+        spent the afternoon in the playground is not reporting on the studio,
+        it is reporting on one of its two doors.
+
+        Never raises: this runs on the socket that is carrying somebody's
+        conversation, and a failed ledger entry must not close it.
+        """
+        job_id = msg.get("job_id") or ""
+        if not job_id:
+            # An older runner, or a frame from before this carried it. A row
+            # filed against no run is a row no page can group, so it is worth
+            # less than the missing count costs.
+            return
+        try:
+            failed = kind == "generate_error"
+            db.record_usage(
+                job_id,
+                0 if failed else (msg.get("prompt_tokens") or 0),
+                0 if failed else (msg.get("tokens") or 0),
+                user_id=self.generation_owner.get(rid),
+                seconds=msg.get("seconds"),
+                stream=True,
+                status="error" if failed else "ok",
+                error=(msg.get("error") or msg.get("detail")) if failed else None,
+                source="playground",
+                runner_id=runner_id)
+        except Exception:  # noqa: BLE001 - see the docstring
+            pass
+
     async def handle_runner_message(self, runner_id: str, msg: dict) -> None:
         kind = msg.get("type")
         jid = msg.get("job_id")
@@ -675,8 +817,32 @@ class Fleet:
                             "%s=%s" % kv for kv in sorted(facts.items()))
                          ) if facts else ""), "error")
             if kind in ("generate_done", "generate_error"):
+                # Filed here only for the browser. A reply asked for over the
+                # OpenAI-compatible API is recorded by that endpoint, which
+                # knows which key asked and under which name -- recording it
+                # twice would double every number on the operations page.
+                if waiter is None:
+                    self._record_chat(runner_id, rid, msg, kind)
                 self.generations.pop(rid, None)
                 self.generation_owner.pop(rid, None)
+            return
+
+        if kind == "deployment_state":
+            # What the machine says happened to a model it was asked to hold.
+            # Recorded rather than relayed: a deployment is watched from a page
+            # somebody may open an hour later, so the last thing said about it
+            # has to survive nobody listening.
+            did = msg.get("deployment_id") or ""
+            state = msg.get("state") or "failed"
+            if db.get_deployment(did):
+                db.set_deployment_state(
+                    did, state, msg.get("detail"),
+                    load_s=msg.get("load_s") if state in ("ready", "failed") else None)
+            if state in ("ready", "failed"):
+                self.deploying.pop(did, None)
+            await self.broadcast_ui({"type": "deployments_changed",
+                                     "deployment_id": did, "state": state,
+                                     "detail": msg.get("detail") or ""})
             return
 
         if kind == "heartbeat":
@@ -685,6 +851,8 @@ class Fleet:
                 self.note_checkpoints(runner_id, held)
             if (resident := msg.get("loaded")) is not None:
                 self.loaded[runner_id] = list(resident)
+            if (held := msg.get("pinned")) is not None:
+                self.pinned[runner_id] = list(held)
             if (on_disk := msg.get("cached")) is not None:
                 # `<id>-adapter` is one artifact of a run rather than a run, and
                 # what the chat router asks is "does this machine have that

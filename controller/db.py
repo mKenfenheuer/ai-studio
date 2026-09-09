@@ -374,6 +374,43 @@ CREATE TABLE IF NOT EXISTS library (
 );
 CREATE INDEX IF NOT EXISTS idx_library_job ON library(job_id);
 CREATE INDEX IF NOT EXISTS idx_library_project ON library(project_id);
+
+-- A model held on a particular machine's card, on purpose.
+--
+-- Serving worked, and the first message always took a minute: the controller
+-- picked a machine, the machine fetched the archive, unpacked it and loaded
+-- it, and only then began to answer. Every subsequent message was fast until
+-- the model was evicted to make room for the next one somebody tried, at
+-- which point the minute came back. That is acceptable for a playground and
+-- not acceptable for the thing a piece of home automation is pointed at.
+--
+-- A deployment is the fix and it is deliberately explicit: *this* run on
+-- *that* machine, loaded now and kept loaded, protected from the eviction
+-- that a casual chat would otherwise cause. It is reconciled rather than
+-- fired once -- a machine that restarts comes back with an empty card, and
+-- the controller puts back what was supposed to be on it.
+--
+-- The state is what the machine last said, not what was intended: `pending`
+-- is waiting for a machine to be reachable, `loading` is a preload in
+-- progress, `ready` means the weights are on the card, and `failed` carries
+-- the reason in `detail` rather than leaving a deployment that silently is
+-- not one.
+CREATE TABLE IF NOT EXISTS deployments (
+    id          TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    runner_id   TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    detail      TEXT,
+    owner_id    TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    ready_at    REAL,
+    load_s      REAL
+);
+-- One deployment per model per machine. Asking twice is not two deployments.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deploy_pair
+    ON deployments(job_id, runner_id);
+CREATE INDEX IF NOT EXISTS idx_deploy_runner ON deployments(runner_id);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -464,6 +501,30 @@ _ADDED_COLUMNS = [
     ("datasets", "project_id", "TEXT"),
     ("evals", "project_id", "TEXT"),
     ("conversations", "project_id", "TEXT"),
+    # What a machine is *for*. A studio with two cards usually wants one of
+    # them answering messages and the other training, and there was no way to
+    # say so: the scheduler handed a training run to whichever machine was
+    # idle, which is the machine that was about to be asked a question.
+    # 'both' (the default, and what every existing machine keeps) takes work
+    # of either kind; 'serving' is reserved -- the scheduler skips it and only
+    # conversations reach it; 'training' takes runs and is never picked to
+    # answer a message.
+    ("runners", "role", "TEXT"),
+    # Why it was set aside, for whoever finds it reserved next month.
+    ("runners", "note", "TEXT"),
+    # Whether the reply was actually produced. Every row in this table was a
+    # success, because a failure returned before anything was recorded -- so
+    # the one question operations asks first, "is it erroring", could not be
+    # answered from the numbers at all.
+    ("usage", "status", "TEXT"),
+    ("usage", "error", "TEXT"),
+    # Which door the request came in at: the OpenAI-compatible API, or the
+    # studio's own playground. Both are the fleet serving a model and both
+    # cost the same card-seconds; only one of them was counted.
+    ("usage", "source", "TEXT"),
+    # The machine that answered, so a slow model and a slow machine can be
+    # told apart.
+    ("usage", "runner_id", "TEXT"),
 ]
 
 _ADDED_INDEXES = [
@@ -580,6 +641,99 @@ def get_runner(runner_id: str) -> dict | None:
     if r:
         r["capabilities"] = json.loads(r["capabilities"])
     return r
+
+
+# What a machine will accept. See the `runners.role` migration note: 'both' is
+# the default and is what every machine that has never been given a role does.
+RUNNER_ROLES = ("both", "serving", "training")
+
+
+def runner_role(runner: dict | None) -> str:
+    """This machine's role, defaulted -- read it rather than the column.
+
+    The column is NULL for every machine that existed before roles did, and a
+    NULL that means "both" is exactly the kind of thing that gets compared to
+    the string "both" in one place and not another.
+    """
+    role = ((runner or {}).get("role") or "").strip().lower()
+    return role if role in RUNNER_ROLES else "both"
+
+
+def set_runner_role(runner_id: str, role: str, note: str | None = None) -> None:
+    if role not in RUNNER_ROLES:
+        raise ValueError("unknown runner role %r" % role)
+    ex("UPDATE runners SET role=?, note=? WHERE id=?",
+       (role, (note or "").strip() or None, runner_id))
+
+
+# --------------------------------------------------------------- deployments
+#
+# See the table's own note. These are small and deliberately dumb: the
+# reconciliation -- putting a model back on a machine that restarted -- lives
+# in the scheduler, where the fleet's live state is.
+
+DEPLOY_STATES = ("pending", "loading", "ready", "failed")
+
+
+def create_deployment(job_id: str, runner_id: str,
+                      owner_id: str | None = None) -> dict:
+    """Ask for a model to be held on a machine. Asking twice is idempotent.
+
+    A deployment that had failed is retried by asking again, which is why this
+    resets the state rather than refusing: "deploy it" after a failure has one
+    obvious meaning and refusing with "it is already deployed" about something
+    that is visibly not deployed is the worst of both.
+    """
+    row = q1("SELECT * FROM deployments WHERE job_id=? AND runner_id=?",
+             (job_id, runner_id))
+    if row:
+        ex("UPDATE deployments SET state='pending', detail=NULL, updated_at=?"
+           " WHERE id=?", (now(), row["id"]))
+        return get_deployment(row["id"])
+    did = new_id("dep")
+    ex("INSERT INTO deployments (id,job_id,runner_id,state,owner_id,"
+       "created_at,updated_at) VALUES (?,?,?,'pending',?,?,?)",
+       (did, job_id, runner_id, owner_id, now(), now()))
+    return get_deployment(did)
+
+
+def get_deployment(deployment_id: str) -> dict | None:
+    return q1("SELECT * FROM deployments WHERE id=?", (deployment_id,))
+
+
+def list_deployments(runner_id: str | None = None) -> list[dict]:
+    if runner_id:
+        return q("SELECT * FROM deployments WHERE runner_id=?"
+                 " ORDER BY created_at", (runner_id,))
+    return q("SELECT * FROM deployments ORDER BY created_at")
+
+
+def deployment_for(job_id: str, runner_id: str) -> dict | None:
+    return q1("SELECT * FROM deployments WHERE job_id=? AND runner_id=?",
+              (job_id, runner_id))
+
+
+def set_deployment_state(deployment_id: str, state: str,
+                         detail: str | None = None,
+                         load_s: float | None = None) -> None:
+    if state not in DEPLOY_STATES:
+        raise ValueError("unknown deployment state %r" % state)
+    ready_at = now() if state == "ready" else None
+    ex("UPDATE deployments SET state=?, detail=?, updated_at=?,"
+       " ready_at=COALESCE(?, ready_at), load_s=COALESCE(?, load_s)"
+       " WHERE id=?",
+       (state, (detail or None), now(), ready_at, load_s, deployment_id))
+
+
+def delete_deployment(deployment_id: str) -> bool:
+    c = connect()
+    cur = c.execute("DELETE FROM deployments WHERE id=?", (deployment_id,))
+    c.commit()
+    return cur.rowcount > 0
+
+
+def deployments_of_job(job_id: str) -> list[dict]:
+    return q("SELECT * FROM deployments WHERE job_id=?", (job_id,))
 
 
 # ------------------------------------------------------------------- jobs
@@ -1855,12 +2009,24 @@ _since_trim = 0
 def record_usage(job_id: str, prompt_tokens: int, completion_tokens: int,
                  user_id: str | None = None, api_key_id: str | None = None,
                  alias: str | None = None, seconds: float | None = None,
-                 stream: bool = False) -> None:
+                 stream: bool = False, status: str = "ok",
+                 error: str | None = None, source: str = "api",
+                 runner_id: str | None = None) -> None:
+    """One row per reply, whether or not the reply happened.
+
+    A failure is recorded with `status="error"` and no tokens. This is the
+    whole reason the operations page can say anything at all about health: a
+    table of successes describes a studio in which nothing ever goes wrong,
+    and the moment somebody asks "is it erroring" the honest answer from that
+    table is "I have no idea".
+    """
     global _since_trim
     ex("INSERT INTO usage (ts,user_id,api_key_id,job_id,alias,prompt_tokens,"
-       "completion_tokens,seconds,stream) VALUES (?,?,?,?,?,?,?,?,?)",
+       "completion_tokens,seconds,stream,status,error,source,runner_id)"
+       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
        (now(), user_id, api_key_id, job_id, alias, int(prompt_tokens or 0),
-        int(completion_tokens or 0), seconds, 1 if stream else 0))
+        int(completion_tokens or 0), seconds, 1 if stream else 0,
+        status, (error or None), source, runner_id))
     _since_trim += 1
     if _since_trim >= _TRIM_EVERY:
         _since_trim = 0
@@ -1881,12 +2047,19 @@ def _usage_where(user_id: str | None, since: float | None) -> tuple[str, list]:
 def usage_by(column: str, user_id: str | None = None,
              since: float | None = None, limit: int = 50) -> list[dict]:
     """Token counts grouped by one column, biggest first."""
-    if column not in ("job_id", "api_key_id", "alias", "user_id"):
+    if column not in ("job_id", "api_key_id", "alias", "user_id",
+                      "runner_id", "source"):
         raise ValueError("refusing to group usage by %r" % column)
     clause, args = _usage_where(user_id, since)
     return q("SELECT %s AS key, COUNT(*) AS calls,"
              " SUM(prompt_tokens) AS prompt_tokens,"
              " SUM(completion_tokens) AS completion_tokens,"
+             " SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,"
+             # Summed rather than averaged, so the caller divides one total by
+             # the other. An average of per-reply rates weights a two-token
+             # reply the same as a two-thousand-token one and reads far faster
+             # than the fleet has ever been.
+             " SUM(CASE WHEN status='error' THEN 0 ELSE seconds END) AS seconds,"
              " MAX(ts) AS last_used"
              " FROM usage%s GROUP BY %s ORDER BY"
              " SUM(prompt_tokens + completion_tokens) DESC LIMIT ?"
@@ -1898,6 +2071,8 @@ def usage_totals(user_id: str | None = None,
     clause, args = _usage_where(user_id, since)
     row = q1("SELECT COUNT(*) AS calls, SUM(prompt_tokens) AS prompt_tokens,"
              " SUM(completion_tokens) AS completion_tokens,"
+             " SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,"
+             " SUM(CASE WHEN status='error' THEN 0 ELSE seconds END) AS seconds,"
              " MIN(ts) AS first_used, MAX(ts) AS last_used"
              " FROM usage%s" % clause, args) or {}
     return {k: (v or 0) for k, v in row.items()}
@@ -1913,6 +2088,63 @@ def usage_daily(user_id: str | None = None, days: int = 30) -> list[dict]:
     return q("SELECT CAST(ts / 86400 AS INTEGER) AS day, COUNT(*) AS calls,"
              " SUM(prompt_tokens + completion_tokens) AS tokens"
              " FROM usage%s GROUP BY day ORDER BY day" % clause, args)
+
+
+def usage_series(user_id: str | None = None, hours: int = 24,
+                 bucket_s: int = 3600) -> list[dict]:
+    """Traffic over time, in buckets, with everything a chart needs at once.
+
+    Hourly rather than daily because the question this answers is different:
+    daily says how much the studio is used, hourly says what happened at
+    eleven o'clock when it went wrong.
+    """
+    clause, args = _usage_where(user_id, now() - hours * 3600)
+    return q("SELECT CAST(ts / ? AS INTEGER) * ? AS t, COUNT(*) AS calls,"
+             " SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,"
+             " SUM(prompt_tokens) AS prompt_tokens,"
+             " SUM(completion_tokens) AS completion_tokens,"
+             " SUM(CASE WHEN status='error' THEN 0 ELSE seconds END) AS seconds"
+             " FROM usage%s GROUP BY t ORDER BY t" % clause,
+             [bucket_s, bucket_s] + args)
+
+
+def usage_recent(user_id: str | None = None, limit: int = 50,
+                 only_errors: bool = False) -> list[dict]:
+    """The last few replies, newest first. The log behind the averages."""
+    clause, args = _usage_where(user_id, None)
+    if only_errors:
+        clause = (clause + " AND " if clause else " WHERE ") + "status='error'"
+    return q("SELECT ts,user_id,api_key_id,job_id,alias,prompt_tokens,"
+             "completion_tokens,seconds,stream,status,error,source,runner_id"
+             " FROM usage%s ORDER BY ts DESC LIMIT ?" % clause, args + [limit])
+
+
+def all_api_keys() -> list[dict]:
+    """Every key in the studio, with its owner. Administrators only.
+
+    "Which keys exist" is an operations question and there was no way to ask
+    it: each account could see its own, so a studio of eight people had eight
+    private lists and nobody could answer "what is still able to call this".
+    """
+    rows = q("SELECT k.id,k.name,k.prefix,k.created_at,k.last_used,k.calls,"
+             "k.expires_at,k.scope,k.user_id,u.username,u.display_name"
+             " FROM api_keys k LEFT JOIN users u ON u.id=k.user_id"
+             " ORDER BY COALESCE(k.last_used, 0) DESC, k.created_at DESC")
+    for r in rows:
+        try:
+            r["scope"] = json.loads(r["scope"]) if r.get("scope") else None
+        except (TypeError, ValueError):
+            r["scope"] = None
+        r["expired"] = bool(r.get("expires_at")) and now() > float(r["expires_at"])
+    return rows
+
+
+def delete_any_api_key(key_id: str) -> bool:
+    """Revoke a key that is not yours. See the endpoint for who may."""
+    c = connect()
+    cur = c.execute("DELETE FROM api_keys WHERE id=?", (key_id,))
+    c.commit()
+    return cur.rowcount > 0
 
 
 # ===========================================================================

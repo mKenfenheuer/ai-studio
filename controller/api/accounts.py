@@ -11,6 +11,14 @@ from .security import current_user, require_admin
 
 router = APIRouter(prefix="/api")
 
+# What an account can be. `chat` is the narrow one: it reaches the models and
+# nothing else -- see CHAT_ROLE_PATHS in api/security.py for exactly what that
+# means. It exists because "let the support team ask the model things" was
+# otherwise an account that could also delete everybody's runs.
+ROLES = ("admin", "member", "chat")
+ROLE_ERROR = ("A role is admin, member, or chat -- chat being an account that "
+              "can talk to the served models and reach nothing else.")
+
 
 def _set_cookie(response: Response, request: Request, raw: str) -> None:
     response.set_cookie(
@@ -411,8 +419,8 @@ async def create_user(request: Request, payload: dict = Body(...)) -> dict:
     username = (payload.get("username") or "").strip().lower()
     password = payload.get("password") or ""
     role = payload.get("role") or "member"
-    if role not in ("admin", "member"):
-        raise HTTPException(400, "A role is either admin or member.")
+    if role not in ROLES:
+        raise HTTPException(400, ROLE_ERROR)
     if problem := auth.username_problem(username):
         raise HTTPException(400, problem)
     if db.get_user_by_name(username):
@@ -443,8 +451,8 @@ async def modify_user(request: Request, user_id: str,
         fields["display_name"] = (payload["display_name"] or "").strip()[:80] \
             or target["display_name"]
     if "role" in payload:
-        if payload["role"] not in ("admin", "member"):
-            raise HTTPException(400, "A role is either admin or member.")
+        if payload["role"] not in ROLES:
+            raise HTTPException(400, ROLE_ERROR)
         fields["role"] = payload["role"]
     if "active" in payload:
         fields["active"] = 1 if payload["active"] else 0
@@ -453,7 +461,10 @@ async def modify_user(request: Request, user_id: str,
 
     # The two ways to lock everybody out of their own studio, refused rather
     # than explained afterwards.
-    demoting = fields.get("role") == "member" and target["role"] == "admin"
+    # Any move off admin, not only the one to member: demoting the last
+    # administrator to a chat account locks the studio exactly as thoroughly.
+    demoting = ("role" in fields and fields["role"] != "admin"
+                and target["role"] == "admin")
     disabling = fields.get("active") == 0 and target["active"]
     if (demoting or disabling) and target["role"] == "admin" \
             and db.count_admins() <= 1:

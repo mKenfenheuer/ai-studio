@@ -56,6 +56,47 @@ RUNNER_TOKEN_PATHS = (
 )
 
 
+# What an account with the `chat` role may reach.
+#
+# A third role, and a deliberately small one: somebody who is here to ask the
+# models questions and has no business seeing the studio's runs, datasets,
+# machines or people. The interesting decision is that it is a list of what is
+# *allowed* rather than a list of what is forbidden. Written the other way
+# round, every endpoint added from now on would be reachable by a chat account
+# until somebody remembered to exclude it -- which is the same argument as the
+# one at the top of this file for gating every /api/ path by default, and it
+# fails the same way.
+#
+# `/v1/` is not here because it is handled before any of this: an API key or a
+# session gets in, and a chat account has a session. That is intentional --
+# chatting *is* the OpenAI-compatible surface, and the chat page calls it the
+# same way any other client would.
+CHAT_ROLE_PATHS = {
+    # Who am I, and let me out.
+    "/api/me",
+    "/api/me/password",
+    "/api/auth/state",
+    "/api/auth/logout",
+    # The names that have been registered. This is the whole menu a chat
+    # account gets: it chooses between models somebody deliberately published
+    # under a name, not between four hundred runs.
+    "/api/models",
+    # Its own conversations.
+    "/api/conversations",
+    # Files it attaches to a message.
+    "/api/assets",
+}
+
+CHAT_ROLE_PREFIXES = (
+    "/api/conversations/",
+    "/api/assets/",
+)
+
+
+def _chat_role_allows(path: str) -> bool:
+    return path in CHAT_ROLE_PATHS or path.startswith(CHAT_ROLE_PREFIXES)
+
+
 def _wants_json(request: Request) -> bool:
     return request.url.path.startswith("/api/")
 
@@ -135,6 +176,17 @@ async def authenticate(request: Request, call_next):
         return JSONResponse(
             {"detail": "Set a new password before continuing.",
              "must_change": True}, status_code=403)
+
+    # An account that is only here to talk to the models. Refused with a 403
+    # and a sentence rather than a 404: the page it came from should not have
+    # made the call, and "this does not exist" would send whoever is debugging
+    # it looking for a routing bug.
+    if user["role"] == "chat" and not _chat_role_allows(path):
+        return JSONResponse(
+            {"detail": "This account can talk to the models and nothing else. "
+                       "Ask an administrator if you need to train, look at "
+                       "datasets, or run the studio."},
+            status_code=403)
 
     request.state.user = user
     # Everything this request does against the Hub now runs as this person:

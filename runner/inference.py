@@ -158,6 +158,16 @@ class ModelHost:
         self.lock = threading.Lock()
         # Insertion-ordered, oldest use first: the next one to go.
         self._residents: dict[str, _Resident] = {}
+        # Models somebody deployed to this machine on purpose. They are exempt
+        # from the eviction below: the point of a deployment is that the model
+        # is *there*, and a resident that any passing conversation can push off
+        # the card is not a deployment, it is a cache that happened to be warm.
+        #
+        # Training still takes the whole card -- see unload_all -- because a
+        # run sized against an empty card and given a card with a deployment on
+        # it fails two minutes in. A machine reserved for serving takes no
+        # training runs, which is the arrangement this is meant for.
+        self._pinned: set[str] = set()
         # A view onto the most recently used resident. Everything that reads a
         # model -- render, generate, the context budget, the diagnostics, and
         # the two job kinds that build their own host -- goes through these, so
@@ -208,19 +218,42 @@ class ModelHost:
         """What is on the card, most recently used first."""
         return list(reversed(list(self._residents)))
 
+    def pinned_ids(self) -> list[str]:
+        """What is on the card because somebody deployed it here."""
+        return [j for j in self._pinned if j in self._residents]
+
+    def pin(self, job_id: str) -> None:
+        self._pinned.add(job_id)
+
+    def unpin(self, job_id: str) -> None:
+        self._pinned.discard(job_id)
+
     def unload(self, job_id: str | None = None) -> None:
         """Drop one model, or -- with no argument -- every one of them."""
         with self.lock:
-            self._unload_locked(job_id)
+            self._unload_locked(job_id, keep_pinned=job_id is None)
 
-    def unload_all(self) -> None:
-        self.unload()
+    def unload_all(self, force: bool = False) -> None:
+        """Empty the card. `force` takes the deployed models with it.
 
-    def _unload_locked(self, job_id: str | None = None) -> None:
+        Training forces it, because a run was sized against a card with
+        nothing on it. Everything else leaves a deployment alone -- the
+        controller put it there and is watching for it to come back if it
+        goes, so silently dropping it would start a loop of it being put back.
+        """
+        with self.lock:
+            self._unload_locked(None, keep_pinned=not force)
+
+    def _unload_locked(self, job_id: str | None = None,
+                       keep_pinned: bool = False) -> None:
         if job_id is None:
+            keep = {j: r for j, r in self._residents.items()
+                    if keep_pinned and j in self._pinned}
             self._residents.clear()
+            self._residents.update(keep)
         else:
             self._residents.pop(job_id, None)
+            self._pinned.discard(job_id)
         self._refresh_view()
         self._reclaim()
 
@@ -298,26 +331,44 @@ class ModelHost:
         what the card looked like while somebody else's conversation was still
         resident.
 
-        With no estimate to work against, everything goes -- which is what this
-        class did unconditionally before it could hold more than one model.
+        With no estimate to work against it aims at a fixed floor rather than
+        clearing the card. Clearing it was the old behaviour and it was quietly
+        expensive: a model with no `params_b` recorded -- a baseline off the
+        Hub, a merge made before the field was written -- evicted every other
+        model on a card that had room for all of them, and the next message
+        evicted it again to put the first one back. Two models that both fit,
+        each paying a full load every time somebody switched between them.
+
+        If the floor turns out to be too low the load fails on memory, and the
+        out-of-memory path in `ensure_loaded` clears the card and retries. The
+        expensive thing still happens when it is genuinely needed; it stopped
+        happening when it was not.
         """
         if need_gb is None:
-            if self._residents:
-                log("Clearing %d model%s off the card to make room."
-                    % (len(self._residents),
-                       "" if len(self._residents) == 1 else "s"))
-            self._unload_locked()
-            return
-        while self._residents:
+            need_gb = UNKNOWN_NEED_GB
+        while True:
             free = self._free_gb()
             if free is None or free >= need_gb:
                 return
-            victim = next(iter(self._residents.values()))
+            # Deployed models are not candidates. If the only thing left on the
+            # card is one of those, there is no more room to make: the load
+            # goes on and either fits compressed or fails saying so, which is
+            # the right outcome -- taking somebody's deployed model down to
+            # serve one passing message is not.
+            victim = next((r for r in self._residents.values()
+                           if r.job_id not in self._pinned), None)
+            if victim is None:
+                if self._residents:
+                    log("%.1f GB free, about %.1f GB needed, and everything "
+                        "resident is deployed here on purpose. Loading into "
+                        "what is left."
+                        % (self._free_gb() or 0.0, need_gb))
+                return
             self._residents.pop(victim.job_id, None)
+            self._refresh_view()
             self._reclaim()
             log("Unloaded %s to make room: %.1f GB free, about %.1f GB needed."
                 % (victim.job_id, self._free_gb() or 0.0, need_gb))
-        self._refresh_view()
 
     def _expert_kwargs(self) -> dict:
         """`experts_implementation`, when this backend needs it and the
@@ -484,6 +535,30 @@ class ModelHost:
             extra["device_map"] = {"": 0}
         else:
             extra["dtype"] = dtype
+            # Place the weights on the card as they are read, instead of
+            # building the whole model in host memory and copying it across
+            # afterwards with `.to(device)`.
+            #
+            # This is the difference between a 7B model taking about a minute
+            # to load and taking two and a half. The old path allocated 14 GB
+            # of ordinary RAM, filled it from the safetensors file, allocated
+            # 14 GB on the card, copied, and then waited for the host copy to
+            # be collected -- and on a machine without 14 GB to spare it went
+            # to swap and took very much longer than that. With a device map
+            # accelerate memory-maps the file and writes each tensor straight
+            # to its final home: one copy instead of two, and the peak host
+            # memory is one tensor rather than one model.
+            #
+            # Only where there is a card to place onto. On a processor-only
+            # runner there is no second copy to avoid, and `low_cpu_mem_usage`
+            # gets the one part that still applies -- not building an empty
+            # model first and then overwriting every weight in it.
+            if self.device == "cuda":
+                extra["device_map"] = {"": 0}
+            elif self.device == "mps":
+                extra["device_map"] = {"": "mps"}
+            else:
+                extra["low_cpu_mem_usage"] = True
 
         # Asked of the FILES rather than of the run that produced them. A
         # fine-tune now saves its merged model beside its adapter, so the kind
@@ -539,7 +614,10 @@ class ModelHost:
             ("pad_token", tok.pad_token), ("unk_token", tok.unk_token))
             if v}
 
-        if not quantize:
+        # Already in the right place when a device map put it there, and
+        # moving a model accelerate has dispatched is both pointless and, for
+        # a quantized one, actively wrong.
+        if not quantize and "device_map" not in extra:
             model = model.to(self.device)
         model = model.eval()
         model.config.use_cache = True
@@ -928,6 +1006,11 @@ class ModelHost:
                 "tool_calls": reply["tool_calls"],
                 "tokens": len(produced),
                 "tokens_per_sec": round(len(produced) / max(elapsed, 1e-6), 1),
+                # Time on the card, not time in the request. The controller
+                # files this rather than its own wall clock, so a rate quoted
+                # on the operations page is the model's speed and not a
+                # measurement of the network between here and the browser.
+                "seconds": round(elapsed, 3),
                 "prompt_tokens": prompt_len,
                 # "end" the model finished, "length" it ran out of budget,
                 # "cancelled" somebody pressed stop.
