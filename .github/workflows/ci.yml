@@ -1,0 +1,149 @@
+# The checks, run on every push and pull request.
+#
+# These are the same scripts a developer runs by hand -- there is no test
+# framework here on purpose, because the controller installs a handful of
+# pure-Python packages and the checks have to run on the machine somebody is
+# debugging on. CI installs exactly what they need and nothing else: no torch,
+# no CUDA, no ROCm. The whole job finishes in a couple of minutes.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first. Nobody needs the results
+# of a commit that has already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python checks (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and a current release. The
+        # controller is meant to install on whatever Python a NAS or a spare
+        # laptop happens to have, so the floor is worth proving every time.
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # The controller's own dependencies, plus websockets -- which the runner
+      # modules import at the top level and several checks reach through.
+      # Deliberately NOT the [runner] extra: that drags in transformers and
+      # torch, and no check here trains anything.
+      - name: Install controller dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install websockets
+
+      - name: Every module imports
+        run: |
+          python -m compileall -q common controller runner scripts
+
+      - name: Conversations survive the round trip to text
+        run: python scripts/check-formats.py
+
+      - name: Row names, editing, splits and transforms
+        run: python scripts/check-datasets.py
+
+      - name: Which run is allowed onto which machine
+        run: python scripts/check-dispatch.py
+
+      - name: Stored files are shared, counted and released
+        run: python scripts/check-assets.py
+
+      - name: A model card says true things
+        run: python scripts/check-cards.py
+
+      - name: A benchmark is asked the way its published number was
+        run: python scripts/check-benchmarks.py
+
+      - name: Reservations, deployments and the usage ledger
+        run: python scripts/check-ops.py
+
+      # Starts a controller of its own on a throwaway data directory and drives
+      # the same HTTP endpoints a browser drives, in the order a person uses
+      # them. This is the one that catches faults living in the seam between a
+      # route, the scheduler and a page.
+      - name: The whole workflow, against a real controller
+        run: python scripts/check-workflow.py
+
+  web:
+    name: Web checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # There is no build step and no bundler, so nothing looks at this code
+      # between writing it and a browser running it. A syntax error would
+      # otherwise ship and show up as a blank page with one console line.
+      - name: Every browser script parses as an ES module
+        run: node --experimental-vm-modules scripts/check-web.mjs
+
+      # Mounts each view in real Chrome, clicks every tab on its ribbon, and
+      # reports what threw. ubuntu-latest ships Chrome at /usr/bin/google-chrome,
+      # which is one of the paths the script already looks in.
+      - name: Every view still draws
+        run: node scripts/check-render.mjs
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The provisioning and deploy scripts run as root on somebody's server.
+      # A quoting mistake there is expensive in a way one in the web UI is not.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning scripts/*.sh
+
+  docker:
+    name: Dockerfiles build (controller, cpu runner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only -- no push. The cuda and rocm images are far too large for a
+      # hosted runner (rocm is ~42 GB) and are built by images.yml on a machine
+      # that has the disk for them.
+      - name: Controller image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.controller
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: CPU runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner.cpu
+          push: false
+          cache-from: type=gha,scope=cpu
+          cache-to: type=gha,mode=max,scope=cpu

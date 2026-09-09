@@ -74,7 +74,7 @@ const styleOf = (run) => STYLE_UI[run.style || run.mode] || STYLE_UI.continue;
  *  A studio dataset is recorded on the run as the URL the runner fetched it
  *  from -- the right thing to store and a terrible thing to read: the card
  *  introduced a model as "fine-tuned on
- *  http://10.1.250.48/api/datasets/ds_63854b537bca/dataset-file". The name
+ *  http://studio.example.com/api/datasets/ds_63854b537bca/dataset-file". The name
  *  travels alongside; it is used when it is there.
  */
 const learnedFrom = (r) =>

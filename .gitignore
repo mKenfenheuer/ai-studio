@@ -12,3 +12,6 @@ artifacts/
 *.pem
 *.key
 id_rsa*
+
+# Local Claude Code settings (machine-specific hosts and permissions)
+.claude/

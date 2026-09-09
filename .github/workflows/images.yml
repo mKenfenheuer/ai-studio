@@ -1,0 +1,215 @@
+# Build the studio's images and publish them to the GitHub Container Registry,
+# so somebody who wants to run AI Studio can `docker pull` it instead of
+# cloning this repo and building thirty gigabytes of GPU userspace.
+#
+# WHAT RUNS WHERE, AND WHY:
+#
+#   controller  ~200 MB   hosted runner, every push        pure Python, no GPU
+#   cpu         ~3 GB     hosted runner, every push        torch CPU wheel
+#   cuda        ~15 GB    hosted runner, on demand         needs a disk purge
+#   rocm        ~42 GB    self-hosted only                 will not fit, ever
+#
+# A GitHub-hosted runner has about 14 GB free on / and another 20-something on
+# /mnt. The cuda image only fits after the pre-installed Android SDK, .NET and
+# Haskell toolchains are deleted, which is what the reclaim step below does and
+# why it is not run for the two small images. The rocm image does not fit even
+# then: its base is `rocm/dev-ubuntu-24.04:*-complete`, which is needed to
+# compile bitsandbytes from source for a specific gfx architecture. Build it on
+# a machine you own -- `scripts/publish-images.sh rocm` does exactly this job.
+name: Images
+
+on:
+  push:
+    branches: [master]
+    # Documentation changes rebuild nothing. The images do not contain them.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/workflows/ci.yml"
+  # A release tag publishes the same images under that version.
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      cuda:
+        description: "Also build and push the CUDA runner (slow, ~40 min)"
+        type: boolean
+        default: false
+      rocm:
+        description: "Also build and push the ROCm runner (needs a self-hosted runner)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------- small ---
+  # The two images that fit on a hosted runner without any tricks. Built as a
+  # matrix because they differ only in a Dockerfile and a tag.
+  small:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: controller
+            dockerfile: docker/Dockerfile.controller
+            image: ai-studio-controller
+            flavour: latest
+          - name: cpu runner
+            dockerfile: docker/Dockerfile.runner.cpu
+            image: ai-studio-runner
+            flavour: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every push carries a moving tag people will actually pull, and an
+      # immovable one so "which build is this?" has an answer six months later.
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ matrix.flavour }},enable={{is_default_branch}}
+            type=raw,value=${{ matrix.flavour }}-{{date 'YYYY.MM.DD'}}-{{sha}},enable={{is_default_branch}}
+            type=semver,pattern={{version}},prefix=${{ matrix.flavour }}-
+          labels: |
+            org.opencontainers.image.title=AI Studio ${{ matrix.name }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # linux/amd64 only, and stated rather than inherited. The runner
+          # bases publish no arm64 variant at all, and an arm64 image pushed as
+          # the moving tag is unrunnable on every server anyone deploys to.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.flavour }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.flavour }}
+
+  # ----------------------------------------------------------------- cuda ---
+  # On demand, or on a release. Forty minutes and a disk purge, so it is not
+  # worth doing on every commit to a page of CSS.
+  cuda:
+    name: CUDA runner
+    if: github.event_name == 'release' || inputs.cuda
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # ~25 GB back. Without this the build dies partway through the torch
+      # wheel with "no space left on device", which is a slow way to find out.
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ai-studio-runner
+          tags: |
+            type=raw,value=cuda,enable={{is_default_branch}}
+            type=raw,value=cuda-{{date 'YYYY.MM.DD'}}-{{sha}},enable={{is_default_branch}}
+            type=semver,pattern={{version}},prefix=cuda-
+          labels: |
+            org.opencontainers.image.title=AI Studio runner (CUDA)
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner.cuda
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # No gha cache here on purpose: the layers are gigabytes each and the
+          # 10 GB cache allowance is spent restoring them more slowly than
+          # rebuilding. The registry's own layer reuse does the real work.
+
+  # ----------------------------------------------------------------- rocm ---
+  # Only ever on a machine with the disk for it. `runs-on: self-hosted` means
+  # this job is skipped harmlessly in a fork with no such runner attached.
+  rocm:
+    name: ROCm runner
+    if: inputs.rocm
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ai-studio-runner
+          tags: |
+            type=raw,value=rocm,enable={{is_default_branch}}
+            type=raw,value=rocm-{{date 'YYYY.MM.DD'}}-{{sha}},enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=AI Studio runner (ROCm)
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # BNB_ROCM_ARCH decides which GPU the bitsandbytes kernels are compiled
+      # for. gfx1030 is the RX 6800/6900 XT, which is what this is verified on.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner.rocm
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BNB_ROCM_ARCH=${{ vars.BNB_ROCM_ARCH || 'gfx1030' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

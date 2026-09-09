@@ -1,14 +1,39 @@
 # AI Studio
 
-A web app for training, fine-tuning and evaluating AI models on your own
-hardware — built so that someone who has never trained a model can get a
-working result, and someone who has can still reach every knob.
+**Train, fine-tune and evaluate AI models on your own hardware, from a browser.**
 
-Runs on **NVIDIA (CUDA)**, **AMD (ROCm)** and **Apple Silicon (Metal)**.
+[![CI](https://github.com/mKenfenheuer/ai-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/mKenfenheuer/ai-studio/actions/workflows/ci.yml)
+[![Images](https://github.com/mKenfenheuer/ai-studio/actions/workflows/images.yml/badge.svg)](https://github.com/mKenfenheuer/ai-studio/actions/workflows/images.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
+AI Studio is a self-hosted studio for the whole small-model workflow: bring in
+data, curate it, fine-tune or train from scratch, evaluate the result against
+something, then serve it over an OpenAI-compatible API — on GPUs you own.
+
+It is built so that someone who has never trained a model can reach a working
+result, and someone who has can still reach every knob. Runs on **NVIDIA
+(CUDA)**, **AMD (ROCm)** and **Apple Silicon (Metal)**.
 
 ---
 
-## How it is put together
+## Contents
+
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [What it does](#what-it-does)
+- [Hardware support](#hardware-support)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Status](#status)
+- [Limitations](#limitations)
+- [License](#license)
+
+---
+
+## Architecture
 
 Two pieces, deliberately separated:
 
@@ -16,8 +41,8 @@ Two pieces, deliberately separated:
 ┌─────────────────────────┐         ┌──────────────────────────┐
 │      CONTROLLER         │         │        RUNNER            │
 │  web UI · job queue     │◄────────│  owns a GPU · trains     │
-│  Hugging Face browsing  │  ws://   │  reports what it can do  │
-│  metrics · artifacts    │ outbound │                          │
+│  Hugging Face browsing  │  ws://  │  reports what it can do  │
+│  metrics · artifacts    │ outbound│                          │
 │  no GPU, no torch       │         │  torch + ROCm/CUDA/MPS   │
 └─────────────────────────┘         └──────────────────────────┘
         one of these                    as many as you like
@@ -30,17 +55,43 @@ out means a runner needs no inbound port, no static IP and no firewall rule.
 The split also quarantines the fragile part. A ROCm or CUDA userspace mismatch
 breaks a *runner*; the UI and your job history are untouched.
 
-## Why the controller has no GPU dependencies
-
-It installs with four pure-Python packages and runs on a NAS, a spare laptop or
-a Raspberry Pi. The web UI has **no build step** — no Node, no npm, no bundler.
-The only toolchain anyone installs is Python.
+**The controller has no GPU dependencies.** It installs with a handful of
+pure-Python packages and runs on a NAS, a spare laptop or a Raspberry Pi. The
+web UI has **no build step** — no Node, no npm, no bundler. The only toolchain
+anyone installs is Python.
 
 ---
 
 ## Quick start
 
-### 1. Start the controller
+### Docker Compose — everything at once
+
+```bash
+git clone https://github.com/mKenfenheuer/ai-studio.git
+cd ai-studio/docker
+echo "AI_STUDIO_JOIN_TOKEN=$(openssl rand -hex 24)" > .env
+docker compose up -d
+```
+
+The UI is on <http://localhost:8420>. First boot asks you to set an
+administrator password.
+
+### Prebuilt images
+
+```bash
+docker pull ghcr.io/mkenfenheuer/ai-studio-controller:latest
+docker pull ghcr.io/mkenfenheuer/ai-studio-runner:cpu     # no GPU
+docker pull ghcr.io/mkenfenheuer/ai-studio-runner:cuda    # NVIDIA
+docker pull ghcr.io/mkenfenheuer/ai-studio-runner:rocm    # AMD
+```
+
+The controller and the CPU runner are rebuilt on every push to `master`. The
+CUDA runner is built on demand and on each release — it is 15 GB and takes
+about forty minutes. The ROCm runner is ~42 GB and does not fit on a
+GitHub-hosted runner at all, so it is built on a self-hosted one; to build it
+yourself, `scripts/publish-images.sh rocm`.
+
+### From source
 
 ```bash
 pip install -e .
@@ -49,50 +100,62 @@ ai-studio                       # → http://localhost:8420
 
 It prints a **join token** on first boot. Runners need it.
 
-### 2. Connect a machine with a GPU
+### Connect a machine with a GPU
 
-Prepare the host once (installs the GPU kernel driver and Docker):
+Prepare the host once — this installs the GPU kernel driver and Docker:
 
 ```bash
 sudo scripts/provision-host.sh          # auto-detects AMD or NVIDIA
 ```
 
-Then run a runner:
+Then run a runner against your controller:
 
 ```bash
-# AMD
+# AMD (ROCm)
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
   -e AI_STUDIO_CONTROLLER=http://your-controller:8420 \
   -e AI_STUDIO_JOIN_TOKEN=your-token \
-  ai-studio/runner:rocm
+  ghcr.io/mkenfenheuer/ai-studio-runner:rocm
 
-# NVIDIA
+# NVIDIA (CUDA) — needs the NVIDIA Container Toolkit
 docker run --rm --gpus all \
   -e AI_STUDIO_CONTROLLER=http://your-controller:8420 \
   -e AI_STUDIO_JOIN_TOKEN=your-token \
-  ai-studio/runner:cuda
+  ghcr.io/mkenfenheuer/ai-studio-runner:cuda
 
-# macOS / no Docker
+# macOS / Apple Silicon / no Docker
 scripts/install-runner.sh
 ```
 
-Or bring up everything at once:
+> **Windows with an NVIDIA card:** use the `cuda` image. Docker Desktop runs
+> Linux containers on a WSL2 kernel, so it works unchanged — there is no
+> separate Windows image and none is needed.
 
-```bash
-cd docker
-echo "AI_STUDIO_JOIN_TOKEN=$(openssl rand -hex 24)" > .env
-docker compose up -d
-```
-
-### 3. Train something
+### Then train something
 
 Open the UI and follow the four steps. Everything technical is chosen for you
-from what your hardware measured about itself, and every choice is explained
-on screen. When a run finishes, the **Playground** lets you talk to it.
+from what your hardware measured about itself, and every choice is explained on
+screen. When a run finishes, the **Playground** lets you talk to it.
 
 ---
 
-## Two ways to make a model
+## What it does
+
+| | |
+|---|---|
+| **Datasets** | Import from Hugging Face, or upload `.jsonl` `.csv` `.txt` `.md` `.html` `.docx` `.zip`. Browse rows as a table, edit in place, filter, deduplicate, split, merge, and build columns with templates. Every derived operation writes a new dataset and records its lineage. |
+| **Fine-tuning** | LoRA and QLoRA over any Hugging Face causal LM, with the exact training string previewed before the run starts. Produces the adapter *and* the adapter merged into its base as a standalone model. |
+| **Training from scratch** | Trained tokenizer, packed corpus, held-out loss charted beside training loss, and live text samples so you can watch noise become sentences. Design the architecture yourself, with every combination checked against your card as you type. |
+| **Evaluation** | Prompt sets with expected answers, scored across several runs in one job (loss, exact match, token F1) with a paired significance test that refuses to name a winner it cannot defend. Standard benchmarks are run with the exact recipe the published number comes from. |
+| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Pin a model to a card with a deployment so it stays warm. |
+| **Operations** | Which models are loaded where, tokens per second, failure rates, and per-key usage. Reserve a machine for serving or for training. |
+| **Synthetic data** | Have a large hosted model (OpenAI, Azure OpenAI, Anthropic, or anything OpenAI-shaped) write the dataset your own small model trains on. |
+| **Publishing** | Push a finished model or dataset to the Hugging Face Hub, with a generated model card carrying the scores that were actually measured. Export to GGUF for llama.cpp. |
+
+For *why* each of these works the way it does — including the measurements that
+corrected the estimates it shipped with — see **[docs/design-notes.md](docs/design-notes.md)**.
+
+### Two ways to make a model
 
 | | Fine-tune | From scratch |
 |---|---|---|
@@ -107,399 +170,6 @@ on screen. When a run finishes, the **Playground** lets you talk to it.
 because it is the only way to actually see what training *is* — and because a
 small model trained properly on simple text writes real English, which is a
 genuinely surprising thing to watch happen on your own desk.
-
-### The arithmetic that decides whether a from-scratch run is worth starting
-
-A model needs roughly **20 tokens of text per parameter** before it has learned
-what its size can hold (Chinchilla). Below that it is undertrained, and a
-*smaller* model given the same compute would have been better.
-
-That single ratio is what the size picker shows, computed for your machine's
-measured throughput and the time you say you can wait. On an RX 6900 XT:
-
-| Size | Params | Chinchilla budget | Time to reach it |
-|---|---|---|---|
-| Nano | 5M | 106M tokens | ~8 min |
-| Tiny | 14M | 275M tokens | ~48 min |
-| Small | 29M | 582M tokens | ~3 hours |
-| Base | 91M | 1.8B tokens | ~29 hours |
-| Large | 211M | 4.2B tokens | ~6 days |
-
-So the UI does not offer a 1B model, and it marks the largest size that
-actually *finishes* in your budget rather than letting you pick the biggest and
-find out overnight.
-
-### These numbers are measured, and measuring them corrected two mistakes
-
-The estimates started as reasoning about how a GPU works. Running real jobs
-disproved both halves of that reasoning:
-
-**Throughput was four times too pessimistic.** The assumption was that narrow
-matmuls underuse the card, so efficiency should climb steeply with width — 6%
-of peak at 256 wide, 22% at 1024. Measured on the RX 6900 XT:
-
-| | measured | of peak |
-|---|---|---|
-| Nano (d=256, seq=256, batch 64) | 222k tokens/s | 22.3% |
-| Small (d=512, seq=512, batch 48) | 50k tokens/s | 27.9% |
-
-The direction was right; the magnitude was not. The original guess would have
-reported Nano as unable to finish, when it in fact reaches a full Chinchilla
-budget in eight minutes.
-
-One measurement was itself misleading, and is worth recording. The same Small
-model first measured 20.3%, because that run used batch 64 and sat against the
-memory ceiling. A model squeezed into barely enough memory does not fail — it
-just runs a third slower. That is a good reason for the batch planner to leave
-headroom, and a good reason to distrust a single benchmark.
-
-**Memory was 1.4× too optimistic, and the missing term was the logits.** For a
-small model the output layer dominates everything else: one value per token per
-vocabulary entry, with about five copies live across the cross-entropy path.
-At batch 64 × 256 tokens with an 8k vocabulary that is 2.15 GB, against 0.72 GB
-for the entire rest of the run. Omitting it was not a rounding error — the
-planner proposed a batch size that died at step one. That is the worst failure
-this app can produce, so the estimator now carries the logits term explicitly,
-doubles the no-flash attention term (scores *and* softmax are both retained for
-the backward pass), and plans against 72% of the card rather than 80%.
-
-### What the from-scratch trainer does differently
-
-Every one of these is a place where reusing the fine-tuning recipe produces a
-run that looks fine and learns nothing:
-
-- **Master weights stay float32.** A frozen fp16 base is correct for LoRA
-  because it is never updated. A model being trained from noise *is* the thing
-  updated, and fp16 weights silently discard every update below one ulp.
-  Speed comes from autocasting the matmuls instead.
-- **Text is packed, not padded.** Documents are concatenated and sliced into
-  equal blocks, so every position in every batch carries a real token.
-- **The tokenizer is trained too.** Borrowing Qwen's 151k vocabulary for a
-  384-wide model would spend 58M parameters on the embedding table — five times
-  the rest of the network. A small purpose-built vocabulary is the correct
-  choice, not a compromise.
-- **A slice of the corpus is never trained on**, and held-out loss is charted
-  beside training loss. It is the only number that can tell you the model is
-  memorising rather than learning.
-- **The model writes a sample every few dozen steps.** Watching noise become
-  words become sentences is the clearest evidence a run is working.
-
-## Choosing the data
-
-The step before training shows **the exact text the model will be trained on**
-— not the raw columns, but the finished string after the instruction template
-or chat flattening has been applied. It is rendered by importing the same
-function the runner uses to build its batches, from `common/formatting.py`, so
-a preview cannot drift from reality.
-
-Three things it catches before a run starts rather than an hour in:
-
-- **Datasets that are several datasets.** `load_dataset` refuses to guess
-  between configurations and fails with *"Config name is missing. Please pick
-  one among the available configs"*. The configurations are discovered up
-  front, from the datasets-server where it indexes the dataset and from the
-  repository's own card where it does not — the latter matters, because the
-  viewer answers 501 for a great many datasets.
-- **The wrong column.** Rows that have content the chosen columns cannot reach
-  are counted and shown, because they would be silently skipped.
-- **Blank rows, which are not a problem.** Line-oriented corpora like WikiText
-  are full of empty lines. Reporting those as failures would be a false alarm
-  on half the dataset, so empty and unreadable are counted separately and only
-  one of them is an error.
-
-### Your own files, and turning them into training data
-
-The dataset library takes files as they actually arrive, not as a trainer
-wishes they had been written:
-
-| Comes in as | Becomes |
-| --- | --- |
-| `.jsonl`, `.json` | rows, including a JSON array, `{"rows": [...]}`, or a dict of columns |
-| `.csv`, `.tsv` | rows, with the delimiter sniffed and the header row detected rather than assumed |
-| `.txt`, `.md` | rows cut by line, by paragraph, by document, or into fixed-size chunks with overlap |
-| `.html` | the text, with scripts, styles and tags removed |
-| `.docx` | its paragraphs — read out of the zip with the standard library, so nothing extra is installed |
-| `.zip` | every readable file inside it, each row tagged with the file it came from |
-| several files at once | one dataset, with a `source` column |
-
-`.pdf` works only if `pypdf` happens to be installed on the controller;
-otherwise it says so rather than importing gibberish. `.parquet` and `.xlsx`
-are refused with the shorter route named — the Hub import for one, "save as
-CSV" for the other.
-
-How a text file is cut into rows is a choice, not a guess, because the same
-file is a corpus of one-line examples or a book depending on what you meant.
-The default reads the file and picks: paragraphs where there are blank lines
-between them, otherwise one row per line.
-
-Once a dataset is in, every operation writes a **new** dataset and records
-what it did, so nothing is destructive and the lineage is visible: drop empty
-rows, remove duplicates, filter by length or by regex, sample, shuffle, split
-off a validation slice, merge several, rewrite as chat turns — and rearrange
-the columns. That last one is what makes an arbitrary spreadsheet trainable:
-rename a column to a name the trainer knows, or build one out of the others
-with a template like `Q: {question}\nA: {answer}` and drop the rest.
-
-### The workbench
-
-Rows are shown as a **table**, because reading data as JSON is reading it
-through a keyhole: you cannot compare two rows, you cannot see that a column
-is empty in half of them, and the punctuation outweighs the content. Columns
-become columns; a value that is a conversation or a tool schema is summarised
-in place ("4 messages") and opens in full on a click. One toggle switches to
-what the trainer actually reads.
-
-From the same panel: search, page, filter by split, select rows and delete
-them or move them to another split, open one row and correct a field, and add
-new rows by hand. Those change the dataset in place — curating data is the
-work, and requiring a derived copy to fix four bad rows is how a library fills
-up with near-identical datasets nobody can tell apart. Every such edit is
-recorded in the dataset's own history.
-
-Everything else still writes a **new** dataset, and now shows you what it
-would do first: **Show me what it would do** runs the same code over a sample
-and reports how many rows would survive, which steps ran, and the first rows
-after — before anything is created.
-
-Columns can be **calculated**, one per line, `name = template`:
-
-```
-who  = {first|title} {last|title}
-text = Q: {question}
-A: {answer|trim}
-```
-
-Any `{column}` is replaced with that row's value, so this is how columns are
-concatenated and how a spreadsheet becomes trainable. Values pass through
-`|` filters — `upper`, `lower`, `title`, `trim`, `lines`, `first`, `last`,
-`len`, `words`, `json`, `slice:0:200` — a short list of verbs rather than an
-expression language, because a spreadsheet's worth of functions in a text box
-is a programming language nobody wrote documentation for. A column can also be
-**split** into several (`name -> first, last  on  ,`), and columns can be
-renamed or dropped, in that order: dropped after the calculations, so a column
-a template reads from can still be thrown away.
-
-### Splits
-
-A dataset holds all of its splits together, with each row naming the split it
-belongs to. Importing from the Hub brings in **every split, in full** unless
-you say otherwise — the old default of "the train split, first 5,000 rows" was
-a decision disguised as a default, and it silently left behind the test split
-that makes a held-out score mean anything. Tick fewer splits if you want
-fewer; they arrive as one dataset rather than three; uploading, say which split the file is, and
-add the test set to the dataset the training data is already in. Every screen
-that reads rows can be pointed at one split — the row browser, the training
-preview, and the trainer itself.
-
-One file with a `split` column rather than a file per split: a dataset here is
-JSONL that streams, appends and can be opened in an editor, and separate files
-would buy nothing a column does not while costing every reader a directory
-walk. The counts are taken when the file is written, so no page has to count
-two million rows to draw a badge.
-
-### Writing a dataset with a model somebody else hosts
-
-The generator can drive a **hosted** model instead of a local one: OpenAI,
-**Azure OpenAI**, Anthropic, or any service that speaks the OpenAI shape —
-Together, Groq, OpenRouter, Mistral, a vLLM or Ollama server on your own
-network, or another AI Studio. This is the one job where paying per token is
-obviously right: a large model writes the dataset, and your own small model is
-trained on what it wrote.
-
-Keys are per account, encrypted at rest, never returned to the browser, and
-attached to a run at the moment it is created — the same rule the Hugging Face
-token follows, and it means "whose key paid for this dataset" has an answer.
-Connect one on your account page; the Test button asks the model to say hello
-and reports exactly what came back, because finding out on row 1 of 5,000 is
-the failure mode worth designing against.
-
-Three request shapes cover it — OpenAI's, Azure's (deployment in the URL, key
-in `api-key`, version on the query string), and Anthropic's (`/v1/messages`, a
-system field of its own, content blocks in the reply) — and they live in one
-module that performs no I/O, so the controller's test button and the runner's
-generation loop cannot disagree about what a provider expects. Rate limits are
-waited out rather than fatal; a rejected key stops the run immediately rather
-than spending five thousand attempts discovering the same thing.
-
-## Designing the model yourself
-
-The five sizes are a starting point, not a ceiling. "Design it yourself" opens
-layers, width, attention heads, context length and feed-forward width, and
-recomputes the parameter count, memory, batch size, step count and time
-estimate as you type. Every training hyperparameter is editable on the review
-step, each with a sentence explaining what it does.
-
-A transformer has combinations that are silently wrong rather than loudly
-broken, and a from-scratch run is far too slow to find them by trying. So
-everything is checked against the machine as it is typed, at three levels —
-`error` cannot start, `warn` will run and disappoint, `info` is a trade-off
-worth knowing:
-
-| Checked | Because |
-|---|---|
-| Width divides by heads | Attention splits the width evenly; it has to divide exactly |
-| Head dimension is 32/64/128 | Other sizes fall back to a slower attention path |
-| Width is a multiple of 64 | Otherwise part of every matrix tile sits idle |
-| Depth against width | Deep and narrow trains slowly and destabilises; wide and shallow cannot compose |
-| Feed-forward ratio | Below ~1.5x starves where most of the capacity lives |
-| Embedding share | Above half the model, the vocabulary is eating the network |
-| Context vs attention kernel | Without a fused kernel, memory grows with the square of it |
-| Fits in VRAM | Checked at the chosen batch, then at batch 1 before refusing |
-| Tokens per parameter | The Chinchilla ratio, against your actual time budget |
-| Learning rate vs width | Scales as 1/width; 3x over is flagged, 4x under too |
-| Tokens per step | Below ~16k the gradient is too noisy to follow |
-| Warmup, weight decay, clipping | Ranges that will run and should not |
-
-Every message names the field, says what is wrong, and suggests a specific
-fix. Where the obvious fix is useless it says something else instead: a width
-of 577 has no sensible divisor, so rather than advising "try 1 head" it
-suggests a width of 576.
-
-## Conversations, roles and templates
-
-Conversation datasets are the awkward case, and there is no single format for
-them. `content` may be a string or a list of typed parts; roles may be under
-`role` or `from`; a tool-calling dataset carries `tool_calls` on assistant
-turns and a `tools` schema in its own column. All of it is normalised to one
-shape in `common/formatting.py` before any template sees it, so system, user,
-assistant and tool turns survive intact — including the tool calls.
-
-Then a **Jinja template** turns that into training text. Three sources:
-
-| | |
-|---|---|
-| **The model's own** | Read from the base model's `tokenizer_config.json`. Almost always right: every instruct model was trained to expect one exact layout and ships it. |
-| **Plain and readable** | Roles written out as text. The correct choice for a base model, which has no format of its own. |
-| **Your own** | A Jinja template given `messages`, `tools` and every column of the row. Sandboxed, and compile and render errors are reported against real rows rather than swallowed. |
-
-**All three work for fine-tuning and for training from scratch.** A model built
-from nothing can learn a conversation format at the same time as it learns the
-language — it simply learns whichever shape it is shown.
-
-## Playground
-
-Every finished run stays available to chat with. Inference runs on a runner,
-never on the controller — that is what keeps the controller GPU-free — so a
-message is routed over the fleet websocket and the reply streams back token by
-token.
-
-**The Playground speaks the shape the model was taught, never one of its own.**
-Every run records the exact format it trained with, and the Playground sends
-the conversation back through that same format. Getting this wrong is how a
-perfectly good fine-tune comes to look broken: give a model a layout it has
-never seen and it ignores most of what it learned. Three interfaces follow from
-the recorded format:
-
-- **chat** — roles, a system prompt, and turns that accumulate as context.
-- **instruct** — one question at a time, wrapped in its training template,
-  with no memory of earlier ones, because that is how it was trained.
-- **continue** — a base model, which continues text and has never seen a
-  question.
-
-The **system prompt** the model trained with is offered back, because a model
-fine-tuned with one behaves noticeably worse without it and nobody writes it
-down. It is recorded when the run is created, and recovered from the run's own
-dataset when it was not — so runs made before this existed, or through the API,
-get theirs back too. "What the model is actually being sent" shows the finished
-prompt after templating, for when the answer is not what you expected.
-
-Runners fetch and cache the artifact from the controller on first use. Loaded
-models stay resident while there is memory for them and are evicted least
-recently used when there is not, so a chat never blocks the next training run
-and the second turn does not pay for the first turn's load.
-
----
-
-## Operations
-
-Training a model and *running* one are different jobs, and the second had no
-page. The studio could serve a model over an OpenAI-compatible API and then
-had nothing to say about whether it was up, how fast it was answering, how
-often it failed, or which key was doing all the work. Those facts existed --
-the token counts were the runner's own and were thrown away, the residency was
-in every heartbeat and was never read. **Operations** is where they are put.
-
-### Deploying a model to a machine
-
-A model is fetched and loaded the first time somebody talks to it, which for a
-7B is a minute or two, and it is dropped again when the card is needed for
-something else. That is right for a playground and wrong for the thing a piece
-of home automation is pointed at, which pays that minute at random intervals
-forever.
-
-A **deployment** pins one model to one machine's card and keeps it there. It
-is a row in the database rather than a one-off request, because the interesting
-cases are all the ones where "load it once and hope" fails: video memory does
-not survive a restart, a training run takes the whole card, and a machine can
-simply be away for an afternoon. A reconciler compares what each connected
-machine says it is holding against what should be there and loads what is
-missing. Nothing is ever unloaded automatically -- a model on a card that
-nobody asked for is a warm cache, not a fault.
-
-A deployed model is exempt from the eviction that a passing conversation would
-otherwise cause. It is *not* exempt from a training run, which is sized against
-an empty card and takes the whole thing; the controller notices and puts the
-deployment back when the run is over. If that matters, reserve the machine.
-
-### Reserving a machine
-
-A studio with two cards usually wants one of them answering messages and the
-other training, and there was no way to say so: the scheduler handed a run to
-whichever machine was idle, which is reliably the machine that was about to be
-asked a question. Each machine is now **both** (the default), **reserved for
-serving** -- the scheduler skips it and only conversations reach it -- or
-**reserved for training**, which is never picked to answer a message.
-
-The reservation is honoured in two places on purpose: the dispatcher skips the
-machine, *and* the "why is this run waiting" explanation says that is why. They
-disagreed once, and a run sat in a queue in front of a card the page reported
-as free.
-
-### What is measured
-
-Every reply is one row in a ledger -- over the API and in the playground alike,
-because both are the same cards and the same seconds and only one of them used
-to be counted. **Failures are rows too.** Every row used to be a success,
-because a failure returned before anything was written, so "is it erroring"
-could not be answered at all and every rate computed from the table was
-flattered by the calls that never happened.
-
-Tokens per second is a sum divided by a sum, not an average of per-reply rates:
-averaging those weights a two-token reply the same as a two-thousand-token one
-and reports a fleet considerably faster than it has ever been. Time spent
-failing is not time spent generating and is left out of the divisor. Where
-there is nothing to divide, the interface draws a dash rather than a zero.
-
-### Keys
-
-Everyone makes their own from their account page. An administrator sees every
-key in the studio, whose it is, what it has cost and the button that turns one
-off -- which is the part that was missing, because the key hammering a model
-at three in the morning is rarely your own.
-
----
-
-## The assistant, and the chat role
-
-The Playground is a workbench. It lists every run, compares two side by side,
-exposes temperature and top-p and the system prompt, and assumes you know what
-a fine-tune is. That is right for the person who trained the model and wrong
-for the person the model was trained *for* -- the colleague who has been told
-"ask the assistant" and has no business seeing four hundred runs, somebody's
-dataset, or the button that deletes a machine.
-
-**Assistant** is the other door: the models somebody deliberately published
-under a name, a message box, the reasoning shown when the model produces any,
-and text files you can attach and ask about. It talks to
-`/v1/chat/completions` -- the same endpoint any outside client uses, with the
-session cookie instead of a key -- so it cannot drift from what everything else
-gets, its usage is counted the same way, and a bug found here is a bug an
-integration would have hit too.
-
-A third role, **chat**, is an account that has that page and nothing else. It
-is enforced on the server as an *allowlist* of paths rather than a list of
-things to forbid: written the other way round, every endpoint added from now on
-would be reachable by a chat account until somebody remembered to exclude it.
 
 ---
 
@@ -522,21 +192,6 @@ for your GPU architecture (`BNB_ROCM_ARCH`, default `gfx1030`). This is
 reports 4-bit as unsupported and the UI hides it rather than letting a run fail
 an hour in.
 
-### Two lessons the probe encodes
-
-Both were measured on an RX 6900 XT, and both would silently ruin a run:
-
-**bfloat16 is a trap on RDNA2.** The card supports it and computes it
-correctly — at 12.7 TFLOP/s against 31.6 for float16. Nearly every fine-tuning
-guide says "use bf16", which here throws away 60% of the GPU. The runner
-benchmarks all three dtypes and recommends from the measurement.
-
-**A GPU library can kill the process, not raise an exception.** Importing the
-stock `bitsandbytes` on unsupported ROCm hardware aborts the interpreter at the
-HIP level (`SIGABRT`). An in-process capability check would take the agent down
-at startup, forever. So risky probes run in a **subprocess**, and results proven
-before a crash are recovered from a partial report.
-
 ---
 
 ## Configuration
@@ -545,34 +200,45 @@ before a crash are recovered from a partial report.
 |---|---|---|
 | `AI_STUDIO_DATA` | controller | State directory (default `./data`) |
 | `AI_STUDIO_PORT` | controller | UI port (default `8420`) |
+| `AI_STUDIO_PUBLIC_URL` | controller | External URL, so SSO redirects are right |
 | `AI_STUDIO_JOIN_TOKEN` | both | Shared join secret; generated if unset |
 | `HF_TOKEN` | both | For gated models (Llama, Gemma) |
 | `AI_STUDIO_CONTROLLER` | runner | Controller URL |
 | `AI_STUDIO_RUNNER_NAME` | runner | Display name |
+| `AI_STUDIO_RUNNER_KINDS` | runner | Restrict to certain job kinds |
 | `BNB_ROCM_ARCH` | rocm build | GPU arch, e.g. `gfx1030`, `gfx1100` |
+
+---
 
 ## Security
 
 **People sign in.** The first boot asks for an administrator password; after
-that there are accounts with two roles (administrator, member), sessions in an
-httpOnly cookie, scrypt-hashed passwords with a rate limit on failures, and
-optional single sign-on through any OIDC provider (Entra, Google, Keycloak,
-Authentik, ...) with PKCE and directory sync. Runs, datasets and prompt sets
-are private to their owner unless shared with a named person or with everyone
-in the studio; anything you cannot see answers 404, not 403.
+that there are accounts with roles, sessions in an httpOnly cookie, scrypt-hashed
+passwords with a rate limit on failures, and optional single sign-on through any
+OIDC provider (Entra, Google, Keycloak, Authentik, …) with PKCE and directory
+sync. Runs, datasets and prompt sets are private to their owner unless shared
+with a named person or with everyone in the studio; anything you cannot see
+answers 404, not 403.
 
 **Credentials are per account.** Each person connects their own Hugging Face
-token and their own hosted-model keys on the account page; they are encrypted
-at rest, never returned to the browser, and attached to a run at the moment it
-is created so "whose key paid for this" has an answer. `HF_TOKEN` in the
-environment is the fallback for people who have not connected one. API keys
-for the OpenAI-compatible endpoint are minted on the same page and shown once.
+token and their own hosted-model keys on the account page; they are encrypted at
+rest, never returned to the browser, and attached to a run at the moment it is
+created — so "whose key paid for this" has an answer. API keys for the
+OpenAI-compatible endpoint are minted on the same page and shown once.
 
 **The join token is the machine credential.** Anyone holding it can attach a
 runner and read the work on it, so treat it as a password. Only administrators
-see it. There is no TLS in the controller itself: put it behind a reverse
-proxy that terminates HTTPS, and set `AI_STUDIO_PUBLIC_URL` so SSO redirects
-carry the right address.
+see it.
+
+> ⚠️ **There is no TLS in the controller itself.** Put it behind a reverse proxy
+> that terminates HTTPS, and set `AI_STUDIO_PUBLIC_URL` so SSO redirects carry
+> the right address. Do not expose it directly to the internet.
+
+Found a security issue? Please open a
+[security advisory](https://github.com/mKenfenheuer/ai-studio/security/advisories/new)
+rather than a public issue.
+
+---
 
 ## Project layout
 
@@ -583,49 +249,46 @@ common/       message normalising, Jinja templating and prompt building --
 controller/   FastAPI app, SQLite, scheduler, HF proxy  (no torch)
 runner/       capability probe, websocket agent, trainers, inference host
 web/          zero-build UI (ES modules, no dependencies)
-docker/       controller + rocm/cuda runner images, compose
-scripts/      host provisioning, bare-metal runner install, and the checks:
-              check-formats.py (conversation round-trips), check-datasets.py
-              (row names, editing, splits, transforms), check-web.mjs (every
-              browser script parses), check-render.mjs (every view still
-              draws, in a real browser, with its tabs clicked)
+docker/       controller + cpu/cuda/rocm runner images, compose files
+scripts/      host provisioning, bare-metal runner install, and the checks
+docs/         design notes
 ```
 
-### One rule in the web UI
+---
 
-`draw()` renders purely from state, and no render may start work that causes
-another render synchronously. Every asynchronous load goes through `ensure()`,
-which marks itself in-flight *before* awaiting, so the re-render it eventually
-triggers finds the work already done rather than starting it again.
+## Development
 
-This is written down because breaking it is not obvious and not survivable: an
-earlier version called `draw()` from inside the click handler that each step
-re-ran on render, which recursed until the stack gave out and filled the
-console with `too much recursion`.
+There is no test framework and that is deliberate: the controller installs a
+handful of pure-Python packages, and these checks have to run on the machine
+somebody is debugging on. Each is a plain script that exits non-zero on failure.
+
+```bash
+python scripts/check-formats.py      # conversations survive the round trip to text
+python scripts/check-datasets.py     # row names, editing, splits, transforms
+python scripts/check-dispatch.py     # which run is allowed onto which machine
+python scripts/check-assets.py       # stored files are shared, counted, released
+python scripts/check-cards.py        # a model card says true things
+python scripts/check-benchmarks.py   # a benchmark is asked the published way
+python scripts/check-ops.py          # reservations, deployments, the usage ledger
+python scripts/check-workflow.py     # the whole workflow, against a real controller
+
+node --experimental-vm-modules scripts/check-web.mjs   # every browser script parses
+node scripts/check-render.mjs                          # every view still draws, in Chrome
+```
+
+All of them run in CI on every push and pull request — see
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+**One rule in the web UI:** `draw()` renders purely from state, and no render
+may start work that causes another render synchronously. The reasoning is in
+[docs/design-notes.md](docs/design-notes.md#one-rule-in-the-web-ui).
+
+---
 
 ## Status
 
-Working end-to-end:
-
-- **LoRA and QLoRA fine-tuning** — browse Hugging Face, preview your data,
-  guided setup, live loss charts, cancel mid-run, and two artifacts at the
-  end: the adapter, and the same adapter merged into its base as a standalone
-  model that loads anywhere. Publish either, or both.
-- **Training from scratch** — trained tokenizer, packed corpus, held-out loss,
-  live text samples, a standalone model with usage instructions in the zip.
-- **Playground** — streaming chat with any finished run, template-aware.
-- **Evaluation** — prompt sets with expected answers, scored across several
-  runs in one job (expected-answer loss, exact match, token F1) with a paired
-  significance test that refuses to name a winner it cannot defend, and the
-  scores written into the model card.
-- **An OpenAI-compatible endpoint** — `/v1/chat/completions` and `/v1/models`
-  over every finished run, streaming, with tool calls and reasoning, behind
-  per-user API keys.
-- **Datasets written by a model** — a local run or a hosted provider writes
-  rows from prompts, topics or seed conversations, and the result lands in the
-  library as a dataset.
-
-Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
+Verified end-to-end on an RX 6900 XT (gfx1030), controller and runner both
+containerised:
 
 | Check | Result |
 |---|---|
@@ -634,23 +297,16 @@ Verified on an RX 6900 XT (gfx1030), controller and runner both containerised:
 | From scratch, 5.3M params, 300 steps | loss 8.999 → 2.904 in **120 s** |
 | Held-out loss on the same run | 6.446 → 2.927, tracking training loss |
 | Playground, from-scratch model | 214 tokens/s, first token in 0.3 s |
-| Playground, second turn | 0.0 s — the loaded model is reused |
 | Playground, 3B fine-tune | base + adapter loaded in 11.7 s |
-| From scratch, 29M params | 11.5 GB against a 10.5 GB estimate |
-| Hand-designed 448x7, 20M params | trained from the designer end to end |
-| Multi-config dataset | configurations listed from the card when the viewer 501s |
 | Tool-calling chat dataset | 4 roles, 19 tools, tool calls preserved end to end |
 | Qwen 0.5B on that dataset | loss 2.246 → 1.392 with the model's own template |
-| Deleting a run | rows, model file and each runner's cached copy |
-| Cancelling a run mid-training | stopped cleanly, runner stayed online |
 | Runner killed mid-run | job requeued and restarted automatically |
 | Runner killed after upload | run kept as finished, not restarted from noise |
-| Second job while one is training | queued once, not re-offered every tick |
-| Unsupported model / bad ID | refused with a plain-language message |
+| Cancelling a run mid-training | stopped cleanly, runner stayed online |
 | Model too large for the GPU | refused at creation, not left queued |
 | UI at 1440px and 390px | no JS errors, no horizontal overflow |
 
-The 5.3M model, from noise, on TinyStories:
+A 5.3M-parameter model, from noise, on TinyStories:
 
 ```
 step  50  Once upon a time, there was a little happy they was very he. The a a
@@ -666,29 +322,42 @@ Loss began at 8.999, which is `ln(8192)` — exactly the cost of guessing
 uniformly from an 8192-token vocabulary, and a useful check that the model
 really did start from nothing.
 
-### Known limitations
+---
+
+## Limitations
 
 - **The ROCm runner image is large** (~42 GB on disk) because it builds on
   `rocm/dev-ubuntu-24.04:*-complete`, which is needed to compile bitsandbytes.
-  A multi-stage build that compiles the wheel and copies it into a slim runtime
-  would cut this substantially.
-- **No TLS in the controller.** Put it behind a reverse proxy that terminates
-  HTTPS.
+  A multi-stage build would cut this substantially.
+- **No TLS in the controller.** Put it behind a reverse proxy.
 - **One job per runner at a time.** No multi-GPU or multi-job scheduling yet,
-  and a runner that is training will not serve the playground. A second job
-  waits on the queue and is told so once, rather than being offered to the busy
-  machine every five seconds.
-- **Loss masking is not a setting yet.** Fine-tuning on conversations trains
-  on the assistant's turns only (the system prompt and the user's turns are
-  masked), and the dataset editor can mark earlier assistant turns as context
-  rather than targets. Which of those a run used is not yet shown on its page,
-  and there is no switch to train on every token instead.
+  and a runner that is training will not serve the playground.
+- **Loss masking is not a setting yet.** Fine-tuning on conversations trains on
+  the assistant's turns only; there is no switch to train on every token.
 - **From-scratch tops out around 200M parameters**, which is a compute limit
-  rather than an arbitrary one. See the table above.
+  rather than an arbitrary one.
 - **The corpus is held in host RAM** while training (capped at 500M tokens,
-  ~1 GB as uint16). Longer runs make repeated passes rather than streaming
-  continuously, and warn when that exceeds four passes.
+  ~1 GB as uint16). Longer runs make repeated passes rather than streaming.
 
-### Next
+What is planned next is in **[ROADMAP.md](ROADMAP.md)**.
 
-See `ROADMAP.md`.
+---
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, please run the
+checks in [Development](#development) — CI runs the same ones, so a green local
+run is a green CI run.
+
+---
+
+## License
+
+AI Studio is free software, licensed under the **GNU Affero General Public
+License v3.0** — see [LICENSE](LICENSE).
+
+The AGPL is the GPL plus one additional condition that matters for software
+like this: if you run a modified version of AI Studio as a network service,
+you must offer its users the corresponding source. Running it unmodified, for
+yourself or inside your organisation, carries no such obligation, and the
+models, datasets and adapters you produce with it are entirely your own.

@@ -13,7 +13,7 @@ def main() -> None:
         prog="ai-studio-runner",
         description="Join this machine's GPU to an AI Studio controller.")
     p.add_argument("--controller", default=os.environ.get("AI_STUDIO_CONTROLLER"),
-                   help="Controller URL, e.g. http://10.1.250.48:8420")
+                   help="Controller URL, e.g. http://studio.example.com:8420")
     p.add_argument("--token", default=os.environ.get("AI_STUDIO_JOIN_TOKEN"),
                    help="Join token shown in the controller UI under Runners.")
     p.add_argument("--name", default=os.environ.get("AI_STUDIO_RUNNER_NAME"),
