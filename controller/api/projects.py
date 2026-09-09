@@ -194,6 +194,122 @@ def _stage_map(c: dict) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# The graph: what was made from what
+# ---------------------------------------------------------------------------
+
+KIND_NODE = {
+    "finetune_llm": ("training", "✦"), "pretrain_llm": ("training", "✦"),
+    "finetune_vision_cls": ("training", "✦"),
+    "generate_dataset": ("writing", "✎"), "evaluate": ("scoring", "◎"),
+    "export_gguf": ("export", "⬓"), "upload": ("export", "☁"),
+    "merge_adapter": ("training", "⊕"),
+}
+
+
+def graph(user: dict, project_id: str | None) -> dict:
+    """Everything in a project and what it was made from.
+
+    A project's page is a map of stages, which answers "how far along is
+    this". It cannot answer the question people actually argue about three
+    weeks later -- *which* data went into the good model, whether the set it
+    was scored on came out of the rows it trained on, what the published
+    version was built from. Every one of those facts is already recorded, on
+    the row that resulted: a derived dataset knows its parent, a run knows the
+    dataset it read and the run it continued, a prompt set knows the split it
+    was taken from, a library entry knows its run.
+
+    Read together they are a directed graph, and it is worth drawing.
+    """
+    c = contents(user, project_id)
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+    present = set()
+
+    def add(node_id: str, **fields: object) -> None:
+        nodes[node_id] = {"id": node_id, **fields}
+        present.add(node_id)
+
+    def link(src: str, dst: str, label: str) -> None:
+        edges.append({"from": src, "to": dst, "label": label})
+
+    datasets = (c["datasets"] or []) + (c["borrowed_datasets"] or [])
+    for d in datasets:
+        splits = d.get("splits") or {}
+        held = [n for n in splits if n in ("validation", "test", "eval", "dev",
+                                           "val", "holdout")]
+        add("ds:" + d["id"], kind="dataset", icon="▤", label=d["name"],
+            sub="%s rows%s" % (f"{d.get('rows') or 0:,}",
+                               " · %s held back" % ", ".join(held) if held else ""),
+            href="#/data/" + d["id"], at=d.get("created_at"),
+            warn=None if held else "nothing held back",
+            borrowed=bool(d.get("borrowed_from")))
+
+    for r in c["runs"]:
+        kind, icon = KIND_NODE.get(r["kind"], ("run", "≡"))
+        metric = (r.get("summary") or {}).get("primary_metric") or {}
+        add("job:" + r["id"], kind=kind, icon=icon, label=r["name"],
+            sub=(("%s %s" % (metric.get("label"), round(metric["value"], 4)))
+                 if metric.get("value") is not None else r["status"]),
+            href="#/jobs/" + r["id"], at=r.get("created_at"),
+            status=r["status"])
+
+    for e in c["prompt_sets"] + c["benchmarks"]:
+        add("ev:" + e["id"], kind="benchmark" if e.get("is_benchmark") else "eval",
+            icon="◈" if e.get("is_benchmark") else "◎", label=e["name"],
+            sub="%d scoring%s" % (e.get("scorings") or 0,
+                                  "" if e.get("scorings") == 1 else "s"),
+            href="#/evals/" + e["id"], at=e.get("created_at"))
+
+    for m in c["library"]:
+        add("lib:" + m["id"], kind="published", icon="⬢",
+            label="%s %s" % (m["name"], m.get("version") or ""),
+            sub="on Hugging Face" if m["location"] == "hf" else "in this studio",
+            href="#/models", at=m.get("published_at"))
+
+    # ---- what came from what
+    for d in datasets:
+        parent = "ds:" + (d.get("parent_id") or "")
+        if d.get("parent_id") and parent in present:
+            steps = ((d.get("recipe") or {}).get("steps") or [])
+            link(parent, "ds:" + d["id"],
+                 (steps[0][:40] if steps else "made from"))
+        # A dataset a run wrote. `origin` holds the job id for those.
+        if ("job:" + str(d.get("origin") or "")) in present:
+            link("job:" + d["origin"], "ds:" + d["id"], "wrote")
+
+    for r in c["runs"]:
+        cfg = r.get("config") or {}
+        if ("ds:" + str(cfg.get("studio_dataset") or "")) in present:
+            link("ds:" + cfg["studio_dataset"], "job:" + r["id"],
+                 "read" if r["kind"] == "generate_dataset" else "trained on")
+        for key, label in (("base_model_job", "continued from"),
+                           ("source_job", "from"), ("trained_by", "from")):
+            other = "job:" + str(cfg.get(key) or "")
+            if other in present and other != "job:" + r["id"]:
+                link(other, "job:" + r["id"], label)
+                break
+        if ("ev:" + str(cfg.get("eval_id") or "")) in present:
+            link("ev:" + cfg["eval_id"], "job:" + r["id"], "asked")
+        for m in cfg.get("models") or []:
+            scored = "job:" + str(m.get("job_id") or "")
+            if scored in present:
+                link(scored, "job:" + r["id"], "scored")
+
+    for e in c["prompt_sets"] + c["benchmarks"]:
+        src = (e.get("source") or {})
+        if ("ds:" + str(src.get("dataset_id") or "")) in present:
+            link("ds:" + src["dataset_id"], "ev:" + e["id"],
+                 "taken from the %s split" % src["split"] if src.get("split")
+                 else "taken from")
+
+    for m in c["library"]:
+        if ("job:" + m["job_id"]) in present:
+            link("job:" + m["job_id"], "lib:" + m["id"], "published as")
+
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
 @router.get("/unfiled")
 async def unfiled(request: Request) -> dict:
     user = current_user(request)
@@ -207,6 +323,13 @@ async def get_project(request: Request, project_id: str) -> dict:
     row = _decorate(_project_or_404(request, project_id), user)
     c = contents(user, project_id)
     return {**row, "contents": c, "map": _stage_map(c)}
+
+
+@router.get("/{project_id}/graph")
+async def project_graph(request: Request, project_id: str) -> dict:
+    user = current_user(request)
+    _project_or_404(request, project_id)
+    return graph(user, project_id)
 
 
 @router.patch("/{project_id}")

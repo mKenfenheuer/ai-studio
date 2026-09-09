@@ -1666,3 +1666,40 @@ textarea.turn-edit {
 .card-link { display: block; color: inherit; text-decoration: none;
   transition: border-color .12s, transform .12s; }
 .card-link:hover { border-color: var(--accent); transform: translateY(-1px); }
+
+/* ---- the project graph ---------------------------------------------------
+   A layered DAG drawn by hand. The colours say what a box is; the edge
+   labels say how one thing became another. */
+.g-scroll { overflow: auto; max-height: 70vh; }
+.g-svg { display: block; min-width: 100%; font-family: inherit; }
+.g-edge { fill: none; stroke: var(--border-strong, var(--border)); stroke-width: 1.5; }
+.g-arrow-head { fill: var(--border-strong, var(--border)); }
+/* Drawn over the wires, so it needs a halo rather than a box: stroking the
+   text in the page colour first is the cheapest one SVG has. */
+.g-edge-label {
+  font-size: 10px; fill: var(--text-3);
+  paint-order: stroke fill; stroke: var(--surface); stroke-width: 3px;
+  stroke-linejoin: round;
+}
+.g-node rect {
+  fill: var(--surface-2); stroke: var(--border); stroke-width: 1.5;
+  transition: stroke .12s;
+}
+.g-node:hover rect { stroke: var(--accent); }
+.g-node text { fill: var(--text); }
+.g-ico { font-size: 14px; fill: var(--text-3); }
+.g-title { font-size: 12.5px; font-weight: 640; }
+.g-sub { font-size: 10.5px; fill: var(--text-3); }
+.g-warn { font-size: 10px; fill: var(--warn); font-weight: 600; }
+.g-key {
+  font-size: 11px; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-2);
+}
+/* One accent per kind, on the left edge of the box and on the legend chip. */
+.n-data rect, .g-key.n-data { stroke: #4a90d9; }
+.n-train rect, .g-key.n-train { stroke: var(--accent); }
+.n-write rect, .g-key.n-write { stroke: #9a72d0; }
+.n-score rect, .g-key.n-score { stroke: #d8a13a; }
+.n-export rect, .g-key.n-export { stroke: #6aa3a0; }
+.n-pub rect, .g-key.n-pub { stroke: var(--ok); }
+.n-run rect, .g-key.n-run { stroke: var(--border); }

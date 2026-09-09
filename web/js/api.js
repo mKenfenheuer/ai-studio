@@ -336,6 +336,7 @@ export const api = {
   projects:    () => req("/api/projects"),
   project:     (id) => req(`/api/projects/${encodeURIComponent(id)}`),
   unfiled:     () => req("/api/projects/unfiled"),
+  projectGraph: (id) => req(`/api/projects/${encodeURIComponent(id)}/graph`),
   createProject: (body) =>
     req("/api/projects", { method: "POST", body: JSON.stringify(body) }),
   updateProject: (id, body) =>

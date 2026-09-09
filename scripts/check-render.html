@@ -278,6 +278,27 @@ const FIXTURES = [
   [/\/api\/hub\/dataset-configs/, { configs: [{ name: "default", splits: ["train"] }],
     default_config: "default" }],
   // ---- projects, the library and the admin section
+  [/\/api\/projects\/[^/]+\/graph/, { nodes: [
+      { id: "ds:ds_1", kind: "dataset", icon: "▤", label: "alpaca",
+        sub: "52,002 rows", href: "#/data/ds_1", at: now - 90000,
+        warn: "nothing held back" },
+      { id: "ds:ds_2", kind: "dataset", icon: "▤", label: "alpaca (split)",
+        sub: "52,002 rows · validation held back", href: "#/data/ds_2", at: now - 80000 },
+      { id: "job:job_1", kind: "training", icon: "✦", label: "SmolLM2 on alpaca",
+        sub: "Held-out loss 1.23", href: "#/jobs/job_1", at: now - 70000 },
+      { id: "ev:ev_1", kind: "eval", icon: "◎", label: "Support questions",
+        sub: "2 scorings", href: "#/evals/ev_1", at: now - 60000 },
+      { id: "job:job_5", kind: "scoring", icon: "◎", label: "Scoring 2 models",
+        sub: "succeeded", href: "#/jobs/job_5", at: now - 50000 },
+      { id: "lib:mdl_1", kind: "published", icon: "⬢", label: "Tone model v1",
+        sub: "in this studio", href: "#/models", at: now - 40000 }],
+    edges: [
+      { from: "ds:ds_1", to: "ds:ds_2", label: "held back 10%" },
+      { from: "ds:ds_2", to: "job:job_1", label: "trained on" },
+      { from: "ds:ds_2", to: "ev:ev_1", label: "taken from the validation split" },
+      { from: "ev:ev_1", to: "job:job_5", label: "asked" },
+      { from: "job:job_1", to: "job:job_5", label: "scored" },
+      { from: "job:job_1", to: "lib:mdl_1", label: "published as" }] }],
   [/\/api\/projects\/unfiled/, { contents: {
       datasets: [dataset()], runs: [job()], training: [job()], writing: [],
       scorings: [], exports: [], prompt_sets: [], benchmarks: [], library: [],

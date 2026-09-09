@@ -17,9 +17,10 @@
 import { api, events } from "../api.js";
 import { html, raw, esc, on, toast, fmtAgo, fmtNum, fmtBytes, modal, $,
          statusBadge } from "../util.js";
-import { ribbon, rb, group } from "../ribbon.js";
+import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
 import { pageHead, emptyState, breadcrumb, confirmDestructive } from "../components.js";
 import { hashParam } from "../util.js";
+import { projectGraph } from "./graph.js";
 import { primaryMetric, modelKinds, subjectOf } from "../kinds.js";
 
 // ---------------------------------------------------------------------------
@@ -192,18 +193,33 @@ function projectCard(p) {
 // One project: the map
 // ---------------------------------------------------------------------------
 
+const PROJECT_TABS = [{ key: "map", label: "The project" },
+                      { key: "graph", label: "What it was made of" }];
+
 export async function projectView(mount, [projectId]) {
   const unfiled = projectId === "unfiled";
   let p = null;
+  let tab = "map";
+  let graph = null;
   const paint = async () => {
     p = unfiled
       ? { id: null, name: "Not in any project", unfiled: true,
           goal: "Everything from before there were projects. File a thing into "
               + "a project and it leaves this page.", ...(await api.unfiled()) }
       : await api.project(projectId);
-    mount.innerHTML = projectLayout(p);
+    mount.innerHTML = projectLayout(p, tab, graph);
   };
   await paint();
+  wireRibbon(mount, async (key) => {
+    tab = key;
+    // Fetched the first time it is asked for: most visits never open it, and
+    // it is a second query over everything in the project.
+    if (tab === "graph" && !graph && !unfiled) {
+      mount.innerHTML = projectLayout(p, tab, null);
+      try { graph = await api.projectGraph(p.id); } catch (e) { graph = { error: e.message }; }
+    }
+    mount.innerHTML = projectLayout(p, tab, graph);
+  });
   if (unfiled) {
     // The picker needs somewhere to file things into, and this is the only
     // page that offers it. Drawn again once the list arrives rather than
@@ -333,7 +349,7 @@ export function publishDialog(jobId, runName, projectId, done) {
 
 const STAGE_ICON = { data: "▤", train: "✦", evaluate: "◎", benchmark: "◈", publish: "⬢" };
 
-function projectLayout(p) {
+function projectLayout(p, tab = "map", graph = null) {
   const c = p.contents || {};
   const map = p.map || [];
   const running = (c.runs || []).filter((r) =>
@@ -346,7 +362,7 @@ function projectLayout(p) {
       back: [{ href: "#/projects", label: "Projects" }],
     }))}
     ${raw(ribbon({
-      tabs: [{ key: "map", label: "The project" }], active: "map",
+      tabs: p.unfiled ? [PROJECT_TABS[0]] : PROJECT_TABS, active: tab,
       body: group("Do the next thing", [
         rb(null, "▤", "Add data", { href: "#/data" + q(p, "") ,
           title: "Upload, import or generate a dataset for this project" }),
@@ -362,6 +378,23 @@ function projectLayout(p) {
         ? `<span class="badge badge-accent">${running.length} running</span>` : "",
     }))}
 
+    ${raw(tab === "graph" ? graphPanel(graph) : projectBody(p, c, map))}`;
+}
+
+/** The graph tab: fetched on demand, so most visits never pay for it. */
+function graphPanel(graph) {
+  if (!graph) {
+    return html`<div class="card muted tiny" aria-busy="true">
+      Working out what came from what…</div>`;
+  }
+  if (graph.error) {
+    return html`<div class="callout callout-err">${graph.error}</div>`;
+  }
+  return projectGraph(graph);
+}
+
+function projectBody(p, c, map) {
+  return html`
     ${raw(p.unfiled ? html`
       <div class="callout" style="margin-bottom:14px">
         <strong>Everything that is not in a project</strong>
