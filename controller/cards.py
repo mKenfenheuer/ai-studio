@@ -37,12 +37,30 @@ from . import db, serving
 # what the Hub calls them. Anything not in here is left out of the front
 # matter rather than invented, and still appears in the prose table below it.
 _METRIC_NAMES = {
+    # A benchmark's accuracy is the number anybody reading a card is looking
+    # for, and it was missing from here entirely -- so a model scored on
+    # ARC-Challenge published a card that did not mention it.
+    "accuracy": ("accuracy", "Accuracy"),
+    "tool_name_ok": ("accuracy", "Called the right tool"),
     "exact": ("exact_match", "Exact match"),
     "contains": ("accuracy", "Answer contained"),
     "f1": ("f1", "Token overlap (F1)"),
+    "chrf": ("chrf", "Character overlap (chrF)"),
     "expected_loss": ("loss", "Loss on the expected answer"),
     "expected_perplexity": ("perplexity", "Perplexity of the expected answer"),
 }
+
+# What the prose table shows, in the order a reader wants it, and only the
+# columns that any of the scorings actually has. A table of "None" is worse
+# than no table.
+_TABLE_COLUMNS = [
+    ("accuracy", "Accuracy", "pct"),
+    ("tool_name_ok", "Right tool", "pct"),
+    ("expected_loss", "Loss", "float"),
+    ("chrf", "Character overlap", "pct"),
+    ("f1", "Token overlap", "pct"),
+    ("exact", "Exact", "pct"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -435,19 +453,52 @@ def _result_rows(f: dict) -> list[tuple[str, str]]:
 
 
 def _evaluations(f: dict) -> list[str]:
-    if not f["scores"]:
-        return []
-    out = ["", "## How it scored", "",
-           "Measured in AI Studio against saved prompt sets.", "",
-           "| Prompt set | Rows | When | Loss | Token overlap | Exact |",
-           "|---|---|---|---|---|---|"]
+    """What it scored, one line per prompt set.
+
+    The latest scoring of each set, not every one: a set run three times while
+    somebody was getting the settings right is one result, and three
+    identical-looking rows in a published card reads as three separate
+    findings.
+
+    The columns are whichever measures these scorings actually produced. A
+    tool-calling set has no loss and a benchmark has no token overlap, and a
+    table printing "None" under both is a card that says nobody read it.
+    """
+    latest: dict[str, dict] = {}
     for s in f["scores"]:
         m = s.get("metrics") or {}
-        out.append("| %s | %s | %s | %s | %s | %s |" % (
+        # A scoring that errored, or one that could measure nothing, has
+        # nothing to say about the model. A row of dashes under its name
+        # reads as a result that came out empty rather than as a run that
+        # did not happen.
+        if not any(isinstance(m.get(key), (int, float))
+                   for key, _, _ in _TABLE_COLUMNS):
+            continue
+        key = s.get("eval_id") or s.get("eval_name") or ""
+        if key not in latest:                      # scores arrive newest first
+            latest[key] = s
+    scores = list(latest.values())
+    if not scores:
+        return []
+
+    columns = [c for c in _TABLE_COLUMNS
+               if any(isinstance((s.get("metrics") or {}).get(c[0]), (int, float))
+                      for s in scores)]
+    head = "| Prompt set | Questions | When |" + "".join(
+        " %s |" % label for _, label, _ in columns)
+    out = ["", "## How it scored", "",
+           "Measured in AI Studio against saved prompt sets. Each line is the "
+           "most recent scoring of that set.", "",
+           head, "|---|---|---|" + "---|" * len(columns)]
+    for s in scores:
+        m = s.get("metrics") or {}
+        cells = "".join(
+            " %s |" % (_pct(m.get(key)) if how == "pct" else _float(m.get(key)))
+            if isinstance(m.get(key), (int, float)) else " — |"
+            for key, _, how in columns)
+        out.append("| %s | %s | %s |%s" % (
             s.get("eval_name") or "—", _provenance(f, s),
-            _date(s.get("created_at")),
-            _float(m.get("expected_loss")), _pct(m.get("f1")),
-            _pct(m.get("exact"))))
+            _date(s.get("created_at")), cells))
     return out
 
 
@@ -460,6 +511,13 @@ def _provenance(f: dict, score: dict) -> str:
     """
     src = score.get("eval_source") or {}
     cfg = f["cfg"]
+    # A benchmark's questions come from a published dataset by a recipe, and
+    # calling that "hand-written" was simply wrong.
+    if src.get("benchmark"):
+        recipe = src.get("recipe") or {}
+        asked = recipe.get("sample")
+        return "%s%s" % (src["benchmark"].upper().replace("_", "-"),
+                         ", %s asked" % f"{asked:,}" if asked else "")
     if not src or not src.get("dataset_id"):
         return "hand-written"
     same_data = src["dataset_id"] == cfg.get("studio_dataset")
