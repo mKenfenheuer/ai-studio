@@ -8,7 +8,7 @@
  * Tuesday's run meant reading.
  */
 import { api, events } from "../api.js";
-import { html, raw, esc, $, on, fmtAgo, fmtDuration, statusBadge, toast } from "../util.js";
+import { html, raw, esc, $, on, fmtAgo, fmtDuration, statusBadge, toast, hashParam } from "../util.js";
 import { KINDS, kindOf, subjectOf, primaryMetric } from "../kinds.js";
 import { ribbon, rb, group, rbSelect, rbSeg, rbSearch, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
@@ -42,6 +42,10 @@ export async function jobsView(mount) {
   let scope = "all";
   let sort = "created";
   let bySweep = false;
+  // Which project's runs. The run history is every run the studio has ever
+  // made; a project's own runs are what anybody is looking for in it.
+  let project = hashParam("project") || "";
+  let projects = [];
 
   const tabs = tabState("jobs", TABS, "home");
   let tab = tabs.get();
@@ -58,9 +62,15 @@ export async function jobsView(mount) {
   };
 
   const draw = () => {
-    mount.innerHTML = layout({ jobs, picked, q, status, kind, scope, sort, bySweep, tab });
+    mount.innerHTML = layout({ jobs, picked, q, status, kind, scope, sort,
+                              bySweep, tab, project, projects });
     wire();
   };
+
+  api.projects().then((d) => {
+    projects = (d.projects || []).filter((p) => !p.archived);
+    if (projects.length) draw();
+  }).catch(() => {});
 
   function wire() {
     wireRibbon(mount, (key) => { tab = key; tabs.set(key); draw(); });
@@ -68,11 +78,12 @@ export async function jobsView(mount) {
     on(mount, "input", "#jobQ", (_e, t) => {
       q = t.value.toLowerCase();
       $("#jobList", mount).innerHTML =
-        listing({ jobs, picked, q, status, kind, scope, sort, bySweep });
+        listing({ jobs, picked, q, status, kind, scope, sort, bySweep, project });
     });
     on(mount, "click", "[data-status]", (_e, t) => { status = t.dataset.status; draw(); });
     on(mount, "click", "[data-scope]", (_e, t) => { scope = t.dataset.scope; draw(); });
     on(mount, "change", "#jobKind", (_e, t) => { kind = t.value; draw(); });
+    on(mount, "change", "#jobProject", (_e, t) => { project = t.value; draw(); });
     on(mount, "change", "#jobSort", (_e, t) => { sort = t.value; draw(); });
     on(mount, "click", "[data-sweepgroup]", (_e, t) => {
       bySweep = t.dataset.sweepgroup === "1"; draw();
@@ -150,7 +161,8 @@ function layout(s) {
 }
 
 function ribbonFor(s) {
-  const { tab, jobs, picked, q, status, kind, scope, sort, bySweep } = s;
+  const { tab, jobs, picked, q, status, kind, scope, sort, bySweep,
+          project, projects } = s;
   const list = jobs.filter((j) => picked.has(j.id));
   const n = list.length;
   const one = n === 1 ? list[0] : null;
@@ -190,6 +202,10 @@ function ribbonFor(s) {
     ]) + group("Status", [
       rbSeg(STATUS_GROUPS.map(([v, label]) =>
         ({ label, on: status === v, data: `data-status="${v}"` }))),
+    ]) + group("Where", [
+      rbSelect("jobProject", { title: "Project", value: project,
+        options: [["", "Every project"], ["none", "Not in a project"],
+                  ...projects.map((p) => [p.id, p.name])] }),
     ]) + group("Kind", [
       rbSelect("jobKind", { title: "Kind of run", value: kind,
         options: [["all", "Every kind"]].concat(
@@ -221,9 +237,12 @@ const rankKey = (j) => {
   return m ? (m.lower ? m.value : -m.value) : 1e9;
 };
 
-function filtered({ jobs, q, status, kind, scope, sort, bySweep }) {
+function filtered({ jobs, q, status, kind, scope, sort, bySweep, project }) {
   let out = jobs.filter((j) => {
     if (kind !== "all" && j.kind !== kind) return false;
+    // "" every project, "none" the ones in none, otherwise that project.
+    if (project && (project === "none" ? j.project_id
+                                       : j.project_id !== project)) return false;
     if (scope === "mine" && !j.mine) return false;
     if (scope === "shared" && j.mine) return false;
     if (status === "active" && !["running", "assigned", "queued"].includes(j.status)) return false;
@@ -280,7 +299,8 @@ function listing(s) {
       <thead><tr>
         <th style="width:28px"></th>
         <th>Name</th><th>Status</th><th>Progress</th>
-        <th class="hide-sm">Working on</th><th class="hide-sm">When</th><th></th>
+        <th class="hide-sm">Working on</th><th class="hide-sm">Project</th>
+        <th class="hide-sm">When</th><th></th>
       </tr></thead>
       <tbody>${raw(shown.map((j) => row(j, picked)).join(""))}</tbody>
     </table></div>`;
@@ -335,6 +355,9 @@ function row(j, picked) {
           : `<span class="tiny muted">${esc(dur ? fmtDuration(dur) : "—")}</span>`)}
       </td>
       <td class="mono tiny hide-sm">${subjectOf(j) || "—"}</td>
+      <td class="tiny hide-sm">${raw(j.project_id
+        ? `<a href="#/projects/${esc(j.project_id)}">${esc(j.project_name || "a project")}</a>`
+        : `<span class="muted">—</span>`)}</td>
       <td class="tiny muted hide-sm">${fmtAgo(j.created_at)}</td>
       <td><div class="row" style="gap:5px">
         ${raw(j.has_model && k.leavesModel

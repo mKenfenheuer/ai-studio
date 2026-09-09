@@ -78,6 +78,11 @@ export async function dataView(mount) {
   let filter = "";
   let sort = "updated";
   let scope = "all";            // all | mine | shared
+  // Which project's data to show. The library is every dataset in the studio;
+  // once there are projects, "the ones this piece of work is about" is the
+  // question being asked of it nearly every time.
+  let project = hashParam("project") || "";
+  let projects = [];
   let tree = false;             // group children under the dataset they came from
   let picked = new Set();
 
@@ -87,10 +92,18 @@ export async function dataView(mount) {
   const chosen = () => items.filter((d) => picked.has(d.id));
 
   const draw = () => {
-    mount.innerHTML = layout({ items, filter, sort, scope, tree, picked, tab });
+    mount.innerHTML = layout({ items, filter, sort, scope, tree, picked, tab,
+                              project, projects });
     wire();
   };
   const refresh = async () => { items = await api.datasets(); draw(); };
+
+  // Fetched once, for the project filter. A studio with no projects gets a
+  // filter with nothing to choose, and the list behaves as it always did.
+  api.projects().then((d) => {
+    projects = (d.projects || []).filter((p) => !p.archived);
+    if (projects.length) draw();
+  }).catch(() => {});
 
   // ---- the ways in ---------------------------------------------------------
 
@@ -403,10 +416,12 @@ export async function dataView(mount) {
 
     on(mount, "input", "#dsFilter", (_e, t) => {
       filter = t.value.toLowerCase();
-      $("#dsList", mount).innerHTML = listing({ items, filter, sort, scope, tree, picked });
+      $("#dsList", mount).innerHTML = listing({ items, filter, sort, scope, tree,
+                                                picked, project });
     });
     on(mount, "change", "#dsSort", (_e, t) => { sort = t.value; draw(); });
     on(mount, "click", "[data-scope]", (_e, t) => { scope = t.dataset.scope; draw(); });
+    on(mount, "change", "#dsProject", (_e, t) => { project = t.value; draw(); });
     on(mount, "click", "[data-tree]", (_e, t) => { tree = t.dataset.tree === "1"; draw(); });
 
     on(mount, "change", "[data-pick]", (_e, t) => {
@@ -498,7 +513,7 @@ function layout(s) {
 }
 
 function ribbonFor(s) {
-  const { tab, picked, items, filter, sort, scope, tree } = s;
+  const { tab, picked, items, filter, sort, scope, tree, project, projects } = s;
   const n = picked.size;
   const mine = items.filter((d) => picked.has(d.id) && d.mine).length;
   let body = "";
@@ -524,6 +539,9 @@ function ribbonFor(s) {
   } else {
     body = group("Find", [
       rbSearch("dsFilter", { placeholder: "Filter by name or origin…", value: filter }),
+      rbSelect("dsProject", { title: "Project", value: project,
+        options: [["", "Every project"], ["none", "Not in a project"],
+                  ...projects.map((p) => [p.id, p.name])] }),
     ]) + group("Show", [
       rbSeg([{ label: "All", on: scope === "all", data: `data-scope="all"` },
              { label: "Mine", on: scope === "mine", data: `data-scope="mine"` },
@@ -579,12 +597,15 @@ function splitBoxes(splits) {
 }
 
 /** The library, in the order and shape the View tab asked for. */
-function listing({ items, filter, sort, scope, tree, picked }) {
+function listing({ items, filter, sort, scope, tree, picked, project }) {
   let shown = items.filter((d) =>
     (!filter || d.name.toLowerCase().includes(filter)
       || (d.origin || "").toLowerCase().includes(filter)
       || (d.tags || []).some((t) => t.includes(filter)))
-    && (scope === "all" || (scope === "mine" ? d.mine : !d.mine)));
+    && (scope === "all" || (scope === "mine" ? d.mine : !d.mine))
+    // "" every project, "none" the unfiled ones, otherwise that project.
+    && (!project || (project === "none" ? !d.project_id
+                                        : d.project_id === project)));
 
   shown.sort(sort === "name" ? (a, b) => a.name.localeCompare(b.name)
     : sort === "rows" ? (a, b) => (b.rows || 0) - (a.rows || 0)
@@ -607,7 +628,7 @@ function listing({ items, filter, sort, scope, tree, picked }) {
   return html`<div class="table-wrap"><table class="table">
     <thead><tr>
       <th style="width:28px"></th><th>Name</th><th>Rows</th>
-      <th class="hide-sm">Where from</th><th class="hide-sm">Owner</th>
+      <th class="hide-sm">Where from</th><th class="hide-sm">Project</th>
       <th class="hide-sm">Updated</th>
     </tr></thead>
     <tbody>
@@ -628,7 +649,10 @@ function listing({ items, filter, sort, scope, tree, picked }) {
             <td>${fmtNum(d.rows)}</td>
             <td class="hide-sm"><span class="${cls}">${label}</span>
               ${raw(d.origin ? `<div class="muted tiny mono">${esc(d.origin)}</div>` : "")}</td>
-            <td class="tiny muted hide-sm">${d.owner_name || "—"}</td>
+            <td class="tiny hide-sm">${raw(d.project_id
+              ? `<a href="#/projects/${esc(d.project_id)}">${esc(d.project_name || "a project")}</a>`
+              : `<span class="muted">—</span>`)}
+              ${raw(d.mine ? "" : `<div class="muted tiny">${esc(d.owner_name || "")}</div>`)}</td>
             <td class="tiny muted hide-sm">${fmtAgo(d.updated_at)}</td>
           </tr>`;
       }).join(""))}

@@ -1568,9 +1568,11 @@ def visible_jobs(user: dict, limit: int = 100) -> list[dict]:
     where, args = _visible_clause(user, "job", "j")
     rows = q("SELECT j.*, EXISTS(SELECT 1 FROM artifacts a WHERE a.job_id = j.id)"
              " AS has_model, u.display_name AS owner_name, u.username AS owner_username,"
+             " p.name AS project_name,"
              " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='job'"
              "        AND s.resource_id = j.id) AS is_shared"
              " FROM jobs j LEFT JOIN users u ON u.id = j.owner_id"
+             " LEFT JOIN projects p ON p.id = j.project_id"
              " WHERE " + where + " ORDER BY j.created_at DESC LIMIT ?",
              args + [limit])
     for r in rows:
@@ -1583,9 +1585,11 @@ def visible_jobs(user: dict, limit: int = 100) -> list[dict]:
 def visible_datasets(user: dict) -> list[dict]:
     where, args = _visible_clause(user, "dataset", "d")
     rows = q("SELECT d.*, u.display_name AS owner_name, u.username AS owner_username,"
+             " p.name AS project_name,"
              " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='dataset'"
              "        AND s.resource_id = d.id) AS is_shared"
              " FROM datasets d LEFT JOIN users u ON u.id = d.owner_id"
+             " LEFT JOIN projects p ON p.id = d.project_id"
              " WHERE " + where + " ORDER BY d.updated_at DESC", args)
     out = []
     for r in rows:
@@ -1656,11 +1660,13 @@ def delete_eval(eval_id: str) -> None:
 def visible_evals(user: dict) -> list[dict]:
     where, args = _visible_clause(user, "eval", "e")
     rows = q("SELECT e.*, u.display_name AS owner_name, u.username AS owner_username,"
+             " p.name AS project_name,"
              " EXISTS(SELECT 1 FROM shares s WHERE s.resource_type='eval'"
              "        AND s.resource_id = e.id) AS is_shared,"
              " (SELECT COUNT(*) FROM eval_scores sc WHERE sc.eval_id = e.id)"
              "   AS score_count"
              " FROM evals e LEFT JOIN users u ON u.id = e.owner_id"
+             " LEFT JOIN projects p ON p.id = e.project_id"
              " WHERE " + where + " ORDER BY e.updated_at DESC", args)
     out = []
     for r in rows:
