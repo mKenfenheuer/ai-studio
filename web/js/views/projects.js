@@ -20,7 +20,7 @@ import { html, raw, esc, on, toast, fmtAgo, fmtNum, fmtBytes, modal, $,
 import { ribbon, rb, group } from "../ribbon.js";
 import { pageHead, emptyState, breadcrumb, confirmDestructive } from "../components.js";
 import { hashParam } from "../util.js";
-import { primaryMetric, modelKinds } from "../kinds.js";
+import { primaryMetric, modelKinds, subjectOf } from "../kinds.js";
 
 // ---------------------------------------------------------------------------
 // Every project
@@ -405,8 +405,7 @@ function projectLayout(p) {
             </tr>`).join(""))}
         </tbody></table></div>
       </div>` : "")}
-    ${raw(section("Runs", c.runs, runRow, "job",
-      "No runs in this project yet.", p))}
+    ${raw(runSections(c, p))}
     ${raw(section("Prompt sets and benchmarks",
       [...(c.prompt_sets || []), ...(c.benchmarks || [])], evalRow, "eval",
       "Nothing to judge it by yet.", p))}
@@ -433,6 +432,37 @@ function stageCard(s, p) {
             ? s.best.metric.value.toFixed(4) : s.best.metric.value}</strong></span>` : "")}
       <span class="stage-next">${s.next}</span>
     </a>`;
+}
+
+/** The runs, grouped the way the map above is.
+ *
+ *  One flat list put the training run -- the thing the project is about --
+ *  underneath its own scorings, and a project with fifty scorings has no
+ *  visible model at all. The groups are the stages: what was trained, what
+ *  judged it, what wrote data for it, what left the building. Empty groups
+ *  are not drawn.
+ */
+function runSections(c, p) {
+  const seen = new Set();
+  const take = (rows) => {
+    const out = (rows || []).filter((r) => !seen.has(r.id));
+    out.forEach((r) => seen.add(r.id));
+    return out;
+  };
+  const groups = [
+    ["Models trained here", take(c.training),
+     "Nothing trained in this project yet."],
+    ["Scorings and benchmarks", take(c.scorings), ""],
+    ["Data written by a model", take(c.writing), ""],
+    ["Exports and publications", take(c.exports), ""],
+    // Anything whose kind the groups above do not name. Better an "other"
+    // heading than a run that quietly disappears from its own project.
+    ["Other runs", (c.runs || []).filter((r) => !seen.has(r.id)), ""],
+  ];
+  return groups
+    .filter(([, rows], i) => rows.length || i === 0)
+    .map(([title, rows, empty]) => section(title, rows, runRow, "job", empty, p))
+    .join("");
 }
 
 function section(title, rows, render, kind, empty, p) {
@@ -494,7 +524,8 @@ function runRow(r, kind, p) {
   return html`
     <tr>
       <td><a href="#/jobs/${r.id}"><strong>${r.name}</strong></a>
-        <div class="muted tiny">${r.kind.replace(/_/g, " ")} · ${fmtAgo(r.created_at)}</div></td>
+        <div class="muted tiny">${subjectOf(r) || r.kind.replace(/_/g, " ")}
+          · ${fmtAgo(r.created_at)}</div></td>
       <td>${statusBadge(r.status)}</td>
       <td class="mono tiny">${pm && pm.value != null
         ? `${pm.label}: ${typeof pm.value === "number" ? pm.value.toFixed(4) : pm.value}` : ""}</td>

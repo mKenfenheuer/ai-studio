@@ -90,7 +90,17 @@ export const KINDS = {
     page: "eval",
     leavesModel: false,
     family: null,
-    subject: (c) => "scoring against " + (c.eval_name || "a prompt set"),
+    // Which models, not just which set. Three scorings of the same set look
+    // identical otherwise -- same generated name, same subject line -- and
+    // the thing that differs between them is exactly what was scored.
+    subject: (c) => {
+      const who = (c.models || []).map((m) => m.name).filter(Boolean);
+      const against = who.length > 2
+        ? `${who.slice(0, 2).join(", ")} and ${who.length - 2} more`
+        : who.join(" vs ");
+      return "scoring " + (against || "models")
+             + " against " + (c.eval_name || "a prompt set");
+    },
   },
   export_gguf: {
     label: "GGUF export",
