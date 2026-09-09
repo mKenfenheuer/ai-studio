@@ -935,15 +935,16 @@ every day would feel first.
 
 ### 15.1 The interface
 
-1. **Projects are invisible in the libraries.** The dataset list and the run
+1. ~~**Projects are invisible in the libraries.**~~ **Done.** The dataset list and the run
    list both carry an *Owner* column repeating the same name on every row of a
    single-account studio, and no project at all -- the thing that now
    organises the work. Owner becomes a project link; a filter beside it.
-2. **A project's runs are one flat list.** A training run sits buried under
+2. ~~**A project's runs are one flat list.**~~ **Done.** A training run sits buried under
    its own scorings and benchmarks; at fifty scorings the model is
    unfindable. Group the section the way the stage map is grouped --
    training, scoring, exports.
-3. **Repeated scorings are indistinguishable**: three rows of "X on 2 models",
+3. ~~**Repeated scorings are indistinguishable**~~ **Done** -- a scoring
+   says which models it scored. Was: : three rows of "X on 2 models",
    same set, same settings. Collapse repeats into one row with a count, or
    label each with what changed.
 4. **The playground lists every finished run in the studio**, newest first, no
@@ -960,7 +961,9 @@ wider than the screen.
 
 ### 15.2 The workflow the app enforces
 
-1. **Nothing sequences the held-out split.** A dataset with one `train` split
+1. ~~**Nothing sequences the held-out split.**~~ **Done**: the Data stage
+   is amber until something is held back, says why, and links to the dataset
+   it needs doing to. Was:  A dataset with one `train` split
    is trained on, and then a prompt set is built from rows the model may have
    trained on -- warned about in the set's notes, and nowhere else. The Data
    stage should want a split held back before Train is offered; Evaluate
@@ -983,13 +986,14 @@ wider than the screen.
 
 ### 15.3 How the work is done
 
-1. **A smoke path.** Every defect in section 14 came from real data on real
+1. ~~**A smoke path.**~~ **Done**: `scripts/check-workflow.py`. Was:  Every defect in section 14 came from real data on real
    machines; the checks are strong on pure functions and rendering and
    structurally cannot see "the wizard pins a machine, so creating a run
    returns 500". One command: throwaway data directory, project, twenty rows,
    a tiny pinned run, a scoring, a publish. It catches two of the six on its
    own.
-2. **Runner images drift silently.** A runner was a week stale -- reporting no
+2. ~~**Runner images drift silently.**~~ **Done**: the agent reports its
+   version and Machines says "out of date" with the reason. Was:  A runner was a week stale -- reporting no
    `kinds`, no `modalities` -- and the studio dispatched to it regardless. The
    controller knows the agent version; Machines should say so, and a deploy
    should not leave a fleet mismatched without saying it has. (Ops item 4.)
@@ -998,4 +1002,22 @@ wider than the screen.
    what it deployed to come back at the version it deployed.
 4. **No CI.** The three check scripts and the render harness are what a push
    should run. (Ops item 5.)
+
+### 15.4 Done since, and what it turned up
+
+Building the list was not the end of it. Sequencing the split, grouping a
+project's runs and putting projects in the libraries were straightforward.
+Two other things came out of doing them:
+
+* **The project graph** (`web/js/views/graph.js`, `GET /api/projects/{id}/graph`).
+  Asked for while the list was being worked through, and it belongs here: the
+  lineage was recorded all along -- a derived dataset knows its parent, a run
+  knows what it read and what it continued, a prompt set knows its split, a
+  library entry knows its run -- and nothing drew it. Columns left to right in
+  the order things were made from each other, the edge saying how.
+* **A view that throws mid-render leaves the page it replaced**, and every
+  check passed while the graph tab said "working out what came from what"
+  forever. The render harness now clicks the tab and counts what was drawn.
+  Worth generalising: a tab whose body does not change is not a tab that
+  worked.
 
