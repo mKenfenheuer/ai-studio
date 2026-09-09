@@ -1021,3 +1021,28 @@ Two other things came out of doing them:
   Worth generalising: a tab whose body does not change is not a tab that
   worked.
 
+### 15.5 Asked for while the list was being worked through
+
+* **Several benchmarks at once.** Nobody quotes MMLU on its own. Pick as many
+  as you want; each is queued as its own run against its own prompt set,
+  because they ask different questions and are read separately, but which
+  models and how many questions is decided once.
+* **A model card editor.** The generator already wrote a proper Hub README and
+  stopped rewriting it the moment somebody edited it -- what was missing was
+  anywhere decent to edit it. Write and Preview, the preview rendered close to
+  the way the Hub renders it, and a form for the fields that are metadata
+  rather than prose: licence, languages, tags, datasets. The form rewrites
+  only its own lines, because the front matter carries a generated
+  `model-index` that a naive YAML round trip would destroy. A card with no
+  licence says so.
+* **The lineage as a strip** along the top of the project page, with a
+  colour-matched count of what the dots are, and stage cards at about half the
+  height they were.
+
+Doing the card editor turned up what the card was actually publishing: a
+results table whose columns were loss, token overlap and exact match -- none
+of which a benchmark or a tool-calling set produces -- so an ARC-Challenge
+result printed `None` in every cell of a public README, called its questions
+"hand-written", and listed a set scored three times as three findings.
+`scripts/check-cards.py` now reads a generated card and asserts all of it.
+
