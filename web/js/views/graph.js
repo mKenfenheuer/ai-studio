@@ -105,9 +105,15 @@ export function projectGraph(data) {
     // long hop across three columns passes over other work; a caption laid on
     // top of that is worse than no caption.
     const room = Math.abs(x2 - x1) <= NODE_W + GAP_X + 4;
+    // One caption per phrase per gutter. A model scored four times fans out
+    // four identical "scored" edges, and four copies of the word stacked on
+    // each other say nothing the fan does not already say.
     const gutter = Math.round(x1);
-    const nth = (perGutter.get(gutter) || 0);
-    perGutter.set(gutter, nth + 1);
+    const said = perGutter.get(gutter) || new Set();
+    perGutter.set(gutter, said);
+    const first = e.label && !said.has(e.label);
+    if (first) said.add(e.label);
+    const nth = said.size - 1;
     // A point on the curve itself, a third to two thirds along depending on
     // how many captions this gutter is already carrying.
     const t = 0.34 + 0.16 * (nth % 3);
@@ -121,7 +127,7 @@ export function projectGraph(data) {
     };
     const lx = along(x1, mid, mid, x2);
     const ly = along(y1, y1, y2, y2);
-    const label = room && e.label
+    const label = room && first
       ? `<text class="g-edge-label" x="${lx.toFixed(1)}" y="${(ly - 6).toFixed(1)}"
              text-anchor="middle">${esc(clip(e.label, 15))}<title>${
                esc(e.label)}</title></text>`
