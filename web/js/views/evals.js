@@ -122,10 +122,14 @@ export async function evalsView(mount) {
             Changing it changes the number.</div>
         </div>
       </div>
-      ${raw(b.needs_local ? html`
-        <p class="muted tiny">Answered by scoring each option's probability, so
-          it needs the weights on a machine here — a hosted model cannot be run
-          on this one.</p>` : "")}
+      ${raw((b ? [b] : all).some((x) => x.needs_local) ? html`
+        <p class="muted tiny">${b || all.every((x) => x.needs_local)
+          ? "Answered by scoring each option's probability, so it needs the "
+            + "weights on a machine here — a hosted model cannot be run on it."
+          : "Some of these are answered by scoring each option's probability, "
+            + "which needs the weights on a machine here: a hosted model "
+            + "cannot be given those, and is left out of the ones that do."}
+        </p>` : "")}
       <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
         <button type="button" class="btn" data-modal-close>Cancel</button>
         <button type="button" class="btn btn-primary" id="bmGo">Run it</button>

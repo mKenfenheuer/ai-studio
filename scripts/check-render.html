@@ -537,6 +537,37 @@ if (!only) {
         folded ? "the rest is folded away" : "no fold for the rest");
     localStorage.removeItem("aistudio.wizard");
 
+    // Dialogs. Nothing above opens one -- a view "renders" perfectly while
+    // every button in it throws -- and the benchmark dialog is drawn twice
+    // from one function, once for a named benchmark and once for the whole
+    // catalogue, which is exactly the shape that hides a missing null guard.
+    const evalsBox = document.createElement("div");
+    main.innerHTML = "";
+    main.appendChild(evalsBox);
+    const { evalsView } = await import("/static/js/views/evals.js");
+    await evalsView(evalsBox);
+    evalsBox.querySelector('[data-tab="benchmarks"]')?.click();
+    await new Promise((r) => setTimeout(r, 400));
+
+    const openDialog = async (selector) => {
+      document.querySelectorAll("dialog").forEach((d) => d.remove());
+      evalsBox.querySelector(selector)?.click();
+      await new Promise((r) => setTimeout(r, 250));
+      return document.querySelector("dialog");
+    };
+    const several = await openDialog("#runSeveral");
+    say("the benchmark dialog opens for all of them",
+        !!several && several.querySelectorAll("[data-bm-pick]").length >= 2
+        && !!several.querySelector("#bmSample"),
+        several ? `${several.querySelectorAll("[data-bm-pick]").length} to pick`
+                : "no dialog");
+    const one = await openDialog("[data-run-bm]");
+    say("and for one of them",
+        !!one && one.querySelectorAll("[data-bm-pick]:checked").length === 1,
+        one ? one.querySelector("h2, .modal-title")?.textContent || "opened"
+            : "no dialog");
+    document.querySelectorAll("dialog").forEach((d) => d.remove());
+
     // The card editor: the form writes into the source, the preview renders
     // it, and the metadata that is generated rather than typed survives both.
     const cardBox = document.createElement("div");
