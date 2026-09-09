@@ -54,6 +54,68 @@ function columns(nodes, edges) {
   return depth;
 }
 
+/** The same graph, an inch tall, for the top of the project page.
+ *
+ *  The full drawing answers "what was this made of" when somebody goes
+ *  looking. The strip answers "what shape is this project in" at a glance --
+ *  how much data, how many attempts, whether anything came out the end -- and
+ *  it is the same layout, so recognising one teaches the other. Nodes are
+ *  dots here because a name at this size is unreadable; every one carries its
+ *  name as a tooltip, and the whole strip opens the full graph.
+ */
+export function projectGraphStrip(data) {
+  const nodes = data?.nodes || [];
+  const edges = (data?.edges || []).filter((e) =>
+    nodes.some((n) => n.id === e.from) && nodes.some((n) => n.id === e.to));
+  if (nodes.length < 2) return "";
+
+  const D = 13;              // a dot
+  const COL = 54;            // and the step between columns
+  const ROW = 19;
+  const depth = columns(nodes, edges);
+  const lanes = new Map();
+  nodes.slice().sort((a, b) => (a.at || 0) - (b.at || 0)).forEach((n) => {
+    const col = depth.get(n.id) || 0;
+    const row = (lanes.get(col) || 0);
+    lanes.set(col, row + 1);
+    n._sx = 8 + col * COL;
+    n._sy = 8 + row * ROW;
+  });
+  const cols = Math.max(...[...lanes.keys()]) + 1;
+  const rows = Math.max(...[...lanes.values()]);
+  const w = 16 + cols * COL - (COL - D);
+  const h = 16 + rows * ROW - (ROW - D);
+  const at = Object.fromEntries(nodes.map((n) => [n.id, n]));
+
+  const wires = edges.map((e) => {
+    const a = at[e.from];
+    const b = at[e.to];
+    const x1 = a._sx + D;
+    const y1 = a._sy + D / 2;
+    const x2 = b._sx;
+    const y2 = b._sy + D / 2;
+    const mid = x1 + (x2 - x1) / 2;
+    return `<path class="g-edge" d="M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${
+      y2}, ${x2} ${y2}"></path>`;
+  }).join("");
+
+  const dots = nodes.map((n) => `
+    <g class="g-dot ${TONE[n.kind] || "n-run"}">
+      <rect x="${n._sx}" y="${n._sy}" width="${D}" height="${D}" rx="4"></rect>
+      <title>${esc(n.label)}${n.sub ? " — " + esc(n.sub) : ""}</title>
+    </g>`).join("");
+
+  return html`
+    <button type="button" class="g-strip" id="openGraph"
+            title="Open the full graph">
+      <svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"
+           role="img" aria-label="What this project was made of, in miniature">
+        ${raw(wires)}${raw(dots)}
+      </svg>
+      <span class="g-strip-hint">what it was made of →</span>
+    </button>`;
+}
+
 export function projectGraph(data) {
   const nodes = data.nodes || [];
   const edges = (data.edges || []).filter((e) =>

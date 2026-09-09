@@ -543,8 +543,12 @@ if (!only) {
     main.appendChild(box);
     location.hash = "#/projects/prj_1";
     await projectView(box, ["prj_1"]);
-    box.querySelector('[data-tab="graph"]').click();
+    await new Promise((r) => setTimeout(r, 300));
     await new Promise((r) => setTimeout(r, 800));
+    const strip = box.querySelectorAll(".g-strip .g-dot").length;
+    say("the map carries a strip of it", strip >= 6, `${strip} dots`);
+    box.querySelector('[data-tab="graph"]').click();
+    await new Promise((r) => setTimeout(r, 500));
     const boxes = box.querySelectorAll(".g-node").length;
     const wires = box.querySelectorAll(".g-edge").length;
     say("graph draws", boxes >= 6 && wires >= 6,

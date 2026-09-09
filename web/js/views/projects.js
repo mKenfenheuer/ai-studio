@@ -20,7 +20,7 @@ import { html, raw, esc, on, toast, fmtAgo, fmtNum, fmtBytes, modal, $,
 import { ribbon, rb, group, wireRibbon } from "../ribbon.js";
 import { pageHead, emptyState, breadcrumb, confirmDestructive } from "../components.js";
 import { hashParam } from "../util.js";
-import { projectGraph } from "./graph.js";
+import { projectGraph, projectGraphStrip } from "./graph.js";
 import { primaryMetric, modelKinds, subjectOf } from "../kinds.js";
 
 // ---------------------------------------------------------------------------
@@ -210,6 +210,16 @@ export async function projectView(mount, [projectId]) {
     mount.innerHTML = projectLayout(p, tab, graph);
   };
   await paint();
+  // The strip at the top of the map wants the same graph the tab draws, so it
+  // is fetched once the page is on screen rather than held up for. Most of
+  // the cost is the query the page has already made.
+  if (!unfiled) {
+    api.projectGraph(projectId).then((g) => {
+      graph = g;
+      p.strip = projectGraphStrip(g);
+      if (tab === "map") mount.innerHTML = projectLayout(p, tab, graph);
+    }).catch(() => {});
+  }
   wireRibbon(mount, async (key) => {
     tab = key;
     // Fetched the first time it is asked for: most visits never open it, and
@@ -230,6 +240,10 @@ export async function projectView(mount, [projectId]) {
     }).catch(() => {});
   }
 
+  on(mount, "click", "#openGraph", () => {
+    tab = "graph";
+    mount.innerHTML = projectLayout(p, tab, graph);
+  });
   on(mount, "click", "#renameProject", () => editProjectDialog(p, paint));
   on(mount, "click", "#archiveProject", async () => {
     try {
@@ -404,6 +418,7 @@ function projectBody(p, c, map) {
         ${raw(fileTargetPicker())}
       </div>` : "")}
 
+    ${raw(p.strip || "")}
     <div class="stage-map">${raw(map.map((s) => stageCard(s, p)).join(""))}</div>
 
     ${raw(p.notes ? html`
@@ -463,13 +478,15 @@ function stageCard(s, p) {
   // not look like.
   const note = s.key === "data" && s.state === "warn" ? "no held-out split" : "";
   return html`
-    <a class="stage ${cls}" href="${href}">
-      <span class="stage-ico" aria-hidden="true">${STAGE_ICON[s.key]}</span>
-      <span class="stage-label">${s.label}</span>
-      <span class="stage-count">${s.count ? fmtNum(s.count) : "—"}</span>
+    <a class="stage ${cls}" href="${href}" title="${esc(s.next || "")}">
+      <span class="stage-head">
+        <span class="stage-ico" aria-hidden="true">${STAGE_ICON[s.key]}</span>
+        <span class="stage-label">${s.label}</span>
+        <span class="stage-count">${s.count ? fmtNum(s.count) : "—"}</span>
+      </span>
       ${raw(note ? `<span class="stage-warn-note">${esc(note)}</span>` : "")}
       ${raw(s.best ? html`
-        <span class="stage-best">best ${s.best.metric.label || "score"}:
+        <span class="stage-best">best ${s.best.metric.label || "score"}
           <strong>${typeof s.best.metric.value === "number"
             ? s.best.metric.value.toFixed(4) : s.best.metric.value}</strong></span>` : "")}
       <span class="stage-next">${s.next}</span>

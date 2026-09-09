@@ -1641,24 +1641,50 @@ textarea.turn-edit {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
 }
 .stage {
-  display: flex; flex-direction: column; gap: 3px;
+  display: flex; flex-direction: column; gap: 2px;
   background: var(--surface); border: 1px solid var(--border);
   border-left: 3px solid var(--border);
-  border-radius: var(--radius); padding: 12px 13px;
+  border-radius: var(--radius); padding: 8px 11px 9px;
   color: inherit; text-decoration: none;
   transition: border-color .12s, transform .12s;
 }
 .stage:hover { border-color: var(--accent); transform: translateY(-1px); }
-.stage-ico { font-size: 17px; line-height: 1; color: var(--text-3); }
-.stage-label { font-weight: 640; font-size: 13.5px; }
-.stage-count { font-size: 20px; font-weight: 680; letter-spacing: -.02em; }
-.stage-best { font-size: 11.5px; color: var(--text-2); }
-.stage-next { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+/* Name, mark and count on one line: the count was a headline of its own and
+   made every card twice as tall as what it said was worth. */
+.stage-head { display: flex; align-items: baseline; gap: 7px; }
+.stage-ico { font-size: 13px; line-height: 1; color: var(--text-3); }
+.stage-label { font-weight: 640; font-size: 12.5px; }
+.stage-count {
+  font-size: 15px; font-weight: 680; letter-spacing: -.02em;
+  margin-left: auto; color: var(--text-2);
+}
+.stage-best { font-size: 11px; color: var(--text-2); }
+.stage-next {
+  font-size: 11px; color: var(--text-3); line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .stage-done { border-left-color: var(--ok, #3fa06a); }
 /* Something is there but it is not finished: data with nothing held back,
    which reads as done and is the one thing that makes a later score a lie. */
 .stage-warn { border-left-color: var(--warn); }
-.stage-warn-note { font-size: 11px; color: var(--warn); font-weight: 600; }
+.stage-warn-note { font-size: 10.5px; color: var(--warn); font-weight: 600; }
+
+/* The lineage, an inch tall, above the stage cards. A button rather than a
+   picture: it opens the full graph, which is the thing it is a preview of. */
+.g-strip {
+  display: flex; align-items: center; gap: 14px; width: 100%;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px;
+  cursor: pointer; overflow-x: auto; text-align: left;
+}
+.g-strip:hover { border-color: var(--accent); }
+.g-strip svg { flex: none; }
+.g-strip-hint {
+  font-size: 11px; color: var(--text-3); white-space: nowrap; margin-left: auto;
+}
+.g-dot rect { fill: var(--surface-2); stroke-width: 2; }
+.g-strip .g-edge { stroke-width: 1.2; }
 .stage-active { border-left-color: var(--accent); }
 .stage-todo .stage-count { color: var(--text-3); }
 
