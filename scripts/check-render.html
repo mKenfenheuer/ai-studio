@@ -530,6 +530,28 @@ if (!only) {
         folded ? "the rest is folded away" : "no fold for the rest");
     localStorage.removeItem("aistudio.wizard");
 
+    // The graph tab has to draw, not merely leave a card behind. A view that
+    // throws mid-render leaves whatever was there before -- which for this
+    // one is the word "working" -- and every tab-switching check passes.
+    const { projectView } = await import("/static/js/views/projects.js");
+    // In a container of its own. Every view above was mounted into #main and
+    // several of them are still holding promises that write to it when they
+    // resolve; a page under test that another page can overwrite mid-check
+    // measures the wrong thing.
+    const box = document.createElement("div");
+    main.innerHTML = "";
+    main.appendChild(box);
+    location.hash = "#/projects/prj_1";
+    await projectView(box, ["prj_1"]);
+    box.querySelector('[data-tab="graph"]').click();
+    await new Promise((r) => setTimeout(r, 800));
+    const boxes = box.querySelectorAll(".g-node").length;
+    const wires = box.querySelectorAll(".g-edge").length;
+    say("graph draws", boxes >= 6 && wires >= 6,
+        `${boxes} boxes, ${wires} edges, on the ${
+          box.querySelector(".ribbon-tabs .on")?.dataset.tab} tab`);
+    location.hash = "#/";
+
     // A run without a project cannot be started at all: the wizard asks
     // first, because a run nobody can find later is the thing projects exist
     // to prevent.

@@ -111,12 +111,16 @@ export function projectGraph(data) {
     // A point on the curve itself, a third to two thirds along depending on
     // how many captions this gutter is already carrying.
     const t = 0.34 + 0.16 * (nth % 3);
-    const at = (a, b, c, d) => {
+    // Named for what it is, and NOT `at`: the lookup table above is called
+    // that, and shadowing it inside this closure put the line that reads it
+    // into the temporal dead zone -- so every graph with an edge in it threw
+    // and the tab sat on "working out what came from what" forever.
+    const along = (a, b, c, d) => {
       const u = 1 - t;
       return u * u * u * a + 3 * u * u * t * b + 3 * u * t * t * c + t * t * t * d;
     };
-    const lx = at(x1, mid, mid, x2);
-    const ly = at(y1, y1, y2, y2);
+    const lx = along(x1, mid, mid, x2);
+    const ly = along(y1, y1, y2, y2);
     const label = room && e.label
       ? `<text class="g-edge-label" x="${lx.toFixed(1)}" y="${(ly - 6).toFixed(1)}"
              text-anchor="middle">${esc(clip(e.label, 15))}<title>${
