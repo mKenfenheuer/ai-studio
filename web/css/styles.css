@@ -200,8 +200,11 @@ p { margin: 0 0 .8em; }
   border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow);
 }
 .grid { display: grid; gap: 14px; }
-.grid-2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-.grid-3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+/* min() so a column narrower than its minimum wraps instead of overflowing:
+   auto-fit honours the minimum, and on a 390px phone a 280px minimum plus
+   the page padding runs off the right edge. */
+.grid-2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); }
+.grid-3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
 .row { display: flex; gap: 10px; align-items: center; }
 .row-top { align-items: flex-start; }
 .row-between { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
@@ -1631,7 +1634,11 @@ textarea.turn-edit {
    diagram of nothing. */
 .stage-map {
   display: grid; gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  /* min() rather than a bare 190px: on a 390px phone two columns of 190 plus
+     the gap are wider than the screen, and `auto-fit` honours the minimum
+     rather than wrapping -- so the map ran off the right edge with the best
+     score and the next step cut in half. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
 }
 .stage {
   display: flex; flex-direction: column; gap: 3px;
