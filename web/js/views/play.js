@@ -69,6 +69,19 @@ const STYLE_UI = {
 
 const styleOf = (run) => STYLE_UI[run.style || run.mode] || STYLE_UI.continue;
 
+/** What a model learned from, in words.
+ *
+ *  A studio dataset is recorded on the run as the URL the runner fetched it
+ *  from -- the right thing to store and a terrible thing to read: the card
+ *  introduced a model as "fine-tuned on
+ *  http://10.1.250.48/api/datasets/ds_63854b537bca/dataset-file". The name
+ *  travels alongside; it is used when it is there.
+ */
+const learnedFrom = (r) =>
+  r.dataset_name
+  || (/^https?:/.test(r.dataset || "") ? "a dataset from this studio"
+                                       : (r.dataset || "unknown data"));
+
 export async function playView(mount, [jobId]) {
   const runs = await api.playground();
   if (!jobId) return pickerView(mount, runs);
@@ -112,8 +125,8 @@ function runCard(r) {
     <a class="pick" href="#/play/${r.id}" style="text-decoration:none">
       <span class="t"><span style="font-size:17px">${ui.icon}</span>${r.name}</span>
       <span class="d">${r.kind === "pretrain_llm"
-        ? `Built from scratch on ${r.dataset}`
-        : `${r.base_model} fine-tuned on ${r.dataset}`}</span>
+        ? `Built from scratch on ${learnedFrom(r)}`
+        : `${r.base_model || "a base model"} fine-tuned on ${learnedFrom(r)}`}</span>
       <span class="row" style="gap:6px;flex-wrap:wrap">
         <span class="badge ${r.kind === "pretrain_llm" ? "badge-ok" : "badge-accent"}">
           ${r.kind === "pretrain_llm" ? "your own model" : "fine-tune"}</span>

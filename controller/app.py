@@ -2484,6 +2484,15 @@ async def playground(request: Request) -> list[dict]:
             # the normal next step and the rest of the studio is noise.
             "project_id": job.get("project_id"),
         }
+        # What it was built from, as a name a person can read. A run continued
+        # from one of this studio's own runs has no `base_model` at all -- the
+        # base is a job id -- which is how the playground came to introduce a
+        # model as "null fine-tuned on http://…/api/datasets/ds_08e6d…".
+        if base_job_id := cfg.get("base_model_job"):
+            base_job = db.get_job(base_job_id)
+            if base_job:
+                entry["base_model"] = entry["base_model"] or base_job["name"]
+                entry["base_model_job"] = base_job_id
         # Which dataset this run learned from, so the playground can offer its
         # held-out rows to try. The held-out split is the one that matters --
         # a row the model trained on proves nothing, because reciting it is
