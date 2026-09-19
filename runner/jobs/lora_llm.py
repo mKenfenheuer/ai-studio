@@ -359,9 +359,28 @@ def run(cfg: dict, ctx: Any) -> dict:
     max_seq = int(cfg.get("max_seq_len") or 512)
     cap_seq = caps.get("max_recommended_seq_len")
     if cap_seq and max_seq > cap_seq:
-        ctx.log("Sequence length %d exceeds what this GPU handles comfortably "
-                "without flash attention; capping to %d." % (max_seq, cap_seq), "warn")
-        max_seq = cap_seq
+        # Said, not done. This used to quietly train at the shorter length,
+        # which is the worst of both: the run that finishes is not the run
+        # that was asked for, every example past the cap is cut in half
+        # without anybody deciding that, and the recorded context length
+        # disagrees with the one on the review screen.
+        #
+        # The comfortable length is a property of the attention kernel, not a
+        # hardware limit -- a card with no fused kernel materialises the
+        # scores matrix and its softmax, so the memory is quadratic rather
+        # than linear. Quadratic is expensive, not impossible: it is exactly
+        # the trade somebody with 16 GB and a long dataset may want to make,
+        # and the memory estimate already charges for it. So the number is
+        # honoured and the cost is quantified here, where it can still be
+        # acted on.
+        ctx.log("Sequence length %d is past the %d this machine handles "
+                "comfortably: it has no fused attention kernel, so attention "
+                "memory grows with the square of length -- about %.1fx more "
+                "than at %d. Training at %d as asked. If this run stops for "
+                "lack of memory, sequence length is the first thing to bring "
+                "down, followed by batch size."
+                % (max_seq, cap_seq, (max_seq / cap_seq) ** 2, cap_seq,
+                   max_seq), "warn")
 
     device = "cuda" if caps["backend"] in ("cuda", "rocm") else (
         "mps" if caps["backend"] == "mps" else "cpu")

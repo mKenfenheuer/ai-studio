@@ -453,7 +453,9 @@ def _derive_recommendations(caps: dict) -> None:
         caps["warnings"].append(
             "Flash attention is unavailable, so attention falls back to a "
             "method whose memory use grows with the square of sequence length."
-            + detail + " Keep sequence length at or below 2048 for comfort.")
+            + detail + " 2048 is the comfortable length here; longer runs"
+            " are allowed and cost memory rising with the square, so they may"
+            " need a smaller batch.")
         caps["max_recommended_seq_len"] = 2048
     else:
         caps["max_recommended_seq_len"] = 8192
