@@ -624,6 +624,34 @@ def mark_runner_offline(runner_id: str) -> None:
     ex("UPDATE runners SET status='offline' WHERE id=?", (runner_id,))
 
 
+def delete_runner(runner_id: str) -> None:
+    """Forget a machine. Finished runs keep pointing at it by id and lose only
+    its name, which every screen that shows one already copes with -- a run
+    from a year ago on a laptop that no longer exists is a normal thing for a
+    studio to hold. If the machine ever dials in again it is inserted afresh,
+    because forgetting is not banning."""
+    ex("DELETE FROM runners WHERE id=?", (runner_id,))
+
+
+def jobs_depending_on_runner(runner_id: str) -> list[dict]:
+    """Unfinished work that would be stranded by forgetting this machine.
+
+    Two ways a job can depend on one. It may be *on* it -- assigned or
+    running, which the heartbeat deadline resolves by itself given a minute.
+    Or it may be pinned to it by name, which nothing resolves: the scheduler
+    matches `required_runner` against the machines that connect, so a job
+    pinned to a machine that no longer exists waits for ever, quietly.
+    """
+    out = []
+    for r in q("SELECT * FROM jobs WHERE status IN ('queued','assigned','running')"):
+        job = _hydrate(r)
+        if job["runner_id"] == runner_id and job["status"] != "queued":
+            out.append(job)
+        elif job["config"].get("required_runner") == runner_id:
+            out.append(job)
+    return out
+
+
 def list_runners() -> list[dict]:
     rows = q("SELECT * FROM runners ORDER BY first_seen")
     cutoff = now() - config.HEARTBEAT_TIMEOUT_S

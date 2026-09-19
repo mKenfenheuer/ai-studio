@@ -65,6 +65,17 @@ export async function runnersView(mount) {
       try { await api.reprobe(t.dataset.reprobe); toast("Re-checking hardware…"); }
       catch (e) { toast(e.message, "err"); }
     });
+    on(mount, "click", "[data-forget]", async (_e, t) => {
+      if (!confirm(`Forget "${t.dataset.name}"?\n\nIt is taken off this list. `
+                   + "Finished runs that used it are untouched, and it comes "
+                   + "back if that machine ever connects again.")) return;
+      try {
+        // No redraw here: the controller broadcasts runners_changed, which is
+        // what this view already reloads from.
+        const r = await api.forgetRunner(t.dataset.forget);
+        toast(r.note || "Removed.", "ok");
+      } catch (e) { toast(e.message, "err"); }
+    });
   }
 
   await load();
@@ -324,5 +335,8 @@ function card(r, admin, dense = false) {
 
       ${raw(!offline && admin ? `<button class="btn-sm" data-reprobe="${esc(r.id)}">
         Re-check hardware</button>` : "")}
+      ${raw(offline && admin ? `<button class="btn-sm btn-danger"
+        data-forget="${esc(r.id)}" data-name="${esc(r.name)}"
+        >Forget this machine</button>` : "")}
     </div>`;
 }

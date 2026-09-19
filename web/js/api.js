@@ -221,6 +221,8 @@ export const api = {
   status:      () => req("/api/status"),
   runners:     () => req("/api/runners"),
   reprobe:     (id) => req(`/api/runners/${encodeURIComponent(id)}/reprobe`, { method: "POST" }),
+  forgetRunner: (id) =>
+    req(`/api/runners/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   jobs:        () => req("/api/jobs"),
   job:         (id) => req(`/api/jobs/${encodeURIComponent(id)}`),

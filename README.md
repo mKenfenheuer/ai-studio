@@ -166,6 +166,21 @@ minutes for the session to return and then starts that run again elsewhere.
 Reconnecting from the same notebook rejoins as the *same* machine rather than
 leaving a row of ghosts on the Machines page.
 
+### Removing a machine
+
+Not every machine is permanent — a laptop lent for an afternoon, a Colab
+session Google took back — and a page of dead cards is a page nobody reads.
+**Forget this machine** removes an offline one from the list.
+
+It forgets, it does not ban: a runner whose agent is still going dials in
+again within seconds and is listed afresh, so stopping it is what removes it
+and this is what tidies up afterwards. Which is why it is refused while the
+machine is connected, and refused again while any unfinished run depends on
+it — one still marked as running there (wait a minute; the studio notices by
+itself) or one queued *pinned* to it, which nothing else would ever resolve.
+Finished runs keep the machine's id and lose only its name, which every screen
+that shows one already copes with.
+
 ### Then train something
 
 Open the UI and follow the four steps. Everything technical is chosen for you

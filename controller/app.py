@@ -437,6 +437,72 @@ async def reprobe(request: Request, runner_id: str) -> dict:
     return {"ok": True}
 
 
+@app.delete("/api/runners/{runner_id}")
+async def forget_runner(request: Request, runner_id: str) -> dict:
+    """Take a machine off the list.
+
+    Needed because machines are not all permanent. A laptop is lent to the
+    studio for an afternoon; a Colab session lives until Google wants the GPU
+    back. Without this every one of them stays on the Machines page for ever,
+    and a page of dead cards is a page nobody reads.
+
+    Deliberately not a ban, and deliberately not available for a machine that
+    is connected: a runner whose agent is still running will dial in again
+    within seconds and be inserted afresh. Stopping it is what removes it;
+    this is what forgets it afterwards.
+    """
+    security.require_admin(request)
+    runner = db.get_runner(runner_id)
+    if not runner:
+        raise HTTPException(404, "No such machine.")
+    if runner_id in fleet.connections:
+        raise HTTPException(
+            409, "'%s' is connected right now, so forgetting it would last "
+                 "until its next heartbeat. Stop the runner on that machine "
+                 "first." % runner["name"])
+
+    if blocking := db.jobs_depending_on_runner(runner_id):
+        names = ", ".join("'%s'" % j["name"] for j in blocking[:3])
+        more = "" if len(blocking) <= 3 else " and %d more" % (len(blocking) - 3)
+        if any(j["status"] != "queued" for j in blocking):
+            raise HTTPException(
+                409, "The studio still has %s%s running on '%s'. Give it a "
+                     "minute: a machine that has stopped answering is noticed, "
+                     "and its work goes back on the queue by itself."
+                     % (names, more, runner["name"]))
+        raise HTTPException(
+            409, "%s%s %s queued for '%s' specifically, and would wait for "
+                 "ever once it is gone. Cancel %s first."
+                 % (names, more, "are" if len(blocking) > 1 else "is",
+                    runner["name"], "them" if len(blocking) > 1 else "it"))
+
+    # A checkpoint is a directory on that machine's disk. The scheduler would
+    # work this out for itself after ten minutes of silence; saying it now
+    # means the run stops waiting for a machine this studio has been told to
+    # forget, and says why in its own log rather than in nobody's.
+    stranded = db.jobs_with_checkpoint_on(runner_id)
+    for jid in stranded:
+        db.clear_checkpoint(jid)
+        db.add_log(jid, "'%s' was removed from the studio, and this run's "
+                        "checkpoint was on its disk. The run starts from the "
+                        "beginning on whichever machine takes it."
+                   % runner["name"], "warn")
+    fleet.checkpoints.pop(runner_id, None)
+    fleet.busy.pop(runner_id, None)
+    fleet.dispatched_at.pop(runner_id, None)
+
+    db.delete_runner(runner_id)
+    await fleet.broadcast_ui({"type": "runners_changed"})
+    if stranded:
+        await fleet.broadcast_ui({"type": "jobs_changed"})
+        fleet.wake()
+    return {"ok": True, "note": "'%s' was removed.%s It comes back on the list "
+                                "if that machine ever connects again."
+                                % (runner["name"],
+                                   " %d run(s) lost their checkpoint with it."
+                                   % len(stranded) if stranded else "")}
+
+
 # ===========================================================================
 # Joining from Google Colab
 # ===========================================================================
