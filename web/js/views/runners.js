@@ -65,6 +65,10 @@ export async function runnersView(mount) {
       try { await api.reprobe(t.dataset.reprobe); toast("Re-checking hardware…"); }
       catch (e) { toast(e.message, "err"); }
     });
+    on(mount, "click", "[data-limits]", (_e, t) => {
+      const r = runners.find((x) => x.id === t.dataset.limits);
+      if (r) limitsDialog(r);
+    });
     on(mount, "click", "[data-forget]", async (_e, t) => {
       if (!confirm(`Forget "${t.dataset.name}"?\n\nIt is taken off this list. `
                    + "Finished runs that used it are untouched, and it comes "
@@ -221,6 +225,114 @@ function joinDialog(status) {
     </details>` });
 }
 
+/** Is any part of this machine being held back? */
+function limited(r) {
+  const l = r.limits || {};
+  return (l.memory_pct != null && l.memory_pct < 100)
+      || (l.compute_pct != null && l.compute_pct < 100);
+}
+
+/** "12 GB of 16 GB · about 50% of its time" -- only the parts that apply. */
+function limitLine(r) {
+  const l = r.limits || {};
+  const c = r.capabilities || {};
+  const bits = [];
+  if (l.memory_pct < 100) {
+    bits.push(c.vram_gb_total
+      ? `${c.vram_gb} GB of ${c.vram_gb_total} GB`
+      : `${l.memory_pct}% of its memory`);
+  }
+  if (l.compute_pct < 100) bits.push(`about ${l.compute_pct}% of its time`);
+  return bits.join(" · ");
+}
+
+/**
+ * How much of one machine the studio may take.
+ *
+ * Two numbers that look alike and are not. Memory is a real cap -- the runner
+ * confines the process to it and the planner sizes the batch to fit inside it
+ * -- so the usual effect of setting it is a smaller batch. Compute is a duty
+ * cycle: the trainer pauses between steps until the card averages that share,
+ * because no consumer card sells a slice of itself. Saying so here is the
+ * whole point of the dialog; a pair of unlabelled percentage boxes would
+ * promise isolation that does not exist.
+ */
+function limitsDialog(r) {
+  const l = r.limits || { memory_pct: 100, compute_pct: 100 };
+  const c = r.capabilities || {};
+  const card = c.vram_gb_total || c.vram_gb;
+  const own = r.limits?.machine || {};
+  const ownSet = own.memory_pct < 100 || own.compute_pct < 100;
+
+  const dlg = modal({ title: `How much of ${r.name} the studio may use`,
+    width: 560, body: html`
+    <div class="field">
+      <label for="limMem">Memory</label>
+      <div class="row" style="align-items:center;gap:10px">
+        <input id="limMem" type="range" min="10" max="100" step="5"
+               value="${l.memory_pct}" style="flex:1">
+        <output id="limMemOut" class="mono" style="min-width:8ch"></output>
+      </div>
+      <p class="hint">A real cap. The run is confined to this share and is
+        planned to fit inside it, so setting it usually costs batch size
+        rather than causing a failure.${card
+          ? ` This card holds ${card} GB.` : ""}</p>
+    </div>
+
+    <div class="field">
+      <label for="limCompute">Compute</label>
+      <div class="row" style="align-items:center;gap:10px">
+        <input id="limCompute" type="range" min="5" max="100" step="5"
+               value="${l.compute_pct}" style="flex:1">
+        <output id="limComputeOut" class="mono" style="min-width:8ch"></output>
+      </div>
+      <p class="hint">Not a partition — no consumer card offers one. The
+        trainer pauses between steps until the card averages this share, so
+        the run takes correspondingly longer. Worth it when the machine is
+        also somebody's desktop, or the power budget is shared. Chat replies
+        are never throttled.</p>
+    </div>
+
+    <p class="muted tiny" id="limEffect"></p>
+
+    <div class="row" style="justify-content:space-between;gap:8px;margin-top:12px">
+      <button type="button" class="btn btn-sm" id="limClear"
+        title="${ownSet ? "Back to what this machine's own configuration says"
+                        : "This machine sets no limit of its own, so this means all of it"}"
+        >Use the machine's own setting</button>
+      <span>
+        <button type="button" class="btn" data-modal-close>Cancel</button>
+        <button type="button" class="btn btn-primary" id="limSave">Save</button>
+      </span>
+    </div>` });
+
+  const paint = () => {
+    const m = +$("#limMem", dlg).value, k = +$("#limCompute", dlg).value;
+    $("#limMemOut", dlg).textContent = card
+      ? `${(card * m / 100).toFixed(1)} GB` : `${m}%`;
+    $("#limComputeOut", dlg).textContent = `${k}%`;
+    $("#limEffect", dlg).textContent = k < 100
+      ? `A run that takes an hour at full speed would take about `
+        + `${(100 / k).toFixed(1)} hours.`
+      : "";
+  };
+  paint();
+  on(dlg, "input", "input[type=range]", paint);
+
+  const save = async (limits, btn) => {
+    btn.disabled = true;
+    try {
+      const res = await api.setRunnerLimits(r.id, limits);
+      toast(res.note || "Saved.", "ok");
+      dlg.close();
+    } catch (ex) { toast(ex.message, "err"); btn.disabled = false; }
+  };
+  on(dlg, "click", "#limSave", (_e, btn) => save({
+    memory_pct: +$("#limMem", dlg).value,
+    compute_pct: +$("#limCompute", dlg).value }, btn));
+  on(dlg, "click", "#limClear", (_e, btn) => save(null, btn));
+}
+
 function card(r, admin, dense = false) {
   const c = r.capabilities || {};
   const offline = r.status === "offline";
@@ -299,6 +411,10 @@ function card(r, admin, dense = false) {
               ? `<div class="tiny muted">no image library: a vision run will not be sent here</div>` : "")}
             ${raw(c.libraries && !c.libraries.torchaudio && !c.libraries.soundfile && !c.libraries.librosa
               ? `<div class="tiny muted">no audio library: a speech run will not be sent here</div>` : "")}</dd>` : "")}
+        ${raw(limited(r) ? html`
+          <dt>Studio may use</dt><dd>${limitLine(r)}
+            <span class="muted tiny">— ${r.limits.source === "machine"
+              ? "this machine's own setting" : "set here"}</span></dd>` : "")}
         <dt>Last seen</dt><dd>${fmtAgo(r.last_seen)}</dd>
         ${raw(r.current_job ? html`
           <dt>Working on</dt><dd><a href="#/jobs/${r.current_job}">open the run →</a></dd>` : "")}
@@ -335,6 +451,8 @@ function card(r, admin, dense = false) {
 
       ${raw(!offline && admin ? `<button class="btn-sm" data-reprobe="${esc(r.id)}">
         Re-check hardware</button>` : "")}
+      ${raw(admin ? `<button class="btn-sm" data-limits="${esc(r.id)}"
+        >Usage limits</button>` : "")}
       ${raw(offline && admin ? `<button class="btn-sm btn-danger"
         data-forget="${esc(r.id)}" data-name="${esc(r.name)}"
         >Forget this machine</button>` : "")}

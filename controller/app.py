@@ -14,7 +14,7 @@ from fastapi import (Body, FastAPI, File, Header, HTTPException, Query, Request,
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from common import apimodels, formatting
+from common import apimodels, formatting, gpulimits
 
 from . import assets
 from . import architectures as arch
@@ -27,6 +27,11 @@ from .api import (accounts, conversations, data, evals, library, media, ops, pro
 from .scheduler import Fleet
 
 fleet = Fleet()
+
+# "Absent" and "null" mean different things to the limits route -- one leaves
+# the setting alone, the other hands it back to the machine -- and `None` alone
+# cannot tell them apart.
+_UNSET = object()
 
 
 @contextlib.asynccontextmanager
@@ -171,6 +176,13 @@ async def runner_ws(ws: WebSocket) -> None:
         fleet.note_checkpoints(runner_id, first.get("checkpoints") or [])
         fleet.attach(runner_id, ws)
         await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
+        # And what it may use of its own card, if this studio has narrowed it.
+        # Sent on every connect rather than only when it changes: a runner
+        # restarts with whatever its compose file says and has no memory of
+        # what it was told last time, so this is the only moment the two can
+        # be brought back into agreement.
+        if limits := (db.get_runner(runner_id) or {}).get("limits"):
+            await ws.send_text(json.dumps({"type": "limits", "limits": limits}))
         # A runner says what it is training as it joins. A machine that has
         # just restarted is training nothing, and anything this controller
         # still has pinned to it needs to go back on the queue now rather than
@@ -435,6 +447,57 @@ async def reprobe(request: Request, runner_id: str) -> dict:
         raise HTTPException(404, "That runner is not connected right now.")
     await fleet.send_to_runner(runner_id, {"type": "reprobe"})
     return {"ok": True}
+
+
+@app.patch("/api/runners/{runner_id}/limits")
+async def set_runner_limits(request: Request, runner_id: str,
+                            payload: dict = Body(...)) -> dict:
+    """How much of this machine's card the studio may use.
+
+    Two numbers, and they are not the same kind of thing. The memory share is
+    a real cap: the runner confines the process to it and the planner sizes
+    the batch to fit inside it, so the usual effect of setting it is a smaller
+    batch rather than a failure. The compute share is a duty cycle -- the
+    trainer pauses between steps so the card averages that fraction -- because
+    no consumer card sells a slice of itself, and pretending otherwise would
+    be the kind of number that reads as a guarantee and is not one.
+
+    Sending null hands the decision back to the machine, which is not the same
+    as sending 100: a box lent out on the condition that it stays usable says
+    so in its own configuration, and clearing the studio's copy restores that
+    rather than overriding it with "use everything".
+    """
+    security.require_admin(request)
+    runner = db.get_runner(runner_id)
+    if not runner:
+        raise HTTPException(404, "No such machine.")
+
+    if payload.get("limits", _UNSET) is None:
+        db.set_runner_limits(runner_id, None)
+    else:
+        limits = gpulimits.clean(payload.get("limits") or payload)
+        db.set_runner_limits(runner_id, limits)
+
+    runner = db.get_runner(runner_id) or {}
+    effective = runner.get("limits") or {}
+    # Told now, not at its next connect. A machine that is idle should be
+    # running under the new limit by the time the page has finished redrawing.
+    await fleet.send_to_runner(runner_id, {"type": "limits", "limits": effective})
+    await fleet.broadcast_ui({"type": "runners_changed"})
+
+    note = gpulimits.describe(effective)
+    busy = fleet.busy.get(runner_id)
+    return {
+        "ok": True,
+        "limits": effective,
+        # What it will and will not do to work already on the machine. A limit
+        # that silently does nothing for the next four hours is worse than one
+        # that says so.
+        "note": ("'%s' may now use %s." % (runner.get("name"), note) if note
+                 else "'%s' may use all of its card again." % runner.get("name"))
+               + (" The run on it now keeps the memory it was sized for; this "
+                  "applies to the next one." if busy else ""),
+    }
 
 
 @app.delete("/api/runners/{runner_id}")

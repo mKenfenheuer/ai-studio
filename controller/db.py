@@ -13,6 +13,8 @@ import time
 import uuid
 from typing import Any, Iterable
 
+from common import gpulimits
+
 from . import config
 
 _SCHEMA = """
@@ -418,6 +420,11 @@ CREATE INDEX IF NOT EXISTS idx_deploy_runner ON deployments(runner_id);
 # each one is attempted and its "duplicate column" complaint ignored.
 _ADDED_COLUMNS = [
     ("jobs", "owner_id", "TEXT"),
+    # How much of its card a machine may give this studio, as percentages of
+    # memory and of time. NULL means the studio has no opinion and whatever
+    # the machine's own configuration says holds -- which is not the same as
+    # "no limit", and is why this is nullable rather than defaulting to 100.
+    ("runners", "limits", "TEXT"),
     # Where a prompt set's rows came from: a dataset id and a split, and
     # whether that split is one nothing trained on. Without it the model card
     # asserted "held out" about rows that were, as often as not, the training
@@ -652,11 +659,53 @@ def jobs_depending_on_runner(runner_id: str) -> list[dict]:
     return out
 
 
+def _hydrate_runner(r: dict) -> dict:
+    """A runner row as the rest of the studio should see it.
+
+    This is where a usage limit stops being a setting and starts being a fact.
+    Every part of the controller that decides whether a run fits -- the batch
+    planner, the size picker, the refusal at creation time, the wizard's
+    recommendations -- reads `vram_gb` out of these capabilities, so capping
+    it here caps all of them at once, and none of them needs to know that
+    limits exist.
+
+    The card's real size stays, under `vram_gb_total`, because a machine that
+    reports 12 GB on a card somebody knows is 16 reads as a broken probe
+    rather than as a policy.
+    """
+    caps = (json.loads(r["capabilities"]) if isinstance(r["capabilities"], str)
+            else (r["capabilities"] or {}))
+    own = caps.get("limits")
+    override = json.loads(r["limits"]) if r.get("limits") else None
+    effective = gpulimits.clean(override if override is not None else own)
+    r["limits"] = dict(effective,
+                       # Which of the two is in force, so the page can say
+                       # "set here" against "this machine's own setting" --
+                       # and so clearing the studio's copy is a visible act
+                       # rather than a jump to a number nobody chose.
+                       source="studio" if override is not None
+                       else ("machine" if own and not gpulimits.is_unlimited(own)
+                             else "none"),
+                       machine=gpulimits.clean(own))
+    if effective["memory_pct"] < 100 and caps.get("vram_gb"):
+        caps["vram_gb_total"] = caps["vram_gb"]
+        caps["vram_gb"] = gpulimits.budget_gb(caps["vram_gb"], effective)
+    r["capabilities"] = caps
+    return r
+
+
+def set_runner_limits(runner_id: str, limits: dict | None) -> None:
+    """Narrow what a machine may give, or hand the decision back to it."""
+    ex("UPDATE runners SET limits=? WHERE id=?",
+       (json.dumps(gpulimits.clean(limits)) if limits is not None else None,
+        runner_id))
+
+
 def list_runners() -> list[dict]:
     rows = q("SELECT * FROM runners ORDER BY first_seen")
     cutoff = now() - config.HEARTBEAT_TIMEOUT_S
     for r in rows:
-        r["capabilities"] = json.loads(r["capabilities"])
+        _hydrate_runner(r)
         # Report a silent runner as offline even if it never closed its socket
         # cleanly, which is what a crash, power loss or network drop looks like.
         if r["status"] != "offline" and r["last_seen"] < cutoff:
@@ -666,9 +715,7 @@ def list_runners() -> list[dict]:
 
 def get_runner(runner_id: str) -> dict | None:
     r = q1("SELECT * FROM runners WHERE id=?", (runner_id,))
-    if r:
-        r["capabilities"] = json.loads(r["capabilities"])
-    return r
+    return _hydrate_runner(r) if r else None
 
 
 # What a machine will accept. See the `runners.role` migration note: 'both' is

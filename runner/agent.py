@@ -25,6 +25,7 @@ import httpx
 import websockets
 
 from . import artifacts, capabilities, checkpoints, inference
+from . import limits as gpu_limits
 from .jobs import (evaluate, export_gguf, generate_data, lora_llm, scratch_llm, upload, vision_cls)
 
 HEARTBEAT_S = 15
@@ -92,11 +93,18 @@ class JobContext:
 
     def __init__(self, job_id: str, outbox: queue.Queue, workdir: str,
                  caps: dict, hf_token: str | None,
-                 controller_url: str = "", runner_token: str = ""):
+                 controller_url: str = "", runner_token: str = "",
+                 limits: dict | None = None):
         self.job_id = job_id
         self.workdir = workdir
         self.capabilities = caps
         self.hf_token = hf_token
+        # How much of the card this run may use. The memory share is applied to
+        # the whole process before the job starts; the compute share is a duty
+        # cycle the training loop honours itself, which is what the throttle is
+        # for. Both are explained in runner/limits.py.
+        self.limits = gpu_limits.clean(limits)
+        self.throttle = gpu_limits.Throttle(self.limits)
         # A job that generates data has to load a finished model, which means
         # fetching it from the controller exactly as the playground does.
         self.controller_url = controller_url
@@ -187,6 +195,12 @@ class Runner:
         self.host: inference.ModelHost | None = None
         self.generating = False
         self.generating_since = 0.0
+        # What this machine's own configuration says it may give. The
+        # controller may narrow it further and says so on connect; until it
+        # does, this is what holds -- so a machine that is lent out on
+        # conditions keeps them even against a controller that has never
+        # heard of it.
+        self.limits = gpu_limits.from_env()
         # Tokenizers, kept between requests. A few megabytes each, and the
         # alternative is downloading one every time somebody adjusts a
         # context length on the review step.
@@ -309,6 +323,14 @@ class Runner:
                 threading.Thread(target=self._force_kill,
                                  args=(msg.get("job_id"),), daemon=True,
                                  name="force-kill").start()
+            elif kind == "limits":
+                # Sent on connect and whenever somebody changes it. Applied to
+                # the next job rather than the running one: taking memory away
+                # from a run that was sized for it is how you turn a setting
+                # into a crash four hours in.
+                self.limits = gpu_limits.clean(msg.get("limits"))
+                if note := gpu_limits.describe(self.limits):
+                    print("[runner] this machine may use %s" % note)
             elif kind == "reprobe":
                 self.caps = await asyncio.get_event_loop().run_in_executor(
                     None, capabilities.probe)
@@ -519,7 +541,7 @@ class Runner:
         # "Illegal header value". Absent must mean None, not "".
         token = (job.get("hf_token") or os.environ.get("HF_TOKEN") or "").strip() or None
         ctx = JobContext(job["id"], self.outbox, workdir, self.caps, token,
-                         self.controller_url, self.token)
+                         self.controller_url, self.token, self.limits)
         self.current = ctx
         threading.Thread(target=self._run_job, args=(job, ctx, workdir),
                          daemon=True, name="job-%s" % job["id"]).start()
@@ -701,6 +723,15 @@ class Runner:
             state = checkpoints.peek(jid) or {}
             self.outbox.put({"type": "job_started", "job_id": jid,
                              "resume_step": int(state.get("step") or 0)})
+            # Before any of it: a run that has been told to use part of a card
+            # has to be confined to that part before it allocates anything.
+            if note := gpu_limits.apply_memory(ctx.limits):
+                ctx.log(note)
+            if ctx.throttle.active:
+                ctx.log("This machine is set to use about %d%% of its card's "
+                        "time, so the run pauses between steps and takes "
+                        "roughly %.1fx as long."
+                        % (ctx.throttle.pct, 100.0 / ctx.throttle.pct))
             handler = JOB_HANDLERS.get(job["kind"])
             if handler is None:
                 raise ValueError("this runner cannot handle job type %r" % job["kind"])

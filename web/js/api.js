@@ -223,6 +223,11 @@ export const api = {
   reprobe:     (id) => req(`/api/runners/${encodeURIComponent(id)}/reprobe`, { method: "POST" }),
   forgetRunner: (id) =>
     req(`/api/runners/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // null hands the decision back to the machine's own configuration, which is
+  // not the same as {memory_pct: 100, compute_pct: 100}.
+  setRunnerLimits: (id, limits) =>
+    req(`/api/runners/${encodeURIComponent(id)}/limits`,
+        { method: "PATCH", body: JSON.stringify({ limits }) }),
 
   jobs:        () => req("/api/jobs"),
   job:         (id) => req(`/api/jobs/${encodeURIComponent(id)}`),

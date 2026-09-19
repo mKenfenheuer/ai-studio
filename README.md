@@ -166,6 +166,45 @@ minutes for the session to return and then starts that run again elsewhere.
 Reconnecting from the same notebook rejoins as the *same* machine rather than
 leaving a row of ghosts on the Machines page.
 
+### Using only part of a machine
+
+A card is not always the studio's to take. It is in somebody's desktop, or the
+room cannot take 300 W for six hours, or a second workload has to stay
+responsive. **Machines → Usage limits** sets, per machine, how much of its
+card this studio may have.
+
+The two numbers look alike and are not, which is the part worth reading:
+
+**Memory is a real cap.** The runner confines the process to that share, and
+the controller plans against the same figure — so the batch is sized to fit
+inside the limit rather than inside the card. The usual effect of setting it
+is a smaller batch, not a failure. A 16 GB card at 50% is planned, checked and
+refused exactly as a 8 GB card would be, everywhere that asks "will this fit",
+because the limit is applied once where capabilities are read rather than at
+each of the places that read them. The card's real size stays visible beside
+it: "8 GB of 16 GB", because a 16 GB card reporting 8 reads as a broken probe.
+
+**Compute is a duty cycle, not a partition.** No consumer card sells you 40%
+of itself: there is no hardware mechanism, MPS is NVIDIA-only and needs a
+daemon, and nothing equivalent exists on RDNA. So the trainer pauses between
+optimiser steps until the card averages the share asked for — 50% means the
+card is busy about half the time and the run takes about twice as long. That
+is worth having, and it is not isolation, so the UI says "about" and tells you
+what the run will now cost in hours. Chat replies are never throttled:
+stuttering somebody's conversation to save power is a worse trade than letting
+a model that is already resident finish its sentence.
+
+A machine can also set its own limit, in its own environment
+(`AI_STUDIO_GPU_MEMORY_PCT`, `AI_STUDIO_GPU_COMPUTE_PCT`), which is what a box
+lent out on conditions should do — it survives the controller forgetting, and
+it holds from the first second the runner is up. The studio's setting takes
+precedence when there is one; clearing it in the UI is not the same as setting
+it to 100%, it hands the decision back to the machine.
+
+A change reaches an idle machine at once and a busy one at its next run.
+Taking memory away from a run that was sized for it is how a setting becomes
+a crash four hours in.
+
 ### Removing a machine
 
 Not every machine is permanent — a laptop lent for an afternoon, a Colab
@@ -256,6 +295,8 @@ an hour in.
 | `AI_STUDIO_CONTROLLER` | runner | Controller URL |
 | `AI_STUDIO_RUNNER_NAME` | runner | Display name |
 | `AI_STUDIO_RUNNER_KINDS` | runner | Restrict to certain job kinds |
+| `AI_STUDIO_GPU_MEMORY_PCT` | runner | Give the studio at most this share of the card's memory |
+| `AI_STUDIO_GPU_COMPUTE_PCT` | runner | Give it at most this share of the card's time |
 | `BNB_ROCM_ARCH` | rocm build | GPU arch, e.g. `gfx1030`, `gfx1100` |
 
 ---

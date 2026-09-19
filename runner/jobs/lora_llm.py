@@ -989,6 +989,9 @@ def run(cfg: dict, ctx: Any) -> dict:
             else:
                 opt.step()
             opt.zero_grad(set_to_none=True)
+            # Hold the card to its share of the clock, if this machine has
+            # been given one. A no-op at 100%, which is the default.
+            ctx.throttle.step()
             step += 1
 
             window = running[-accum:]

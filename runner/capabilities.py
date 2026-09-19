@@ -234,6 +234,12 @@ def _agent_version() -> str:
 AGENT_VERSION = _agent_version()
 
 
+def _env_limits() -> dict:
+    """This machine's own cap on what the studio may use of its card."""
+    from . import limits as gpu_limits
+    return gpu_limits.from_env()
+
+
 def probe(quick: bool = False) -> dict:
     """Build the capability report this runner advertises to the controller."""
     caps: dict = {
@@ -248,6 +254,10 @@ def probe(quick: bool = False) -> dict:
         # Machines page point at the actual problem instead of leaving
         # somebody to infer it from a missing field.
         "agent_version": AGENT_VERSION,
+        # What this machine's own configuration allows, before the controller
+        # has any say. Reported rather than applied here: the probe describes
+        # the machine, and the limit is enforced where the work happens.
+        "limits": _env_limits(),
         "probed_at": time.time(),
         "backend": "cpu",
         "device_name": platform.processor() or "CPU",

@@ -992,6 +992,10 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         else:
             opt.step()
 
+        # Hold the card to its share of the clock, if this machine has been
+        # given one. A no-op at 100%, which is the default.
+        ctx.throttle.step()
+
         avg = accum_loss / accum
         first_loss = first_loss if first_loss is not None else avg
         last_loss = avg
