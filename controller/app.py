@@ -11,14 +11,14 @@ from typing import Any
 
 from fastapi import (Body, FastAPI, File, Header, HTTPException, Query, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from common import apimodels, formatting
 
 from . import assets
 from . import architectures as arch
-from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
+from . import cards, colab, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
 from .api import (accounts, conversations, data, evals, library, media, ops, projects,
@@ -435,6 +435,47 @@ async def reprobe(request: Request, runner_id: str) -> dict:
         raise HTTPException(404, "That runner is not connected right now.")
     await fleet.send_to_runner(runner_id, {"type": "reprobe"})
     return {"ok": True}
+
+
+# ===========================================================================
+# Joining from Google Colab
+# ===========================================================================
+
+@app.get("/api/runner/colab.ipynb")
+async def colab_notebook(request: Request) -> Any:
+    """A notebook that attaches a Colab session to this studio as a machine.
+
+    Administrator-only, in step with the join token: the notebook carries no
+    credential, but a machine is no use to somebody who cannot be given one.
+    """
+    security.require_admin(request)
+    if not colab.source_available():
+        raise HTTPException(
+            503, "This controller has no copy of the runner's code to hand "
+                 "out, so the notebook would have nothing to download. It is "
+                 "running an image built before that was included; rebuild it.")
+    body = json.dumps(colab.notebook(sso.public_base(request)), indent=1)
+    return Response(body, media_type="application/x-ipynb+json", headers={
+        "Content-Disposition": 'attachment; filename="ai-studio-runner.ipynb"',
+        "Cache-Control": "no-store",
+    })
+
+
+@app.get("/api/runner/bundle.zip")
+async def runner_bundle() -> Any:
+    """The runner's source, for a machine with no checkout of its own.
+
+    Authenticated with the join token, because the caller is a Colab VM with
+    no session and nowhere to keep one -- the same credential, and the same
+    door, that machine is about to use to join the fleet anyway.
+    """
+    if not colab.source_available():
+        raise HTTPException(404, "This controller does not carry the runner's "
+                                 "source.")
+    return Response(colab.bundle(VERSION), media_type="application/zip",
+                    headers={"Content-Disposition":
+                             'attachment; filename="ai-studio-runner.zip"',
+                             "Cache-Control": "no-store"})
 
 
 # ===========================================================================

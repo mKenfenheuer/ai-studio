@@ -131,6 +131,41 @@ scripts/install-runner.sh
 > Linux containers on a WSL2 kernel, so it works unchanged — there is no
 > separate Windows image and none is needed.
 
+### Or borrow a GPU from Google Colab
+
+**Machines → Connect a machine → Colab notebook** downloads an `.ipynb`
+that attaches a Colab session to this studio for as long as Google lets the session live. It is the
+answer to "I want to try this and I do not own a graphics card": a free T4
+fine-tunes a 7B in 4-bit, and everything that matters — datasets, runs,
+finished models — stays on your controller.
+
+Nothing about the runner had to change for it. The agent has dialed *out*
+since the day it was written, and Colab is the extreme case that design was
+for: no inbound address, none possible, none needed.
+
+Three things follow from where Colab is, and the notebook says all three
+before it does anything:
+
+- **Your controller needs an address Google can reach.** `localhost` inside a
+  Colab VM is that VM. For a studio on your own network, put a tunnel in front
+  of it first — `cloudflared tunnel --url http://localhost:8420` prints one —
+  and treat that address plus the join token as a password. The notebook
+  refuses a private address outright rather than failing obscurely later.
+- **The runner's code comes from your controller**, not from a package index,
+  so the machine runs exactly the version your studio speaks. Only third-party
+  libraries are installed in Colab, and deliberately not torch: Google's build
+  is matched to the card in that VM, and replacing it is the quickest way to
+  end up training on the CPU.
+- **The join token is not written into the notebook.** An `.ipynb` is a file
+  people forward and commit. The notebook asks for the token instead, out of
+  Colab's own secret store if you put it there, and never prints it.
+
+When the session ends, the run it was training goes back on the queue. Its
+checkpoint was on Colab's disk, which is wiped, so the studio waits ten
+minutes for the session to return and then starts that run again elsewhere.
+Reconnecting from the same notebook rejoins as the *same* machine rather than
+leaving a row of ghosts on the Machines page.
+
 ### Then train something
 
 Open the UI and follow the four steps. Everything technical is chosen for you
@@ -239,6 +274,13 @@ Found a security issue? Please open a
 rather than a public issue.
 
 ---
+
+Connecting a Colab runner means giving the controller an address on the public
+internet, which is the one thing the rest of this design avoids. A quick
+tunnel is a reasonable way to do it and a bad thing to leave running: while it
+is up, the studio is as exposed as whatever is in front of it, and the join
+token is what stands between a stranger and your job data. Stop the tunnel
+when the session ends.
 
 ## Project layout
 

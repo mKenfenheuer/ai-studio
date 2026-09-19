@@ -24,6 +24,13 @@ COPY controller /app/controller
 COPY web /app/web
 COPY common /app/common
 
+# The runner's source, which this image serves but never runs: a machine with
+# no checkout -- a Google Colab session following the notebook -- downloads it
+# from here, so the runner it starts is exactly the version this controller
+# speaks. Source only. None of the runner's dependencies are installed, and
+# this image still has no torch, no CUDA and no ROCm in it.
+COPY runner /app/runner
+
 EXPOSE 8420
 VOLUME ["/data"]
 

@@ -187,6 +187,20 @@ function joinDialog(status) {
       password.</p>
     ${raw(block("AMD graphics card (Docker)", docker))}
     ${raw(block("NVIDIA graphics card (Docker)", dockerCuda))}
+    <div class="field">
+      <label>No graphics card of your own</label>
+      <div class="row row-top">
+        <p class="muted tiny" style="flex:1;margin:0">
+          Google lends one out. This notebook turns a Colab session into a
+          machine here for as long as the session lasts, with nothing to
+          install — open Colab, <em>File → Upload notebook</em>, run it. Your
+          datasets and models stay on this controller. Colab does have to be
+          able to reach this address, which for a studio on your own network
+          means a tunnel in front of it; the notebook says how.</p>
+        <a class="btn btn-sm" href="/api/runner/colab.ipynb"
+           download="ai-studio-runner.ipynb">↓ Colab notebook</a>
+      </div>
+    </div>
     <details class="adv">
       <summary>Without Docker — also the only option on an Apple Mac</summary>
       <div style="margin-top:8px">${raw(block("Command", cmd))}</div>

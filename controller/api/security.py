@@ -53,6 +53,10 @@ RUNNER_TOKEN_PATHS = (
     # Read by the deploy script on the host, which has the join token in the
     # same .env that starts the containers and has no browser session.
     "/in-flight",
+    # The runner's own source, fetched by a machine that has no checkout of
+    # it -- a Colab VM following the notebook. It is the code that machine is
+    # about to run as a runner, gated on the credential that lets it be one.
+    "/runner/bundle.zip",
 )
 
 
