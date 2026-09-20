@@ -725,7 +725,7 @@ def _load_model(path: Path, arch: dict, ctx: Any, torch,
         optional["attn_implementation"] = attn["implementation"]
     model = attentionfit.load_base_model(
         AutoModelForCausalLM, str(path), {"dtype": torch.float32}, optional,
-        ctx)
+        ctx, attn)
 
     embedding = model.get_input_embeddings().weight.numel()
     total = sum(p.numel() for p in model.parameters())

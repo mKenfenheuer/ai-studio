@@ -59,6 +59,12 @@ ENV MIOPEN_USER_DB_PATH=/data/miopen \
     MIOPEN_CUSTOM_CACHE_DIR=/data/miopen \
     TRITON_CACHE_DIR=/data/triton
 
+# The grammar engine behind `response_format`. Pure Python and tiny, and
+# deliberately in a layer of its own AFTER the expensive build above: putting
+# it on the same pip line would invalidate the bitsandbytes source compile
+# every time this pin moves, and that compile is the long pole in this image.
+RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
+
 COPY runner /app/runner
 COPY common /app/common
 COPY pyproject.toml /app/

@@ -44,7 +44,22 @@ COMFORTABLE_SEQ_MATH = 2048
 _BACKENDS = {
     "flash": ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "MATH"),
     "mem_efficient": ("EFFICIENT_ATTENTION", "MATH"),
+    # FlexAttention does not go through SDPA at all -- it compiles its own
+    # kernel -- so the backend list here is only what the REST of the model
+    # falls back to. MATH, because a card that reaches this line has no
+    # working SDPA kernel; that is why it is using Flex in the first place.
+    "flex": ("MATH",),
     "math": ("MATH",),
+}
+
+# What to ask transformers for, per kind. Flex is the only one that is not
+# `sdpa`: transformers routes to `torch.nn.attention.flex_attention` when
+# asked by name, and to a kernel somebody shipped otherwise.
+_IMPLEMENTATION = {
+    "flash": "sdpa",
+    "mem_efficient": "sdpa",
+    "flex": "flex_attention",
+    "math": "sdpa",
 }
 
 
@@ -59,20 +74,29 @@ def report(caps: dict | None) -> dict:
     attn = ((caps or {}).get("attention") or {})
     flash = bool(attn.get("flash"))
     mem_efficient = bool(attn.get("mem_efficient"))
-    kind = "flash" if flash else ("mem_efficient" if mem_efficient else "math")
+    # Last, because it is the slowest of the three and the most likely to be
+    # recompiled at an awkward moment -- a shipped kernel is preferred to one
+    # that has to be built. It is still fused, and that is what matters for
+    # every memory decision downstream.
+    flex = bool(attn.get("flex"))
+    kind = ("flash" if flash else "mem_efficient" if mem_efficient
+            else "flex" if flex else "math")
     fused = kind != "math"
     return {
         "flash": flash,
         "mem_efficient": mem_efficient,
+        "flex": flex,
         "fused": fused,
         "kind": kind,
-        # Which of transformers' attention paths to ask for. `sdpa` either way:
-        # even with no fused backend behind it, torch's math SDPA keeps fewer
-        # copies of the scores than transformers' eager path, which upcasts
-        # them to fp32 in a separate tensor. The job retries with `eager` if
-        # the model has no SDPA implementation, so this is a preference rather
-        # than a requirement.
-        "implementation": "sdpa",
+        # Which of transformers' attention paths to ask for. `sdpa` unless
+        # Flex is the only fused option: even with no fused backend behind it,
+        # torch's math SDPA keeps fewer copies of the scores than
+        # transformers' eager path, which upcasts them to fp32 in a separate
+        # tensor. The job drops the argument if the model or the library will
+        # not take it, so this is a preference rather than a requirement --
+        # and where the preference was Flex, dropping it means the run is
+        # quadratic after all, which the job says out loud.
+        "implementation": _IMPLEMENTATION[kind],
         "backends": list(_BACKENDS[kind]),
         # Environment the job has to set for the above to be true. Empty on
         # almost every machine; see `runner/capabilities.py` for the one case
@@ -123,5 +147,9 @@ def describe(caps: dict | None) -> str:
     if rep["kind"] == "mem_efficient":
         return ("the memory-efficient attention kernel, which costs the same "
                 "memory as flash attention and rather less speed")
+    if rep["kind"] == "flex":
+        return ("FlexAttention, which compiles a tiled kernel of its own "
+                "rather than calling one this card has no build of -- the "
+                "same linear memory, at the cost of a compile on first use")
     return ("no fused attention kernel, so attention memory grows with the "
             "square of sequence length")

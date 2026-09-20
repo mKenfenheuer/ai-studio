@@ -60,7 +60,7 @@ _ATTENTION_RETRY_ENV = {"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"}
 _ATTENTION_PROBE = r"""
 import json, warnings
 warnings.filterwarnings("ignore")
-out = {"flash_attn": False, "mem_efficient_attn": False}
+out = {"flash_attn": False, "mem_efficient_attn": False, "flex_attn": False}
 try:
     import torch
     if torch.cuda.is_available():
@@ -76,6 +76,14 @@ try:
                 out[key] = True
             except Exception:
                 out[key] = False
+        try:
+            from torch.nn.attention.flex_attention import flex_attention
+            fq = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
+            torch.compile(flex_attention, dynamic=False)(fq, fq, fq)
+            torch.cuda.synchronize()
+            out["flex_attn"] = True
+        except Exception:
+            out["flex_attn"] = False
 except Exception:
     pass
 print("RESULT:" + json.dumps(out))
@@ -87,7 +95,8 @@ import json, sys, warnings
 warnings.filterwarnings("ignore")
 out = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
        "bnb_optim": False, "bnb_4bit_error": None, "bnb_4bit_decode_error": None,
-       "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
+       "flash_attn": False, "mem_efficient_attn": False, "flex_attn": False,
+       "bnb_error": None}
 try:
     import torch
     dev = "cuda" if torch.cuda.is_available() else None
@@ -104,6 +113,26 @@ try:
                 out[key] = True
             except Exception:
                 out[key] = False
+        # FlexAttention, which is a different answer to the same question:
+        # instead of calling a kernel somebody shipped, it COMPILES one with
+        # Triton. That matters here because ROCm's flash and memory-efficient
+        # kernels come from AOTriton, whose architecture list is short, while
+        # Triton itself supports rather more cards -- so a GPU with neither
+        # kernel can still get tiled attention that never writes the scores
+        # matrix. Worth minutes of probing for four times the sequence length.
+        #
+        # Compiled here rather than assumed, because "the import works" and
+        # "the kernel runs on this card" have already been shown to be
+        # different facts on this hardware.
+        try:
+            from torch.nn.attention.flex_attention import flex_attention
+            fq = torch.randn(1, 4, 256, 64, device=dev, dtype=torch.float16)
+            compiled = torch.compile(flex_attention, dynamic=False)
+            compiled(fq, fq, fq)
+            torch.cuda.synchronize()
+            out["flex_attn"] = True
+        except Exception:
+            out["flex_attn"] = False
         # Emit attention results before touching bitsandbytes: if bnb aborts
         # the process, the parent still learns what we proved up to here.
         sys.stderr.write("PARTIAL:" + json.dumps(out) + "\n")
@@ -187,7 +216,8 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
     fallback = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
                 "bnb_optim": False, "bnb_4bit_error": None,
                 "bnb_4bit_decode_error": None,
-                "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
+                "flash_attn": False, "mem_efficient_attn": False,
+                "flex_attn": False, "bnb_error": None}
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _SUBPROCESS_PROBE],
@@ -347,8 +377,8 @@ def probe(quick: bool = False) -> dict:
         "torch_version": None,
         "dtypes": {},
         "quantization": {"4bit": False, "8bit": False, "optim_8bit": False},
-        "attention": {"flash": False, "mem_efficient": False, "math": True,
-                      "env": {}},
+        "attention": {"flash": False, "mem_efficient": False, "flex": False,
+                      "math": True, "env": {}},
         "recommended_dtype": "float32",
         "warnings": [],
         "notes": [],
@@ -371,6 +401,12 @@ def probe(quick: bool = False) -> dict:
     # matter for the same reason on the CPU-bound stages -- decoding a
     # thousand images a step is not GPU work.
     caps["libraries"] = _libraries()
+    # Said in its own key as well as in the library list, because it is a
+    # promise the serving API makes to callers rather than a package somebody
+    # installed. A runner whose image predates this reports False and the
+    # controller refuses the request in words instead of ignoring the field.
+    caps["constrained_decoding"] = bool(
+        caps["libraries"].get("lmformatenforcer"))
     caps["cpu_cores"] = os.cpu_count()
     caps["ram_gb"] = _ram_gb()
 
@@ -440,6 +476,7 @@ def probe(quick: bool = False) -> dict:
         caps["attention"] = {
             "flash": sub["flash_attn"],
             "mem_efficient": sub["mem_efficient_attn"],
+            "flex": sub.get("flex_attn", False),
             "math": True,
             "env": attn_env,
         }
@@ -462,7 +499,12 @@ def probe(quick: bool = False) -> dict:
 # only -- versions are the job's problem -- and checked without importing
 # torch-heavy packages fully where a lighter probe exists.
 _LIBRARIES = ("torchvision", "torchaudio", "diffusers", "PIL", "soundfile",
-              "librosa", "timm", "transformers", "peft", "datasets")
+              "librosa", "timm", "transformers", "peft", "datasets",
+              # The grammar engine behind `response_format`. Reported because
+              # the controller must be able to tell "this machine will hold a
+              # reply to your schema" from "this machine will ignore that you
+              # asked", and answer differently -- see runner/grammar.py.
+              "lmformatenforcer")
 
 
 def _libraries() -> dict:

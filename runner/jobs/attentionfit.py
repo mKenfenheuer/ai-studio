@@ -37,7 +37,7 @@ _OPTIONAL_KWARG_HINTS = {
 
 
 def load_base_model(cls, name: str, required: dict, optional: dict,
-                    ctx: Any) -> Any:
+                    ctx: Any, plan: dict | None = None) -> Any:
     """Load a model, dropping the optional arguments this one will not take.
 
     Both of the optional arguments used here -- which attention path to use,
@@ -64,8 +64,23 @@ def load_base_model(cls, name: str, required: dict, optional: dict,
             if dropped is None:
                 raise
             attempt.pop(dropped)
-            ctx.log("This model does not accept %s, so it is being loaded "
-                    "without it." % dropped, "warn")
+            if dropped == "attn_implementation" and plan and plan.get("fused")                     and not (plan.get("flash") or plan.get("mem_efficient")):
+                # The plan said this run would be fused, the memory estimate
+                # was written against that, and the only thing making it true
+                # was the argument that has just been refused. Said in terms
+                # of the consequence rather than the argument, because the
+                # consequence is what somebody has to act on: attention is
+                # quadratic again, and the sequence length that was going to
+                # fit may not.
+                ctx.log("This model has no FlexAttention path, so attention "
+                        "falls back to the method whose memory grows with the "
+                        "square of sequence length. The plan for this run "
+                        "assumed otherwise -- if it stops for lack of memory, "
+                        "sequence length is the first thing to bring down.",
+                        "warn")
+            else:
+                ctx.log("This model does not accept %s, so it is being loaded "
+                        "without it." % dropped, "warn")
 
 
 # The most of the card's free memory the attention scores may claim. The rest

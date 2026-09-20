@@ -18,7 +18,7 @@ from common.formatting import (conversation_style, detect_format,
 from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import attention_plan, expert_kernel
 
-from . import attentionfit, merge, source
+from . import attentionfit, chunkedloss, merge, source
 
 # How much of the training set is held back to measure honestly. A fine-tune
 # had no held-out set at all until now, which meant the only number on screen
@@ -433,7 +433,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     if kernel:
         optional["experts_implementation"] = kernel
     model = attentionfit.load_base_model(
-        AutoModelForCausalLM, base_model, load_kwargs, optional, ctx)
+        AutoModelForCausalLM, base_model, load_kwargs, optional, ctx, attn)
     if not use_4bit:
         model = model.to(device)
     model.config.use_cache = False
@@ -967,10 +967,33 @@ def run(cfg: dict, ctx: Any) -> dict:
             with torch.amp.autocast("cuda", dtype=torch_dtype,
                                     enabled=device == "cuda"
                                     and torch_dtype != torch.float32):
-                total += float(model(**vb).loss)
+                total += float(compute_loss(vb))
             n += 1
         model.train()
         return total / max(n, 1)
+
+    # Whether the output layer's logits are big enough to be worth computing
+    # in slices, and whether doing so gives this model's own answer. Settled
+    # here, against a real batch, before the first step -- see
+    # `chunkedloss.enable` for why it is verified rather than assumed.
+    sliced_loss = False
+    try:
+        probe_batch = next(iter(loader))
+        sliced_loss = chunkedloss.enable(
+            model, {k: v.to(device) for k, v in probe_batch.items()}, torch,
+            ctx, max_seq, bs,
+            int(getattr(model.config, "vocab_size", 0) or 0))
+        del probe_batch
+    except StopIteration:
+        pass
+
+    def compute_loss(b: dict):
+        """This batch's loss, in slices where that was proven equivalent."""
+        if sliced_loss:
+            out = chunkedloss.loss(model, b, torch)
+            if out is not None:
+                return out
+        return model(**b).loss
 
     model.train()
     step = start_step
@@ -1017,7 +1040,7 @@ def run(cfg: dict, ctx: Any) -> dict:
             batch = {k: v.to(device) for k, v in batch.items()}
             autocast_on = device == "cuda" and torch_dtype != torch.float32
             with torch.amp.autocast("cuda", dtype=torch_dtype, enabled=autocast_on):
-                loss = model(**batch).loss / accum
+                loss = compute_loss(batch) / accum
             if use_scaler:
                 scaler.scale(loss).backward()
             else:

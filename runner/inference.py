@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 from common import conversation, formatting
 
-from . import artifacts, capabilities
+from . import artifacts, capabilities, grammar as grammars
 
 CACHE_DIR = artifacts.CACHE_DIR
 
@@ -135,6 +135,25 @@ def _is_oom(e: BaseException) -> bool:
     return "out of memory" in str(e).lower()
 
 
+def _with_instruction(messages: list, instruction: str) -> list:
+    """The conversation with the format instruction added to its system turn.
+
+    Appended to the existing system message rather than inserted as a second
+    one. Two system turns is a shape most chat templates have never seen -- a
+    few render only the first, and a few refuse outright -- so a reply would
+    come back unconstrained-looking for a reason nobody could find from the
+    request. A conversation with no system turn at all gets one.
+    """
+    out = [dict(m) for m in messages]
+    for m in out:
+        if m.get("role") in ("system", "developer"):
+            existing = (m.get("content") or "").rstrip()
+            m["content"] = ("%s\n\n%s" % (existing, instruction) if existing
+                            else instruction)
+            return out
+    return [{"role": "system", "content": instruction}] + out
+
+
 class _Resident:
     """One model on the card, and everything that describes it.
 
@@ -143,12 +162,18 @@ class _Resident:
     every message.
     """
     __slots__ = ("job_id", "model", "tok", "chat_template", "specials",
-                 "quantized", "params_b", "added_tokens", "last_used")
+                 "quantized", "params_b", "added_tokens", "last_used",
+                 # Work that belongs to this model and costs too much to redo
+                 # per request. Only the grammar's vocabulary table so far,
+                 # which takes tens of seconds to build on a 152k vocabulary
+                 # and depends on nothing but the tokenizer.
+                 "derived")
 
     def __init__(self, job_id: str, model, tok, chat_template, specials,
                  quantized: bool, params_b: float | None,
                  added_tokens: list[str]):
         self.job_id = job_id
+        self.derived: dict = {}
         self.model = model
         self.tok = tok
         self.chat_template = chat_template
@@ -880,12 +905,22 @@ class ModelHost:
             self.last_used = time.time()
 
             want_reasoning = bool(params.get("reasoning"))
+
+            # What the reply is being held to, if anything. Built before the
+            # prompt is rendered, because a grammar puts the schema in front
+            # of the model as well as behind the sampler -- see
+            # `grammar.Grammar.instruction` for why both are worth doing.
+            resident = self._residents.get(spec["job_id"])
+            grammar = grammars.build(spec.get("response_format"), tok,
+                                     resident.derived if resident else {}, log)
+            if grammar is not None:
+                messages = _with_instruction(messages, grammar.instruction())
+
             fmt, text = self.render(spec, messages, want_reasoning, log)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
             # Everything this exact template writes around a message, read off
             # the template itself. What the stream may not show half of.
-            resident = self._residents.get(spec["job_id"])
             markers = formatting.boundary_markers(
                 fmt, self.specials,
                 added=resident.added_tokens if resident else None)
@@ -983,6 +1018,32 @@ class ModelHost:
                 past = out.past_key_values
                 logits = out.logits[:, -1, :].float()
 
+                # FIRST, before temperature, top-k and top-p. Those three
+                # reshape a distribution; this one decides which tokens are in
+                # it at all, and a token ruled out by the grammar must not be
+                # able to win a sample no matter how confident the model is.
+                #
+                # Applied by addition rather than assignment so a token the
+                # grammar allows keeps its score: the model still chooses, it
+                # simply chooses from the legal moves.
+                if grammar is not None:
+                    allowed = grammar.allowed(produced)
+                    if not allowed:
+                        # The grammar has painted itself into a corner: no
+                        # token continues the reply and none ends it. Said out
+                        # loud rather than falling back to unconstrained
+                        # sampling, which would hand back the one thing this
+                        # whole file exists to prevent -- text that does not
+                        # match the format it was promised to match.
+                        raise RuntimeError(
+                            "The reply could not be completed in the format "
+                            "it was asked for: no token left continues it. "
+                            "This usually means a schema no text can satisfy.")
+                    keep = torch.full_like(logits, float("-inf"))
+                    keep[0, torch.tensor(allowed, device=logits.device,
+                                         dtype=torch.long)] = 0.0
+                    logits = logits + keep
+
                 if temperature <= 0:
                     nxt = torch.argmax(logits, dim=-1, keepdim=True)
                 else:
@@ -1069,6 +1130,14 @@ class ModelHost:
             # out of what is stored and handed back.
             content = formatting.strip_special(reply["content"])
             reasoning = formatting.strip_special(reply["reasoning"])
+
+            # The last word on whether the promise was kept. Checked on the
+            # text that is actually about to be returned -- after the format
+            # markers have been stripped and the reply reassembled -- because
+            # that is the string the caller will parse, and an earlier check
+            # would be checking something else. See grammar.Grammar.validate.
+            if grammar is not None:
+                grammar.validate(content)
             return {
                 # The fallback is for a reply nothing could be made of: hand
                 # back the raw text rather than nothing. It must NOT fire when

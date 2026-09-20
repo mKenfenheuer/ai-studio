@@ -52,6 +52,12 @@ RUN pip install --no-cache-dir \
         "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
         "datasets>=2.20" "Pillow>=10"
 
+# The grammar engine behind `response_format`. Pure Python and tiny, and
+# deliberately in a layer of its own AFTER the expensive build above: putting
+# it on the same pip line would invalidate the bitsandbytes source compile
+# every time this pin moves, and that compile is the long pole in this image.
+RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
+
 # llama.cpp, for turning a finished model into the one file everything outside
 # this studio wants. Two pieces: a Python converter that reads safetensors and
 # writes GGUF, and a compiled `llama-quantize` that shrinks it.

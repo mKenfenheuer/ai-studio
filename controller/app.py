@@ -2594,7 +2594,7 @@ def _serves_models(r: dict) -> bool:
     return not kinds or bool(kinds & _SERVING_KINDS)
 
 
-def _pick_chat_runner(job: dict) -> tuple[str, dict]:
+def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict]:
     """The best machine to talk to this model on, of the ones that can.
 
     In order: one that can actually serve, then one that already has the model
@@ -2614,6 +2614,13 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
         if fleet.busy.get(r["id"]):
             return False
         caps = r["capabilities"] or {}
+        if needs_grammar and not caps.get("constrained_decoding"):
+            # A reply asked to match a schema may only go to a machine that
+            # can hold it to one. Filtered rather than refused outright, so a
+            # fleet where one runner has an older image still serves the
+            # request from the machine that can -- and the refusal below,
+            # when nothing can, says which capability was missing.
+            return False
         params_b = job["config"].get("params_b")
         if job["kind"] != "pretrain_llm" and params_b and caps.get("vram_gb"):
             # Serving needs the base model resident but no optimiser state, so
@@ -2670,6 +2677,15 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
         if usable(r):
             return r["id"], r
     busy = [r["name"] for r in ordered if fleet.busy.get(r["id"])]
+    if needs_grammar and not any(
+            (r["capabilities"] or {}).get("constrained_decoding")
+            for r in ordered):
+        # Said before "busy" and before "too big", because it is the one
+        # refusal here that no amount of waiting fixes.
+        raise HTTPException(400,
+            "No connected machine can hold a reply to a format: none of them "
+            "has the grammar engine in its runner image. Update the runners, "
+            "or ask for `response_format: {\"type\": \"text\"}`.")
     if busy:
         raise HTTPException(400,
             "%s is training right now. Wait for the run to finish, or connect "

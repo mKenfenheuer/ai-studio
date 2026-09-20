@@ -236,7 +236,7 @@ screen. When a run finishes, the **Playground** lets you talk to it.
 | **Fine-tuning** | LoRA and QLoRA over any Hugging Face causal LM, with the exact training string previewed before the run starts. Produces the adapter *and* the adapter merged into its base as a standalone model. |
 | **Training from scratch** | Trained tokenizer, packed corpus, held-out loss charted beside training loss, and live text samples so you can watch noise become sentences. Design the architecture yourself, with every combination checked against your card as you type. |
 | **Evaluation** | Prompt sets with expected answers, scored across several runs in one job (loss, exact match, token F1) with a paired significance test that refuses to name a winner it cannot defend. Standard benchmarks are run with the exact recipe the published number comes from. |
-| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Concurrent requests queue rather than fail; past the queue's bound the answer is `429` with a `Retry-After`. Options that cannot be honoured (`n` above 1, `logprobs`, `response_format` beyond `text`, `tool_choice: required`) are refused with a `400` rather than accepted and ignored. Pin a model to a card with a deployment so it stays warm. |
+| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Concurrent requests queue rather than fail; past the queue's bound the answer is `429` with a `Retry-After`. `response_format` is enforced by constrained decoding, not requested in the prompt: tokens that would break the grammar are ruled out before each one is chosen, so a reply asked for as JSON could not have been written any other way. Options that genuinely cannot be honoured (`n` above 1, `logprobs`, `tool_choice: required`) are refused with a `400` rather than accepted and ignored. Pin a model to a card with a deployment so it stays warm. |
 | **Operations** | Which models are loaded where, tokens per second, failure rates, and per-key usage. Reserve a machine for serving or for training. |
 | **Synthetic data** | Have a large hosted model (OpenAI, Azure OpenAI, Anthropic, or anything OpenAI-shaped) write the dataset your own small model trains on. |
 | **Publishing** | Push a finished model or dataset to the Hugging Face Hub, with a generated model card carrying the scores that were actually measured. Export to GGUF for llama.cpp. |
@@ -308,6 +308,24 @@ On a machine with neither kernel, and without anybody choosing it:
 - the sequence length that was asked for is still trained at. It is a cost, not
   a limit, and the run says what the cost is instead of quietly shortening
   everybody's examples.
+
+Three further levers apply whether or not attention is fused, and all three are
+automatic:
+
+- **the loss is computed in slices.** At 4,096 tokens against a 152k-token
+  vocabulary the logits are ~1.24 GB *per copy* and the cross-entropy path
+  keeps about five — larger than the attention scores beside them. Each slice
+  is rebuilt during its own backward pass, so the peak is one slice rather than
+  the whole sequence. Verified against the model's own loss on a real batch
+  before it is used, and abandoned if the two disagree.
+- **FlexAttention is probed for.** It compiles a tiled kernel with Triton
+  instead of calling one from AOTriton, whose architecture list is the shorter
+  of the two — so a card with neither flash nor memory-efficient attention may
+  still get linear-memory attention. Measured, never assumed.
+- **the allocator is asked to grow rather than fragment**
+  (`expandable_segments`), because at a long context one enormous allocation
+  arriving and leaving every step is what turns "fits on paper" into an
+  out-of-memory.
 
 ---
 

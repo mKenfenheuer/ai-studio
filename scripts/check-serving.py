@@ -7,10 +7,10 @@ Two faults live here, and they are opposites of each other.
 
 The first is accepting an option and ignoring it. The server refuses `n`,
 `logprobs` and `tool_choice: "required"` for exactly this reason, and
-`response_format` was the one that slipped through -- the sharpest case of the
-lot, because a caller asking for a JSON schema has stopped checking the reply.
-Prose returned under a schema goes straight into whatever the schema was going
-to fill in.
+`response_format` was the one that slipped through. It is neither ignored nor
+refused now: it is ENFORCED, by constraining what the sampler may pick --
+scripts/check-grammar.py checks that half. What is checked here is the shape of
+the field and the combinations that cannot be honoured alongside it.
 
 The second is refusing something that should simply have waited. A runner holds
 one model on one card and answers one message at a time, so a second request
@@ -93,21 +93,35 @@ def options() -> None:
     check("`tool_choice: none` is not, because it can be honoured",
           refusal({"tool_choice": "none"})[0], None)
 
-    print("\n...including response_format, which used to be accepted silently")
-    check("a JSON schema is refused",
+    print("\n...and response_format, which is enforced rather than refused")
+    # This used to be a refusal, because nothing constrained decoding. It is
+    # now kept by constraining the sampler -- scripts/check-grammar.py checks
+    # that half. What is checked here is the shape of the field, and the two
+    # combinations that would need the model to write something the grammar
+    # forbids.
+    check("a JSON schema is accepted",
           refusal({"response_format": {"type": "json_schema",
-                                       "json_schema": {"name": "x"}}})[0], 400)
-    check("and says why, in terms of what it cannot promise",
-          "constrain" in refusal({"response_format":
-                                  {"type": "json_schema"}})[1])
-    check("a bare JSON object is refused too",
-          refusal({"response_format": {"type": "json_object"}})[0], 400)
+                                       "json_schema": {"schema": {}}}})[0],
+          None)
+    check("so is a bare JSON object",
+          refusal({"response_format": {"type": "json_object"}})[0], None)
     check("`text` is accepted, because it promises nothing",
           refusal({"response_format": {"type": "text"}})[0], None)
+    check("a json_schema with no schema to enforce is refused",
+          refusal({"response_format": {"type": "json_schema",
+                                       "json_schema": {"name": "x"}}})[0], 400)
     check("an unknown type is refused",
           refusal({"response_format": {"type": "yaml"}})[0], 400)
     check("and so is one that is not an object at all",
           refusal({"response_format": "json"})[0], 400)
+    check("tools alongside a format is refused, not silently dropped",
+          refusal({"response_format": {"type": "json_object"},
+                   "tools": [{"type": "function"}]})[0], 400)
+    check("and so is reasoning, for the same reason",
+          refusal({"response_format": {"type": "json_object"},
+                   "reasoning": True})[0], 400)
+    check("tools on their own are still fine",
+          refusal({"tools": [{"type": "function"}]})[0], None)
 
 
 async def queueing() -> None:

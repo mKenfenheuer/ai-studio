@@ -23,6 +23,7 @@ numbers that changed somebody's mind.
 - [Two lessons the hardware probe encodes](#two-lessons-the-probe-encodes)
 - [Working around a missing attention kernel](#working-around-a-missing-attention-kernel)
 - [One card, one reply at a time](#one-card-one-reply-at-a-time)
+- [Making response_format a promise](#making-response_format-a-promise)
 - [One rule in the web UI](#one-rule-in-the-web-ui)
 
 ---
@@ -534,14 +535,54 @@ the request would then be sent anyway the moment the slot came free.
 `response_format` was accepted and ignored, which is the one failure this API
 is written to avoid: a caller that asks for a JSON schema has stopped checking
 the reply, so prose returned under it goes wherever the schema was going to go.
-It is a `400` now, like `n`, `logprobs` and `tool_choice: "required"` — nothing
-here constrains decoding, so neither of `response_format`'s two promises can be
-kept.
+It was briefly a `400`, and is now enforced — see the next section.
 
 Writing the check for it turned up that `logprobs` was never refused either.
 The guard was a loop over `(None, False, 1)`, where the `1` was meant for `n`
 — and `True == 1` in Python, so `logprobs: true` passed the test written to
 reject it. The fields are checked one at a time now.
+
+---
+
+## Making response_format a promise
+
+Nothing in a prompt is binding. A model asked for JSON usually writes JSON, and
+"usually" is exactly the wrong guarantee for a field whose entire purpose is
+that the caller has stopped checking.
+
+What is binding is the sampler. Before each token is chosen, every token that
+would break the grammar is scored at negative infinity, so the model picks from
+the legal moves. The reply is not checked against the schema afterwards and
+never repaired — it could not have been written in another shape. The schema is
+*also* put in the prompt, which changes nothing about validity and a great deal
+about whether the fields are filled with the answer or with a guess.
+
+**The grammar is a dependency, and the training loop next door is not.** That
+looks inconsistent and is not. The training loop is hand-written to escape an
+API that churns. A grammar is either correct or it emits `{"a": 01.}` at three
+in the morning; JSON's escaping, number syntax and unicode rules are a
+well-known source of subtle bugs, and correctness-critical, bounded and already
+solved is the shape of problem a dependency is for.
+
+**It still needs a guard, and finding out why is the point of the check.** The
+check drives a model that picks *uniformly at random* from whatever the mask
+allows — a maximally unhelpful model that would write "Sure! Here's the JSON:"
+if it could. Two real failures fell out of it:
+
+- raw tabs and newlines are accepted inside a JSON string, which RFC 8259
+  forbids and `json.loads` rejects;
+- an internal parser error is handled by allowing only end-of-text, which stops
+  the reply wherever it stands — mid-string, if that is where it was.
+
+Failing open is a reasonable default for a library that cannot know what its
+caller promised. It is not a reasonable default here. So the finished reply is
+parsed, and validated against the schema, before it is handed over; a reply
+that fails becomes an error. A reply that is nearly JSON is worth less than an
+error, because the error is the only one of the two anybody notices.
+
+The same check also disproved a plausible-looking assertion of mine: `6e9` is a
+valid `integer` by JSON Schema, which counts any number with a zero fractional
+part. `8e-15` is not, and is refused. The test was wrong, not the code.
 
 ---
 

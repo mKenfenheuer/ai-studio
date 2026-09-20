@@ -30,9 +30,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common import attention  # noqa: E402
 from controller import architectures as arch  # noqa: E402
+from runner.jobs import chunkedloss  # noqa: E402
 from runner.jobs.attentionfit import _largest_divisor  # noqa: E402
 
 FAILED: list[str] = []
+
+# A blank line before each heading, named so it survives being written by a
+# patch script rather than typed.
+NL = chr(10)
 
 FLASH = {"backend": "cuda", "vram_gb": 24.0,
          "attention": {"flash": True, "mem_efficient": True, "math": True}}
@@ -120,6 +125,54 @@ def main() -> int:
           arch.training_memory_gb(shape, 1, checkpointing=True,
                                   fused=attention.is_fused(MEM_EFF))["total_gb"],
           fused_gb)
+
+    print(NL + "The output layer, which is larger than the attention it sits by")
+    # 4096 tokens x 151,936 vocabulary x 2 bytes = 1.24 GB for ONE copy, and
+    # the cross-entropy path keeps about five. Against that, one layer's
+    # attention scores at batch 1 and 32 heads are 2 GB -- so on a large
+    # vocabulary the term nobody mentions is three times the one everybody
+    # does, and it does not care what attention kernel the card has.
+    check("a long context on a large vocabulary is worth slicing",
+          chunkedloss.worth_it(4096, 1, 151936))
+    check("and is bigger than one layer of attention scores",
+          4096 * 151936 * 2 * 5 > attention.scores_bytes(1, 32, 4096))
+    check("a small vocabulary at a short length is not worth it",
+          chunkedloss.worth_it(512, 1, 8192), False)
+    check("nor is a short context on a large vocabulary",
+          chunkedloss.worth_it(256, 1, 151936), False)
+    check("but a large batch of short rows is",
+          chunkedloss.worth_it(512, 16, 151936))
+
+    print(NL + "Finding the body and the head through however it is wrapped")
+
+    class Head:
+        pass
+
+    class Real:
+        def __init__(self):
+            self.body, self.head = object(), Head()
+
+        def get_decoder(self):
+            return self.body
+
+        def get_output_embeddings(self):
+            return self.head
+
+    class Wrapper:
+        """A PEFT-shaped wrapper that does NOT forward the two methods."""
+
+        def __init__(self, inner):
+            self.base_model = inner
+
+    real = Real()
+    check("an ordinary model gives up its two halves",
+          chunkedloss.parts(real), (real.body, real.head))
+    check("and so does one behind a wrapper",
+          chunkedloss.parts(Wrapper(real)), (real.body, real.head))
+    check("two wrappers deep, as PEFT actually nests",
+          chunkedloss.parts(Wrapper(Wrapper(real))), (real.body, real.head))
+    check("a model that exposes neither is left alone",
+          chunkedloss.parts(object()), None)
 
     print()
     if FAILED:

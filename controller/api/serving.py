@@ -37,12 +37,20 @@ it will ignore them.
 DeepSeek API emit, and what most clients read) and as `reasoning`, kept apart
 from `content` rather than left inline for the client to strip.
 
-Not implemented, and not faked: `n` above 1, `logprobs`, embeddings, and
-`response_format` beyond `{"type": "text"}`. A field that is accepted and
-ignored is worse than one that is refused -- it produces a client that believes
-it asked for something. `response_format` is the sharpest case: a caller that
-asks for a schema has stopped checking the reply, so returning prose under it
-puts the prose wherever the schema was going to go.
+Not implemented, and not faked: `n` above 1, `logprobs`, embeddings. A field
+that is accepted and ignored is worse than one that is refused -- it produces a
+client that believes it asked for something.
+
+**`response_format` is enforced, not requested.** `json_object` and
+`json_schema` are kept by constraining the sampler: at every step the tokens
+that would break the grammar are scored at negative infinity before anything is
+chosen, so the reply could not have been written in any other shape. It is not
+checked afterwards and never repaired. The schema is also shown to the model,
+which changes nothing about validity and a great deal about whether the fields
+are filled with the answer or with a guess. `tools` and `reasoning` are refused
+alongside it, because both would need the model to write something the grammar
+forbids. A machine whose image has no grammar engine is not sent these requests
+at all, and if no machine has one the request is refused saying so.
 
 **Concurrency.** A runner holds one model on one card and answers one message
 at a time. Requests that arrive meanwhile are QUEUED, not refused -- an
@@ -302,10 +310,18 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
     """Send the request to a runner and return (request_id, queue, runner_id)."""
     from ..app import _pick_chat_runner        # local: avoids an import cycle
 
-    runner_id, _runner = _pick_chat_runner(job)
+    fmt = payload.get("response_format") or {}
+    constrained = (fmt.get("type") or "text") != "text"
+    runner_id, _runner = _pick_chat_runner(job, needs_grammar=constrained)
     spec = spec_for.chat_spec(job)
     if config.HF_TOKEN:
         spec["hf_token"] = config.HF_TOKEN
+    if constrained:
+        # Travels on the spec, beside `tools` and `stop`, because the runner
+        # needs it before it renders the prompt: the schema is shown to the
+        # model as well as enforced on the sampler, and the two have to be the
+        # same schema.
+        spec["response_format"] = fmt
     # Tools travel on the spec because that is where the runner reads them
     # when it renders the prompt -- the same field the playground fills, so a
     # tool declared over this API is declared to the model in exactly the same
@@ -378,39 +394,47 @@ def unsupported_options(payload: dict):
         return _error(400, "`logprobs` is not supported. Token probabilities "
                            "are not available.")
 
-    # `response_format` carries two promises, and this server can keep
-    # neither: `json_object` promises the reply parses as JSON, and
-    # `json_schema` promises it matches a schema. Both are kept by constrained
-    # decoding -- masking the tokens that would break the grammar at each
-    # step -- and nothing here masks anything.
+    # `response_format` carries two promises -- `json_object` promises the
+    # reply parses as JSON, `json_schema` promises it matches a schema -- and
+    # both are now kept, by constraining what the sampler may pick rather than
+    # by asking the model nicely. See runner/grammar.py.
     #
-    # This is the field it was worst to accept quietly, because the client
-    # that sets it is precisely the client that has stopped checking. A tagger
-    # asking for a schema and getting prose does not raise; it writes the
-    # prose into whatever it was filling in. `{"type": "text"}` is the default
-    # and promises nothing, so it is the one shape that is honoured.
+    # What is refused here is the shape of the field, and the two requests
+    # that ask for a format and something incompatible with it in the same
+    # breath. Whether the MACHINE can enforce it is a separate question with a
+    # separate answer, asked once a machine has been chosen.
     fmt = payload.get("response_format")
-    if isinstance(fmt, dict):
-        kind = fmt.get("type")
-        if kind == "json_schema":
-            return _error(400, "`response_format: \"json_schema\"` cannot be "
-                               "honoured: this server does not constrain "
-                               "decoding, so a reply cannot be guaranteed to "
-                               "match a schema. Describe the shape you want "
-                               "in the prompt and check what comes back.")
-        if kind == "json_object":
-            return _error(400, "`response_format: \"json_object\"` cannot be "
-                               "honoured: this server does not constrain "
-                               "decoding, so a reply cannot be guaranteed to "
-                               "parse as JSON. Ask for JSON in the prompt and "
-                               "check what comes back.")
-        if kind not in (None, "text"):
-            return _error(400, "`response_format` may be {\"type\": \"text\"}. "
-                               "Anything stronger would need constrained "
-                               "decoding, which this server does not do.")
-    elif fmt is not None:
+    if fmt is not None and not isinstance(fmt, dict):
         return _error(400, "`response_format` must be an object, such as "
                            "{\"type\": \"text\"}.")
+    kind = (fmt or {}).get("type") or "text"
+    if kind not in ("text", "json_object", "json_schema"):
+        return _error(400, "`response_format.type` may be \"text\", "
+                           "\"json_object\" or \"json_schema\"; this "
+                           "request asked for %r." % kind)
+    if kind == "json_schema":
+        block = (fmt or {}).get("json_schema")
+        schema = block.get("schema") if isinstance(block, dict) else None
+        if not isinstance(schema, dict):
+            return _error(400, "`response_format: \"json_schema\"` needs the "
+                               "schema at `response_format.json_schema."
+                               "schema`. Use `json_object` to ask only for "
+                               "valid JSON of any shape.")
+    if kind != "text":
+        # Both of these would be honoured by producing something the grammar
+        # forbids, so one of the two promises would have to give way. Which
+        # one is not ours to choose quietly.
+        if payload.get("tools"):
+            return _error(400, "`tools` and `response_format` cannot both be "
+                               "asked for: a tool call is not a value of the "
+                               "format the reply is being held to, so the "
+                               "model would be unable to make one.")
+        if payload.get("reasoning"):
+            return _error(400, "`reasoning` and `response_format` cannot both "
+                               "be asked for: the reply is constrained to the "
+                               "format from its first token, which leaves no "
+                               "room for the model to work through anything "
+                               "first.")
 
     # `tool_choice` is honoured only where it can be. Nothing here constrains
     # decoding, so "you must call a tool" cannot be promised -- and a request
