@@ -107,6 +107,14 @@ class Fleet:
         # so the reconciler does not send a second one every five seconds
         # while the first is still fetching fourteen gigabytes.
         self.deploying: dict[str, float] = {}   # deployment_id -> sent at
+        # How many times each deployment has been sent without ever reaching
+        # "ready". The state machine already skips a deployment marked failed,
+        # and that was enough for every way a load can fail EXCEPT the one
+        # that matters most: a load that kills the runner reports nothing, so
+        # nothing ever marks it failed, and the machine is handed the same
+        # model again the moment it reconnects. One model that faulted the GPU
+        # became twenty-four restarts that way.
+        self.preload_attempts: dict[str, int] = {}
         self.gave_up_waiting: set[str] = set()
         self._wake = asyncio.Event()
 
@@ -567,6 +575,12 @@ class Fleet:
     # gigabytes arriving at one machine.
     PRELOAD_PATIENCE_S = 1800.0
 
+    # How many times a deployment may be sent to a machine that never reports
+    # back before it is written off. Three, because the commonest reason for
+    # one silent failure is a restart that happened to land mid-load, and the
+    # commonest reason for three is the model.
+    PRELOAD_TRIES = 3
+
     async def reconcile_deployments(self) -> None:
         """Put back what is supposed to be on each card, and only that.
 
@@ -615,7 +629,28 @@ class Fleet:
                     await self.broadcast_ui({"type": "deployments_changed",
                                              "deployment_id": row["id"]})
                 self.deploying.pop(row["id"], None)
+                # It is on the card, so whatever went wrong before did not
+                # stop it in the end. The count goes back to zero rather than
+                # counting a machine's whole history against it.
+                self.preload_attempts.pop(row["id"], None)
                 continue
+            if self.preload_attempts.get(row["id"], 0) >= self.PRELOAD_TRIES:
+                # Stopped, and stopped in a way somebody can see and undo.
+                # The alternative is not "it might work next time" -- it is a
+                # machine that restarts into the same model for ever and takes
+                # the host with it.
+                db.set_deployment_state(
+                    row["id"], "failed",
+                    "This machine did not survive loading the model, %d times "
+                    "in a row -- it stopped without reporting why, which "
+                    "usually means the GPU faulted rather than ran out of "
+                    "room. Deploy it somewhere else, or serve it without "
+                    "pinning it to a card." % self.PRELOAD_TRIES)
+                self.deploying.pop(row["id"], None)
+                await self.broadcast_ui({"type": "deployments_changed",
+                                         "deployment_id": row["id"]})
+                continue
+            self.preload_attempts[row["id"]] =                 self.preload_attempts.get(row["id"], 0) + 1
             await self.send_deployment(row)
 
     async def send_deployment(self, row: dict) -> bool:

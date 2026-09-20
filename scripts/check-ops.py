@@ -137,6 +137,41 @@ ok("deployments are found by the run behind them",
 ok("taking it down removes it", db.delete_deployment(d1["id"])
    and not db.list_deployments(a))
 
+# A deployment that kills the machine it is sent to, which is the one failure
+# the state machine could not see: the runner dies mid-load, so it never
+# reports "failed", so the deployment stays pending and is sent again the
+# moment the machine reconnects. One model that faulted the GPU became
+# twenty-four restarts of a production runner before this existed.
+print("")
+print("A model the machine does not survive loading")
+
+import asyncio  # noqa: E402
+
+fleet2 = Fleet()
+fleet2.attach(a, object())
+silent = db.create_deployment(job["id"], a, owner_id="usr_1")
+sent = []
+
+async def _never_answers():
+    """Drive the reconciler the way a crash loop does: the preload is sent,
+    the machine dies without a word, and it reconnects clean."""
+    async def fake_send(row):
+        sent.append(row["id"])
+    fleet2.send_deployment = fake_send
+    for _ in range(6):
+        fleet2.deploying.clear()       # what a restart looks like from here
+        await fleet2.reconcile_deployments()
+
+asyncio.run(_never_answers())
+ok("it is sent a few times, not endlessly",
+   len(sent) == Fleet.PRELOAD_TRIES,
+   "-- %d attempts, then it stops" % len(sent))
+ok("and is written off rather than left pending",
+   db.get_deployment(silent["id"])["state"] == "failed")
+ok("saying what actually happened",
+   "did not survive" in (db.get_deployment(silent["id"])["detail"] or ""))
+db.delete_deployment(silent["id"])
+
 bad = False
 try:
     db.set_deployment_state("dep_nope", "sideways")

@@ -74,17 +74,43 @@ def report(caps: dict | None) -> dict:
     attn = ((caps or {}).get("attention") or {})
     flash = bool(attn.get("flash"))
     mem_efficient = bool(attn.get("mem_efficient"))
-    # Last, because it is the slowest of the three and the most likely to be
-    # recompiled at an awkward moment -- a shipped kernel is preferred to one
-    # that has to be built. It is still fused, and that is what matters for
-    # every memory decision downstream.
-    flex = bool(attn.get("flex"))
+    # Measured, reported, and NOT used unless somebody asks for it. This was
+    # briefly the default and it crash-looped a production runner twenty-four
+    # times, which is worth recording in full because the mistake is a subtle
+    # one and easy to repeat.
+    #
+    # The probe compiled `flex_attention` directly and it worked, so the card
+    # was reported as having fused attention: comfortable sequence length went
+    # from 2048 to 8192 and every memory estimate was rewritten against it.
+    # Then a real model was loaded and Inductor refused to compile the kernel
+    # transformers actually uses -- "out of resource: shared memory, Required:
+    # 131072, Hardware limit: 65536" -- because RDNA2 has 64 KB of LDS per
+    # workgroup and the masked kernel wants 128.
+    #
+    # The temptation is to fix the probe by probing at a realistic head
+    # dimension. That does not work either: raw `flex_attention` at head_dim
+    # 128 compiles fine, and a two-layer Llama through transformers at the
+    # same shape compiles fine, and Qwen2.5-3B does not. What fails is the
+    # block mask a particular architecture builds, and the only probe that
+    # predicts it is loading that model -- which is not a probe, it is the
+    # thing the probe was supposed to avoid.
+    #
+    # So the honest position is that this cannot be decided in advance on this
+    # hardware. It stays off unless the machine is told to try it, and a
+    # machine that is told still falls back per model rather than crashing:
+    # see `attentionfit.load_base_model`. A capability that cannot be measured
+    # must not be assumed, and the cost of assuming it here was not a slower
+    # run -- it was a memory estimate written for a kernel that does not exist
+    # and a process killed by a GPU fault.
+    flex = bool(attn.get("flex")) and bool(attn.get("flex_opt_in"))
     kind = ("flash" if flash else "mem_efficient" if mem_efficient
             else "flex" if flex else "math")
     fused = kind != "math"
     return {
         "flash": flash,
         "mem_efficient": mem_efficient,
+        # What the probe measured, whether or not it is being used.
+        "flex_available": bool(attn.get("flex")),
         "flex": flex,
         "fused": fused,
         "kind": kind,

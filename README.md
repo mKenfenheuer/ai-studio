@@ -318,10 +318,14 @@ automatic:
   is rebuilt during its own backward pass, so the peak is one slice rather than
   the whole sequence. Verified against the model's own loss on a real batch
   before it is used, and abandoned if the two disagree.
-- **FlexAttention is probed for.** It compiles a tiled kernel with Triton
-  instead of calling one from AOTriton, whose architecture list is the shorter
-  of the two — so a card with neither flash nor memory-efficient attention may
-  still get linear-memory attention. Measured, never assumed.
+- **FlexAttention is probed for, reported, and left off** unless
+  `AI_STUDIO_FLEX_ATTENTION=1` is set. It compiles a tiled kernel with Triton
+  rather than calling one from AOTriton, so on paper a card with neither flash
+  nor memory-efficient attention could still get linear-memory attention — and
+  on this hardware the probe does not predict the outcome. One that compiled
+  cleanly went on to fail for Qwen2.5-3B with `out of resource: shared memory,
+  Required: 131072, Hardware limit: 65536`, because RDNA2 has 64 KB of LDS per
+  workgroup. A model it cannot compile for now falls back instead of failing.
 - **the allocator is asked to grow rather than fragment**
   (`expandable_segments`), because at a long context one enormous allocation
   arriving and leaving every step is what turns "fits on paper" into an

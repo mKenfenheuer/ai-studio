@@ -485,11 +485,18 @@ class ModelHost:
         try:
             return AutoModelForCausalLM.from_pretrained(name, token=token,
                                                         **extra)
-        except (TypeError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - any refusal of the attention path
             message = str(e)
+            # Widened from (TypeError, ValueError) because a FlexAttention
+            # kernel the compiler will not build raises from inside Inductor,
+            # which is neither -- and serving a model it cannot build for then
+            # killed the process rather than falling back. See the note in
+            # runner/jobs/attentionfit.load_base_model.
             if "attn_implementation" not in extra or not any(
                     hint in message for hint in
-                    ("attn_implementation", "scaled_dot_product_attention")):
+                    ("attn_implementation", "scaled_dot_product_attention",
+                     "triton", "shared memory", "flex_attention",
+                     "InductorError")):
                 raise
             log("This model has no fused-attention implementation, so it is "
                 "being loaded with the library's own.")

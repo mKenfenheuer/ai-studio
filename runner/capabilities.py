@@ -378,7 +378,7 @@ def probe(quick: bool = False) -> dict:
         "dtypes": {},
         "quantization": {"4bit": False, "8bit": False, "optim_8bit": False},
         "attention": {"flash": False, "mem_efficient": False, "flex": False,
-                      "math": True, "env": {}},
+                      "flex_opt_in": False, "math": True, "env": {}},
         "recommended_dtype": "float32",
         "warnings": [],
         "notes": [],
@@ -477,9 +477,23 @@ def probe(quick: bool = False) -> dict:
             "flash": sub["flash_attn"],
             "mem_efficient": sub["mem_efficient_attn"],
             "flex": sub.get("flex_attn", False),
+            # Whether this machine has been told to USE FlexAttention, which
+            # is a separate question from whether it compiles here -- see the
+            # long note in common/attention.py for the twenty-four restarts
+            # that separated the two.
+            "flex_opt_in": bool(os.environ.get("AI_STUDIO_FLEX_ATTENTION")),
             "math": True,
             "env": attn_env,
         }
+        if sub.get("flex_attn") and not os.environ.get("AI_STUDIO_FLEX_ATTENTION"):
+            caps["notes"].append(
+                "FlexAttention compiles on this card, which would allow much "
+                "longer sequences. It is off because compiling in a probe "
+                "does not predict compiling for a real model here -- one that "
+                "passed this check then failed on Qwen2.5-3B, and took the "
+                "runner down with it. Set AI_STUDIO_FLEX_ATTENTION=1 to try "
+                "it; a model it cannot compile for falls back rather than "
+                "failing the run.")
         if attn_env:
             caps["notes"].append(
                 "Fused attention on this card needs %s, which the studio sets "

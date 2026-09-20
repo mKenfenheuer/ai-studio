@@ -31,7 +31,11 @@ describe = attention.describe
 # attention yet".
 _OPTIONAL_KWARG_HINTS = {
     "attn_implementation": ("attn_implementation",
-                            "scaled_dot_product_attention"),
+                            "scaled_dot_product_attention",
+                            # What a refused FlexAttention compile says. It
+                            # never mentions the argument that asked for it.
+                            "triton", "shared memory", "flex_attention",
+                            "InductorError"),
     "experts_implementation": ("experts_implementation",),
 }
 
@@ -55,12 +59,26 @@ def load_base_model(cls, name: str, required: dict, optional: dict,
     while True:
         try:
             return cls.from_pretrained(name, **attempt, **required)
-        except (TypeError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - see below
             message = str(e)
             dropped = next((k for k in attempt
                             if any(h in message
                                    for h in _OPTIONAL_KWARG_HINTS.get(k, (k,)))),
                            None)
+            # `Exception`, not `(TypeError, ValueError)`, and the widening was
+            # paid for. An attention implementation that the library accepts
+            # and the COMPILER then refuses raises from inside Inductor --
+            # `InductorError: No valid triton configs. out of resource: shared
+            # memory, Required: 131072, Hardware limit: 65536` on RDNA2 -- and
+            # that is neither of the two types this used to catch. It escaped,
+            # killed the load, and the runner was restarted into loading the
+            # same model again, twenty-four times.
+            #
+            # Nothing here is load-bearing enough to fail a run over: every
+            # optional argument is a performance choice with a working
+            # default behind it. So anything that names one is treated as
+            # that argument being refused, whatever type it arrives as, and
+            # an exception naming none of them is re-raised untouched.
             if dropped is None:
                 raise
             attempt.pop(dropped)

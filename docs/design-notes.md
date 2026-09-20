@@ -24,6 +24,7 @@ numbers that changed somebody's mind.
 - [Working around a missing attention kernel](#working-around-a-missing-attention-kernel)
 - [One card, one reply at a time](#one-card-one-reply-at-a-time)
 - [Making response_format a promise](#making-response_format-a-promise)
+- [A capability that cannot be measured](#a-capability-that-cannot-be-measured-must-not-be-assumed)
 - [One rule in the web UI](#one-rule-in-the-web-ui)
 
 ---
@@ -583,6 +584,52 @@ error, because the error is the only one of the two anybody notices.
 The same check also disproved a plausible-looking assertion of mine: `6e9` is a
 valid `integer` by JSON Schema, which counts any number with a zero fractional
 part. `8e-15` is not, and is refused. The test was wrong, not the code.
+
+---
+
+## A capability that cannot be measured must not be assumed
+
+FlexAttention was briefly switched on automatically, and it crash-looped a
+production runner twenty-four times. The mistake is subtle enough to be worth
+keeping.
+
+The probe compiled `flex_attention` on the card and it worked. That was taken
+as "this machine has fused attention": the comfortable sequence length went
+from 2048 to 8192, and every memory estimate was rewritten against a kernel
+that never materialises the scores matrix. Then a real model was loaded and
+Inductor refused to build the kernel transformers actually uses — `out of
+resource: shared memory, Required: 131072, Hardware limit: 65536`, because
+RDNA2 has 64 KB of LDS per workgroup and the masked kernel wants 128.
+
+The obvious repair is to probe at a realistic head dimension. It does not
+work. Raw `flex_attention` at head_dim 128 compiles; a two-layer Llama through
+transformers at the same shape compiles; Qwen2.5-3B does not. What fails is the
+block mask a particular architecture builds, and the only probe that predicts
+it is loading that model — which is not a probe, it is the thing a probe
+exists to avoid.
+
+So it stays off unless a machine is told to try it, and a machine that is told
+falls back per model rather than dying. The general rule the whole
+`capabilities` module already followed — measure, do not trust — needed one
+more clause: **a measurement is only worth what it predicts.**
+
+Two smaller faults fell out of the same incident:
+
+**The fallback caught the wrong exceptions.** `load_base_model` dropped an
+optional argument on `TypeError` or `ValueError`. A compiler that refuses to
+build a kernel raises `InductorError`, which is neither, so it escaped and
+killed the load. Nothing among those optional arguments is worth failing a run
+over — each is a performance choice with a working default behind it — so
+anything naming one is now treated as that argument being refused, whatever
+type it arrives as.
+
+**A deployment that kills the machine was retried for ever.** The state machine
+skips a deployment marked `failed`, which covers every way a load can fail
+except the one that matters most: a load that kills the runner reports nothing,
+so it stays `pending` and is sent again the moment the machine reconnects. It
+is capped at three attempts now and then written off, in words that say the
+machine did not survive loading it rather than leaving it to be inferred from a
+restart count.
 
 ---
 
