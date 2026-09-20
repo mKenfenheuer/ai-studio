@@ -257,6 +257,29 @@ export async function jobView(mount, [jobId]) {
  *  Remembered per kind of run rather than per run: which tab you want on a
  *  training run is a habit, and it is a different habit from the one you want
  *  on a scoring run. */
+/**
+ * How fast the run is going, in whichever unit is legible at that speed.
+ *
+ * Steps per second is the right unit for a small model on a fast card and
+ * the wrong one for everything else: a 7B at 6144 tokens takes tens of
+ * seconds per step, which `toFixed(2)` renders as "0.00/s" -- no speed, no
+ * ETA to sanity-check, nothing to tell a slow run from a stalled one. It
+ * reads as broken at exactly the moment somebody is checking whether it is.
+ *
+ * So below one step a second it inverts, because seconds per step is what
+ * anybody would say out loud anyway. The label changes with it, or the
+ * number would simply be wrong rather than unreadable.
+ */
+function stepSpeed(sps) {
+  if (sps == null || !(sps > 0)) return ["—", "steps per second"];
+  if (sps >= 1) return [sps.toFixed(2) + "/s", "steps per second"];
+  const secs = 1 / sps;
+  // One decimal under a minute, where the difference between 12s and 18s a
+  // step is worth seeing; coarser above it, where it is not.
+  return [secs < 60 ? secs.toFixed(1) + "s" : fmtDuration(secs),
+          "per step"];
+}
+
 function wireRunTabs(mount, job, repaint) {
   const tabs = tabState(`run.${kindOf(job).page}`, RUN_TABS(job), "home");
   let tab = tabs.get();
@@ -2072,7 +2095,7 @@ function paintStats(mount, job, m, scratch, stage = "training",
   ] : [
     ["Loss now", m.loss != null ? m.loss.toFixed(4) : "—", "lower is better"],
     held,
-    ["Speed", m.steps_per_sec != null ? m.steps_per_sec.toFixed(2) + "/s" : "—", "steps per second"],
+    ["Speed", ...stepSpeed(m.steps_per_sec)],
     ["GPU memory", m.vram_gb != null ? m.vram_gb + " GB" : "—", "peak used"],
     ["Time left", m.eta_s != null && job.status === "running"
       ? fmtDuration(m.eta_s) : "—", "estimate"],
