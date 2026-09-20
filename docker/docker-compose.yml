@@ -53,6 +53,20 @@ services:
       # than defaulted, because an empty value reads as "no limit" too.
       AI_STUDIO_GPU_MEMORY_PCT: ${AI_STUDIO_GPU_MEMORY_PCT:-}
       AI_STUDIO_GPU_COMPUTE_PCT: ${AI_STUDIO_GPU_COMPUTE_PCT:-}
+      # FlexAttention, for a card with no flash or memory-efficient kernel.
+      # It compiles one with Triton instead, which makes attention memory
+      # linear in sequence length rather than quadratic -- the difference
+      # between a long-context run fitting here and not.
+      #
+      # Off unless asked for, and passed through here so asking does not mean
+      # editing this file. The reason it is not simply on is in
+      # common/attention.py: the probe compiling `flex_attention` does not
+      # predict transformers compiling it for a particular model, and the
+      # gap between those two facts once crash-looped a runner two dozen
+      # times. A model it cannot compile for now falls back to the ordinary
+      # path and says the memory estimate no longer holds -- see
+      # jobs/attentionfit.load_base_model.
+      AI_STUDIO_FLEX_ATTENTION: ${AI_STUDIO_FLEX_ATTENTION:-}
       HF_TOKEN: ${HF_TOKEN:-}
 
   # The controller's own machine, working as a runner for the jobs that need
