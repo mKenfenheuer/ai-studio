@@ -16,9 +16,9 @@ from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
 from runner import artifacts, checkpoints, earlystop
-from runner.capabilities import expert_kernel
+from runner.capabilities import attention_plan, expert_kernel
 
-from . import merge, source
+from . import attentionfit, merge, source
 
 # How much of the training set is held back to measure honestly. A fine-tune
 # had no held-out set at all until now, which meant the only number on screen
@@ -389,6 +389,20 @@ def run(cfg: dict, ctx: Any) -> dict:
     if device == "cpu":
         torch_dtype = torch.float32
 
+    # Settled before the model is loaded, because part of it is environment
+    # the loading itself reads -- see capabilities.attention_plan.
+    attn = attention_plan(caps)
+    if attn["quadratic"] and device != "cpu":
+        ctx.log("This machine has %s. Gradient checkpointing is on, the "
+                "batch is kept to what the scores matrix can afford, and the "
+                "rest of the batch is made up by accumulation."
+                % attentionfit.describe(caps))
+    elif attn["env"]:
+        ctx.log("Using %s, which this card only offers with %s set. The "
+                "studio sets it for this run."
+                % (attentionfit.describe(caps),
+                   ", ".join(sorted(attn["env"]))))
+
     ctx.log("Loading tokenizer and base model: %s" % base_model)
     ctx.progress(0, 0, stage="loading_model")
 
@@ -415,21 +429,36 @@ def run(cfg: dict, ctx: Any) -> dict:
     # installed transformers is too old to know the argument, so that a
     # dense model on an old library is never affected by any of this.
     kernel = expert_kernel(caps)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model, **({"experts_implementation": kernel} if kernel else {}),
-            **load_kwargs)
-    except (TypeError, ValueError) as e:
-        if not kernel or "experts_implementation" not in str(e):
-            raise
-        model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
+    optional = {"attn_implementation": attn["implementation"]}
+    if kernel:
+        optional["experts_implementation"] = kernel
+    model = attentionfit.load_base_model(
+        AutoModelForCausalLM, base_model, load_kwargs, optional, ctx)
     if not use_4bit:
         model = model.to(device)
     model.config.use_cache = False
 
-    if cfg.get("gradient_checkpointing", True) and device != "cpu":
+    checkpointing = bool(cfg.get("gradient_checkpointing", True))
+    if not checkpointing and attn["quadratic"] and device != "cpu":
+        # Turned back on rather than honoured, and this is the one setting in
+        # this file that overrides what was asked for. The reason it is worth
+        # the inconsistency: without a fused kernel every layer keeps its own
+        # scores matrix for the backward pass instead of one being live at a
+        # time, so switching checkpointing off multiplies the largest term on
+        # the card by the number of layers. That is not a trade between speed
+        # and memory, which is what the setting offers -- it is a run that
+        # cannot start. Said out loud, because a setting that does not hold
+        # should never be silent.
+        checkpointing = True
+        ctx.log("Gradient checkpointing was switched off, and this machine "
+                "has no fused attention kernel -- which means every layer "
+                "would keep its own attention scores instead of one at a "
+                "time. Leaving checkpointing on: the run costs about 30% more "
+                "time and fits, rather than being 30% quicker and not "
+                "starting.", "warn")
+    if checkpointing and device != "cpu":
         # Trades ~30% speed for a large activation-memory saving. Essential on
-        # cards without flash attention, where activations dominate.
+        # cards without a fused attention kernel, where activations dominate.
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
@@ -842,6 +871,8 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     bs = int(cfg.get("batch_size", 1))
     accum = int(cfg.get("grad_accum", 8))
+    bs, accum = attentionfit.fit_batch(bs, accum, attn, model, max_seq, ctx,
+                                       checkpointing=checkpointing)
     epochs = float(cfg.get("epochs", 1))
     lr = float(cfg.get("learning_rate", 2e-4))
 

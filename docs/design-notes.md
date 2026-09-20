@@ -21,6 +21,8 @@ numbers that changed somebody's mind.
 - [Operations](#operations)
 - [The assistant, and the chat role](#the-assistant-and-the-chat-role)
 - [Two lessons the hardware probe encodes](#two-lessons-the-probe-encodes)
+- [Working around a missing attention kernel](#working-around-a-missing-attention-kernel)
+- [One card, one reply at a time](#one-card-one-reply-at-a-time)
 - [One rule in the web UI](#one-rule-in-the-web-ui)
 
 ---
@@ -437,6 +439,109 @@ stock `bitsandbytes` on unsupported ROCm hardware aborts the interpreter at the
 HIP level (`SIGABRT`). An in-process capability check would take the agent down
 at startup, forever. So risky probes run in a **subprocess**, and results proven
 before a crash are recovered from a partial report.
+
+---
+
+## Working around a missing attention kernel
+
+The capability probe answers a question the rest of the studio kept asking
+badly. Four places read `caps["attention"]["flash"]` and meant "does attention
+cost memory with the square of sequence length here" — and those are not the
+same question. The memory-efficient kernel is a second implementation of the
+same tiling idea, costs the same memory, and runs on hardware flash attention
+does not. Reading only the flash flag charged those cards for a quadratic term
+they never pay and capped them at 2048 tokens when they can comfortably do
+8192. `common/attention.py` now answers the question that was meant, once, and
+the four callers ask it rather than each other.
+
+**A card without a kernel may still have one.** On ROCm the kernels come from
+AOTriton, and the architectures its wheels compile for are a shorter list than
+the ones PyTorch will dispatch to. On the ones in between, torch says no and
+the kernel is there — behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`,
+because AMD has not finished validating it. So a card that reports nothing gets
+one more probe with the flag set, and if that one works the variable is
+reported alongside the answer and set by every job that runs there. Reporting
+`flash: true` from a probe whose environment the job does not reproduce would
+be the worst outcome available: an optimistic memory estimate against a
+pessimistic kernel.
+
+**Where there is genuinely no kernel, the batch moves and the length does
+not.** Attention without fusion keeps `batch × heads × seq × seq` scores and
+the softmax over them — quadratic in length, linear in batch. The length is the
+thing the dataset needs, so the batch is what gives:
+
+- gradient checkpointing stays on, and is turned back on if it was switched
+  off. This is the one setting the fine-tuner overrides rather than honouring,
+  and the reason is that it is not the trade it looks like: without
+  checkpointing every layer keeps its own scores instead of one being live at
+  a time, which multiplies the largest term on the card by the depth of the
+  model. That is not "30% faster", it is "does not start".
+- the micro-batch falls to what the scores matrix can afford, and gradient
+  accumulation rises to match. Four sequences one at a time and four at once
+  produce the same gradient, the same optimiser steps and the same schedule.
+- the replacement is a **divisor** of the original batch, never just the cap.
+  Accumulating eight in groups of three is nine a step, and an effective batch
+  that drifts changes the tokens per step, the token budget and the learning
+  rate the schedule was written against. `batch × accumulation` comes out
+  exactly where it went in.
+- serving reads a prompt into the key/value cache 256 tokens at a time instead
+  of in one pass, for the same arithmetic in a different order. Where the
+  kernel *is* fused that slicing is pure overhead, so the chunk is 2048 there.
+
+What does not happen is the sequence length being quietly shortened. It is
+honoured, and the run says what it costs — see the note in
+`runner/jobs/lora_llm.py` about the difference between saying and doing.
+
+---
+
+## One card, one reply at a time
+
+A runner holds one model on one card and writes one reply at a time. That is
+not going away, so the only real question is what happens to the second
+request — and the answer used to be an error. An evaluation sending sixty
+prompts got one answer and fifty-nine failures.
+
+**They are queued now, and the message is held rather than the caller.** Both
+places a reply is waited for already exist: `waiters` for an API request, the
+browser's websocket for the playground. Holding an HTTP connection open to do
+the waiting a second time helps nobody, so the controller keeps the request in
+`serving_queue[runner_id]` and sends it when the machine frees up. A queued
+request is told where it stands straight away, on the same `generate_status`
+frame a runner uses for its own progress, because a request that will wait four
+minutes and says nothing is indistinguishable from one that was lost — and the
+client that cannot tell is the one that retries and makes the queue longer.
+
+**The bound matters more than the queue.** An unbounded queue is not a queue,
+it is a way of turning a busy machine into a slow one and then into a timeout.
+Past `SERVING_QUEUE_MAX` the honest answer is `429` with a `Retry-After`, and
+the status code is the point: `502` tells a client library the upstream is
+broken, and the correct response to that is to stop trying.
+
+**Three ways a slot could leak, all closed.** A socket that dies between
+choosing a machine and writing to it releases the slot rather than holding it
+for a request that was never sent. A machine that disconnects fails everything
+it was answering or had queued, with a sentence rather than a timeout. And a
+reply that simply never arrives is reaped by `reconcile_serving` after the
+runner's own deadline plus two minutes — because a queue that can deadlock
+permanently is worse than no queue at all.
+
+Cancelling takes a request *out of the line* if it never left it. Forwarding a
+cancel for a request the machine has not been given yet cancels nothing, and
+the request would then be sent anyway the moment the slot came free.
+
+### And a field that was refused by code that did not refuse it
+
+`response_format` was accepted and ignored, which is the one failure this API
+is written to avoid: a caller that asks for a JSON schema has stopped checking
+the reply, so prose returned under it goes wherever the schema was going to go.
+It is a `400` now, like `n`, `logprobs` and `tool_choice: "required"` — nothing
+here constrains decoding, so neither of `response_format`'s two promises can be
+kept.
+
+Writing the check for it turned up that `logprobs` was never refused either.
+The guard was a loop over `(None, False, 1)`, where the `1` was meant for `n`
+— and `True == 1` in Python, so `logprobs: true` passed the test written to
+reject it. The fields are checked one at a time now.
 
 ---
 

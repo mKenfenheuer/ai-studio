@@ -64,6 +64,12 @@ jobs:
       - name: Which run is allowed onto which machine
         run: python scripts/check-dispatch.py
 
+      - name: What the studio does about the attention kernel a machine has
+        run: python scripts/check-attention.py
+
+      - name: What the serving API refuses, and what it queues
+        run: python scripts/check-serving.py
+
       - name: Stored files are shared, counted and released
         run: python scripts/check-assets.py
 

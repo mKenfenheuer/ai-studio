@@ -37,9 +37,19 @@ it will ignore them.
 DeepSeek API emit, and what most clients read) and as `reasoning`, kept apart
 from `content` rather than left inline for the client to strip.
 
-Not implemented, and not faked: `n` above 1, `logprobs`, embeddings. A field
-that is accepted and ignored is worse than one that is refused -- it produces a
-client that believes it asked for something.
+Not implemented, and not faked: `n` above 1, `logprobs`, embeddings, and
+`response_format` beyond `{"type": "text"}`. A field that is accepted and
+ignored is worse than one that is refused -- it produces a client that believes
+it asked for something. `response_format` is the sharpest case: a caller that
+asks for a schema has stopped checking the reply, so returning prose under it
+puts the prose wherever the schema was going to go.
+
+**Concurrency.** A runner holds one model on one card and answers one message
+at a time. Requests that arrive meanwhile are QUEUED, not refused -- an
+evaluation sending sixty prompts gets sixty answers, one after another, rather
+than one answer and fifty-nine errors. The queue is bounded; past its depth the
+answer is `429` with a `Retry-After`, which is the status a client library
+knows how to back off from, and not the `502` that tells it to give up.
 
 Token counts are real counts from the runner, not estimates. `prompt_tokens`
 is what the model was actually given after the run's own chat template was
@@ -91,9 +101,20 @@ def _finish(msg: dict) -> str:
     return "length" if msg.get("stop_reason") in ("length", "timeout") else "stop"
 
 
-def _error(status: int, message: str, code: str = "invalid_request_error"):
+def _error(status: int, message: str, code: str = "invalid_request_error",
+           retry_after: float | None = None):
+    """OpenAI's error shape, and the one header a refusal sometimes carries.
+
+    `Retry-After` is not decoration on a 429. Without it a client library
+    backs off on whatever schedule it invented, which for the ones that
+    invented "immediately" means a refused request becomes a refused request
+    per millisecond.
+    """
+    headers = ({"Retry-After": str(max(1, int(round(retry_after))))}
+               if retry_after else None)
     return JSONResponse({"error": {"message": message, "type": code,
-                                   "code": code}}, status_code=status)
+                                   "code": code}}, status_code=status,
+                        headers=headers)
 
 
 def _slug(name: str) -> str:
@@ -263,6 +284,20 @@ def _tools(payload: dict) -> list[dict]:
     return conversation.flat_tools(conv)
 
 
+class TooManyRequests(HTTPException):
+    """A 429 that carries the Retry-After a client should honour.
+
+    Its own class because the header has to survive the trip through the
+    handler that converts an HTTPException into OpenAI's error shape, and a
+    status code with no header is a client that retries immediately and is
+    refused again.
+    """
+
+    def __init__(self, detail: str, retry_after: float) -> None:
+        super().__init__(429, detail)
+        self.retry_after = max(1, int(round(retry_after)))
+
+
 async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
     """Send the request to a runner and return (request_id, queue, runner_id)."""
     from ..app import _pick_chat_runner        # local: avoids an import cycle
@@ -285,8 +320,11 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
 
     rid = db.new_id("gen")
     queue: asyncio.Queue = asyncio.Queue()
+    # Registered BEFORE the request is submitted, because a queued request is
+    # told where it stands the moment it joins the line -- and a waiter that
+    # does not exist yet would miss that frame.
     FLEET.waiters[rid] = queue
-    sent = await FLEET.send_to_runner(runner_id, {
+    placed = await FLEET.submit_generation(runner_id, rid, {
         "type": "generate", "request_id": rid, "spec": spec,
         "messages": messages,
         "params": {
@@ -300,21 +338,79 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
             "deadline_s": config.GENERATION_DEADLINE_S,
         },
     })
-    if not sent:
+    if placed == "gone":
         FLEET.waiters.pop(rid, None)
         raise HTTPException(503, "That machine dropped off just now. Try again.")
-    FLEET.generations[rid] = runner_id
+    if placed == "full":
+        FLEET.waiters.pop(rid, None)
+        # 429, not 502. The difference matters more than it looks: 502 tells a
+        # client library the upstream is broken, and the correct response to
+        # that is to stop. This is "come back shortly", which every client
+        # already knows how to do, and Retry-After says how shortly.
+        raise TooManyRequests(
+            "This machine already has %d requests waiting. It answers one at "
+            "a time; try again shortly."
+            % FLEET.queue_depth(runner_id),
+            retry_after=config.SERVING_QUEUE_RETRY_S)
     return rid, queue, runner_id
 
 
-@router.post("/chat/completions")
-async def chat_completions(request: Request, payload: dict = Body(...)):
-    user = current_user(request)
-    for unsupported, why in (
-            ("n", "Only one reply per request is produced."),
-            ("logprobs", "Token probabilities are not available.")):
-        if payload.get(unsupported) not in (None, False, 1):
-            return _error(400, "`%s` is not supported. %s" % (unsupported, why))
+def unsupported_options(payload: dict):
+    """The request options this server will not pretend to honour.
+
+    A JSONResponse to return as-is, or None when there is nothing to refuse.
+    Pulled out of the route so it can be checked without a running controller,
+    a signed-in user and a machine to send the request to -- which is what it
+    took before, and is why the one field missing from it stayed missing.
+    """
+    # Checked one at a time rather than in a loop over a tuple of allowed
+    # values, which is how this was written and why `logprobs: true` was never
+    # actually refused: in Python `True == 1`, so a boolean sailed through a
+    # membership test whose `1` was meant for `n`. The field this file exists
+    # to refuse was accepted and ignored by the code that refuses fields.
+    try:
+        if int(payload.get("n") or 1) != 1:
+            return _error(400, "`n` is not supported. Only one reply per "
+                               "request is produced.")
+    except (TypeError, ValueError):
+        return _error(400, "`n` must be a number, and only 1 is supported.")
+    if payload.get("logprobs") or payload.get("top_logprobs"):
+        return _error(400, "`logprobs` is not supported. Token probabilities "
+                           "are not available.")
+
+    # `response_format` carries two promises, and this server can keep
+    # neither: `json_object` promises the reply parses as JSON, and
+    # `json_schema` promises it matches a schema. Both are kept by constrained
+    # decoding -- masking the tokens that would break the grammar at each
+    # step -- and nothing here masks anything.
+    #
+    # This is the field it was worst to accept quietly, because the client
+    # that sets it is precisely the client that has stopped checking. A tagger
+    # asking for a schema and getting prose does not raise; it writes the
+    # prose into whatever it was filling in. `{"type": "text"}` is the default
+    # and promises nothing, so it is the one shape that is honoured.
+    fmt = payload.get("response_format")
+    if isinstance(fmt, dict):
+        kind = fmt.get("type")
+        if kind == "json_schema":
+            return _error(400, "`response_format: \"json_schema\"` cannot be "
+                               "honoured: this server does not constrain "
+                               "decoding, so a reply cannot be guaranteed to "
+                               "match a schema. Describe the shape you want "
+                               "in the prompt and check what comes back.")
+        if kind == "json_object":
+            return _error(400, "`response_format: \"json_object\"` cannot be "
+                               "honoured: this server does not constrain "
+                               "decoding, so a reply cannot be guaranteed to "
+                               "parse as JSON. Ask for JSON in the prompt and "
+                               "check what comes back.")
+        if kind not in (None, "text"):
+            return _error(400, "`response_format` may be {\"type\": \"text\"}. "
+                               "Anything stronger would need constrained "
+                               "decoding, which this server does not do.")
+    elif fmt is not None:
+        return _error(400, "`response_format` must be an object, such as "
+                           "{\"type\": \"text\"}.")
 
     # `tool_choice` is honoured only where it can be. Nothing here constrains
     # decoding, so "you must call a tool" cannot be promised -- and a request
@@ -329,9 +425,20 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
         return _error(400, "`tool_choice: \"required\"` cannot be honoured: "
                            "nothing here constrains what the model emits, so a "
                            "tool call cannot be guaranteed.")
-    if choice == "none":
+    # "none" is not refused: it means "answer without tools", which this can
+    # do. The route acts on it.
+    return None
+
+
+@router.post("/chat/completions")
+async def chat_completions(request: Request, payload: dict = Body(...)):
+    user = current_user(request)
+    if refusal := unsupported_options(payload):
+        return refusal
+    if payload.get("tool_choice") == "none":
         # Not an error -- the plain meaning is "answer without tools", and the
-        # way to do that is not to declare any.
+        # way to do that is not to declare any. Done here rather than in the
+        # check above, because it changes the request instead of refusing it.
         payload = {**payload, "tools": []}
 
     wanted = str(payload.get("model") or "")
@@ -367,7 +474,10 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
         # had nothing free, which no count of successful replies would show.
         _record(job, who, {}, started, stream=bool(payload.get("stream")),
                 failed=str(e.detail))
-        return _error(e.status_code, e.detail)
+        return _error(e.status_code, e.detail,
+                      "rate_limit_exceeded" if e.status_code == 429
+                      else "invalid_request_error",
+                      retry_after=getattr(e, "retry_after", None))
 
     created = int(time.time())
     if payload.get("stream"):

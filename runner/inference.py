@@ -70,10 +70,28 @@ class OutOfRoom(RuntimeError):
 # arithmetic is identical either way; only the order changes.
 PREFILL_CHUNK = 256
 
+# And the same number where attention IS fused. A flash or memory-efficient
+# kernel never materialises the scores matrix, so the quadratic term the chunk
+# above exists to bound is not there to bound: the cost of a slice is linear in
+# its length, and slicing finely just means more launches for the same work.
+#
+# Not unlimited, because the chunk still bounds the activations of one forward
+# pass and the allocator still has to find a block for them. 2048 is where
+# those stop being free on a 16 GB card, and it is eight times fewer passes
+# over a long conversation.
+PREFILL_CHUNK_FUSED = 2048
+
 # Room kept for the working set of one prefill slice and the allocator's slack,
 # on top of the conversation's own key/value cache. Measured: a 256-token slice
 # peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
 PREFILL_HEADROOM_GB = 0.6
+
+# ...and the same, per token of chunk, so the two move together. A larger slice
+# is a larger working set, and a fused kernel raises the slice eightfold. This
+# is the number above divided by the chunk it was measured at, which is what
+# makes it a measurement rather than two constants that have to be kept in
+# step by hand.
+PREFILL_HEADROOM_PER_TOKEN = PREFILL_HEADROOM_GB / PREFILL_CHUNK
 
 # How long one reply may take before it is stopped and handed back as it
 # stands. A runner answers one message at a time, so this is not really a limit
@@ -187,6 +205,17 @@ class ModelHost:
         # diagnostics().
         self.last_request: dict = {}
         self._cancel = threading.Event()
+        # The same attention plan a training run gets, and for the same
+        # reasons: serving materialises a scores matrix the size of the
+        # conversation squared on a card with no fused kernel, and it is the
+        # term that decides how long a conversation can get. Settled once, in
+        # the process that will load the models, because part of the plan is
+        # environment `from_pretrained` reads.
+        self.attn = capabilities.attention_plan(caps)
+        self.prefill_chunk = (PREFILL_CHUNK if self.attn["quadratic"]
+                              else PREFILL_CHUNK_FUSED)
+        self.prefill_headroom_gb = (self.prefill_chunk
+                                    * PREFILL_HEADROOM_PER_TOKEN)
 
     # ------------------------------------------------------------ device
     @property
@@ -393,6 +422,56 @@ class ModelHost:
             pass
         return {"experts_implementation": kernel}
 
+    def _attention_kwargs(self) -> dict:
+        """`attn_implementation`, when the installed transformers takes it.
+
+        Checked against the signature rather than tried-and-retried, for the
+        same reason as the expert kernel above: a retry here would download and
+        load a multi-gigabyte model twice.
+
+        A model whose family has no SDPA path still refuses this at load time,
+        with a ValueError naming `attn_implementation`. That one is caught
+        where the model is loaded, because by then the weights are on the disk
+        and the second attempt is cheap.
+        """
+        from transformers import AutoModelForCausalLM
+        try:
+            import inspect
+            params = inspect.signature(
+                AutoModelForCausalLM.from_pretrained).parameters
+            if ("attn_implementation" not in params
+                    and not any(p.kind == p.VAR_KEYWORD
+                                for p in params.values())):
+                return {}
+        except (TypeError, ValueError):
+            pass
+        return {"attn_implementation": self.attn["implementation"]}
+
+    def _load_causal_lm(self, name: str, token, extra: dict, log) -> Any:
+        """`from_pretrained`, retried without the attention path if refused.
+
+        Model families that have no SDPA implementation raise a ValueError
+        rather than falling back, and the message points at the function
+        instead of at the argument. Cheap to retry at this point: the weights
+        are already on the disk, and the refusal happens before any of them
+        are read.
+        """
+        from transformers import AutoModelForCausalLM
+        try:
+            return AutoModelForCausalLM.from_pretrained(name, token=token,
+                                                        **extra)
+        except (TypeError, ValueError) as e:
+            message = str(e)
+            if "attn_implementation" not in extra or not any(
+                    hint in message for hint in
+                    ("attn_implementation", "scaled_dot_product_attention")):
+                raise
+            log("This model has no fused-attention implementation, so it is "
+                "being loaded with the library's own.")
+            return AutoModelForCausalLM.from_pretrained(
+                name, token=token,
+                **{k: v for k, v in extra.items() if k != "attn_implementation"})
+
     # ------------------------------------------------------------ fitting
     def _can_quantize(self) -> bool:
         """Whether 4-bit can be TRUSTED here, which is not whether it runs.
@@ -520,6 +599,10 @@ class ModelHost:
         # "grouped gemm is not supported on ROCM". Anywhere a model is
         # constructed needs this, not just the trainer.
         extra = self._expert_kwargs()
+        # And the attention path, for exactly the same reason one paragraph
+        # up: the kernel a model was fine-tuned under is the kernel it should
+        # answer under, and the card's sequence limit is written against it.
+        extra.update(self._attention_kwargs())
         # The same settings the trainer quantizes a frozen base with, so a
         # model served compressed behaves the way it did while it was learning.
         if quantize:
@@ -572,8 +655,7 @@ class ModelHost:
                 else "Downloading %s…" % path)
             token = spec.get("hf_token")
             tok = AutoTokenizer.from_pretrained(str(path), token=token)
-            model = AutoModelForCausalLM.from_pretrained(str(path), token=token,
-                                                         **extra)
+            model = self._load_causal_lm(str(path), token, extra, log)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):
@@ -596,8 +678,8 @@ class ModelHost:
             tok = AutoTokenizer.from_pretrained(str(path)) \
                 if (path / "tokenizer_config.json").exists() \
                 else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
-            model = AutoModelForCausalLM.from_pretrained(
-                base, token=spec.get("hf_token"), **extra)
+            model = self._load_causal_lm(base, spec.get("hf_token"),
+                                         extra, log)
             model = PeftModel.from_pretrained(model, str(path))
 
         if tok.pad_token is None:
@@ -697,10 +779,10 @@ class ModelHost:
         import torch
         past = None
         total = ids.shape[1]
-        for i in range(0, total, PREFILL_CHUNK):
+        for i in range(0, total, self.prefill_chunk):
             if self._cancel.is_set() or (deadline and time.time() > deadline):
                 break
-            chunk = ids[:, i:i + PREFILL_CHUNK]
+            chunk = ids[:, i:i + self.prefill_chunk]
             with torch.no_grad():
                 if self._logits_to_keep is not False:
                     try:
@@ -717,7 +799,7 @@ class ModelHost:
                                 use_cache=True)
             past = out.past_key_values
             del out
-            if total > PREFILL_CHUNK and i == 0:
+            if total > self.prefill_chunk and i == 0:
                 log("Reading %s tokens of conversation…" % f"{total:,}")
         return past
 
@@ -726,7 +808,7 @@ class ModelHost:
 
         The key/value cache is the part that grows with the conversation and
         does not go away again: two tensors per layer per token, for as long as
-        the exchange lasts. Everything else is bounded by PREFILL_CHUNK.
+        the exchange lasts. Everything else is bounded by the prefill chunk.
 
         Worth computing because the alternative is not a clean failure. A model
         given more than the card can hold does not reliably raise -- on ROCm it
@@ -752,7 +834,7 @@ class ModelHost:
         if not (layers and kv_heads and dim):
             return None
         per_token = 2 * layers * kv_heads * dim * 2      # key and value, fp16
-        room = (free - PREFILL_HEADROOM_GB) * 1024 ** 3
+        room = (free - self.prefill_headroom_gb) * 1024 ** 3
         return int(max(room, 0) // per_token)
 
     def diagnostics(self) -> dict:

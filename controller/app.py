@@ -14,7 +14,7 @@ from fastapi import (Body, FastAPI, File, Header, HTTPException, Query, Request,
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from common import apimodels, formatting, gpulimits
+from common import apimodels, attention, formatting, gpulimits
 
 from . import assets
 from . import architectures as arch
@@ -206,7 +206,7 @@ async def runner_ws(ws: WebSocket) -> None:
         pass
     finally:
         if runner_id:
-            fleet.detach(runner_id)
+            await fleet.detach(runner_id)
             db.mark_runner_offline(runner_id)
             # Deliberately NOT requeuing here. A dropped socket does not stop
             # a training run: the runner keeps going and dials back in. The
@@ -2339,12 +2339,12 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         raise HTTPException(400, "Unknown model size: %s" % size_id)
 
     counts = arch.count_params(architecture)
-    flash = bool((caps.get("attention") or {}).get("flash"))
+    fused = attention.is_fused(caps)
     optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
 
     fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                optim_8bit=optim_8bit, checkpointing=False,
-                               flash=flash)
+                               fused=fused)
     checkpointing = False
     if not fit["fits"]:
         # Recomputing activations instead of storing them does the forward
@@ -2354,7 +2354,7 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         checkpointing = True
         fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                    optim_8bit=optim_8bit, checkpointing=True,
-                                   flash=flash)
+                                   fused=fused)
     # How much text the clock allows. This is a ceiling, not a plan: three
     # separate things can make the right answer smaller, and each says so.
     # `checkpointing` matters here and was ignored. The planner turns it on to
@@ -2928,7 +2928,10 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
             for t in tools if isinstance(t, dict)
             and (t.get("function") or t).get("name")]
     request_id = db.new_id("gen")
-    sent = await fleet.send_to_runner(runner_id, {
+    # Registered before the request is submitted: a queued request is told
+    # where it stands straight away, and that frame goes to whoever owns it.
+    fleet.generation_owner[request_id] = security.current_user(request)["id"]
+    placed = await fleet.submit_generation(runner_id, request_id, {
         "type": "generate", "request_id": request_id, "spec": spec,
         "messages": messages,
         "params": {
@@ -2949,12 +2952,23 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
             "deadline_s": config.GENERATION_DEADLINE_S,
         },
     })
-    if not sent:
+    if placed == "gone":
+        fleet.generation_owner.pop(request_id, None)
         raise HTTPException(503, "That machine dropped off just now. Try again.")
-    fleet.generations[request_id] = runner_id
-    fleet.generation_owner[request_id] = security.current_user(request)["id"]
+    if placed == "full":
+        fleet.generation_owner.pop(request_id, None)
+        raise HTTPException(429,
+            "%s already has %d messages waiting. It answers one at a time; "
+            "wait a moment, or pick another machine."
+            % (runner["name"], fleet.queue_depth(runner_id)))
+    # "queued" is not an error and is deliberately not reported as one. The
+    # request has a place in the line and an id to watch, which is exactly
+    # what "sent" gives; the page learns the difference from the status frame
+    # the queue emits, and says "3rd in the queue" rather than going quiet.
     return {"request_id": request_id, "runner": runner["name"],
-            "runner_id": runner_id, "style": spec["style"]}
+            "runner_id": runner_id, "style": spec["style"],
+            "queued": placed == "queued",
+            "ahead": fleet.queue_depth(runner_id) - 1 if placed == "queued" else 0}
 
 
 @app.post("/api/chat/{request_id}/cancel")
@@ -2965,6 +2979,13 @@ async def chat_cancel(request: Request, request_id: str) -> dict:
     owner = fleet.generation_owner.get(request_id)
     if owner and owner != user["id"] and user["role"] != "admin":
         raise HTTPException(404, "No such request.")
+    # Dropped from the queue if it never left it. Forwarding a cancel for a
+    # request the machine has not been given yet cancels nothing, and the
+    # request would then be sent anyway the moment the slot came free -- a
+    # reply nobody asked for any more, written while somebody waits behind it.
+    if fleet.drop_queued_generation(request_id):
+        fleet.generation_owner.pop(request_id, None)
+        return {"ok": True, "queued": True}
     runner_id = fleet.generations.get(request_id)
     if runner_id:
         await fleet.send_to_runner(runner_id, {"type": "generate_cancel",

@@ -236,7 +236,7 @@ screen. When a run finishes, the **Playground** lets you talk to it.
 | **Fine-tuning** | LoRA and QLoRA over any Hugging Face causal LM, with the exact training string previewed before the run starts. Produces the adapter *and* the adapter merged into its base as a standalone model. |
 | **Training from scratch** | Trained tokenizer, packed corpus, held-out loss charted beside training loss, and live text samples so you can watch noise become sentences. Design the architecture yourself, with every combination checked against your card as you type. |
 | **Evaluation** | Prompt sets with expected answers, scored across several runs in one job (loss, exact match, token F1) with a paired significance test that refuses to name a winner it cannot defend. Standard benchmarks are run with the exact recipe the published number comes from. |
-| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Pin a model to a card with a deployment so it stays warm. |
+| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Concurrent requests queue rather than fail; past the queue's bound the answer is `429` with a `Retry-After`. Options that cannot be honoured (`n` above 1, `logprobs`, `response_format` beyond `text`, `tool_choice: required`) are refused with a `400` rather than accepted and ignored. Pin a model to a card with a deployment so it stays warm. |
 | **Operations** | Which models are loaded where, tokens per second, failure rates, and per-key usage. Reserve a machine for serving or for training. |
 | **Synthetic data** | Have a large hosted model (OpenAI, Azure OpenAI, Anthropic, or anything OpenAI-shaped) write the dataset your own small model trains on. |
 | **Publishing** | Push a finished model or dataset to the Hugging Face Hub, with a generated model card carrying the scores that were actually measured. Export to GGUF for llama.cpp. |
@@ -271,7 +271,7 @@ the UI disables what a given machine cannot do.
 |---|---|---|---|---|
 | LoRA fine-tuning | ✅ | ✅ | ✅ | ✅ (slow) |
 | 4-bit / QLoRA | ✅ | build-dependent¹ | ❌ | ❌ |
-| Flash attention | ✅ | RDNA3+ / CDNA only | ❌ | ❌ |
+| Fused attention² | ✅ | RDNA3+ / CDNA, sometimes behind a flag | ❌ | ❌ |
 | 8-bit optimizers | ✅ | build-dependent¹ | ❌ | ❌ |
 
 ¹ `bitsandbytes` ships CUDA-only wheels. The ROCm image builds it from source
@@ -280,6 +280,34 @@ for your GPU architecture (`BNB_ROCM_ARCH`, default `gfx1030`). This is
 4-bit, against ~8 GB in fp16. Where the build is unavailable, the runner
 reports 4-bit as unsupported and the UI hides it rather than letting a run fail
 an hour in.
+
+² Flash attention and the memory-efficient kernel are two implementations of
+the same idea — compute the softmax in tiles and never write the scores matrix
+to memory — so the studio treats them as one capability. Without either,
+attention keeps `batch × heads × seq × seq` scores *and* the softmax over them,
+which is quadratic in sequence length and the largest single thing on the card
+at a long context.
+
+The runner probes for both rather than inferring them from the architecture,
+and on ROCm it re-probes with `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`
+before giving up: a handful of cards have working kernels that PyTorch will not
+dispatch to unless asked. When that second probe succeeds, the variable travels
+with the capability report and every job sets it, so the kernel a run gets is
+the kernel its memory estimate was written against.
+
+On a machine with neither kernel, and without anybody choosing it:
+
+- gradient checkpointing stays on, and is switched back on if it was turned
+  off — without it every layer keeps its own scores matrix instead of one
+  being live at a time;
+- the micro-batch drops to what the scores matrix can afford and gradient
+  accumulation rises to match, which preserves the effective batch exactly and
+  so changes nothing about the resulting model;
+- prompts are read into the key/value cache 256 tokens at a time when the model
+  is serving, rather than in one quadratic pass;
+- the sequence length that was asked for is still trained at. It is a cost, not
+  a limit, and the run says what the cost is instead of quietly shortening
+  everybody's examples.
 
 ---
 

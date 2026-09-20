@@ -8,9 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from typing import Any
 
 from fastapi import WebSocket
+
+from common import attention
 
 from . import architectures, db, hub, notify
 
@@ -49,6 +52,21 @@ class Fleet:
         # what it may hear.
         self.ui_clients: dict[WebSocket, dict] = {}
         self.generations: dict[str, str] = {}   # request_id -> runner_id
+        # Serving, one machine at a time. A runner holds one model on one card
+        # and answers one message at a time, so a second request arriving while
+        # the first is being written has to go somewhere. It used to go back to
+        # the caller as an error, which turned an evaluation of sixty prompts
+        # into fifty-nine failures.
+        #
+        # So it goes here instead. `serving_now` is the request each machine is
+        # actually answering; `serving_queue` is the line for it, in arrival
+        # order. The message is held rather than the HTTP response: the caller
+        # already has somewhere to wait -- `waiters` for an API request, the
+        # browser's websocket for the playground -- and holding a connection
+        # open to do the waiting twice helps nobody.
+        self.serving_now: dict[str, str] = {}      # runner_id -> request_id
+        self.serving_since: dict[str, float] = {}  # runner_id -> when it started
+        self.serving_queue: dict[str, deque] = {}  # runner_id -> [(rid, msg)]
         self.generation_owner: dict[str, str] = {}  # request_id -> user id
         # (user id, job id) -> (may see it, when that was checked). Visibility
         # is a database question, and a run emits a metric every step; this
@@ -96,8 +114,14 @@ class Fleet:
     def attach(self, runner_id: str, ws: WebSocket) -> None:
         self.connections[runner_id] = ws
 
-    def detach(self, runner_id: str) -> None:
+    async def detach(self, runner_id: str) -> None:
         self.connections.pop(runner_id, None)
+        # Everything this machine was answering or had queued. Told rather
+        # than dropped: a caller waiting on a reply from a machine that has
+        # gone should get a sentence, not the full timeout and then nothing.
+        for rid in self._abandon_serving(runner_id):
+            await self._fail_generation(
+                rid, "That machine disconnected before it finished answering.")
         self.busy.pop(runner_id, None)
         self.dispatched_at.pop(runner_id, None)
         # Deliberately NOT clearing self.checkpoints here. The commonest reason
@@ -127,6 +151,167 @@ class Fleet:
             return True
         except Exception:  # noqa: BLE001 - a dead socket is handled by its own task
             return False
+
+    # --------------------------------------------------------- serving
+    async def submit_generation(self, runner_id: str, rid: str,
+                                msg: dict) -> str:
+        """Ask a machine to write a reply, now or when it is free.
+
+        Returns "sent" if it went straight out, "queued" if it is in the line
+        behind other requests, "full" if the line is at its bound, and "gone"
+        if the machine is not there. Only the caller knows what to do about
+        the last two -- the API answers 429 and 503, the playground says so in
+        the page -- so this reports rather than decides.
+
+        The whole point of holding the MESSAGE rather than the caller is that
+        both of the places a reply is waited for already exist. Nothing here
+        needs to know which one is watching.
+        """
+        from . import config
+
+        if runner_id not in self.connections:
+            return "gone"
+        queue = self.serving_queue.setdefault(runner_id, deque())
+        if self.serving_now.get(runner_id) is None and not queue:
+            if await self._send_generation(runner_id, rid, msg):
+                return "sent"
+            return "gone"
+        if len(queue) >= config.SERVING_QUEUE_MAX:
+            return "full"
+        queue.append((rid, msg))
+        # Said as soon as it is true, not when the reply starts. A request that
+        # will sit behind eleven others for four minutes and says nothing is
+        # indistinguishable from one that has been lost, and the client that
+        # cannot tell is the one that retries and makes the queue longer.
+        ahead = len(queue) - 1
+        await self.relay_generation({
+            "type": "generate_status", "request_id": rid,
+            # `status` is the key a runner's own progress lines use, so the
+            # playground shows this in the same place with no change to it.
+            # The machine-readable pair travels alongside for anything that
+            # wants to count rather than read.
+            # `ahead` counts the ones queued in front; the machine is also
+            # writing one, which is the +1.
+            "status": ("Waiting for the machine to finish the reply it is "
+                       "writing." if not ahead else
+                       "Waiting behind %d replies." % (ahead + 1)),
+            "stage": "queued", "ahead": ahead,
+        })
+        return "queued"
+
+    async def _send_generation(self, runner_id: str, rid: str,
+                               msg: dict) -> bool:
+        """Hand one request to a machine and mark the machine as answering."""
+        self.serving_now[runner_id] = rid
+        self.serving_since[runner_id] = time.time()
+        self.generations[rid] = runner_id
+        if await self.send_to_runner(runner_id, msg):
+            return True
+        # The socket died between choosing the machine and writing to it.
+        # Release the slot rather than leaving it held by a request that was
+        # never sent, which would stall every reply behind it.
+        self.serving_now.pop(runner_id, None)
+        self.serving_since.pop(runner_id, None)
+        self.generations.pop(rid, None)
+        return False
+
+    def queue_depth(self, runner_id: str) -> int:
+        """How many requests are waiting for this machine, excluding the one
+        it is answering."""
+        return len(self.serving_queue.get(runner_id) or ())
+
+    def drop_queued_generation(self, rid: str) -> bool:
+        """Take a request out of the line. True if it was still in it.
+
+        False means it is already being answered -- or was never here -- and
+        the caller should send a real cancel to the machine instead.
+        """
+        for queue in self.serving_queue.values():
+            for item in queue:
+                if item[0] == rid:
+                    queue.remove(item)
+                    return True
+        return False
+
+    async def finish_generation(self, runner_id: str, rid: str) -> None:
+        """This machine has stopped writing that reply. Start the next one."""
+        if self.serving_now.get(runner_id) != rid:
+            # A late frame for a request the slot has already moved past --
+            # a cancel that crossed with a completion, or a duplicate. Not an
+            # error, and emphatically not a reason to free a slot somebody
+            # else is now holding.
+            return
+        self.serving_now.pop(runner_id, None)
+        self.serving_since.pop(runner_id, None)
+        await self._drain_serving(runner_id)
+
+    async def _drain_serving(self, runner_id: str) -> None:
+        queue = self.serving_queue.get(runner_id)
+        while queue and self.serving_now.get(runner_id) is None:
+            nxt, msg = queue.popleft()
+            if nxt not in self.waiters and nxt not in self.generation_owner:
+                # Nobody is listening any more: the caller gave up or the page
+                # was closed. Skipping it is the difference between a queue
+                # that drains and one that spends its time answering questions
+                # nobody asked.
+                continue
+            if not await self._send_generation(runner_id, nxt, msg):
+                await self._fail_generation(
+                    nxt, "That machine dropped off while this request was "
+                         "waiting in the queue.")
+
+    async def _fail_generation(self, rid: str, why: str) -> None:
+        await self.relay_generation({
+            "type": "generate_error", "request_id": rid, "error": why})
+        self.generations.pop(rid, None)
+        self.generation_owner.pop(rid, None)
+
+    async def relay_generation(self, msg: dict) -> None:
+        """Put a frame the controller made itself in front of whoever is
+        waiting, by the same two routes a runner's own frames take."""
+        rid = msg.get("request_id") or ""
+        if (waiter := self.waiters.get(rid)) is not None:
+            waiter.put_nowait(msg)
+            return
+        if owner := self.generation_owner.get(rid):
+            await self.broadcast_ui(msg, user_id=owner)
+
+    async def reconcile_serving(self) -> None:
+        """Free a serving slot whose reply is never going to arrive.
+
+        The runner stops itself at `GENERATION_DEADLINE_S` and says so, so this
+        should never fire. It exists because the failure it guards against is
+        unbounded: one wedged request with no `generate_done` behind it holds
+        a machine's slot for ever, and every request queued after it waits for
+        a reply that is not coming. A queue that can deadlock permanently is
+        worse than no queue at all.
+        """
+        from . import config
+
+        cutoff = time.time() - (config.GENERATION_DEADLINE_S + 120.0)
+        for runner_id, started in list(self.serving_since.items()):
+            if started > cutoff:
+                continue
+            rid = self.serving_now.get(runner_id) or ""
+            print("[serving] freeing a stuck slot on %s (request %s, %ds)"
+                  % (runner_id, rid, int(time.time() - started)))
+            await self._fail_generation(
+                rid, "The machine stopped answering and did not say why. "
+                     "Nothing was kept; try again.")
+            self.serving_now.pop(runner_id, None)
+            self.serving_since.pop(runner_id, None)
+            await self._drain_serving(runner_id)
+
+    def _abandon_serving(self, runner_id: str) -> list[str]:
+        """Everything this machine was answering or about to. Returns the
+        request ids, so the caller can tell each of them what happened."""
+        rids = []
+        if rid := self.serving_now.pop(runner_id, None):
+            rids.append(rid)
+        self.serving_since.pop(runner_id, None)
+        for rid, _msg in self.serving_queue.pop(runner_id, ()):
+            rids.append(rid)
+        return rids
 
     # Frames that carry a run's own data, as opposed to "something changed,
     # go and look" -- which carries nothing a list page would not show anyway.
@@ -287,7 +472,7 @@ class Fleet:
             optim_8bit=bool(cfg.get("optim_8bit"))
             and bool((caps.get("quantization") or {}).get("optim_8bit")),
             checkpointing=bool(cfg.get("gradient_checkpointing")),
-            flash=bool((caps.get("attention") or {}).get("flash")),
+            fused=attention.is_fused(caps),
         )
         if mem["total_gb"] > vram * 0.92:
             return False, ("training every parameter of this model needs about "
@@ -363,6 +548,7 @@ class Fleet:
             try:
                 await self.reconcile_orphans()
                 await self.reconcile_deployments()
+                await self.reconcile_serving()
                 await self._dispatch_once()
             except asyncio.CancelledError:
                 raise
@@ -825,6 +1011,11 @@ class Fleet:
                     self._record_chat(runner_id, rid, msg, kind)
                 self.generations.pop(rid, None)
                 self.generation_owner.pop(rid, None)
+                # ...and the machine is free. Done last, on purpose: the next
+                # request is sent from here, and sending it before this one
+                # has been struck off would have two replies in flight on a
+                # machine that can only write one.
+                await self.finish_generation(runner_id, rid)
             return
 
         if kind == "deployment_state":

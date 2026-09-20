@@ -86,6 +86,31 @@ MAX_NEW_TOKENS: int = int(os.environ.get("AI_STUDIO_MAX_NEW_TOKENS") or 4096)
 GENERATION_DEADLINE_S: float = float(
     os.environ.get("AI_STUDIO_GENERATION_DEADLINE_S") or 300)
 
+# How many requests may be WAITING for one machine, on top of the one it is
+# answering. A runner serves one message at a time because it holds one model
+# on one card, and that is not going to change -- so the only question is
+# whether the ones that arrive meanwhile are queued or refused.
+#
+# They were refused, and it was the wrong answer twice over: an evaluation
+# sending sixty requests got fifty-nine failures, and it got them as 502s,
+# which tells a client library that the upstream is broken rather than that it
+# should slow down. Queued, sixty requests take sixty times one reply and all
+# sixty arrive.
+#
+# The queue is bounded because an unbounded one is not a queue, it is a way of
+# converting a busy machine into a slow one and then into a timeout. Past this
+# depth the honest answer is 429 with a Retry-After, which is the status every
+# client library already knows how to back off from.
+SERVING_QUEUE_MAX: int = int(os.environ.get("AI_STUDIO_SERVING_QUEUE_MAX") or 32)
+
+# What one place in that queue is worth in seconds, for the Retry-After a
+# refusal carries. The deadline above is the worst case for a single reply and
+# most are far quicker, so this is deliberately the optimistic end: a client
+# that comes back too early is refused again cheaply, and one that waits the
+# full worst case for every request ahead of it would sleep for an hour.
+SERVING_QUEUE_RETRY_S: float = float(
+    os.environ.get("AI_STUDIO_SERVING_QUEUE_RETRY_S") or 20)
+
 
 def ensure_dirs() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,19 @@ const TABS = [
   { key: "queue", label: "Queue" },
 ];
 
+// Flash attention is not the question the badge is asking. The memory-efficient
+// kernel avoids materialising the scores matrix in exactly the same way, costs
+// the same memory and runs on cards flash attention does not, so a machine that
+// has it is not warned about. See common/attention.py, which is where the
+// controller and the runner answer the same question.
+function attentionKernel(caps) {
+  const attn = caps?.attention || {};
+  if (attn.flash) return { fused: true, label: "flash attention" };
+  if (attn.mem_efficient)
+    return { fused: true, label: "memory-efficient attention" };
+  return { fused: false, label: "no fused attention" };
+}
+
 export async function runnersView(mount) {
   let status = null, runners = [], jobs = [];
   let dense = localStorage.getItem("aistudio.runnersDense") === "1";
@@ -442,8 +455,8 @@ function card(r, admin, dense = false) {
       <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:10px">
         <span class="badge ${c.quantization?.["4bit"] ? "badge-ok" : "badge-warn"}">
           4-bit ${c.quantization?.["4bit"] ? "available" : "unavailable"}</span>
-        <span class="badge ${c.attention?.flash ? "badge-ok" : "badge-warn"}">
-          flash attention ${c.attention?.flash ? "available" : "unavailable"}</span>
+        <span class="badge ${attentionKernel(c).fused ? "badge-ok" : "badge-warn"}">
+          ${attentionKernel(c).label}</span>
       </div>
 
       ${raw((c.warnings || []).map((w) =>
