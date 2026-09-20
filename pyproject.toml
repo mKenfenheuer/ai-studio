@@ -37,6 +37,16 @@ runner = [
     "accelerate>=0.34",
     "datasets>=2.20",
     "safetensors>=0.4",
+    # Constrained decoding, so `response_format` on the serving API is a
+    # promise the sampler keeps rather than a request the prompt makes. Pure
+    # Python; see runner/grammar.py for why this one is a dependency when the
+    # training loop next to it is not.
+    "lm-format-enforcer>=0.10",
+    # The last word on whether the grammar held. The enforcer is lax in two
+    # measured places -- raw control characters inside strings, and failing
+    # open on an internal error -- so the finished reply is parsed and checked
+    # before it is handed over. See runner/grammar.py.
+    "jsonschema>=4.0",
 ]
 
 [project.scripts]

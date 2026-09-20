@@ -50,6 +50,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
           pip install websockets
+          # The grammar engine and the validator behind `response_format`.
+          # Both are pure Python with no GPU stack behind them, which is the
+          # only reason they belong in a job that installs no torch.
+          pip install lm-format-enforcer jsonschema
 
       - name: Every module imports
         run: |
@@ -63,6 +67,15 @@ jobs:
 
       - name: Which run is allowed onto which machine
         run: python scripts/check-dispatch.py
+
+      - name: What the studio does about the attention kernel a machine has
+        run: python scripts/check-attention.py
+
+      - name: What the serving API refuses, and what it queues
+        run: python scripts/check-serving.py
+
+      - name: A reply held to its format could not have been written otherwise
+        run: python scripts/check-grammar.py
 
       - name: Stored files are shared, counted and released
         run: python scripts/check-assets.py

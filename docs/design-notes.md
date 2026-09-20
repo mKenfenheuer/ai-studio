@@ -21,6 +21,10 @@ numbers that changed somebody's mind.
 - [Operations](#operations)
 - [The assistant, and the chat role](#the-assistant-and-the-chat-role)
 - [Two lessons the hardware probe encodes](#two-lessons-the-probe-encodes)
+- [Working around a missing attention kernel](#working-around-a-missing-attention-kernel)
+- [One card, one reply at a time](#one-card-one-reply-at-a-time)
+- [Making response_format a promise](#making-response_format-a-promise)
+- [A capability that cannot be measured](#a-capability-that-cannot-be-measured-must-not-be-assumed)
 - [One rule in the web UI](#one-rule-in-the-web-ui)
 
 ---
@@ -437,6 +441,195 @@ stock `bitsandbytes` on unsupported ROCm hardware aborts the interpreter at the
 HIP level (`SIGABRT`). An in-process capability check would take the agent down
 at startup, forever. So risky probes run in a **subprocess**, and results proven
 before a crash are recovered from a partial report.
+
+---
+
+## Working around a missing attention kernel
+
+The capability probe answers a question the rest of the studio kept asking
+badly. Four places read `caps["attention"]["flash"]` and meant "does attention
+cost memory with the square of sequence length here" — and those are not the
+same question. The memory-efficient kernel is a second implementation of the
+same tiling idea, costs the same memory, and runs on hardware flash attention
+does not. Reading only the flash flag charged those cards for a quadratic term
+they never pay and capped them at 2048 tokens when they can comfortably do
+8192. `common/attention.py` now answers the question that was meant, once, and
+the four callers ask it rather than each other.
+
+**A card without a kernel may still have one.** On ROCm the kernels come from
+AOTriton, and the architectures its wheels compile for are a shorter list than
+the ones PyTorch will dispatch to. On the ones in between, torch says no and
+the kernel is there — behind `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`,
+because AMD has not finished validating it. So a card that reports nothing gets
+one more probe with the flag set, and if that one works the variable is
+reported alongside the answer and set by every job that runs there. Reporting
+`flash: true` from a probe whose environment the job does not reproduce would
+be the worst outcome available: an optimistic memory estimate against a
+pessimistic kernel.
+
+**Where there is genuinely no kernel, the batch moves and the length does
+not.** Attention without fusion keeps `batch × heads × seq × seq` scores and
+the softmax over them — quadratic in length, linear in batch. The length is the
+thing the dataset needs, so the batch is what gives:
+
+- gradient checkpointing stays on, and is turned back on if it was switched
+  off. This is the one setting the fine-tuner overrides rather than honouring,
+  and the reason is that it is not the trade it looks like: without
+  checkpointing every layer keeps its own scores instead of one being live at
+  a time, which multiplies the largest term on the card by the depth of the
+  model. That is not "30% faster", it is "does not start".
+- the micro-batch falls to what the scores matrix can afford, and gradient
+  accumulation rises to match. Four sequences one at a time and four at once
+  produce the same gradient, the same optimiser steps and the same schedule.
+- the replacement is a **divisor** of the original batch, never just the cap.
+  Accumulating eight in groups of three is nine a step, and an effective batch
+  that drifts changes the tokens per step, the token budget and the learning
+  rate the schedule was written against. `batch × accumulation` comes out
+  exactly where it went in.
+- serving reads a prompt into the key/value cache 256 tokens at a time instead
+  of in one pass, for the same arithmetic in a different order. Where the
+  kernel *is* fused that slicing is pure overhead, so the chunk is 2048 there.
+
+What does not happen is the sequence length being quietly shortened. It is
+honoured, and the run says what it costs — see the note in
+`runner/jobs/lora_llm.py` about the difference between saying and doing.
+
+---
+
+## One card, one reply at a time
+
+A runner holds one model on one card and writes one reply at a time. That is
+not going away, so the only real question is what happens to the second
+request — and the answer used to be an error. An evaluation sending sixty
+prompts got one answer and fifty-nine failures.
+
+**They are queued now, and the message is held rather than the caller.** Both
+places a reply is waited for already exist: `waiters` for an API request, the
+browser's websocket for the playground. Holding an HTTP connection open to do
+the waiting a second time helps nobody, so the controller keeps the request in
+`serving_queue[runner_id]` and sends it when the machine frees up. A queued
+request is told where it stands straight away, on the same `generate_status`
+frame a runner uses for its own progress, because a request that will wait four
+minutes and says nothing is indistinguishable from one that was lost — and the
+client that cannot tell is the one that retries and makes the queue longer.
+
+**The bound matters more than the queue.** An unbounded queue is not a queue,
+it is a way of turning a busy machine into a slow one and then into a timeout.
+Past `SERVING_QUEUE_MAX` the honest answer is `429` with a `Retry-After`, and
+the status code is the point: `502` tells a client library the upstream is
+broken, and the correct response to that is to stop trying.
+
+**Three ways a slot could leak, all closed.** A socket that dies between
+choosing a machine and writing to it releases the slot rather than holding it
+for a request that was never sent. A machine that disconnects fails everything
+it was answering or had queued, with a sentence rather than a timeout. And a
+reply that simply never arrives is reaped by `reconcile_serving` after the
+runner's own deadline plus two minutes — because a queue that can deadlock
+permanently is worse than no queue at all.
+
+Cancelling takes a request *out of the line* if it never left it. Forwarding a
+cancel for a request the machine has not been given yet cancels nothing, and
+the request would then be sent anyway the moment the slot came free.
+
+### And a field that was refused by code that did not refuse it
+
+`response_format` was accepted and ignored, which is the one failure this API
+is written to avoid: a caller that asks for a JSON schema has stopped checking
+the reply, so prose returned under it goes wherever the schema was going to go.
+It was briefly a `400`, and is now enforced — see the next section.
+
+Writing the check for it turned up that `logprobs` was never refused either.
+The guard was a loop over `(None, False, 1)`, where the `1` was meant for `n`
+— and `True == 1` in Python, so `logprobs: true` passed the test written to
+reject it. The fields are checked one at a time now.
+
+---
+
+## Making response_format a promise
+
+Nothing in a prompt is binding. A model asked for JSON usually writes JSON, and
+"usually" is exactly the wrong guarantee for a field whose entire purpose is
+that the caller has stopped checking.
+
+What is binding is the sampler. Before each token is chosen, every token that
+would break the grammar is scored at negative infinity, so the model picks from
+the legal moves. The reply is not checked against the schema afterwards and
+never repaired — it could not have been written in another shape. The schema is
+*also* put in the prompt, which changes nothing about validity and a great deal
+about whether the fields are filled with the answer or with a guess.
+
+**The grammar is a dependency, and the training loop next door is not.** That
+looks inconsistent and is not. The training loop is hand-written to escape an
+API that churns. A grammar is either correct or it emits `{"a": 01.}` at three
+in the morning; JSON's escaping, number syntax and unicode rules are a
+well-known source of subtle bugs, and correctness-critical, bounded and already
+solved is the shape of problem a dependency is for.
+
+**It still needs a guard, and finding out why is the point of the check.** The
+check drives a model that picks *uniformly at random* from whatever the mask
+allows — a maximally unhelpful model that would write "Sure! Here's the JSON:"
+if it could. Two real failures fell out of it:
+
+- raw tabs and newlines are accepted inside a JSON string, which RFC 8259
+  forbids and `json.loads` rejects;
+- an internal parser error is handled by allowing only end-of-text, which stops
+  the reply wherever it stands — mid-string, if that is where it was.
+
+Failing open is a reasonable default for a library that cannot know what its
+caller promised. It is not a reasonable default here. So the finished reply is
+parsed, and validated against the schema, before it is handed over; a reply
+that fails becomes an error. A reply that is nearly JSON is worth less than an
+error, because the error is the only one of the two anybody notices.
+
+The same check also disproved a plausible-looking assertion of mine: `6e9` is a
+valid `integer` by JSON Schema, which counts any number with a zero fractional
+part. `8e-15` is not, and is refused. The test was wrong, not the code.
+
+---
+
+## A capability that cannot be measured must not be assumed
+
+FlexAttention was briefly switched on automatically, and it crash-looped a
+production runner twenty-four times. The mistake is subtle enough to be worth
+keeping.
+
+The probe compiled `flex_attention` on the card and it worked. That was taken
+as "this machine has fused attention": the comfortable sequence length went
+from 2048 to 8192, and every memory estimate was rewritten against a kernel
+that never materialises the scores matrix. Then a real model was loaded and
+Inductor refused to build the kernel transformers actually uses — `out of
+resource: shared memory, Required: 131072, Hardware limit: 65536`, because
+RDNA2 has 64 KB of LDS per workgroup and the masked kernel wants 128.
+
+The obvious repair is to probe at a realistic head dimension. It does not
+work. Raw `flex_attention` at head_dim 128 compiles; a two-layer Llama through
+transformers at the same shape compiles; Qwen2.5-3B does not. What fails is the
+block mask a particular architecture builds, and the only probe that predicts
+it is loading that model — which is not a probe, it is the thing a probe
+exists to avoid.
+
+So it stays off unless a machine is told to try it, and a machine that is told
+falls back per model rather than dying. The general rule the whole
+`capabilities` module already followed — measure, do not trust — needed one
+more clause: **a measurement is only worth what it predicts.**
+
+Two smaller faults fell out of the same incident:
+
+**The fallback caught the wrong exceptions.** `load_base_model` dropped an
+optional argument on `TypeError` or `ValueError`. A compiler that refuses to
+build a kernel raises `InductorError`, which is neither, so it escaped and
+killed the load. Nothing among those optional arguments is worth failing a run
+over — each is a performance choice with a working default behind it — so
+anything naming one is now treated as that argument being refused, whatever
+type it arrives as.
+
+**A deployment that kills the machine was retried for ever.** The state machine
+skips a deployment marked `failed`, which covers every way a load can fail
+except the one that matters most: a load that kills the runner reports nothing,
+so it stays `pending` and is sent again the moment the machine reconnects. It
+is capped at three attempts now and then written off, in words that say the
+machine did not survive loading it rather than leaving it to be inferred from a
+restart count.
 
 ---
 

@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 from common import conversation, formatting
 
-from . import artifacts, capabilities
+from . import artifacts, capabilities, grammar as grammars
 
 CACHE_DIR = artifacts.CACHE_DIR
 
@@ -70,10 +70,28 @@ class OutOfRoom(RuntimeError):
 # arithmetic is identical either way; only the order changes.
 PREFILL_CHUNK = 256
 
+# And the same number where attention IS fused. A flash or memory-efficient
+# kernel never materialises the scores matrix, so the quadratic term the chunk
+# above exists to bound is not there to bound: the cost of a slice is linear in
+# its length, and slicing finely just means more launches for the same work.
+#
+# Not unlimited, because the chunk still bounds the activations of one forward
+# pass and the allocator still has to find a block for them. 2048 is where
+# those stop being free on a 16 GB card, and it is eight times fewer passes
+# over a long conversation.
+PREFILL_CHUNK_FUSED = 2048
+
 # Room kept for the working set of one prefill slice and the allocator's slack,
 # on top of the conversation's own key/value cache. Measured: a 256-token slice
 # peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
 PREFILL_HEADROOM_GB = 0.6
+
+# ...and the same, per token of chunk, so the two move together. A larger slice
+# is a larger working set, and a fused kernel raises the slice eightfold. This
+# is the number above divided by the chunk it was measured at, which is what
+# makes it a measurement rather than two constants that have to be kept in
+# step by hand.
+PREFILL_HEADROOM_PER_TOKEN = PREFILL_HEADROOM_GB / PREFILL_CHUNK
 
 # How long one reply may take before it is stopped and handed back as it
 # stands. A runner answers one message at a time, so this is not really a limit
@@ -117,6 +135,25 @@ def _is_oom(e: BaseException) -> bool:
     return "out of memory" in str(e).lower()
 
 
+def _with_instruction(messages: list, instruction: str) -> list:
+    """The conversation with the format instruction added to its system turn.
+
+    Appended to the existing system message rather than inserted as a second
+    one. Two system turns is a shape most chat templates have never seen -- a
+    few render only the first, and a few refuse outright -- so a reply would
+    come back unconstrained-looking for a reason nobody could find from the
+    request. A conversation with no system turn at all gets one.
+    """
+    out = [dict(m) for m in messages]
+    for m in out:
+        if m.get("role") in ("system", "developer"):
+            existing = (m.get("content") or "").rstrip()
+            m["content"] = ("%s\n\n%s" % (existing, instruction) if existing
+                            else instruction)
+            return out
+    return [{"role": "system", "content": instruction}] + out
+
+
 class _Resident:
     """One model on the card, and everything that describes it.
 
@@ -125,12 +162,18 @@ class _Resident:
     every message.
     """
     __slots__ = ("job_id", "model", "tok", "chat_template", "specials",
-                 "quantized", "params_b", "added_tokens", "last_used")
+                 "quantized", "params_b", "added_tokens", "last_used",
+                 # Work that belongs to this model and costs too much to redo
+                 # per request. Only the grammar's vocabulary table so far,
+                 # which takes tens of seconds to build on a 152k vocabulary
+                 # and depends on nothing but the tokenizer.
+                 "derived")
 
     def __init__(self, job_id: str, model, tok, chat_template, specials,
                  quantized: bool, params_b: float | None,
                  added_tokens: list[str]):
         self.job_id = job_id
+        self.derived: dict = {}
         self.model = model
         self.tok = tok
         self.chat_template = chat_template
@@ -187,6 +230,17 @@ class ModelHost:
         # diagnostics().
         self.last_request: dict = {}
         self._cancel = threading.Event()
+        # The same attention plan a training run gets, and for the same
+        # reasons: serving materialises a scores matrix the size of the
+        # conversation squared on a card with no fused kernel, and it is the
+        # term that decides how long a conversation can get. Settled once, in
+        # the process that will load the models, because part of the plan is
+        # environment `from_pretrained` reads.
+        self.attn = capabilities.attention_plan(caps)
+        self.prefill_chunk = (PREFILL_CHUNK if self.attn["quadratic"]
+                              else PREFILL_CHUNK_FUSED)
+        self.prefill_headroom_gb = (self.prefill_chunk
+                                    * PREFILL_HEADROOM_PER_TOKEN)
 
     # ------------------------------------------------------------ device
     @property
@@ -413,6 +467,63 @@ class ModelHost:
             pass
         return {"experts_implementation": kernel}
 
+    def _attention_kwargs(self) -> dict:
+        """`attn_implementation`, when the installed transformers takes it.
+
+        Checked against the signature rather than tried-and-retried, for the
+        same reason as the expert kernel above: a retry here would download and
+        load a multi-gigabyte model twice.
+
+        A model whose family has no SDPA path still refuses this at load time,
+        with a ValueError naming `attn_implementation`. That one is caught
+        where the model is loaded, because by then the weights are on the disk
+        and the second attempt is cheap.
+        """
+        from transformers import AutoModelForCausalLM
+        try:
+            import inspect
+            params = inspect.signature(
+                AutoModelForCausalLM.from_pretrained).parameters
+            if ("attn_implementation" not in params
+                    and not any(p.kind == p.VAR_KEYWORD
+                                for p in params.values())):
+                return {}
+        except (TypeError, ValueError):
+            pass
+        return {"attn_implementation": self.attn["implementation"]}
+
+    def _load_causal_lm(self, name: str, token, extra: dict, log) -> Any:
+        """`from_pretrained`, retried without the attention path if refused.
+
+        Model families that have no SDPA implementation raise a ValueError
+        rather than falling back, and the message points at the function
+        instead of at the argument. Cheap to retry at this point: the weights
+        are already on the disk, and the refusal happens before any of them
+        are read.
+        """
+        from transformers import AutoModelForCausalLM
+        try:
+            return AutoModelForCausalLM.from_pretrained(name, token=token,
+                                                        **extra)
+        except Exception as e:  # noqa: BLE001 - any refusal of the attention path
+            message = str(e)
+            # Widened from (TypeError, ValueError) because a FlexAttention
+            # kernel the compiler will not build raises from inside Inductor,
+            # which is neither -- and serving a model it cannot build for then
+            # killed the process rather than falling back. See the note in
+            # runner/jobs/attentionfit.load_base_model.
+            if "attn_implementation" not in extra or not any(
+                    hint in message for hint in
+                    ("attn_implementation", "scaled_dot_product_attention",
+                     "triton", "shared memory", "flex_attention",
+                     "InductorError")):
+                raise
+            log("This model has no fused-attention implementation, so it is "
+                "being loaded with the library's own.")
+            return AutoModelForCausalLM.from_pretrained(
+                name, token=token,
+                **{k: v for k, v in extra.items() if k != "attn_implementation"})
+
     # ------------------------------------------------------------ fitting
     def _can_quantize(self) -> bool:
         """Whether 4-bit can be TRUSTED here, which is not whether it runs.
@@ -540,6 +651,10 @@ class ModelHost:
         # "grouped gemm is not supported on ROCM". Anywhere a model is
         # constructed needs this, not just the trainer.
         extra = self._expert_kwargs()
+        # And the attention path, for exactly the same reason one paragraph
+        # up: the kernel a model was fine-tuned under is the kernel it should
+        # answer under, and the card's sequence limit is written against it.
+        extra.update(self._attention_kwargs())
         # The same settings the trainer quantizes a frozen base with, so a
         # model served compressed behaves the way it did while it was learning.
         if quantize:
@@ -592,8 +707,7 @@ class ModelHost:
                 else "Downloading %s…" % path)
             token = spec.get("hf_token")
             tok = AutoTokenizer.from_pretrained(str(path), token=token)
-            model = AutoModelForCausalLM.from_pretrained(str(path), token=token,
-                                                         **extra)
+            model = self._load_causal_lm(str(path), token, extra, log)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):
@@ -616,8 +730,8 @@ class ModelHost:
             tok = AutoTokenizer.from_pretrained(str(path)) \
                 if (path / "tokenizer_config.json").exists() \
                 else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
-            model = AutoModelForCausalLM.from_pretrained(
-                base, token=spec.get("hf_token"), **extra)
+            model = self._load_causal_lm(base, spec.get("hf_token"),
+                                         extra, log)
             model = PeftModel.from_pretrained(model, str(path))
 
         if tok.pad_token is None:
@@ -717,10 +831,10 @@ class ModelHost:
         import torch
         past = None
         total = ids.shape[1]
-        for i in range(0, total, PREFILL_CHUNK):
+        for i in range(0, total, self.prefill_chunk):
             if self._cancel.is_set() or (deadline and time.time() > deadline):
                 break
-            chunk = ids[:, i:i + PREFILL_CHUNK]
+            chunk = ids[:, i:i + self.prefill_chunk]
             with torch.no_grad():
                 if self._logits_to_keep is not False:
                     try:
@@ -737,7 +851,7 @@ class ModelHost:
                                 use_cache=True)
             past = out.past_key_values
             del out
-            if total > PREFILL_CHUNK and i == 0:
+            if total > self.prefill_chunk and i == 0:
                 log("Reading %s tokens of conversation…" % f"{total:,}")
         return past
 
@@ -746,7 +860,7 @@ class ModelHost:
 
         The key/value cache is the part that grows with the conversation and
         does not go away again: two tensors per layer per token, for as long as
-        the exchange lasts. Everything else is bounded by PREFILL_CHUNK.
+        the exchange lasts. Everything else is bounded by the prefill chunk.
 
         Worth computing because the alternative is not a clean failure. A model
         given more than the card can hold does not reliably raise -- on ROCm it
@@ -772,7 +886,7 @@ class ModelHost:
         if not (layers and kv_heads and dim):
             return None
         per_token = 2 * layers * kv_heads * dim * 2      # key and value, fp16
-        room = (free - PREFILL_HEADROOM_GB) * 1024 ** 3
+        room = (free - self.prefill_headroom_gb) * 1024 ** 3
         return int(max(room, 0) // per_token)
 
     def diagnostics(self) -> dict:
@@ -819,12 +933,22 @@ class ModelHost:
             self.last_used = time.time()
 
             want_reasoning = bool(params.get("reasoning"))
+
+            # What the reply is being held to, if anything. Built before the
+            # prompt is rendered, because a grammar puts the schema in front
+            # of the model as well as behind the sampler -- see
+            # `grammar.Grammar.instruction` for why both are worth doing.
+            resident = self._residents.get(spec["job_id"])
+            grammar = grammars.build(spec.get("response_format"), tok,
+                                     resident.derived if resident else {}, log)
+            if grammar is not None:
+                messages = _with_instruction(messages, grammar.instruction())
+
             fmt, text = self.render(spec, messages, want_reasoning, log)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
             # Everything this exact template writes around a message, read off
             # the template itself. What the stream may not show half of.
-            resident = self._residents.get(spec["job_id"])
             markers = formatting.boundary_markers(
                 fmt, self.specials,
                 added=resident.added_tokens if resident else None)
@@ -922,6 +1046,32 @@ class ModelHost:
                 past = out.past_key_values
                 logits = out.logits[:, -1, :].float()
 
+                # FIRST, before temperature, top-k and top-p. Those three
+                # reshape a distribution; this one decides which tokens are in
+                # it at all, and a token ruled out by the grammar must not be
+                # able to win a sample no matter how confident the model is.
+                #
+                # Applied by addition rather than assignment so a token the
+                # grammar allows keeps its score: the model still chooses, it
+                # simply chooses from the legal moves.
+                if grammar is not None:
+                    allowed = grammar.allowed(produced)
+                    if not allowed:
+                        # The grammar has painted itself into a corner: no
+                        # token continues the reply and none ends it. Said out
+                        # loud rather than falling back to unconstrained
+                        # sampling, which would hand back the one thing this
+                        # whole file exists to prevent -- text that does not
+                        # match the format it was promised to match.
+                        raise RuntimeError(
+                            "The reply could not be completed in the format "
+                            "it was asked for: no token left continues it. "
+                            "This usually means a schema no text can satisfy.")
+                    keep = torch.full_like(logits, float("-inf"))
+                    keep[0, torch.tensor(allowed, device=logits.device,
+                                         dtype=torch.long)] = 0.0
+                    logits = logits + keep
+
                 if temperature <= 0:
                     nxt = torch.argmax(logits, dim=-1, keepdim=True)
                 else:
@@ -1008,6 +1158,14 @@ class ModelHost:
             # out of what is stored and handed back.
             content = formatting.strip_special(reply["content"])
             reasoning = formatting.strip_special(reply["reasoning"])
+
+            # The last word on whether the promise was kept. Checked on the
+            # text that is actually about to be returned -- after the format
+            # markers have been stripped and the reply reassembled -- because
+            # that is the string the caller will parse, and an earlier check
+            # would be checking something else. See grammar.Grammar.validate.
+            if grammar is not None:
+                grammar.validate(content)
             return {
                 # The fallback is for a reply nothing could be made of: hand
                 # back the raw text rather than nothing. It must NOT fire when

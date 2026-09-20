@@ -47,6 +47,12 @@ services:
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-amd-runner}
+      # This machine's own cap on what the studio may have of its card, if
+      # it is not the studio's to take in full -- a share of the memory, and
+      # a share of the time. Unset means all of it. Left empty here rather
+      # than defaulted, because an empty value reads as "no limit" too.
+      AI_STUDIO_GPU_MEMORY_PCT: ${AI_STUDIO_GPU_MEMORY_PCT:-}
+      AI_STUDIO_GPU_COMPUTE_PCT: ${AI_STUDIO_GPU_COMPUTE_PCT:-}
       HF_TOKEN: ${HF_TOKEN:-}
 
   # The controller's own machine, working as a runner for the jobs that need

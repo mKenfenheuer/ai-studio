@@ -131,6 +131,95 @@ scripts/install-runner.sh
 > Linux containers on a WSL2 kernel, so it works unchanged — there is no
 > separate Windows image and none is needed.
 
+### Or borrow a GPU from Google Colab
+
+**Machines → Connect a machine → Colab notebook** downloads an `.ipynb`
+that attaches a Colab session to this studio for as long as Google lets the session live. It is the
+answer to "I want to try this and I do not own a graphics card": a free T4
+fine-tunes a 7B in 4-bit, and everything that matters — datasets, runs,
+finished models — stays on your controller.
+
+Nothing about the runner had to change for it. The agent has dialed *out*
+since the day it was written, and Colab is the extreme case that design was
+for: no inbound address, none possible, none needed.
+
+Three things follow from where Colab is, and the notebook says all three
+before it does anything:
+
+- **Your controller needs an address Google can reach.** `localhost` inside a
+  Colab VM is that VM. For a studio on your own network, put a tunnel in front
+  of it first — `cloudflared tunnel --url http://localhost:8420` prints one —
+  and treat that address plus the join token as a password. The notebook
+  refuses a private address outright rather than failing obscurely later.
+- **The runner's code comes from your controller**, not from a package index,
+  so the machine runs exactly the version your studio speaks. Only third-party
+  libraries are installed in Colab, and deliberately not torch: Google's build
+  is matched to the card in that VM, and replacing it is the quickest way to
+  end up training on the CPU.
+- **The join token is not written into the notebook.** An `.ipynb` is a file
+  people forward and commit. The notebook asks for the token instead, out of
+  Colab's own secret store if you put it there, and never prints it.
+
+When the session ends, the run it was training goes back on the queue. Its
+checkpoint was on Colab's disk, which is wiped, so the studio waits ten
+minutes for the session to return and then starts that run again elsewhere.
+Reconnecting from the same notebook rejoins as the *same* machine rather than
+leaving a row of ghosts on the Machines page.
+
+### Using only part of a machine
+
+A card is not always the studio's to take. It is in somebody's desktop, or the
+room cannot take 300 W for six hours, or a second workload has to stay
+responsive. **Machines → Usage limits** sets, per machine, how much of its
+card this studio may have.
+
+The two numbers look alike and are not, which is the part worth reading:
+
+**Memory is a real cap.** The runner confines the process to that share, and
+the controller plans against the same figure — so the batch is sized to fit
+inside the limit rather than inside the card. The usual effect of setting it
+is a smaller batch, not a failure. A 16 GB card at 50% is planned, checked and
+refused exactly as a 8 GB card would be, everywhere that asks "will this fit",
+because the limit is applied once where capabilities are read rather than at
+each of the places that read them. The card's real size stays visible beside
+it: "8 GB of 16 GB", because a 16 GB card reporting 8 reads as a broken probe.
+
+**Compute is a duty cycle, not a partition.** No consumer card sells you 40%
+of itself: there is no hardware mechanism, MPS is NVIDIA-only and needs a
+daemon, and nothing equivalent exists on RDNA. So the trainer pauses between
+optimiser steps until the card averages the share asked for — 50% means the
+card is busy about half the time and the run takes about twice as long. That
+is worth having, and it is not isolation, so the UI says "about" and tells you
+what the run will now cost in hours. Chat replies are never throttled:
+stuttering somebody's conversation to save power is a worse trade than letting
+a model that is already resident finish its sentence.
+
+A machine can also set its own limit, in its own environment
+(`AI_STUDIO_GPU_MEMORY_PCT`, `AI_STUDIO_GPU_COMPUTE_PCT`), which is what a box
+lent out on conditions should do — it survives the controller forgetting, and
+it holds from the first second the runner is up. The studio's setting takes
+precedence when there is one; clearing it in the UI is not the same as setting
+it to 100%, it hands the decision back to the machine.
+
+A change reaches an idle machine at once and a busy one at its next run.
+Taking memory away from a run that was sized for it is how a setting becomes
+a crash four hours in.
+
+### Removing a machine
+
+Not every machine is permanent — a laptop lent for an afternoon, a Colab
+session Google took back — and a page of dead cards is a page nobody reads.
+**Forget this machine** removes an offline one from the list.
+
+It forgets, it does not ban: a runner whose agent is still going dials in
+again within seconds and is listed afresh, so stopping it is what removes it
+and this is what tidies up afterwards. Which is why it is refused while the
+machine is connected, and refused again while any unfinished run depends on
+it — one still marked as running there (wait a minute; the studio notices by
+itself) or one queued *pinned* to it, which nothing else would ever resolve.
+Finished runs keep the machine's id and lose only its name, which every screen
+that shows one already copes with.
+
 ### Then train something
 
 Open the UI and follow the four steps. Everything technical is chosen for you
@@ -147,7 +236,7 @@ screen. When a run finishes, the **Playground** lets you talk to it.
 | **Fine-tuning** | LoRA and QLoRA over any Hugging Face causal LM, with the exact training string previewed before the run starts. Produces the adapter *and* the adapter merged into its base as a standalone model. |
 | **Training from scratch** | Trained tokenizer, packed corpus, held-out loss charted beside training loss, and live text samples so you can watch noise become sentences. Design the architecture yourself, with every combination checked against your card as you type. |
 | **Evaluation** | Prompt sets with expected answers, scored across several runs in one job (loss, exact match, token F1) with a paired significance test that refuses to name a winner it cannot defend. Standard benchmarks are run with the exact recipe the published number comes from. |
-| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Pin a model to a card with a deployment so it stays warm. |
+| **Serving** | An OpenAI-compatible `/v1/chat/completions` and `/v1/models` over every finished run — streaming, with tool calls and reasoning, behind per-user API keys. Concurrent requests queue rather than fail; past the queue's bound the answer is `429` with a `Retry-After`. `response_format` is enforced by constrained decoding, not requested in the prompt: tokens that would break the grammar are ruled out before each one is chosen, so a reply asked for as JSON could not have been written any other way. Options that genuinely cannot be honoured (`n` above 1, `logprobs`, `tool_choice: required`) are refused with a `400` rather than accepted and ignored. Pin a model to a card with a deployment so it stays warm. |
 | **Operations** | Which models are loaded where, tokens per second, failure rates, and per-key usage. Reserve a machine for serving or for training. |
 | **Synthetic data** | Have a large hosted model (OpenAI, Azure OpenAI, Anthropic, or anything OpenAI-shaped) write the dataset your own small model trains on. |
 | **Publishing** | Push a finished model or dataset to the Hugging Face Hub, with a generated model card carrying the scores that were actually measured. Export to GGUF for llama.cpp. |
@@ -182,7 +271,7 @@ the UI disables what a given machine cannot do.
 |---|---|---|---|---|
 | LoRA fine-tuning | ✅ | ✅ | ✅ | ✅ (slow) |
 | 4-bit / QLoRA | ✅ | build-dependent¹ | ❌ | ❌ |
-| Flash attention | ✅ | RDNA3+ / CDNA only | ❌ | ❌ |
+| Fused attention² | ✅ | RDNA3+ / CDNA, sometimes behind a flag | ❌ | ❌ |
 | 8-bit optimizers | ✅ | build-dependent¹ | ❌ | ❌ |
 
 ¹ `bitsandbytes` ships CUDA-only wheels. The ROCm image builds it from source
@@ -191,6 +280,56 @@ for your GPU architecture (`BNB_ROCM_ARCH`, default `gfx1030`). This is
 4-bit, against ~8 GB in fp16. Where the build is unavailable, the runner
 reports 4-bit as unsupported and the UI hides it rather than letting a run fail
 an hour in.
+
+² Flash attention and the memory-efficient kernel are two implementations of
+the same idea — compute the softmax in tiles and never write the scores matrix
+to memory — so the studio treats them as one capability. Without either,
+attention keeps `batch × heads × seq × seq` scores *and* the softmax over them,
+which is quadratic in sequence length and the largest single thing on the card
+at a long context.
+
+The runner probes for both rather than inferring them from the architecture,
+and on ROCm it re-probes with `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`
+before giving up: a handful of cards have working kernels that PyTorch will not
+dispatch to unless asked. When that second probe succeeds, the variable travels
+with the capability report and every job sets it, so the kernel a run gets is
+the kernel its memory estimate was written against.
+
+On a machine with neither kernel, and without anybody choosing it:
+
+- gradient checkpointing stays on, and is switched back on if it was turned
+  off — without it every layer keeps its own scores matrix instead of one
+  being live at a time;
+- the micro-batch drops to what the scores matrix can afford and gradient
+  accumulation rises to match, which preserves the effective batch exactly and
+  so changes nothing about the resulting model;
+- prompts are read into the key/value cache 256 tokens at a time when the model
+  is serving, rather than in one quadratic pass;
+- the sequence length that was asked for is still trained at. It is a cost, not
+  a limit, and the run says what the cost is instead of quietly shortening
+  everybody's examples.
+
+Three further levers apply whether or not attention is fused, and all three are
+automatic:
+
+- **the loss is computed in slices.** At 4,096 tokens against a 152k-token
+  vocabulary the logits are ~1.24 GB *per copy* and the cross-entropy path
+  keeps about five — larger than the attention scores beside them. Each slice
+  is rebuilt during its own backward pass, so the peak is one slice rather than
+  the whole sequence. Verified against the model's own loss on a real batch
+  before it is used, and abandoned if the two disagree.
+- **FlexAttention is probed for, reported, and left off** unless
+  `AI_STUDIO_FLEX_ATTENTION=1` is set. It compiles a tiled kernel with Triton
+  rather than calling one from AOTriton, so on paper a card with neither flash
+  nor memory-efficient attention could still get linear-memory attention — and
+  on this hardware the probe does not predict the outcome. One that compiled
+  cleanly went on to fail for Qwen2.5-3B with `out of resource: shared memory,
+  Required: 131072, Hardware limit: 65536`, because RDNA2 has 64 KB of LDS per
+  workgroup. A model it cannot compile for now falls back instead of failing.
+- **the allocator is asked to grow rather than fragment**
+  (`expandable_segments`), because at a long context one enormous allocation
+  arriving and leaving every step is what turns "fits on paper" into an
+  out-of-memory.
 
 ---
 
@@ -206,6 +345,8 @@ an hour in.
 | `AI_STUDIO_CONTROLLER` | runner | Controller URL |
 | `AI_STUDIO_RUNNER_NAME` | runner | Display name |
 | `AI_STUDIO_RUNNER_KINDS` | runner | Restrict to certain job kinds |
+| `AI_STUDIO_GPU_MEMORY_PCT` | runner | Give the studio at most this share of the card's memory |
+| `AI_STUDIO_GPU_COMPUTE_PCT` | runner | Give it at most this share of the card's time |
 | `BNB_ROCM_ARCH` | rocm build | GPU arch, e.g. `gfx1030`, `gfx1100` |
 
 ---
@@ -239,6 +380,13 @@ Found a security issue? Please open a
 rather than a public issue.
 
 ---
+
+Connecting a Colab runner means giving the controller an address on the public
+internet, which is the one thing the rest of this design avoids. A quick
+tunnel is a reasonable way to do it and a bad thing to leave running: while it
+is up, the studio is as exposed as whatever is in front of it, and the join
+token is what stands between a stranger and your job data. Stop the tunnel
+when the session ends.
 
 ## Project layout
 

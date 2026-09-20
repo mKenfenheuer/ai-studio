@@ -67,14 +67,20 @@ fi
 
 log "Installing training libraries"
 # shellcheck disable=SC2086
-# Pillow is what a vision run decodes images with, and the runner advertises
-# the kinds of work it can take from the libraries it finds. Left out, a
-# machine installed this way reported "text only" and never saw a vision job --
-# a limit of the installer, not of the hardware. The container images have
-# always installed it; this keeps the two the same.
+# Two of these are here to keep a natively installed runner level with the
+# container images, because the runner advertises what it can take from the
+# libraries it finds -- so a missing package is not a smaller install, it is a
+# machine that silently never gets offered a kind of work.
+#
+#   Pillow            decodes images for a vision run. Without it the machine
+#                     reports "text only" and no vision job is ever sent.
+#   lm-format-enforcer  constrained decoding behind `response_format`, with
+#   + jsonschema        jsonschema checking the finished reply. Without them
+#                     the controller refuses those requests in words.
 "$PIP" install --quiet \
   "transformers>=4.44" "peft>=0.12" "accelerate>=0.34" "datasets>=2.20" \
-  "safetensors>=0.4" "websockets>=12" "httpx>=0.27" "Pillow>=10" numpy $EXTRA
+  "safetensors>=0.4" "websockets>=12" "httpx>=0.27" "Pillow>=10" \
+  "lm-format-enforcer>=0.10" "jsonschema>=4.0" numpy $EXTRA
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log "Installing AI Studio runner from $SRC"

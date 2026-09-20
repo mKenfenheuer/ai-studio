@@ -16,9 +16,9 @@ from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
 from runner import artifacts, checkpoints, earlystop
-from runner.capabilities import expert_kernel, peak_memory_gb
+from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
-from . import merge, source
+from . import attentionfit, chunkedloss, merge, source
 
 # How much of the training set is held back to measure honestly. A fine-tune
 # had no held-out set at all until now, which meant the only number on screen
@@ -359,9 +359,28 @@ def run(cfg: dict, ctx: Any) -> dict:
     max_seq = int(cfg.get("max_seq_len") or 512)
     cap_seq = caps.get("max_recommended_seq_len")
     if cap_seq and max_seq > cap_seq:
-        ctx.log("Sequence length %d exceeds what this GPU handles comfortably "
-                "without flash attention; capping to %d." % (max_seq, cap_seq), "warn")
-        max_seq = cap_seq
+        # Said, not done. This used to quietly train at the shorter length,
+        # which is the worst of both: the run that finishes is not the run
+        # that was asked for, every example past the cap is cut in half
+        # without anybody deciding that, and the recorded context length
+        # disagrees with the one on the review screen.
+        #
+        # The comfortable length is a property of the attention kernel, not a
+        # hardware limit -- a card with no fused kernel materialises the
+        # scores matrix and its softmax, so the memory is quadratic rather
+        # than linear. Quadratic is expensive, not impossible: it is exactly
+        # the trade somebody with 16 GB and a long dataset may want to make,
+        # and the memory estimate already charges for it. So the number is
+        # honoured and the cost is quantified here, where it can still be
+        # acted on.
+        ctx.log("Sequence length %d is past the %d this machine handles "
+                "comfortably: it has no fused attention kernel, so attention "
+                "memory grows with the square of length -- about %.1fx more "
+                "than at %d. Training at %d as asked. If this run stops for "
+                "lack of memory, sequence length is the first thing to bring "
+                "down, followed by batch size."
+                % (max_seq, cap_seq, (max_seq / cap_seq) ** 2, cap_seq,
+                   max_seq), "warn")
 
     device = "cuda" if caps["backend"] in ("cuda", "rocm") else (
         "mps" if caps["backend"] == "mps" else "cpu")
@@ -369,6 +388,20 @@ def run(cfg: dict, ctx: Any) -> dict:
                    "float32": torch.float32}.get(dtype_name, torch.float32)
     if device == "cpu":
         torch_dtype = torch.float32
+
+    # Settled before the model is loaded, because part of it is environment
+    # the loading itself reads -- see capabilities.attention_plan.
+    attn = attention_plan(caps)
+    if attn["quadratic"] and device != "cpu":
+        ctx.log("This machine has %s. Gradient checkpointing is on, the "
+                "batch is kept to what the scores matrix can afford, and the "
+                "rest of the batch is made up by accumulation."
+                % attentionfit.describe(caps))
+    elif attn["env"]:
+        ctx.log("Using %s, which this card only offers with %s set. The "
+                "studio sets it for this run."
+                % (attentionfit.describe(caps),
+                   ", ".join(sorted(attn["env"]))))
 
     ctx.log("Loading tokenizer and base model: %s" % base_model)
     ctx.progress(0, 0, stage="loading_model")
@@ -396,21 +429,36 @@ def run(cfg: dict, ctx: Any) -> dict:
     # installed transformers is too old to know the argument, so that a
     # dense model on an old library is never affected by any of this.
     kernel = expert_kernel(caps)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model, **({"experts_implementation": kernel} if kernel else {}),
-            **load_kwargs)
-    except (TypeError, ValueError) as e:
-        if not kernel or "experts_implementation" not in str(e):
-            raise
-        model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
+    optional = {"attn_implementation": attn["implementation"]}
+    if kernel:
+        optional["experts_implementation"] = kernel
+    model = attentionfit.load_base_model(
+        AutoModelForCausalLM, base_model, load_kwargs, optional, ctx, attn)
     if not use_4bit:
         model = model.to(device)
     model.config.use_cache = False
 
-    if cfg.get("gradient_checkpointing", True) and device != "cpu":
+    checkpointing = bool(cfg.get("gradient_checkpointing", True))
+    if not checkpointing and attn["quadratic"] and device != "cpu":
+        # Turned back on rather than honoured, and this is the one setting in
+        # this file that overrides what was asked for. The reason it is worth
+        # the inconsistency: without a fused kernel every layer keeps its own
+        # scores matrix for the backward pass instead of one being live at a
+        # time, so switching checkpointing off multiplies the largest term on
+        # the card by the number of layers. That is not a trade between speed
+        # and memory, which is what the setting offers -- it is a run that
+        # cannot start. Said out loud, because a setting that does not hold
+        # should never be silent.
+        checkpointing = True
+        ctx.log("Gradient checkpointing was switched off, and this machine "
+                "has no fused attention kernel -- which means every layer "
+                "would keep its own attention scores instead of one at a "
+                "time. Leaving checkpointing on: the run costs about 30% more "
+                "time and fits, rather than being 30% quicker and not "
+                "starting.", "warn")
+    if checkpointing and device != "cpu":
         # Trades ~30% speed for a large activation-memory saving. Essential on
-        # cards without flash attention, where activations dominate.
+        # cards without a fused attention kernel, where activations dominate.
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
@@ -823,6 +871,8 @@ def run(cfg: dict, ctx: Any) -> dict:
 
     bs = int(cfg.get("batch_size", 1))
     accum = int(cfg.get("grad_accum", 8))
+    bs, accum = attentionfit.fit_batch(bs, accum, attn, model, max_seq, ctx,
+                                       checkpointing=checkpointing)
     epochs = float(cfg.get("epochs", 1))
     lr = float(cfg.get("learning_rate", 2e-4))
 
@@ -917,10 +967,33 @@ def run(cfg: dict, ctx: Any) -> dict:
             with torch.amp.autocast("cuda", dtype=torch_dtype,
                                     enabled=device == "cuda"
                                     and torch_dtype != torch.float32):
-                total += float(model(**vb).loss)
+                total += float(compute_loss(vb))
             n += 1
         model.train()
         return total / max(n, 1)
+
+    # Whether the output layer's logits are big enough to be worth computing
+    # in slices, and whether doing so gives this model's own answer. Settled
+    # here, against a real batch, before the first step -- see
+    # `chunkedloss.enable` for why it is verified rather than assumed.
+    sliced_loss = False
+    try:
+        probe_batch = next(iter(loader))
+        sliced_loss = chunkedloss.enable(
+            model, {k: v.to(device) for k, v in probe_batch.items()}, torch,
+            ctx, max_seq, bs,
+            int(getattr(model.config, "vocab_size", 0) or 0))
+        del probe_batch
+    except StopIteration:
+        pass
+
+    def compute_loss(b: dict):
+        """This batch's loss, in slices where that was proven equivalent."""
+        if sliced_loss:
+            out = chunkedloss.loss(model, b, torch)
+            if out is not None:
+                return out
+        return model(**b).loss
 
     model.train()
     step = start_step
@@ -967,7 +1040,7 @@ def run(cfg: dict, ctx: Any) -> dict:
             batch = {k: v.to(device) for k, v in batch.items()}
             autocast_on = device == "cuda" and torch_dtype != torch.float32
             with torch.amp.autocast("cuda", dtype=torch_dtype, enabled=autocast_on):
-                loss = model(**batch).loss / accum
+                loss = compute_loss(batch) / accum
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
@@ -989,6 +1062,9 @@ def run(cfg: dict, ctx: Any) -> dict:
             else:
                 opt.step()
             opt.zero_grad(set_to_none=True)
+            # Hold the card to its share of the clock, if this machine has
+            # been given one. A no-op at 100%, which is the default.
+            ctx.throttle.step()
             step += 1
 
             window = running[-accum:]

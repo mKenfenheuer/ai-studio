@@ -41,6 +41,24 @@ Not implemented, and not faked: `n` above 1, `logprobs`, embeddings. A field
 that is accepted and ignored is worse than one that is refused -- it produces a
 client that believes it asked for something.
 
+**`response_format` is enforced, not requested.** `json_object` and
+`json_schema` are kept by constraining the sampler: at every step the tokens
+that would break the grammar are scored at negative infinity before anything is
+chosen, so the reply could not have been written in any other shape. It is not
+checked afterwards and never repaired. The schema is also shown to the model,
+which changes nothing about validity and a great deal about whether the fields
+are filled with the answer or with a guess. `tools` and `reasoning` are refused
+alongside it, because both would need the model to write something the grammar
+forbids. A machine whose image has no grammar engine is not sent these requests
+at all, and if no machine has one the request is refused saying so.
+
+**Concurrency.** A runner holds one model on one card and answers one message
+at a time. Requests that arrive meanwhile are QUEUED, not refused -- an
+evaluation sending sixty prompts gets sixty answers, one after another, rather
+than one answer and fifty-nine errors. The queue is bounded; past its depth the
+answer is `429` with a `Retry-After`, which is the status a client library
+knows how to back off from, and not the `502` that tells it to give up.
+
 Token counts are real counts from the runner, not estimates. `prompt_tokens`
 is what the model was actually given after the run's own chat template was
 applied, which is usually not what a client would compute from the message
@@ -91,9 +109,20 @@ def _finish(msg: dict) -> str:
     return "length" if msg.get("stop_reason") in ("length", "timeout") else "stop"
 
 
-def _error(status: int, message: str, code: str = "invalid_request_error"):
+def _error(status: int, message: str, code: str = "invalid_request_error",
+           retry_after: float | None = None):
+    """OpenAI's error shape, and the one header a refusal sometimes carries.
+
+    `Retry-After` is not decoration on a 429. Without it a client library
+    backs off on whatever schedule it invented, which for the ones that
+    invented "immediately" means a refused request becomes a refused request
+    per millisecond.
+    """
+    headers = ({"Retry-After": str(max(1, int(round(retry_after))))}
+               if retry_after else None)
     return JSONResponse({"error": {"message": message, "type": code,
-                                   "code": code}}, status_code=status)
+                                   "code": code}}, status_code=status,
+                        headers=headers)
 
 
 def _slug(name: str) -> str:
@@ -263,14 +292,36 @@ def _tools(payload: dict) -> list[dict]:
     return conversation.flat_tools(conv)
 
 
+class TooManyRequests(HTTPException):
+    """A 429 that carries the Retry-After a client should honour.
+
+    Its own class because the header has to survive the trip through the
+    handler that converts an HTTPException into OpenAI's error shape, and a
+    status code with no header is a client that retries immediately and is
+    refused again.
+    """
+
+    def __init__(self, detail: str, retry_after: float) -> None:
+        super().__init__(429, detail)
+        self.retry_after = max(1, int(round(retry_after)))
+
+
 async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
     """Send the request to a runner and return (request_id, queue, runner_id)."""
     from ..app import _pick_chat_runner        # local: avoids an import cycle
 
-    runner_id, _runner = _pick_chat_runner(job)
+    fmt = payload.get("response_format") or {}
+    constrained = (fmt.get("type") or "text") != "text"
+    runner_id, _runner = _pick_chat_runner(job, needs_grammar=constrained)
     spec = spec_for.chat_spec(job)
     if config.HF_TOKEN:
         spec["hf_token"] = config.HF_TOKEN
+    if constrained:
+        # Travels on the spec, beside `tools` and `stop`, because the runner
+        # needs it before it renders the prompt: the schema is shown to the
+        # model as well as enforced on the sampler, and the two have to be the
+        # same schema.
+        spec["response_format"] = fmt
     # Tools travel on the spec because that is where the runner reads them
     # when it renders the prompt -- the same field the playground fills, so a
     # tool declared over this API is declared to the model in exactly the same
@@ -285,8 +336,11 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
 
     rid = db.new_id("gen")
     queue: asyncio.Queue = asyncio.Queue()
+    # Registered BEFORE the request is submitted, because a queued request is
+    # told where it stands the moment it joins the line -- and a waiter that
+    # does not exist yet would miss that frame.
     FLEET.waiters[rid] = queue
-    sent = await FLEET.send_to_runner(runner_id, {
+    placed = await FLEET.submit_generation(runner_id, rid, {
         "type": "generate", "request_id": rid, "spec": spec,
         "messages": messages,
         "params": {
@@ -300,21 +354,87 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
             "deadline_s": config.GENERATION_DEADLINE_S,
         },
     })
-    if not sent:
+    if placed == "gone":
         FLEET.waiters.pop(rid, None)
         raise HTTPException(503, "That machine dropped off just now. Try again.")
-    FLEET.generations[rid] = runner_id
+    if placed == "full":
+        FLEET.waiters.pop(rid, None)
+        # 429, not 502. The difference matters more than it looks: 502 tells a
+        # client library the upstream is broken, and the correct response to
+        # that is to stop. This is "come back shortly", which every client
+        # already knows how to do, and Retry-After says how shortly.
+        raise TooManyRequests(
+            "This machine already has %d requests waiting. It answers one at "
+            "a time; try again shortly."
+            % FLEET.queue_depth(runner_id),
+            retry_after=config.SERVING_QUEUE_RETRY_S)
     return rid, queue, runner_id
 
 
-@router.post("/chat/completions")
-async def chat_completions(request: Request, payload: dict = Body(...)):
-    user = current_user(request)
-    for unsupported, why in (
-            ("n", "Only one reply per request is produced."),
-            ("logprobs", "Token probabilities are not available.")):
-        if payload.get(unsupported) not in (None, False, 1):
-            return _error(400, "`%s` is not supported. %s" % (unsupported, why))
+def unsupported_options(payload: dict):
+    """The request options this server will not pretend to honour.
+
+    A JSONResponse to return as-is, or None when there is nothing to refuse.
+    Pulled out of the route so it can be checked without a running controller,
+    a signed-in user and a machine to send the request to -- which is what it
+    took before, and is why the one field missing from it stayed missing.
+    """
+    # Checked one at a time rather than in a loop over a tuple of allowed
+    # values, which is how this was written and why `logprobs: true` was never
+    # actually refused: in Python `True == 1`, so a boolean sailed through a
+    # membership test whose `1` was meant for `n`. The field this file exists
+    # to refuse was accepted and ignored by the code that refuses fields.
+    try:
+        if int(payload.get("n") or 1) != 1:
+            return _error(400, "`n` is not supported. Only one reply per "
+                               "request is produced.")
+    except (TypeError, ValueError):
+        return _error(400, "`n` must be a number, and only 1 is supported.")
+    if payload.get("logprobs") or payload.get("top_logprobs"):
+        return _error(400, "`logprobs` is not supported. Token probabilities "
+                           "are not available.")
+
+    # `response_format` carries two promises -- `json_object` promises the
+    # reply parses as JSON, `json_schema` promises it matches a schema -- and
+    # both are now kept, by constraining what the sampler may pick rather than
+    # by asking the model nicely. See runner/grammar.py.
+    #
+    # What is refused here is the shape of the field, and the two requests
+    # that ask for a format and something incompatible with it in the same
+    # breath. Whether the MACHINE can enforce it is a separate question with a
+    # separate answer, asked once a machine has been chosen.
+    fmt = payload.get("response_format")
+    if fmt is not None and not isinstance(fmt, dict):
+        return _error(400, "`response_format` must be an object, such as "
+                           "{\"type\": \"text\"}.")
+    kind = (fmt or {}).get("type") or "text"
+    if kind not in ("text", "json_object", "json_schema"):
+        return _error(400, "`response_format.type` may be \"text\", "
+                           "\"json_object\" or \"json_schema\"; this "
+                           "request asked for %r." % kind)
+    if kind == "json_schema":
+        block = (fmt or {}).get("json_schema")
+        schema = block.get("schema") if isinstance(block, dict) else None
+        if not isinstance(schema, dict):
+            return _error(400, "`response_format: \"json_schema\"` needs the "
+                               "schema at `response_format.json_schema."
+                               "schema`. Use `json_object` to ask only for "
+                               "valid JSON of any shape.")
+    if kind != "text":
+        # Both of these would be honoured by producing something the grammar
+        # forbids, so one of the two promises would have to give way. Which
+        # one is not ours to choose quietly.
+        if payload.get("tools"):
+            return _error(400, "`tools` and `response_format` cannot both be "
+                               "asked for: a tool call is not a value of the "
+                               "format the reply is being held to, so the "
+                               "model would be unable to make one.")
+        if payload.get("reasoning"):
+            return _error(400, "`reasoning` and `response_format` cannot both "
+                               "be asked for: the reply is constrained to the "
+                               "format from its first token, which leaves no "
+                               "room for the model to work through anything "
+                               "first.")
 
     # `tool_choice` is honoured only where it can be. Nothing here constrains
     # decoding, so "you must call a tool" cannot be promised -- and a request
@@ -329,9 +449,20 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
         return _error(400, "`tool_choice: \"required\"` cannot be honoured: "
                            "nothing here constrains what the model emits, so a "
                            "tool call cannot be guaranteed.")
-    if choice == "none":
+    # "none" is not refused: it means "answer without tools", which this can
+    # do. The route acts on it.
+    return None
+
+
+@router.post("/chat/completions")
+async def chat_completions(request: Request, payload: dict = Body(...)):
+    user = current_user(request)
+    if refusal := unsupported_options(payload):
+        return refusal
+    if payload.get("tool_choice") == "none":
         # Not an error -- the plain meaning is "answer without tools", and the
-        # way to do that is not to declare any.
+        # way to do that is not to declare any. Done here rather than in the
+        # check above, because it changes the request instead of refusing it.
         payload = {**payload, "tools": []}
 
     wanted = str(payload.get("model") or "")
@@ -367,7 +498,10 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
         # had nothing free, which no count of successful replies would show.
         _record(job, who, {}, started, stream=bool(payload.get("stream")),
                 failed=str(e.detail))
-        return _error(e.status_code, e.detail)
+        return _error(e.status_code, e.detail,
+                      "rate_limit_exceeded" if e.status_code == 429
+                      else "invalid_request_error",
+                      retry_after=getattr(e, "retry_after", None))
 
     created = int(time.time())
     if payload.get("stream"):

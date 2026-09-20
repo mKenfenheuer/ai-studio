@@ -27,10 +27,68 @@ import sys
 import time
 from pathlib import Path
 
+from common import attention
+
 # GPU architectures with no usable flash/memory-efficient attention kernels.
 # On these, attention falls back to the O(n^2)-memory math path, which caps
 # usable sequence length far below what VRAM alone would suggest.
 _NO_FLASH_ATTN_ARCHS = ("gfx1030", "gfx1031", "gfx1032", "gfx1010", "gfx1012")
+
+# Environment that has been observed to switch a fused attention kernel ON for
+# a card that reports none without it.
+#
+# ROCm's flash and memory-efficient kernels come from AOTriton, and the list of
+# architectures its wheels compile for is shorter than the list PyTorch will
+# dispatch to. On the ones in between, torch says no and the kernel exists --
+# it is behind a flag because AMD has not finished validating it, not because
+# it is absent. A card that gains flash attention here gains about four times
+# the sequence length it can train at, which is too large a difference to leave
+# on the table because an environment variable has the word EXPERIMENTAL in it.
+#
+# Measured rather than assumed, and that distinction is the whole point: this
+# is applied to a probe, not to a training run. If attention still fails with
+# it set, nothing is reported and nothing is exported. If it succeeds, the
+# variable travels with the capability report so the job that eventually runs
+# sets exactly the environment the measurement was taken in. Reporting "flash:
+# true" from a probe whose environment the job does not reproduce would be the
+# worst outcome available: an optimistic memory estimate against a pessimistic
+# kernel.
+_ATTENTION_RETRY_ENV = {"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"}
+
+# Attention alone, for the retry above. Deliberately not the full probe: it
+# touches no bitsandbytes, so it is seconds rather than minutes, and it cannot
+# abort the interpreter.
+_ATTENTION_PROBE = r"""
+import json, warnings
+warnings.filterwarnings("ignore")
+out = {"flash_attn": False, "mem_efficient_attn": False, "flex_attn": False}
+try:
+    import torch
+    if torch.cuda.is_available():
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        qq = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
+        for key, be in (("flash_attn", SDPBackend.FLASH_ATTENTION),
+                        ("mem_efficient_attn", SDPBackend.EFFICIENT_ATTENTION)):
+            try:
+                with sdpa_kernel(be):
+                    sdpa(qq, qq, qq)
+                torch.cuda.synchronize()
+                out[key] = True
+            except Exception:
+                out[key] = False
+        try:
+            from torch.nn.attention.flex_attention import flex_attention
+            fq = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
+            torch.compile(flex_attention, dynamic=False)(fq, fq, fq)
+            torch.cuda.synchronize()
+            out["flex_attn"] = True
+        except Exception:
+            out["flex_attn"] = False
+except Exception:
+    pass
+print("RESULT:" + json.dumps(out))
+"""
 
 # Probes that may abort the interpreter rather than raise. Run out-of-process.
 _SUBPROCESS_PROBE = r"""
@@ -38,8 +96,8 @@ import json, sys, warnings
 warnings.filterwarnings("ignore")
 out = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
        "bnb_optim": False, "bnb_4bit_error": None, "bnb_4bit_decode_error": None,
-       "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None,
-       "sdpa": False, "sdpa_error": None}
+       "flash_attn": False, "mem_efficient_attn": False, "flex_attn": False,
+       "bnb_error": None, "sdpa": False, "sdpa_error": None}
 try:
     import torch
     if torch.cuda.is_available():
@@ -65,6 +123,32 @@ try:
                     out[key] = True
                 except Exception:
                     out[key] = False
+            # FlexAttention, which is a different answer to the same question:
+            # instead of calling a kernel somebody shipped, it COMPILES one with
+            # Triton. That matters here because ROCm's flash and memory-efficient
+            # kernels come from AOTriton, whose architecture list is short, while
+            # Triton itself supports rather more cards -- so a GPU with neither
+            # kernel can still get tiled attention that never writes the scores
+            # matrix. Worth minutes of probing for four times the sequence length.
+            #
+            # Compiled here rather than assumed, because "the import works" and
+            # "the kernel runs on this card" have already been shown to be
+            # different facts on this hardware.
+            #
+            # Not attempted on Metal: the reason to pay for a Triton compile is
+            # a card whose shipped kernels are missing because AOTriton did not
+            # build for it, which is a ROCm predicament. Inductor has no such
+            # route to a Metal kernel, so this would buy minutes of compiling
+            # for a no.
+            try:
+                from torch.nn.attention.flex_attention import flex_attention
+                fq = torch.randn(1, 4, 256, 64, device=dev, dtype=torch.float16)
+                compiled = torch.compile(flex_attention, dynamic=False)
+                compiled(fq, fq, fq)
+                _sync()
+                out["flex_attn"] = True
+            except Exception:
+                out["flex_attn"] = False
         else:
             # `sdpa_kernel` is a CUDA dispatch hint that MPS ignores, so asking
             # it which backend is in use answers yes to everything and proves
@@ -165,7 +249,8 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
                 "bnb_optim": False, "bnb_4bit_error": None,
                 "bnb_4bit_decode_error": None,
                 "flash_attn": False, "mem_efficient_attn": False,
-                "bnb_error": None, "sdpa": False, "sdpa_error": None}
+                "flex_attn": False, "bnb_error": None,
+                "sdpa": False, "sdpa_error": None}
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _SUBPROCESS_PROBE],
@@ -196,6 +281,36 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
         return partial
     fallback["bnb_error"] = "probe produced no result (exit %s)" % proc.returncode
     return fallback
+
+
+def _retry_attention(sub: dict, caps: dict) -> dict:
+    """Second opinion on attention, with the experimental kernels switched on.
+
+    Only ever runs when the first probe found no fused kernel at all, because
+    it can only turn a no into a yes. Returns the environment that has to be in
+    place for the answer it gives -- empty when the retry changed nothing,
+    which is the common case and the one that costs a few seconds.
+    """
+    if sub.get("flash_attn") or sub.get("mem_efficient_attn"):
+        return {}
+    if caps.get("backend") != "rocm":
+        # The flag is a ROCm one. Setting it elsewhere is not harmful, but a
+        # probe that cannot succeed is a probe not worth the seconds.
+        return {}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _ATTENTION_PROBE],
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, **_ATTENTION_RETRY_ENV, "PYTHONWARNINGS": "ignore"},
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    got = _extract(proc.stdout, "RESULT:")
+    if not got or not (got.get("flash_attn") or got.get("mem_efficient_attn")):
+        return {}
+    sub["flash_attn"] = bool(got.get("flash_attn"))
+    sub["mem_efficient_attn"] = bool(got.get("mem_efficient_attn"))
+    return dict(_ATTENTION_RETRY_ENV)
 
 
 def _extract(stream: str | None, marker: str) -> dict | None:
@@ -264,6 +379,12 @@ def _agent_version() -> str:
 AGENT_VERSION = _agent_version()
 
 
+def _env_limits() -> dict:
+    """This machine's own cap on what the studio may use of its card."""
+    from . import limits as gpu_limits
+    return gpu_limits.from_env()
+
+
 def probe(quick: bool = False) -> dict:
     """Build the capability report this runner advertises to the controller."""
     caps: dict = {
@@ -278,6 +399,10 @@ def probe(quick: bool = False) -> dict:
         # Machines page point at the actual problem instead of leaving
         # somebody to infer it from a missing field.
         "agent_version": AGENT_VERSION,
+        # What this machine's own configuration allows, before the controller
+        # has any say. Reported rather than applied here: the probe describes
+        # the machine, and the limit is enforced where the work happens.
+        "limits": _env_limits(),
         "probed_at": time.time(),
         "backend": "cpu",
         "device_name": platform.processor() or "CPU",
@@ -287,7 +412,8 @@ def probe(quick: bool = False) -> dict:
         "torch_version": None,
         "dtypes": {},
         "quantization": {"4bit": False, "8bit": False, "optim_8bit": False},
-        "attention": {"flash": False, "mem_efficient": False, "math": True},
+        "attention": {"flash": False, "mem_efficient": False, "flex": False,
+                      "flex_opt_in": False, "math": True, "env": {}},
         "recommended_dtype": "float32",
         "warnings": [],
         "notes": [],
@@ -310,6 +436,12 @@ def probe(quick: bool = False) -> dict:
     # matter for the same reason on the CPU-bound stages -- decoding a
     # thousand images a step is not GPU work.
     caps["libraries"] = _libraries()
+    # Said in its own key as well as in the library list, because it is a
+    # promise the serving API makes to callers rather than a package somebody
+    # installed. A runner whose image predates this reports False and the
+    # controller refuses the request in words instead of ignoring the field.
+    caps["constrained_decoding"] = bool(
+        caps["libraries"].get("lmformatenforcer"))
     caps["cpu_cores"] = os.cpu_count()
     caps["ram_gb"] = _ram_gb()
 
@@ -388,11 +520,40 @@ def probe(quick: bool = False) -> dict:
             "8bit": sub["bnb_8bit"],
             "optim_8bit": sub["bnb_optim"],
         }
+        # A card that reports no fused kernel gets one more chance, with the
+        # experimental ROCm kernels enabled -- see _ATTENTION_RETRY_ENV. The
+        # environment that produced the answer is reported alongside it, and
+        # every job sets it before loading a model, so the kernel a run gets is
+        # the kernel the memory estimate was written against.
+        attn_env = _retry_attention(sub, caps)
         caps["attention"] = {
             "flash": sub["flash_attn"],
             "mem_efficient": sub["mem_efficient_attn"],
+            "flex": sub.get("flex_attn", False),
+            # Whether this machine has been told to USE FlexAttention, which
+            # is a separate question from whether it compiles here -- see the
+            # long note in common/attention.py for the twenty-four restarts
+            # that separated the two.
+            "flex_opt_in": bool(os.environ.get("AI_STUDIO_FLEX_ATTENTION")),
             "math": True,
+            "env": attn_env,
         }
+        if sub.get("flex_attn") and not os.environ.get("AI_STUDIO_FLEX_ATTENTION"):
+            caps["notes"].append(
+                "FlexAttention compiles on this card, which would allow much "
+                "longer sequences. It is off because compiling in a probe "
+                "does not predict compiling for a real model here -- one that "
+                "passed this check then failed on Qwen2.5-3B, and took the "
+                "runner down with it. Set AI_STUDIO_FLEX_ATTENTION=1 to try "
+                "it; a model it cannot compile for falls back rather than "
+                "failing the run.")
+        if attn_env:
+            caps["notes"].append(
+                "Fused attention on this card needs %s, which the studio sets "
+                "for every run it starts here. Without it torch reports no "
+                "kernel and falls back to attention whose memory grows with "
+                "the square of sequence length."
+                % ", ".join("%s=%s" % kv for kv in sorted(attn_env.items())))
         if sub.get("bnb_error"):
             caps["quantization"]["error"] = sub["bnb_error"]
         if sub.get("sdpa_error"):
@@ -410,7 +571,12 @@ def probe(quick: bool = False) -> dict:
 # only -- versions are the job's problem -- and checked without importing
 # torch-heavy packages fully where a lighter probe exists.
 _LIBRARIES = ("torchvision", "torchaudio", "diffusers", "PIL", "soundfile",
-              "librosa", "timm", "transformers", "peft", "datasets")
+              "librosa", "timm", "transformers", "peft", "datasets",
+              # The grammar engine behind `response_format`. Reported because
+              # the controller must be able to tell "this machine will hold a
+              # reply to your schema" from "this machine will ignore that you
+              # asked", and answer differently -- see runner/grammar.py.
+              "lmformatenforcer")
 
 
 def _libraries() -> dict:
@@ -524,7 +690,13 @@ def _derive_recommendations(caps: dict) -> None:
         caps["recommended_dtype"] = "float16"
 
     arch = (caps.get("arch") or "").lower()
-    if not caps["attention"].get("flash") and caps["backend"] != "cpu":
+    # Flash attention is not the question -- see common/attention.py. The
+    # memory-efficient kernel is a different implementation of the same idea
+    # and costs the same memory, so a card that has it is not penalised here
+    # for lacking the one with the famous name.
+    plan = attention.report(caps)
+    caps["max_recommended_seq_len"] = plan["comfortable_seq"]
+    if plan["quadratic"] and caps["backend"] != "cpu":
         detail = ""
         if caps["backend"] == "mps":
             detail = (" Metal has no flash-attention kernels, and whether"
@@ -533,12 +705,21 @@ def _derive_recommendations(caps: dict) -> None:
         elif any(a in arch for a in _NO_FLASH_ATTN_ARCHS):
             detail = (" %s has no flash-attention kernels in ROCm." % caps["arch"])
         caps["warnings"].append(
-            "Flash attention is unavailable, so attention falls back to a "
-            "method whose memory use grows with the square of sequence length."
-            + detail + " Keep sequence length at or below 2048 for comfort.")
-        caps["max_recommended_seq_len"] = 2048
-    else:
-        caps["max_recommended_seq_len"] = 8192
+            "No fused attention kernel is available, so attention falls back "
+            "to a method whose memory use grows with the square of sequence "
+            "length." + detail + " %d is the comfortable length here; longer"
+            " runs are allowed and cost memory rising with the square, so the"
+            " studio drops them to one sequence at a time and makes the batch"
+            " up by accumulation." % plan["comfortable_seq"])
+    elif not plan["flash"] and caps["backend"] != "cpu":
+        # Worth saying, because the Machines page shows a "Flash attention"
+        # row and a bare no there reads as a card that cannot do long
+        # sequences. It can: it just gets there by the other kernel.
+        caps["notes"].append(
+            "Flash attention is unavailable, but the memory-efficient "
+            "attention kernel works here. It costs the same memory -- linear "
+            "in sequence length, not quadratic -- and a little more time, so "
+            "long sequences are fine on this card.")
 
     if not caps["quantization"].get("4bit") and caps["backend"] == "mps":
         # Apple silicon is NOT a platform without 4-bit: bitsandbytes ships a
@@ -579,14 +760,14 @@ def _estimate_max_model(caps: dict) -> float | None:
     LoRA freezes the base model, so the frozen weights dominate. Activations do
     NOT shrink with quantization, so they are subtracted as a fixed budget
     rather than folded into a percentage -- and that budget roughly doubles
-    without flash attention, where attention memory grows with the square of
-    sequence length.
+    without a fused attention kernel, where attention memory grows with the
+    square of sequence length.
     """
     vram = caps.get("vram_gb")
     if not vram:
         return None
     bytes_per_param = 0.5 if caps["quantization"].get("4bit") else 2.0
-    activation_budget = 2.0 if caps.get("attention", {}).get("flash") else 3.5
+    activation_budget = 2.0 if attention.is_fused(caps) else 3.5
     usable = max(0.0, vram - activation_budget) * 0.85
     return round(usable / bytes_per_param, 1) or None
 
@@ -636,6 +817,74 @@ def peak_memory_gb(device: str) -> float | None:
     except Exception:  # noqa: BLE001 - telemetry never fails a run
         return None
     return None
+
+
+def attention_plan(caps: dict) -> dict:
+    """What attention this job should ask for, with the environment applied.
+
+    Applying the environment is the point of doing this here rather than
+    reading `common.attention.report` directly: the variable that unlocked a
+    fused kernel during the probe has to be set in the process that loads the
+    model, or the run gets the slow kernel and the fast estimate. Every job --
+    fine-tuning, training from scratch and serving -- calls this once before
+    `from_pretrained`.
+
+    Setting it is safe to repeat and safe on machines that never needed it,
+    where the dict is empty and this does nothing at all. The same call limits
+    torch to the attention backends the probe proved -- see
+    `apply_sdpa_backends` -- so one call covers both halves of the plan.
+    """
+    plan = attention.report(caps)
+    for key, value in (plan.get("env") or {}).items():
+        os.environ.setdefault(key, value)
+    plan["enabled_backends"] = apply_sdpa_backends(plan)
+    return plan
+
+
+# The switch torch offers for each SDPA backend. Process-global rather than
+# scoped, which suits a runner exactly: it does one job at a time, and each job
+# sets these once against its own plan before it loads a model.
+_SDPA_SWITCHES = {
+    "FLASH_ATTENTION": "enable_flash_sdp",
+    "EFFICIENT_ATTENTION": "enable_mem_efficient_sdp",
+    "MATH": "enable_math_sdp",
+}
+
+
+def apply_sdpa_backends(plan: dict) -> list[str]:
+    """Allow exactly the attention backends the probe proved, and no others.
+
+    Left alone, torch decides per call which backend to dispatch to, and it
+    decides from the shapes rather than from whether the kernel works on this
+    card. On ROCm that has been observed to pick a backend that then raises
+    inside the backward pass -- a fault an hour into a run, from a heuristic
+    that had no way of knowing better. The probe does know, so the answer is
+    set here instead of being rediscovered per call.
+
+    MATH is in every plan, so this never leaves torch with nothing to
+    dispatch to: an unusual head dimension or mask that no fused kernel
+    supports still runs, slowly, rather than raising.
+
+    Returns the backends left enabled, for the log. An older torch that lacks
+    one of these switches simply keeps whatever it does by default.
+    """
+    try:
+        import torch
+    except ImportError:
+        return []
+    wanted = set(plan.get("backends") or _SDPA_SWITCHES)
+    enabled = []
+    for name, switch in _SDPA_SWITCHES.items():
+        fn = getattr(torch.backends.cuda, switch, None)
+        if fn is None:
+            continue
+        try:
+            fn(name in wanted)
+        except (RuntimeError, TypeError):
+            continue
+        if name in wanted:
+            enabled.append(name)
+    return enabled
 
 
 def expert_kernel(caps: dict) -> str | None:

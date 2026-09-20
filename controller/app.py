@@ -11,14 +11,14 @@ from typing import Any
 
 from fastapi import (Body, FastAPI, File, Header, HTTPException, Query, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from common import apimodels, formatting
+from common import apimodels, attention, formatting, gpulimits
 
 from . import assets
 from . import architectures as arch
-from . import cards, config, datasets as dsets, db, diagnose, hfaccount, hub
+from . import cards, colab, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
 from .api import (accounts, conversations, data, evals, library, media, ops, projects,
@@ -27,6 +27,11 @@ from .api import (accounts, conversations, data, evals, library, media, ops, pro
 from .scheduler import Fleet
 
 fleet = Fleet()
+
+# "Absent" and "null" mean different things to the limits route -- one leaves
+# the setting alone, the other hands it back to the machine -- and `None` alone
+# cannot tell them apart.
+_UNSET = object()
 
 
 @contextlib.asynccontextmanager
@@ -171,6 +176,13 @@ async def runner_ws(ws: WebSocket) -> None:
         fleet.note_checkpoints(runner_id, first.get("checkpoints") or [])
         fleet.attach(runner_id, ws)
         await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
+        # And what it may use of its own card, if this studio has narrowed it.
+        # Sent on every connect rather than only when it changes: a runner
+        # restarts with whatever its compose file says and has no memory of
+        # what it was told last time, so this is the only moment the two can
+        # be brought back into agreement.
+        if limits := (db.get_runner(runner_id) or {}).get("limits"):
+            await ws.send_text(json.dumps({"type": "limits", "limits": limits}))
         # A runner says what it is training as it joins. A machine that has
         # just restarted is training nothing, and anything this controller
         # still has pinned to it needs to go back on the queue now rather than
@@ -194,7 +206,7 @@ async def runner_ws(ws: WebSocket) -> None:
         pass
     finally:
         if runner_id:
-            fleet.detach(runner_id)
+            await fleet.detach(runner_id)
             db.mark_runner_offline(runner_id)
             # Deliberately NOT requeuing here. A dropped socket does not stop
             # a training run: the runner keeps going and dials back in. The
@@ -435,6 +447,164 @@ async def reprobe(request: Request, runner_id: str) -> dict:
         raise HTTPException(404, "That runner is not connected right now.")
     await fleet.send_to_runner(runner_id, {"type": "reprobe"})
     return {"ok": True}
+
+
+@app.patch("/api/runners/{runner_id}/limits")
+async def set_runner_limits(request: Request, runner_id: str,
+                            payload: dict = Body(...)) -> dict:
+    """How much of this machine's card the studio may use.
+
+    Two numbers, and they are not the same kind of thing. The memory share is
+    a real cap: the runner confines the process to it and the planner sizes
+    the batch to fit inside it, so the usual effect of setting it is a smaller
+    batch rather than a failure. The compute share is a duty cycle -- the
+    trainer pauses between steps so the card averages that fraction -- because
+    no consumer card sells a slice of itself, and pretending otherwise would
+    be the kind of number that reads as a guarantee and is not one.
+
+    Sending null hands the decision back to the machine, which is not the same
+    as sending 100: a box lent out on the condition that it stays usable says
+    so in its own configuration, and clearing the studio's copy restores that
+    rather than overriding it with "use everything".
+    """
+    security.require_admin(request)
+    runner = db.get_runner(runner_id)
+    if not runner:
+        raise HTTPException(404, "No such machine.")
+
+    if payload.get("limits", _UNSET) is None:
+        db.set_runner_limits(runner_id, None)
+    else:
+        limits = gpulimits.clean(payload.get("limits") or payload)
+        db.set_runner_limits(runner_id, limits)
+
+    runner = db.get_runner(runner_id) or {}
+    effective = runner.get("limits") or {}
+    # Told now, not at its next connect. A machine that is idle should be
+    # running under the new limit by the time the page has finished redrawing.
+    await fleet.send_to_runner(runner_id, {"type": "limits", "limits": effective})
+    await fleet.broadcast_ui({"type": "runners_changed"})
+
+    note = gpulimits.describe(effective)
+    busy = fleet.busy.get(runner_id)
+    return {
+        "ok": True,
+        "limits": effective,
+        # What it will and will not do to work already on the machine. A limit
+        # that silently does nothing for the next four hours is worse than one
+        # that says so.
+        "note": ("'%s' may now use %s." % (runner.get("name"), note) if note
+                 else "'%s' may use all of its card again." % runner.get("name"))
+               + (" The run on it now keeps the memory it was sized for; this "
+                  "applies to the next one." if busy else ""),
+    }
+
+
+@app.delete("/api/runners/{runner_id}")
+async def forget_runner(request: Request, runner_id: str) -> dict:
+    """Take a machine off the list.
+
+    Needed because machines are not all permanent. A laptop is lent to the
+    studio for an afternoon; a Colab session lives until Google wants the GPU
+    back. Without this every one of them stays on the Machines page for ever,
+    and a page of dead cards is a page nobody reads.
+
+    Deliberately not a ban, and deliberately not available for a machine that
+    is connected: a runner whose agent is still running will dial in again
+    within seconds and be inserted afresh. Stopping it is what removes it;
+    this is what forgets it afterwards.
+    """
+    security.require_admin(request)
+    runner = db.get_runner(runner_id)
+    if not runner:
+        raise HTTPException(404, "No such machine.")
+    if runner_id in fleet.connections:
+        raise HTTPException(
+            409, "'%s' is connected right now, so forgetting it would last "
+                 "until its next heartbeat. Stop the runner on that machine "
+                 "first." % runner["name"])
+
+    if blocking := db.jobs_depending_on_runner(runner_id):
+        names = ", ".join("'%s'" % j["name"] for j in blocking[:3])
+        more = "" if len(blocking) <= 3 else " and %d more" % (len(blocking) - 3)
+        if any(j["status"] != "queued" for j in blocking):
+            raise HTTPException(
+                409, "The studio still has %s%s running on '%s'. Give it a "
+                     "minute: a machine that has stopped answering is noticed, "
+                     "and its work goes back on the queue by itself."
+                     % (names, more, runner["name"]))
+        raise HTTPException(
+            409, "%s%s %s queued for '%s' specifically, and would wait for "
+                 "ever once it is gone. Cancel %s first."
+                 % (names, more, "are" if len(blocking) > 1 else "is",
+                    runner["name"], "them" if len(blocking) > 1 else "it"))
+
+    # A checkpoint is a directory on that machine's disk. The scheduler would
+    # work this out for itself after ten minutes of silence; saying it now
+    # means the run stops waiting for a machine this studio has been told to
+    # forget, and says why in its own log rather than in nobody's.
+    stranded = db.jobs_with_checkpoint_on(runner_id)
+    for jid in stranded:
+        db.clear_checkpoint(jid)
+        db.add_log(jid, "'%s' was removed from the studio, and this run's "
+                        "checkpoint was on its disk. The run starts from the "
+                        "beginning on whichever machine takes it."
+                   % runner["name"], "warn")
+    fleet.checkpoints.pop(runner_id, None)
+    fleet.busy.pop(runner_id, None)
+    fleet.dispatched_at.pop(runner_id, None)
+
+    db.delete_runner(runner_id)
+    await fleet.broadcast_ui({"type": "runners_changed"})
+    if stranded:
+        await fleet.broadcast_ui({"type": "jobs_changed"})
+        fleet.wake()
+    return {"ok": True, "note": "'%s' was removed.%s It comes back on the list "
+                                "if that machine ever connects again."
+                                % (runner["name"],
+                                   " %d run(s) lost their checkpoint with it."
+                                   % len(stranded) if stranded else "")}
+
+
+# ===========================================================================
+# Joining from Google Colab
+# ===========================================================================
+
+@app.get("/api/runner/colab.ipynb")
+async def colab_notebook(request: Request) -> Any:
+    """A notebook that attaches a Colab session to this studio as a machine.
+
+    Administrator-only, in step with the join token: the notebook carries no
+    credential, but a machine is no use to somebody who cannot be given one.
+    """
+    security.require_admin(request)
+    if not colab.source_available():
+        raise HTTPException(
+            503, "This controller has no copy of the runner's code to hand "
+                 "out, so the notebook would have nothing to download. It is "
+                 "running an image built before that was included; rebuild it.")
+    body = json.dumps(colab.notebook(sso.public_base(request)), indent=1)
+    return Response(body, media_type="application/x-ipynb+json", headers={
+        "Content-Disposition": 'attachment; filename="ai-studio-runner.ipynb"',
+        "Cache-Control": "no-store",
+    })
+
+
+@app.get("/api/runner/bundle.zip")
+async def runner_bundle() -> Any:
+    """The runner's source, for a machine with no checkout of its own.
+
+    Authenticated with the join token, because the caller is a Colab VM with
+    no session and nowhere to keep one -- the same credential, and the same
+    door, that machine is about to use to join the fleet anyway.
+    """
+    if not colab.source_available():
+        raise HTTPException(404, "This controller does not carry the runner's "
+                                 "source.")
+    return Response(colab.bundle(VERSION), media_type="application/zip",
+                    headers={"Content-Disposition":
+                             'attachment; filename="ai-studio-runner.zip"',
+                             "Cache-Control": "no-store"})
 
 
 # ===========================================================================
@@ -2169,12 +2339,12 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         raise HTTPException(400, "Unknown model size: %s" % size_id)
 
     counts = arch.count_params(architecture)
-    flash = bool((caps.get("attention") or {}).get("flash"))
+    fused = attention.is_fused(caps)
     optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
 
     fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                optim_8bit=optim_8bit, checkpointing=False,
-                               flash=flash)
+                               fused=fused)
     checkpointing = False
     if not fit["fits"]:
         # Recomputing activations instead of storing them does the forward
@@ -2184,7 +2354,7 @@ async def scratch_plan(payload: dict = Body(...)) -> dict:
         checkpointing = True
         fit = arch.pick_batch_size(architecture, caps.get("vram_gb"),
                                    optim_8bit=optim_8bit, checkpointing=True,
-                                   flash=flash)
+                                   fused=fused)
     # How much text the clock allows. This is a ceiling, not a plan: three
     # separate things can make the right answer smaller, and each says so.
     # `checkpointing` matters here and was ignored. The planner turns it on to
@@ -2424,7 +2594,7 @@ def _serves_models(r: dict) -> bool:
     return not kinds or bool(kinds & _SERVING_KINDS)
 
 
-def _pick_chat_runner(job: dict) -> tuple[str, dict]:
+def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict]:
     """The best machine to talk to this model on, of the ones that can.
 
     In order: one that can actually serve, then one that already has the model
@@ -2444,6 +2614,13 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
         if fleet.busy.get(r["id"]):
             return False
         caps = r["capabilities"] or {}
+        if needs_grammar and not caps.get("constrained_decoding"):
+            # A reply asked to match a schema may only go to a machine that
+            # can hold it to one. Filtered rather than refused outright, so a
+            # fleet where one runner has an older image still serves the
+            # request from the machine that can -- and the refusal below,
+            # when nothing can, says which capability was missing.
+            return False
         params_b = job["config"].get("params_b")
         if job["kind"] != "pretrain_llm" and params_b and caps.get("vram_gb"):
             # Serving needs the base model resident but no optimiser state, so
@@ -2500,6 +2677,15 @@ def _pick_chat_runner(job: dict) -> tuple[str, dict]:
         if usable(r):
             return r["id"], r
     busy = [r["name"] for r in ordered if fleet.busy.get(r["id"])]
+    if needs_grammar and not any(
+            (r["capabilities"] or {}).get("constrained_decoding")
+            for r in ordered):
+        # Said before "busy" and before "too big", because it is the one
+        # refusal here that no amount of waiting fixes.
+        raise HTTPException(400,
+            "No connected machine can hold a reply to a format: none of them "
+            "has the grammar engine in its runner image. Update the runners, "
+            "or ask for `response_format: {\"type\": \"text\"}`.")
     if busy:
         raise HTTPException(400,
             "%s is training right now. Wait for the run to finish, or connect "
@@ -2758,7 +2944,10 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
             for t in tools if isinstance(t, dict)
             and (t.get("function") or t).get("name")]
     request_id = db.new_id("gen")
-    sent = await fleet.send_to_runner(runner_id, {
+    # Registered before the request is submitted: a queued request is told
+    # where it stands straight away, and that frame goes to whoever owns it.
+    fleet.generation_owner[request_id] = security.current_user(request)["id"]
+    placed = await fleet.submit_generation(runner_id, request_id, {
         "type": "generate", "request_id": request_id, "spec": spec,
         "messages": messages,
         "params": {
@@ -2779,12 +2968,23 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
             "deadline_s": config.GENERATION_DEADLINE_S,
         },
     })
-    if not sent:
+    if placed == "gone":
+        fleet.generation_owner.pop(request_id, None)
         raise HTTPException(503, "That machine dropped off just now. Try again.")
-    fleet.generations[request_id] = runner_id
-    fleet.generation_owner[request_id] = security.current_user(request)["id"]
+    if placed == "full":
+        fleet.generation_owner.pop(request_id, None)
+        raise HTTPException(429,
+            "%s already has %d messages waiting. It answers one at a time; "
+            "wait a moment, or pick another machine."
+            % (runner["name"], fleet.queue_depth(runner_id)))
+    # "queued" is not an error and is deliberately not reported as one. The
+    # request has a place in the line and an id to watch, which is exactly
+    # what "sent" gives; the page learns the difference from the status frame
+    # the queue emits, and says "3rd in the queue" rather than going quiet.
     return {"request_id": request_id, "runner": runner["name"],
-            "runner_id": runner_id, "style": spec["style"]}
+            "runner_id": runner_id, "style": spec["style"],
+            "queued": placed == "queued",
+            "ahead": fleet.queue_depth(runner_id) - 1 if placed == "queued" else 0}
 
 
 @app.post("/api/chat/{request_id}/cancel")
@@ -2795,6 +2995,13 @@ async def chat_cancel(request: Request, request_id: str) -> dict:
     owner = fleet.generation_owner.get(request_id)
     if owner and owner != user["id"] and user["role"] != "admin":
         raise HTTPException(404, "No such request.")
+    # Dropped from the queue if it never left it. Forwarding a cancel for a
+    # request the machine has not been given yet cancels nothing, and the
+    # request would then be sent anyway the moment the slot came free -- a
+    # reply nobody asked for any more, written while somebody waits behind it.
+    if fleet.drop_queued_generation(request_id):
+        fleet.generation_owner.pop(request_id, None)
+        return {"ok": True, "queued": True}
     runner_id = fleet.generations.get(request_id)
     if runner_id:
         await fleet.send_to_runner(runner_id, {"type": "generate_cancel",

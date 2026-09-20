@@ -37,9 +37,9 @@ from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
 from runner import artifacts, checkpoints, earlystop
-from runner.capabilities import expert_kernel, peak_memory_gb
+from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
-from . import source
+from . import attentionfit, source
 from .lora_llm import Cancelled
 
 EOS = "<|endoftext|>"
@@ -67,6 +67,10 @@ def run(cfg: dict, ctx: Any) -> dict:
         dtype_name = "float32"
     autocast_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
                       "float32": torch.float32}.get(dtype_name, torch.float32)
+
+    # What attention this machine has, and the environment it needs to have
+    # it. Settled before the model is built, because building it reads both.
+    attn = attention_plan(caps)
 
     seq_len = int(arch["max_position_embeddings"])
     batch = int(cfg.get("batch_size", 8))
@@ -151,17 +155,32 @@ def run(cfg: dict, ctx: Any) -> dict:
     # ---- 3. the model ---------------------------------------------------
     ctx.progress(0, 0, stage="building_model")
     if started_from is not None:
-        model, counts = _load_model(started_from, arch, ctx, torch)
+        model, counts = _load_model(started_from, arch, ctx, torch, attn)
     else:
-        model, counts = _build_model(arch, ctx, torch, tok)
+        model, counts = _build_model(arch, ctx, torch, tok, attn)
     if resume:
         _load_weights(model, Path(resume["path"]), ctx, torch)
     model = model.to(device)
     model.config.use_cache = False
 
     checkpointing = bool(cfg.get("gradient_checkpointing", False))
+    if (not checkpointing and attn["quadratic"] and seq_len > 1024
+            and device != "cpu"):
+        # Default-on where it is the difference between a run and an
+        # out-of-memory: with no fused kernel every layer holds its own
+        # attention scores for the backward pass, so the largest term on the
+        # card is multiplied by the depth of the model. Checkpointing leaves
+        # one layer's scores live at a time. Below 1024 tokens the term is
+        # small enough that the 30% of speed is not worth paying.
+        checkpointing = True
+        ctx.log("This machine has no fused attention kernel and the context "
+                "is %d tokens, so every layer would keep its own attention "
+                "scores. Turning gradient checkpointing on: about 30%% slower "
+                "a step, and a fraction of the memory." % seq_len, "warn")
     if checkpointing and device != "cpu":
         model.gradient_checkpointing_enable()
+    batch, accum = attentionfit.fit_batch(batch, accum, attn, model, seq_len,
+                                          ctx, checkpointing=checkpointing)
 
     ctx.emit_meta({
         "architecture": arch, "params_total": counts["total"],
@@ -483,7 +502,8 @@ def is_moe(arch: dict) -> bool:
     return int(arch.get("num_local_experts") or 0) > 1
 
 
-def _build_model(arch: dict, ctx: Any, torch, tok=None):
+def _build_model(arch: dict, ctx: Any, torch, tok=None,
+                 attn: dict | None = None):
     from transformers import AutoModelForCausalLM, LlamaConfig, MixtralConfig
 
     shared = dict(
@@ -531,6 +551,14 @@ def _build_model(arch: dict, ctx: Any, torch, tok=None):
                     "on this backend." % kernel, "debug")
     else:
         conf = LlamaConfig(**shared)
+
+    # Which attention path the blocks are built with. Set on the config the
+    # way the library sets it on itself rather than passed to `from_config`,
+    # which did not take the argument until recently: an older transformers
+    # carries the attribute along harmlessly and builds what it would have
+    # built anyway. See common/attention.py for why it is worth asking.
+    if attn:
+        conf._attn_implementation = attn["implementation"]
 
     # from_config, not from_pretrained: random initialisation is the point.
     model = AutoModelForCausalLM.from_config(conf)
@@ -679,7 +707,8 @@ def _cache_corpus(prepared: Path | None, fingerprint: dict, tokens, np,
                 % e, "warn")
 
 
-def _load_model(path: Path, arch: dict, ctx: Any, torch):
+def _load_model(path: Path, arch: dict, ctx: Any, torch,
+                attn: dict | None = None):
     """Load one of this studio's own finished models, to train it further.
 
     float32 is not a default carried over by accident. A model being trained
@@ -689,16 +718,14 @@ def _load_model(path: Path, arch: dict, ctx: Any, torch):
     """
     from transformers import AutoModelForCausalLM
 
-    extra = {}
+    optional = {}
     if is_moe(arch) and (kernel := expert_kernel(ctx.capabilities)):
-        extra["experts_implementation"] = kernel
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            str(path), dtype=torch.float32, **extra)
-    except (TypeError, ValueError) as e:
-        if not extra or "experts_implementation" not in str(e):
-            raise
-        model = AutoModelForCausalLM.from_pretrained(str(path), dtype=torch.float32)
+        optional["experts_implementation"] = kernel
+    if attn:
+        optional["attn_implementation"] = attn["implementation"]
+    model = attentionfit.load_base_model(
+        AutoModelForCausalLM, str(path), {"dtype": torch.float32}, optional,
+        ctx, attn)
 
     embedding = model.get_input_embeddings().weight.numel()
     total = sum(p.numel() for p in model.parameters())
@@ -991,6 +1018,10 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
             scaler.update()
         else:
             opt.step()
+
+        # Hold the card to its share of the clock, if this machine has been
+        # given one. A no-op at 100%, which is the default.
+        ctx.throttle.step()
 
         avg = accum_loss / accum
         first_loss = first_loss if first_loss is not None else avg

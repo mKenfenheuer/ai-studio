@@ -26,6 +26,8 @@ Two rules drive everything below:
 """
 from __future__ import annotations
 
+from common import attention
+
 # ---------------------------------------------------------------------------
 # Sizes
 # ---------------------------------------------------------------------------
@@ -227,7 +229,7 @@ def _shape_fits(shape: tuple, vocab_size: int, caps: dict) -> bool:
         _arch_from_shape(shape, vocab_size), 1,
         optim_8bit=bool((caps.get("quantization") or {}).get("optim_8bit")),
         checkpointing=True,
-        flash=bool((caps.get("attention") or {}).get("flash")))
+        fused=attention.is_fused(caps))
     return mem["total_gb"] <= usable_vram_gb(vram)
 
 
@@ -393,7 +395,7 @@ UNNAMED_OVERHEAD = 1.10
 
 
 def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
-                       checkpointing: bool = False, flash: bool = False) -> dict:
+                       checkpointing: bool = False, fused: bool = False) -> dict:
     """VRAM needed to train every parameter of this model.
 
     Nothing like the LoRA estimate in hub.py. There the base model is frozen
@@ -443,7 +445,7 @@ def training_memory_gb(arch: dict, batch: int, *, optim_8bit: bool = False,
         live_layers = L
 
     attn = 0
-    if not flash:
+    if not fused:
         # Without a fused kernel the scores matrix is materialised per layer
         # AND its softmax is kept for the backward pass -- two tensors, not
         # one, which is why this is doubled. Quadratic in sequence length, so
@@ -505,7 +507,7 @@ def usable_vram_gb(vram_gb: float | None) -> float:
 
 
 def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = False,
-                    checkpointing: bool = False, flash: bool = False,
+                    checkpointing: bool = False, fused: bool = False,
                     target_tokens_per_step: int = 65536) -> dict:
     """Largest batch that fits, then accumulation to reach a sane token count.
 
@@ -520,14 +522,14 @@ def pick_batch_size(arch: dict, vram_gb: float | None, *, optim_8bit: bool = Fal
     batch = 1
     for candidate in (64, 48, 32, 24, 16, 12, 8, 6, 4, 2, 1):
         mem = training_memory_gb(arch, candidate, optim_8bit=optim_8bit,
-                                 checkpointing=checkpointing, flash=flash)
+                                 checkpointing=checkpointing, fused=fused)
         if mem["total_gb"] <= budget:
             batch = candidate
             break
 
     accum = max(1, round(target_tokens_per_step / (batch * seq)))
     mem = training_memory_gb(arch, batch, optim_8bit=optim_8bit,
-                             checkpointing=checkpointing, flash=flash)
+                             checkpointing=checkpointing, fused=fused)
     return {"batch_size": batch, "grad_accum": accum,
             "tokens_per_step": batch * accum * seq, "memory": mem,
             "fits": mem["total_gb"] <= budget}
@@ -553,7 +555,7 @@ ATTENTION_EFFICIENCY = 0.40
 CHECKPOINT_COST = 4.0 / 3.0
 
 
-def _efficiency(dim: int, flash: bool = False) -> float:
+def _efficiency(dim: int, fused: bool = False) -> float:
     """Fraction of the GPU's measured peak a model of this width can reach.
 
     The capability probe multiplies 2048x2048 matrices, which saturates the
@@ -588,7 +590,7 @@ def _efficiency(dim: int, flash: bool = False) -> float:
     Widths above 1024 are extrapolated flat rather than upward. Guessing high
     on speed means promising an overnight run that takes two nights.
     """
-    del flash  # a fused kernel changes the attention term, not this one
+    del fused  # a fused kernel changes the attention term, not this one
     return 0.28 if dim <= 256 else 0.33 if dim <= 384 else 0.37
 
 
@@ -653,7 +655,7 @@ def tokens_per_second(arch: dict, caps: dict,
     if not tflops:
         return None
     counts = count_params(arch)
-    flash = bool((caps.get("attention") or {}).get("flash"))
+    fused = attention.is_fused(caps)
     eff = _efficiency(arch["hidden_size"])
     peak = tflops * 1e12 * eff
     if peak <= 0:
@@ -679,7 +681,7 @@ def tokens_per_second(arch: dict, caps: dict,
     # Attention is untouched by a mixture of experts -- only the feed-forward
     # half is routed -- so it sits outside the multiplier above.
     attention_flops = 12 * layers * seq * width
-    attention_s = attention_flops / (peak * (1.0 if flash else ATTENTION_EFFICIENCY))
+    attention_s = attention_flops / (peak * (1.0 if fused else ATTENTION_EFFICIENCY))
 
     seconds_per_token = weights_s + attention_s
     if checkpointing:
@@ -745,7 +747,7 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
     picking the biggest and finding out overnight.
     """
     vram = caps.get("vram_gb")
-    flash = bool((caps.get("attention") or {}).get("flash"))
+    fused = attention.is_fused(caps)
     optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
 
     out = []
@@ -753,10 +755,10 @@ def size_options(caps: dict, minutes: float, vocab_size: int = DEFAULT_VOCAB,
         arch = build_arch(p["id"], vocab_size, moe=moe, caps=caps)
         counts = count_params(arch)
         fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
-                              checkpointing=False, flash=flash)
+                              checkpointing=False, fused=fused)
         if not fit["fits"]:
             fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
-                                  checkpointing=True, flash=flash)
+                                  checkpointing=True, fused=fused)
             fit["checkpointing"] = True
         achievable = tokens_in_time(arch, caps, minutes,
                                     fit.get("checkpointing", False))
@@ -938,7 +940,7 @@ def _largest_that_fits(arch: dict, field: str, stops: list[int],
         return None          # no machine in hand: no mark to draw
     budget = usable_vram_gb(caps["vram_gb"])
     optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
-    flash = bool((caps.get("attention") or {}).get("flash"))
+    fused = attention.is_fused(caps)
     best = None
     for value in stops:
         candidate = dict(arch)
@@ -951,7 +953,7 @@ def _largest_that_fits(arch: dict, field: str, stops: list[int],
             candidate["num_attention_heads"] = heads[len(heads) // 2]
             candidate["num_key_value_heads"] = candidate["num_attention_heads"]
         mem = training_memory_gb(candidate, 1, optim_8bit=optim_8bit,
-                                 checkpointing=True, flash=flash)
+                                 checkpointing=True, fused=fused)
         if mem["total_gb"] <= budget:
             best = value
         else:
@@ -1084,8 +1086,8 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
             "but a smaller one would leave more capacity for the network."
             % (counts["embedding_share"] * 100)))
 
-    flash = bool((caps.get("attention") or {}).get("flash"))
-    if seq > 1024 and not flash:
+    fused = attention.is_fused(caps)
+    if seq > 1024 and not fused:
         out.append(_issue("warn", "max_position_embeddings",
             "This machine has no fused attention kernel, so attention memory "
             "grows with the square of context length. At %d tokens that "
@@ -1114,10 +1116,10 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
     if vram:
         optim_8bit = bool((caps.get("quantization") or {}).get("optim_8bit"))
         fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
-                              checkpointing=False, flash=flash)
+                              checkpointing=False, fused=fused)
         if not fit["fits"]:
             fit = pick_batch_size(arch, vram, optim_8bit=optim_8bit,
-                                  checkpointing=True, flash=flash)
+                                  checkpointing=True, fused=fused)
             recomputing = fit["fits"]
             if fit["fits"]:
                 out.append(_issue("info", "hidden_size",
@@ -1127,7 +1129,7 @@ def validate_arch(arch: dict, caps: dict, *, corpus_tokens: int | None = None,
                     "already accounts for it."))
             else:
                 at_one = training_memory_gb(arch, 1, optim_8bit=optim_8bit,
-                                            checkpointing=True, flash=flash)
+                                            checkpointing=True, fused=fused)
                 out.append(_issue("error", "hidden_size",
                     "This will not fit. One sequence at a time needs about "
                     "%.1f GB, and only about %.1f GB of this %.1f GB card can "
