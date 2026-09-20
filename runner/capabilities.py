@@ -18,6 +18,7 @@ Two hard-won rules, both from real failures on an RX 6900 XT (gfx1030):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -37,23 +38,49 @@ import json, sys, warnings
 warnings.filterwarnings("ignore")
 out = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
        "bnb_optim": False, "bnb_4bit_error": None, "bnb_4bit_decode_error": None,
-       "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
+       "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None,
+       "sdpa": False, "sdpa_error": None}
 try:
     import torch
-    dev = "cuda" if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        dev = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        dev = "mps"
+    else:
+        dev = None
     if dev:
+        def _sync():
+            (torch.cuda if dev == "cuda" else torch.mps).synchronize()
+
         from torch.nn.functional import scaled_dot_product_attention as sdpa
-        from torch.nn.attention import SDPBackend, sdpa_kernel
         qq = torch.randn(1, 4, 128, 64, device=dev, dtype=torch.float16)
-        for key, be in (("flash_attn", SDPBackend.FLASH_ATTENTION),
-                        ("mem_efficient_attn", SDPBackend.EFFICIENT_ATTENTION)):
+        if dev == "cuda":
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            for key, be in (("flash_attn", SDPBackend.FLASH_ATTENTION),
+                            ("mem_efficient_attn", SDPBackend.EFFICIENT_ATTENTION)):
+                try:
+                    with sdpa_kernel(be):
+                        sdpa(qq, qq, qq)
+                    _sync()
+                    out[key] = True
+                except Exception:
+                    out[key] = False
+        else:
+            # `sdpa_kernel` is a CUDA dispatch hint that MPS ignores, so asking
+            # it which backend is in use answers yes to everything and proves
+            # nothing. Measuring is no better: the MPS allocator does not count
+            # a kernel's scratch memory and Metal buffers do not appear in the
+            # process's resident size, so a materialised score matrix and a
+            # fused kernel are indistinguishable from in here -- both were
+            # tried, both report zero. So flash and memory-efficient stay
+            # false, which costs a conservative memory estimate rather than an
+            # over-promise, and all that is established is that attention runs.
             try:
-                with sdpa_kernel(be):
-                    sdpa(qq, qq, qq)
-                torch.cuda.synchronize()
-                out[key] = True
-            except Exception:
-                out[key] = False
+                sdpa(qq, qq, qq)
+                _sync()
+                out["sdpa"] = True
+            except Exception as e:
+                out["sdpa_error"] = str(e)[:200]
         # Emit attention results before touching bitsandbytes: if bnb aborts
         # the process, the parent still learns what we proved up to here.
         sys.stderr.write("PARTIAL:" + json.dumps(out) + "\n")
@@ -137,7 +164,8 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
     fallback = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_8bit": False,
                 "bnb_optim": False, "bnb_4bit_error": None,
                 "bnb_4bit_decode_error": None,
-                "flash_attn": False, "mem_efficient_attn": False, "bnb_error": None}
+                "flash_attn": False, "mem_efficient_attn": False,
+                "bnb_error": None, "sdpa": False, "sdpa_error": None}
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _SUBPROCESS_PROBE],
@@ -207,6 +235,8 @@ def _benchmark_dtypes(torch, device: str) -> dict:
             del a, b
             if device == "cuda":
                 torch.cuda.empty_cache()
+            elif device == "mps":
+                torch.mps.empty_cache()
         except Exception:
             results[name] = None
     return results
@@ -312,12 +342,30 @@ def probe(quick: bool = False) -> dict:
         device = "cuda"
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         caps["backend"] = "mps"
-        caps["device_name"] = "Apple Silicon GPU"
+        gpu = _apple_gpu()
+        caps["device_name"] = ("%s GPU" % gpu["name"]) if gpu.get("name") \
+            else "Apple Silicon GPU"
+        caps["compute_units"] = gpu.get("cores")
         caps["arch"] = platform.machine()
+        caps["unified_memory"] = True
+        if gpu.get("metal"):
+            caps["metal_family"] = gpu["metal"]
+        # Metal's own recommendation for how much this process should hold at
+        # once (`recommendedMaxWorkingSetSize`), which is the number to plan
+        # against on a unified-memory machine. Total RAM is the wrong one: it
+        # is shared with everything else running, and a model sized against it
+        # does not fail cleanly, it swaps, and a swapping training run is
+        # indistinguishable from a hung one.
+        with contextlib.suppress(Exception):
+            caps["vram_gb"] = round(
+                torch.mps.recommended_max_memory() / 1024 ** 3, 1)
         device = "mps"
         caps["notes"].append(
-            "Apple Metal shares system RAM with the GPU, so the usable model "
-            "size depends on total memory rather than a fixed VRAM figure.")
+            "Apple Metal shares system RAM with the GPU. Of this machine's %s, "
+            "Metal recommends holding at most %s at once, and that is the "
+            "figure the size estimates here are based on."
+            % ("%.0f GB" % caps["ram_gb"] if caps.get("ram_gb") else "memory",
+               "%.1f GB" % caps["vram_gb"] if caps.get("vram_gb") else "a share"))
     else:
         device = "cpu"
         caps["warnings"].append(
@@ -347,6 +395,11 @@ def probe(quick: bool = False) -> dict:
         }
         if sub.get("bnb_error"):
             caps["quantization"]["error"] = sub["bnb_error"]
+        if sub.get("sdpa_error"):
+            caps["warnings"].append(
+                "This machine's GPU could not run an attention kernel at all "
+                "(%s). Training here will fail; the PyTorch build most likely "
+                "does not match the hardware." % sub["sdpa_error"])
 
     _derive_recommendations(caps)
     caps["modalities"] = _modalities(caps)
@@ -400,6 +453,41 @@ def _modalities(caps: dict) -> list[str]:
     return out
 
 
+def _apple_gpu() -> dict:
+    """Chip name, GPU core count and Metal family, asked of macOS itself.
+
+    torch says nothing about an Apple GPU beyond "there is one" -- no name, no
+    core count, no memory -- which is why this runner used to report the bare
+    string "Apple Silicon GPU" and a dash for every other field. macOS knows
+    all of it; it just has to be asked.
+    """
+    info: dict = {}
+    try:
+        out = subprocess.run(["system_profiler", "-json", "SPDisplaysDataType"],
+                             capture_output=True, text=True, timeout=30).stdout
+        for gpu in json.loads(out).get("SPDisplaysDataType", []):
+            if gpu.get("sppci_device_type") not in (None, "spdisplays_gpu"):
+                continue
+            info["name"] = gpu.get("sppci_model") or gpu.get("_name")
+            cores = str(gpu.get("sppci_cores") or "").strip()
+            if cores.isdigit():
+                info["cores"] = int(cores)
+            # e.g. "spdisplays_metal4" -> "metal4"
+            if fam := (gpu.get("spdisplays_mtlgpufamilysupport") or ""):
+                info["metal"] = fam.replace("spdisplays_", "") or None
+            break
+    except Exception:  # noqa: BLE001 - absent or reshaped output is not fatal
+        pass
+    if not info.get("name"):
+        # system_profiler is slow and occasionally unavailable; the chip name
+        # alone is worth a second, cheaper try.
+        with contextlib.suppress(Exception):
+            info["name"] = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=10).stdout.strip() or None
+    return info
+
+
 def _rocm_marketing_name() -> str | None:
     try:
         out = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=20).stdout
@@ -438,7 +526,11 @@ def _derive_recommendations(caps: dict) -> None:
     arch = (caps.get("arch") or "").lower()
     if not caps["attention"].get("flash") and caps["backend"] != "cpu":
         detail = ""
-        if any(a in arch for a in _NO_FLASH_ATTN_ARCHS):
+        if caps["backend"] == "mps":
+            detail = (" Metal has no flash-attention kernels, and whether"
+                      " PyTorch's own path avoids that cost cannot be measured"
+                      " from here, so the safe assumption is made.")
+        elif any(a in arch for a in _NO_FLASH_ATTN_ARCHS):
             detail = (" %s has no flash-attention kernels in ROCm." % caps["arch"])
         caps["warnings"].append(
             "Flash attention is unavailable, so attention falls back to a "
@@ -448,7 +540,19 @@ def _derive_recommendations(caps: dict) -> None:
     else:
         caps["max_recommended_seq_len"] = 8192
 
-    if not caps["quantization"].get("4bit") and caps["backend"] != "cpu":
+    if not caps["quantization"].get("4bit") and caps["backend"] == "mps":
+        # Apple silicon is NOT a platform without 4-bit: bitsandbytes ships a
+        # macOS arm64 wheel and its 4-bit path measures correct here (about
+        # 0.11 relative error, the same as a working CUDA card). So when it is
+        # missing the cause is the install, which is worth saying, because
+        # "unavailable on this machine" reads as a dead end and this one is a
+        # pip install away from quadrupling the model size that fits.
+        caps["warnings"].append(
+            "4-bit quantization is unavailable because bitsandbytes is not "
+            "installed or is too old (%s). Apple silicon does support it: "
+            "install bitsandbytes 0.50 or newer and re-check the hardware."
+            % (caps["quantization"].get("error") or "no reason reported"))
+    elif not caps["quantization"].get("4bit") and caps["backend"] != "cpu":
         caps["warnings"].append(
             "4-bit quantization is unavailable on this runner, so large models "
             "cannot be shrunk to fit. That lowers the biggest model you can "
@@ -506,6 +610,32 @@ def _estimate_max_scratch(caps: dict) -> float | None:
     per_param = (10 if caps["quantization"].get("optim_8bit") else 16) + 2
     usable = max(0.0, vram - 3.0) * 1024 ** 3
     return round(usable / per_param / 1e6) or None
+
+
+def peak_memory_gb(device: str) -> float | None:
+    """The most GPU memory this process has held, for a run's progress and
+    summary.
+
+    Every caller used to ask `torch.cuda.max_memory_allocated()` and report
+    nothing at all when the answer was not CUDA, so a run on Apple silicon
+    charted a flat empty line where its memory use should have been -- on the
+    one kind of machine where that number matters most, because the memory
+    being filled is the same memory the rest of the desktop is using.
+
+    Metal keeps no high-water mark, so the driver's allocation stands in for
+    one: it counts what torch has taken from the system and, unlike the live
+    figure, does not drop back when a tensor is freed into the allocator's
+    cache.
+    """
+    try:
+        import torch
+        if device == "cuda" and torch.cuda.is_available():
+            return round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+        if device == "mps":
+            return round(torch.mps.driver_allocated_memory() / 1024 ** 3, 2)
+    except Exception:  # noqa: BLE001 - telemetry never fails a run
+        return None
+    return None
 
 
 def expert_kernel(caps: dict) -> str | None:

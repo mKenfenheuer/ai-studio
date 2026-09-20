@@ -286,6 +286,15 @@ class ModelHost:
         left. So collect first, THEN return the blocks.
         """
         gc.collect()
+        if self.device == "mps":
+            # Metal's allocator caches freed blocks exactly as CUDA's does, so
+            # skipping this left an evicted model's memory held against the
+            # next one -- on the machine least able to spare it, where the GPU
+            # is sharing RAM with the desktop.
+            import torch
+            with contextlib.suppress(Exception):
+                torch.mps.empty_cache()
+            return
         if self.device != "cuda":
             return
         import torch
@@ -311,9 +320,20 @@ class ModelHost:
         shows as free -- and a budget computed from that shrinks turn by turn
         until it starts refusing conversations that would have fitted.
         """
+        import torch
+        if self.device == "mps":
+            # Metal exposes no free-memory call, so it is worked out from the
+            # budget: what this process may hold, less what it is holding.
+            # Blocks sitting in the allocator's cache are free to this process
+            # and so are not subtracted, which is the same correction the CUDA
+            # path makes below.
+            try:
+                return (torch.mps.recommended_max_memory()
+                        - torch.mps.current_allocated_memory()) / 1024 ** 3
+            except Exception:  # noqa: BLE001 - older torch has neither call
+                return None
         if self.device != "cuda":
             return None
-        import torch
         try:
             free, _total = torch.cuda.mem_get_info()
         except Exception:  # noqa: BLE001 - not every backend reports this
@@ -768,12 +788,13 @@ class ModelHost:
         out["quantized"] = self.quantized
         if (free := self._free_gb()) is not None:
             out["free_gb"] = round(free, 2)
+        if (peak := capabilities.peak_memory_gb(self.device)) is not None:
+            out["peak_gb"] = peak
         with contextlib.suppress(Exception):
             import torch
-            out["peak_gb"] = round(
-                torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
             out["vram_gb"] = round(
-                torch.cuda.mem_get_info()[1] / 1024 ** 3, 2)
+                (torch.mps.recommended_max_memory() if self.device == "mps"
+                 else torch.cuda.mem_get_info()[1]) / 1024 ** 3, 2)
         return out
 
     def cancel(self) -> None:

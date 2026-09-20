@@ -253,10 +253,14 @@ function card(r, admin, dense = false) {
           script does it for a machine this controller can reach.
         </div>` : "")}
       <p class="muted tiny mono" style="margin:6px 0 10px">
-        ${c.device_name || "unknown device"}${c.arch ? " · " + c.arch : ""}</p>
+        ${c.device_name || "unknown device"}${c.arch ? " · " + c.arch : ""}${
+        c.compute_units ? " · " + c.compute_units
+          + (c.backend === "mps" ? " GPU cores" : " compute units") : ""}</p>
 
       <dl class="kv" style="margin-bottom:10px">
-        <dt>Memory</dt><dd>${c.vram_gb ? c.vram_gb + " GB" : "—"}</dd>
+        <dt>Memory</dt><dd>${c.vram_gb
+          ? c.vram_gb + " GB" + (c.unified_memory ? " shared with the system" : "")
+          : "—"}</dd>
         <dt>Backend</dt><dd>${(c.backend || "—").toUpperCase()}${
           c.rocm_version ? " " + String(c.rocm_version).split("-")[0]
           : c.cuda_version ? " " + c.cuda_version : ""}</dd>

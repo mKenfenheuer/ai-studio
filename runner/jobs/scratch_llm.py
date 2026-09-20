@@ -37,7 +37,7 @@ from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
 from runner import artifacts, checkpoints, earlystop
-from runner.capabilities import expert_kernel
+from runner.capabilities import expert_kernel, peak_memory_gb
 
 from . import source
 from .lora_llm import Cancelled
@@ -1042,8 +1042,7 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
             "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
             "tokens_per_sec": round(
                 done_now * S["tokens_per_step"] / max(elapsed, 1e-6)),
-            "vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
-            if device == "cuda" else None,
+            "vram_gb": peak_memory_gb(device),
             "eta_s": round((total_steps - step) * elapsed / max(done_now, 1)),
         })
         ctx.progress(step, total_steps, stage="training")

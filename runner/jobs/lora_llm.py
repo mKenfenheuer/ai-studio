@@ -16,7 +16,7 @@ from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
 from runner import artifacts, checkpoints, earlystop
-from runner.capabilities import expert_kernel
+from runner.capabilities import expert_kernel, peak_memory_gb
 
 from . import merge, source
 
@@ -1028,8 +1028,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 # Rates describe this attempt, not the resumed step number
                 # divided by the time since this process started.
                 "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
-                "vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
-                if device == "cuda" else None,
+                "vram_gb": peak_memory_gb(device),
                 "eta_s": round((total_steps - step) * elapsed / max(done_now, 1)),
             })
             last_val = None
@@ -1166,8 +1165,7 @@ def run(cfg: dict, ctx: Any) -> dict:
         # The most memory the card held at once, so the estimate that put
         # this run on this card can be checked against what it actually
         # took. The fit check learns from the pair.
-        "peak_vram_gb": (round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
-                         if torch.cuda.is_available() else None),
+        "peak_vram_gb": peak_memory_gb(device),
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
     adapter_zip = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")

@@ -32,7 +32,14 @@ fi
 case "$BACKEND" in
   cuda)  INDEX="https://download.pytorch.org/whl/cu124";   EXTRA="bitsandbytes>=0.43" ;;
   rocm)  INDEX="https://download.pytorch.org/whl/rocm6.4"; EXTRA="" ;;
-  metal) INDEX="";                                          EXTRA="" ;;
+  # bitsandbytes ships a macOS arm64 wheel from 0.50, and its 4-bit path
+  # measures correct on Metal -- about 0.11 relative error against float16,
+  # the same as a working CUDA card, with the weights really held at a
+  # quarter of the size. Left out, an Apple machine reported "no 4-bit" and
+  # sized itself for 16-bit only, which is roughly a quarter of the model it
+  # can actually fine-tune. The 8-bit optimiser has no Metal kernel and the
+  # probe finds that by itself.
+  metal) INDEX="";                                          EXTRA="bitsandbytes>=0.50" ;;
   cpu)   INDEX="https://download.pytorch.org/whl/cpu";     EXTRA="" ;;
   *) die "Unknown backend '$BACKEND'. Use one of: cuda rocm metal cpu" ;;
 esac
@@ -60,9 +67,14 @@ fi
 
 log "Installing training libraries"
 # shellcheck disable=SC2086
+# Pillow is what a vision run decodes images with, and the runner advertises
+# the kinds of work it can take from the libraries it finds. Left out, a
+# machine installed this way reported "text only" and never saw a vision job --
+# a limit of the installer, not of the hardware. The container images have
+# always installed it; this keeps the two the same.
 "$PIP" install --quiet \
   "transformers>=4.44" "peft>=0.12" "accelerate>=0.34" "datasets>=2.20" \
-  "safetensors>=0.4" "websockets>=12" "httpx>=0.27" numpy $EXTRA
+  "safetensors>=0.4" "websockets>=12" "httpx>=0.27" "Pillow>=10" numpy $EXTRA
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log "Installing AI Studio runner from $SRC"
@@ -80,9 +92,14 @@ log "Checking what this machine can do"
 import json, sys
 try: c = json.load(sys.stdin)
 except Exception: print("  (probe failed)"); raise SystemExit
-print("  device      :", c.get("device_name"))
+print("  device      :", c.get("device_name"),
+      ("(%d GPU cores)" % c["compute_units"]) if c.get("compute_units") and c.get("backend") == "mps" else "")
 print("  backend     :", c.get("backend"), c.get("arch") or "")
-print("  memory      :", (str(c.get("vram_gb")) + " GB") if c.get("vram_gb") else "shared with system")
+print("  memory      :", ((str(c.get("vram_gb")) + " GB"
+                           + (" shared with the system" if c.get("unified_memory") else ""))
+                          if c.get("vram_gb") else "shared with system"))
+if c.get("max_finetune_params_b"):
+    print("  biggest model:", "about %sB parameters" % c["max_finetune_params_b"])
 print("  best dtype  :", c.get("recommended_dtype"))
 print("  4-bit       :", "yes" if c.get("quantization",{}).get("4bit") else "no")
 for w in c.get("warnings", []): print("  note        :", w)

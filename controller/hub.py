@@ -523,16 +523,26 @@ def recommend_models(runner_caps: dict) -> dict:
         "models": out,
         "best": best["id"] if best else None,
         "ceiling_b": runner_caps.get("max_finetune_params_b"),
-        "note": _recommendation_note(best, usable, vram, has_4bit),
+        "note": _recommendation_note(best, usable, vram, has_4bit,
+                                     runner_caps.get("backend")),
     }
 
 
-def _recommendation_note(best: dict | None, usable: list, vram, has_4bit) -> str:
+def _recommendation_note(best: dict | None, usable: list, vram, has_4bit,
+                         backend: str | None = None) -> str:
     if not vram:
         return "This machine has not reported how much memory it has."
     if not usable:
         return ("Nothing in this list fits on %.0f GB. Search Hugging Face for "
                 "something smaller." % vram)
+    if not has_4bit and backend == "mps":
+        # Not a limit of Apple silicon, which runs 4-bit correctly when the
+        # library is there -- so this points at the fix rather than reading
+        # like a ceiling that cannot be raised.
+        return ("4-bit is not available on this machine, so only models that "
+                "fit in 16-bit are usable. Apple silicon does support it: "
+                "installing bitsandbytes on the runner raises this ceiling "
+                "sharply.")
     if not has_4bit:
         return ("4-bit is not working on this machine, so only models that fit "
                 "in 16-bit are usable -- which is a much lower ceiling than "
