@@ -453,12 +453,62 @@ def test_shapes_in_the_wild() -> None:
           quoted[C.MESSAGES_KEY][1])
 
 
+# A published template's two awkward habits, reduced to the smallest Jinja
+# that shows them. Not a copy of Mistral's -- just the branches that caught us,
+# so this runs with no model, no download and no transformers.
+_PUBLISHED_ISH = (
+    "{% for m in messages %}"
+    "{% if m.role == 'assistant' and m.tool_calls is defined"
+    " and m.tool_calls is not none %}"
+    "[TOOL_CALLS] [{% for c in m.tool_calls %}{{ c.function.name }}{% endfor %}]"
+    "{% elif m.role == 'system' %}"          # rendered only when nothing follows
+    "{% if loop.last %}[SYS] {{ m.content }}{% endif %}"
+    "{% else %}{{ m.content }}{% endif %}"
+    "{% endfor %}"
+)
+
+
+def test_published_template_habits() -> None:
+    """The two ways a base model's own template silently loses content.
+
+    Both were found in one run on Mistral-7B-Instruct-v0.3, and neither raised:
+    the rendered text was merely shorter than the conversation that went into
+    it, which nothing was comparing.
+    """
+    print("\nA published template that branches on tool_calls")
+    fmt = {"mode": "chat", "chat_template": _PUBLISHED_ISH}
+    conv = {C.MESSAGES_KEY: [{"role": "user", "content": "q"},
+                             {"role": "assistant", "content": "THE-ANSWER"}],
+            C.TOOLS_KEY: [], C.META_KEY: {}}
+    text = C.render(conv, fmt)
+    # `tool_calls: []` is defined and is not none, so a message with no calls
+    # at all took the tool-call branch and its content was never rendered.
+    check("an assistant turn with no tool calls still renders its content",
+          "THE-ANSWER" in text, text)
+    check("and does not claim a tool call", "[TOOL_CALLS]" not in text, text)
+
+    print("\nA published template that drops the system prompt")
+    sys_conv = {C.MESSAGES_KEY: [{"role": "system", "content": "SYS-RULES"},
+                                 {"role": "user", "content": "q"},
+                                 {"role": "assistant", "content": "a"}],
+                C.TOOLS_KEY: [], C.META_KEY: {}}
+    sys_text = C.render(sys_conv, fmt)
+    check("the system prompt survives into the trained text",
+          "SYS-RULES" in sys_text, sys_text)
+    _t, spans, exact = C.trainable_spans(sys_conv, fmt, "assistant")
+    check("and turn boundaries stay measurable once it is folded in", exact)
+    check("so only the assistant's reply is trained on",
+          bool(spans) and _t[spans[0][0]:spans[0][1]].strip() == "a",
+          [_t[s:e] for s, e in spans])
+
+
 def main() -> int:
     test_import()
     test_repair()
     test_other_shapes()
     test_shapes_in_the_wild()
     test_formats()
+    test_published_template_habits()
     test_reading_a_reply_back()
     print()
     if FAILED:

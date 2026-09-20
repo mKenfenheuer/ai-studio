@@ -1070,9 +1070,24 @@ def for_template(conv: dict, template: str | None = None,
             "tool_call_id": ids.get(called, called),
             "weight": m.get("weight", 1),
             "train": m.get("weight", 1) != 0,
-            "tool_calls": [_call_for_template(c, form, ids)
-                           for c in (m.get("tool_calls") or [])],
         }
+        # Present only when there ARE tool calls. An empty list is not the
+        # same statement as no key at all, and published templates read the
+        # difference: Mistral's asks `tool_calls is defined and tool_calls is
+        # not none`, and an empty list answers yes to both. Every assistant
+        # message then took the tool-call branch, which renders "[TOOL_CALLS]
+        # [", loops over nothing, and -- because the branches are exclusive --
+        # never renders the content at all.
+        #
+        # So a fine-tune on Mistral trained on conversations whose every reply
+        # had been replaced by that fragment. Nothing raised: the text was
+        # shorter than the source by exactly the length of the answers, which
+        # is not a thing anything was checking. It is caught now by
+        # `scripts/check-formats.py`, which renders each shipped template both
+        # ways and requires them to agree.
+        if calls := [_call_for_template(c, form, ids)
+                     for c in (m.get("tool_calls") or [])]:
+            item["tool_calls"] = calls
         out.append(item)
     return out
 
@@ -1201,9 +1216,8 @@ def render(conv: dict, fmt: dict | None = None, *,
     do it by rendering prefixes that each claim to be the end.
     """
     fmt = formatting.resolve_format(fmt or {})
-    template = fmt.get("chat_template") or (
-        fmt.get("template") if fmt.get("mode") == "jinja" else None) \
-        or formatting.BUILTIN_CHAT_TEMPLATE
+    template = template_for(fmt)
+    conv = _system_into_first_user(conv, template, fmt.get("specials"))
     tools = tools_for_template(conv)
     text = formatting.render_template(
         template,
@@ -1219,6 +1233,90 @@ def render(conv: dict, fmt: dict | None = None, *,
                "reasoning_effort": (conv.get(META_KEY) or {}).get(
                    "reasoning_effort") or "medium"})
     return text
+
+
+def template_for(fmt: dict | None) -> str:
+    """The Jinja this format renders through.
+
+    Its own function because `render` and `segments` must agree about it: they
+    are measuring the same text, and a boundary measured against one template
+    and applied to another is worse than no measurement at all.
+    """
+    fmt = formatting.resolve_format(fmt or {})
+    return fmt.get("chat_template") or (
+        fmt.get("template") if fmt.get("mode") == "jinja" else None) \
+        or formatting.BUILTIN_CHAT_TEMPLATE
+
+
+# A string no dataset will contain, used to ask a template what it does with a
+# system message rather than reading its Jinja and deciding we understand it.
+_SYSTEM_PROBE = "ai-studio-system-probe"
+
+#: template -> does it discard the system message. Keyed by the template text,
+#: because the answer is a property of the template and nothing else.
+_DROPS_SYSTEM: dict[str, bool] = {}
+
+
+def _drops_system(template: str, specials: dict | None = None) -> bool:
+    """Whether this template throws a system message away.
+
+    Published templates disagree about system prompts, and some disagree with
+    themselves depending on what follows. Mistral v0.3 renders one when the
+    conversation ends with the user -- the shape serving uses -- and discards
+    it when an assistant turn follows, which is the shape every training row
+    has. So a fine-tune's instructions went in at inference and vanished
+    during training, on the same template, with nothing raised.
+
+    Asked rather than assumed, and asked in the shape training uses.
+    """
+    if (known := _DROPS_SYSTEM.get(template)) is not None:
+        return known
+    probe = {MESSAGES_KEY: [{"role": "system", "content": _SYSTEM_PROBE},
+                            {"role": "user", "content": "q"},
+                            {"role": "assistant", "content": "a"}]}
+    # Templates reference their own special tokens, and an undefined one is a
+    # hard error in Jinja rather than a blank -- so the probe is given the
+    # real ones, with neutral stand-ins where the caller has none. Without
+    # this the probe raised, reported "does not drop", and the fold never ran.
+    probe_specials = {"bos_token": "", "eos_token": "", "pad_token": "",
+                      "unk_token": "", **(specials or {})}
+    try:
+        text = formatting.render_template(
+            template, row={}, messages=for_template(probe, template),
+            tools=None, specials=probe_specials, add_generation_prompt=False,
+            reasoning=False, tools_text="", extra={"more_turns": False})
+        drops = _SYSTEM_PROBE not in text
+    except Exception:  # noqa: BLE001 - a template that will not render at all
+        drops = False  # is not this function's problem to report
+    _DROPS_SYSTEM[template] = drops
+    return drops
+
+
+def _system_into_first_user(conv: dict, template: str,
+                            specials: dict | None = None) -> dict:
+    """Move the system prompt into the first user turn, where it survives.
+
+    Only for templates measured to discard it, and it is what the [INST]
+    family means by a system prompt anyway -- this repo's own `inst` format
+    folds it in exactly here. Doing it before rendering rather than hoping the
+    template will has a second effect worth as much: with no system message
+    left to be relocated, each rendered prefix extends the one before it, so
+    `segments` can measure turn boundaries and the trainers can score the
+    assistant's replies alone instead of falling back to every token.
+    """
+    msgs = conv.get(MESSAGES_KEY) or []
+    system = [m for m in msgs
+              if m.get("role") == "system" and str(m.get("content") or "").strip()]
+    if not system or not _drops_system(template, specials):
+        return conv
+    rest = [m for m in msgs if m.get("role") != "system"]
+    if not rest or rest[0].get("role") != "user":
+        # Nowhere to fold it into; leave it be rather than invent a turn.
+        return conv
+    preamble = "\n\n".join(str(m.get("content")).strip() for m in system)
+    first = {**rest[0],
+             "content": "%s\n\n%s" % (preamble, str(rest[0].get("content") or ""))}
+    return {**conv, MESSAGES_KEY: [first] + rest[1:]}
 
 
 def segments(conv: dict, fmt: dict | None = None) -> list[dict]:
@@ -1242,6 +1340,15 @@ def segments(conv: dict, fmt: dict | None = None) -> list[dict]:
     Returns [{role, text, trainable}], or one segment with `exact: False` when
     the boundaries could not be established.
     """
+    # Folded here as well as in `render`, and that is the point rather than a
+    # duplication: this walks the message list turn by turn, so it has to walk
+    # the SAME list rendering will use. Left to differ, a template that folds
+    # the system prompt away gives a prefix count that does not match the text,
+    # and the walk below fails for a reason that has nothing to do with the
+    # template being unstable. Folding is idempotent -- there is no system
+    # message left afterwards -- so doing it twice costs a dictionary lookup.
+    conv = _system_into_first_user(
+        conv, template_for(fmt), formatting.resolve_format(fmt or {}).get("specials"))
     msgs = conv.get(MESSAGES_KEY) or []
     whole = render(conv, fmt)
     if not msgs:
