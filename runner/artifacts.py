@@ -22,7 +22,10 @@ from typing import Callable, Iterable
 
 import httpx
 
-CACHE_DIR = Path(os.environ.get("AI_STUDIO_MODEL_CACHE", "/data/models"))
+from . import paths
+
+CACHE_DIR = paths.ensure(Path(
+    os.environ.get("AI_STUDIO_MODEL_CACHE") or paths.data_root() / "models"))
 HF_CACHE_DIR = Path(
     os.environ.get("HF_HUB_CACHE")
     or os.environ.get("HUGGINGFACE_HUB_CACHE")

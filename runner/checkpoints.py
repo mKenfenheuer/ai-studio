@@ -36,7 +36,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-CHECKPOINT_DIR = Path(os.environ.get("AI_STUDIO_CHECKPOINTS", "/data/checkpoints"))
+from . import paths
+
+CHECKPOINT_DIR = paths.ensure(Path(
+    os.environ.get("AI_STUDIO_CHECKPOINTS") or paths.data_root() / "checkpoints"))
 
 # A checkpoint for a run nobody ever came back to is dead weight on the disk.
 # Long enough to survive a weekend, short enough not to fill a volume.
