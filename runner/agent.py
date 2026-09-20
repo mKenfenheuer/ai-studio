@@ -795,6 +795,7 @@ class Runner:
             # nothing at all.
             if self.host:
                 self.host.unload_all()
+            _release_accelerator()
 
     def _upload(self, job_id: str, path: str, kind: str = "model") -> None:
         """Send the finished thing to the controller.
@@ -837,6 +838,41 @@ class Runner:
                                "Content-Type": "application/zip",
                                "Content-Length": str(total)})
         r.raise_for_status()
+
+
+def _release_accelerator() -> None:
+    """Hand the GPU back after a job, whether it finished or failed.
+
+    `unload_all` above returns what the *serving* host is holding. A training
+    run's model is not there: it is a local in the job function, and when that
+    function raises, the traceback keeps its frame -- and therefore the model,
+    and therefore every block the allocator gave it -- reachable well past the
+    point the run is over.
+
+    The consequence is not a slow leak but an immediately broken machine. A 7B
+    that ran out of memory at 6144 tokens left 15.4 GB of a 16 GB card still
+    occupied, and the next run was refused before it began: the fit check reads
+    the card rather than the arithmetic, found 97% of it gone, and correctly
+    said there was no room to train. Two runs failed for the cost of one, and
+    the second failure named the model rather than the corpse of the first.
+
+    Collect first, then empty: the cache cannot release blocks that something
+    still points at, so emptying without collecting frees nothing at all.
+    """
+    import gc
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    for empty in (getattr(getattr(torch, "cuda", None), "empty_cache", None),
+                  getattr(getattr(torch, "mps", None), "empty_cache", None)):
+        if empty is None:
+            continue
+        try:
+            empty()
+        except Exception:  # noqa: BLE001 - a backend that is not present here
+            pass
 
 
 def _friendly_error(e: Exception, kind: str | None = None) -> str:
