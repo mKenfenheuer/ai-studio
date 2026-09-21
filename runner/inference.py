@@ -198,7 +198,11 @@ class ModelHost:
         self.controller_url = controller_url.rstrip("/")
         self.token = token
         self.caps = caps
-        self.lock = threading.Lock()
+        # The card, as a thing only one caller may change at a time. Re-entrant
+        # because `generate` holds it and then asks `ensure_loaded` -- which
+        # takes it too, since the other caller of `ensure_loaded` did not hold
+        # it. See the note there.
+        self.lock = threading.RLock()
         # Insertion-ordered, oldest use first: the next one to go.
         self._residents: dict[str, _Resident] = {}
         # Models somebody deployed to this machine on purpose. They are exempt
@@ -576,6 +580,27 @@ class ModelHost:
         return True
 
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
+        """Put this model on the card if it is not there already.
+
+        Under the card's lock, always. `generate` took the lock before calling
+        this, and a deployment's preload called it without -- so a deployment
+        and a conversation arriving for the same model ran two loads at once.
+        On a 16 GB card serving a 7B that is two 13.65 GiB copies: the second
+        ran out of memory and reported, truthfully by its own lights, that the
+        model "is simply too large for this machine". Measured alone, the same
+        model loads in ten seconds with 2.3 GiB to spare. Both threads were
+        also importing transformers for the first time in the same instant,
+        and one of them got "cannot import name 'AutoModelForCausalLM'" from a
+        lazy module that is not safe to import from two threads at once.
+
+        Taking the lock here rather than trusting every caller to is the point:
+        it was the caller that forgot which caused both.
+        """
+        with self.lock:
+            self._ensure_loaded_locked(spec, log)
+
+    def _ensure_loaded_locked(self, spec: dict,
+                              log: Callable[[str], None]) -> None:
         job_id = spec["job_id"]
         if resident := self._residents.get(job_id):
             # Already here. Moved to the front of the queue and nothing else:

@@ -301,6 +301,63 @@ def main() -> int:
     check("with nothing left over beside it",
           stale.exists(), False)
 
+    # ------------------------------------------------------------------
+    print(NL + "A deployment and a conversation never load onto the card at once")
+    # The second half of the same morning. With the download fixed, both
+    # callers got the model -- and then both loaded it, because a deployment's
+    # preload called ensure_loaded without the lock `generate` holds. Two
+    # 13.65 GiB copies on a 16 GiB card: the second ran out of memory and
+    # reported the model as "simply too large for this machine", which it is
+    # not. Measured alone it loads with 2.3 GiB to spare.
+    from runner.inference import ModelHost
+
+    host = ModelHost("http://unused", "token", {"backend": "cpu"})
+    state = {"now": 0, "most": 0, "loads": 0}
+    guard = threading.Lock()
+
+    class FakeResident:
+        def __init__(self, job_id):
+            self.job_id, self.last_used = job_id, time.time()
+            self.model = self.tok = self.chat_template = None
+            self.specials, self.quantized = {}, False
+
+    def slow_load(spec, path, quantize, log):
+        with guard:
+            state["now"] += 1
+            state["loads"] += 1
+            state["most"] = max(state["most"], state["now"])
+        time.sleep(0.3)                    # a load takes a while
+        with guard:
+            state["now"] -= 1
+        return FakeResident(spec["job_id"])
+
+    host._fetch = lambda job_id, log: _TMP
+    host._make_room = lambda need, log: None
+    host._plan_precision = lambda spec, log: False
+    host._load = slow_load
+    spec = {"job_id": "job_mistral", "params_b": 7.248}
+
+    def as_generate():            # holds the card lock, as generate() does
+        with host.lock:
+            host.ensure_loaded(spec, lambda _s: None)
+
+    def as_preload():             # calls straight in, as the agent's preload does
+        host.ensure_loaded(spec, lambda _s: None)
+
+    threads = [threading.Thread(target=f) for f in (as_preload, as_generate,
+                                                    as_preload)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    check("no caller is left waiting for ever",
+          not any(t.is_alive() for t in threads))
+    check("at most one load is ever on the card at a time", state["most"], 1)
+    check("and the model is loaded once, not once per caller",
+          state["loads"], 1)
+    check("the one holding the lock already can still take it again",
+          host.loaded_id, "job_mistral")
+
     print()
     shutil.rmtree(_TMP, ignore_errors=True)
     if FAILED:
