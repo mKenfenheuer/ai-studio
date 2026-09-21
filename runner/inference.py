@@ -56,6 +56,57 @@ class OutOfRoom(RuntimeError):
     already_explained = True
 
 
+class ContextTooLong(OutOfRoom):
+    """A request refused for its length, before any of it reached the card.
+
+    Its own class for the sake of whoever sent it. Every other failure here is
+    the machine's, and a client is right to try again later; this one is the
+    request's, and trying again sends the same request. So it carries the code
+    OpenAI uses for exactly this, which clients know not to retry, and the API
+    answers 400 rather than 502.
+    """
+    code = "context_length_exceeded"
+
+
+def length_refusal(prompt_len: int, max_new: int, context: int,
+                   budget: int | None) -> ContextTooLong | None:
+    """Why this exchange must not start, or None if it may.
+
+    `context` is the model's own length (0 if it does not say); `budget` is
+    how many tokens of conversation the card has room for, None if that could
+    not be worked out. Both count the whole exchange, because the reply is
+    cached exactly as the question is.
+
+    Two limits, checked in the order that gives the more useful answer. The
+    model's own length first: a request past it cannot be answered on ANY
+    card, and "not enough memory" would send somebody off to find a bigger one.
+
+    Then the card, and `is not None` rather than truthiness is the whole of
+    the fix this function was pulled out for. Zero is the budget when there is
+    no room left at all, and `if budget and ...` read it as "could not be
+    worked out" and let the request through: a 132,875-token conversation
+    against a budget of 0, twice, on a 7B filling a 16 GB card. The prefill ran
+    the card to zero bytes free, and at zero ROCm does not raise -- it aborts
+    the process with HSA_STATUS_ERROR_OUT_OF_RESOURCES. The runner restarted,
+    the studio showed it offline, and the next copy of the request did it again.
+    """
+    total = prompt_len + max_new
+    if context and total > context:
+        return ContextTooLong(
+            "This conversation is longer than this model can read: %s tokens "
+            "of history plus up to %s more of reply, and the model was built "
+            "for %s in all. Send less of it -- a document this size has to be "
+            "split or summarised first."
+            % (f"{prompt_len:,}", f"{max_new:,}", f"{context:,}"))
+    if budget is not None and total > budget:
+        return ContextTooLong(
+            "This conversation is too long for the memory left on this card: "
+            "%s tokens of history plus up to %s more of reply, against room "
+            "for about %s. Start a new conversation, or lower the length "
+            "limit." % (f"{prompt_len:,}", f"{max_new:,}", f"{budget:,}"))
+    return None
+
+
 # How many prompt tokens go through the model at once before writing starts.
 #
 # Attention without flash-attention kernels costs memory with the SQUARE of the
@@ -1008,17 +1059,14 @@ class ModelHost:
             off_template = False
 
             # Refused before anything is spent, where the arithmetic says it
-            # cannot end well. `budget` counts the whole exchange, because the
-            # reply is cached exactly as the question is.
+            # cannot end well. See `length_refusal`.
+            context = int(getattr(getattr(model, "config", None),
+                                  "max_position_embeddings", 0) or 0)
             budget = self._context_budget(model)
+            self.last_request["context_length"] = context or None
             self.last_request["context_budget"] = budget
-            if budget and prompt_len + max_new > budget:
-                raise OutOfRoom(
-                    "This conversation is too long for the memory left on this "
-                    "card: %s tokens of history plus up to %s more of reply, "
-                    "against room for about %s. Start a new conversation, or "
-                    "lower the length limit."
-                    % (f"{prompt_len:,}", f"{max_new:,}", f"{budget:,}"))
+            if refusal := length_refusal(prompt_len, max_new, context, budget):
+                raise refusal
 
             produced: list[int] = []
             t0 = time.time()

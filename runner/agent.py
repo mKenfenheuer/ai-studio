@@ -668,6 +668,11 @@ class Runner:
                              "job_id": spec.get("job_id"),
                              "error": _friendly_error(e, "serve"),
                              "detail": ("%s: %s" % (type(e).__name__, e))[:400],
+                             # Set only by a failure that is the request's
+                             # fault rather than the machine's -- see
+                             # inference.ContextTooLong -- so the API can
+                             # answer it as one.
+                             "code": getattr(e, "code", None),
                              "diagnostics": facts})
         finally:
             self.generating = False

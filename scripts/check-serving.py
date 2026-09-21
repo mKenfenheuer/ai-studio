@@ -224,9 +224,62 @@ async def queueing() -> None:
           [m["request_id"] for m in ws6.sent], ["e1", "e2"])
 
 
+def too_long() -> None:
+    """A conversation too long for the card is refused before it reaches it.
+
+    The numbers are the ones from the runner's log: a 132,875-token request
+    against a budget of 0, which `if budget and ...` let through because zero
+    is falsy. The prefill ran a 16 GB card to zero bytes free and ROCm aborted
+    the process -- twice, three minutes apart, the runner shown offline both
+    times.
+    """
+    from controller.api import serving as api
+    from runner.inference import ContextTooLong, OutOfRoom, length_refusal
+
+    print(chr(10) + "A conversation too long for the card never reaches it")
+    r = length_refusal(132875, 3000, 32768, 0)
+    check("this morning's request is refused", isinstance(r, ContextTooLong))
+    check("for being longer than the model can read at all, which is the "
+          "more useful of the two answers", "longer than this model" in str(r))
+    r = length_refusal(10000, 3000, 32768, 0)
+    check("a budget of ZERO refuses -- it is not 'unknown'",
+          isinstance(r, ContextTooLong))
+    check("and says it is the card's memory", "memory left" in str(r))
+    check("a conversation that fits is let through",
+          length_refusal(1000, 500, 32768, 13000), None)
+    check("an unknown budget is still not a refusal",
+          length_refusal(1000, 500, 0, None), None)
+    check("the refusal is already worded, so it is not rewritten as advice",
+          isinstance(r, OutOfRoom) and r.already_explained)
+    check("and carries the code clients know not to retry",
+          r.code, "context_length_exceeded")
+
+    print(chr(10) + "...and the caller is told it is their request, not our machine")
+    api.FLEET = api.FLEET or Fleet()      # set by the app at startup
+
+    async def reply(frame):
+        q: asyncio.Queue = asyncio.Queue()
+        q.put_nowait(frame)
+        return await api._collect("gen_x", q, {"id": "job_x"}, 0,
+                                  {"user_id": "u"})
+
+    got = asyncio.run(reply({"type": "generate_error", "error": str(r),
+                             "code": "context_length_exceeded"}))
+    body = json.loads(bytes(got.body))
+    check("a 400, because resending it will fail the same way",
+          got.status_code, 400)
+    check("with the code OpenAI uses for exactly this",
+          body["error"]["code"], "context_length_exceeded")
+    got = asyncio.run(reply({"type": "generate_error",
+                             "error": "The GPU faulted."}))
+    check("a failure that is the machine's is still a 502",
+          got.status_code, 502)
+
+
 def main() -> int:
     options()
     asyncio.run(queueing())
+    too_long()
     print()
     if FAILED:
         print("%d check(s) failed:" % len(FAILED))
