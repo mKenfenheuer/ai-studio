@@ -2605,13 +2605,32 @@ def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict
     merged it. Nothing remembered that another machine had loaded the same
     model a minute earlier and could answer immediately.
     """
-    online = [r for r in db.list_runners() if r["status"] != "offline"
+    registered = db.list_runners()
+    online = [r for r in registered if r["status"] != "offline"
               and r["id"] in fleet.connections]
     if not online:
         raise HTTPException(400, "No machine is connected to run the model on.")
 
+    # The machines this studio has for serving -- connected or not. While
+    # there is one, a machine that is not one is never the fallback.
+    #
+    # `_serves_models` was only ever a sort key here, which made it a
+    # preference: the processor-only box went to the back of the line and was
+    # still in it. So the morning the GPU runner dropped off, a conversation
+    # with a freshly trained Mistral-7B went to the CPU runner instead -- a
+    # machine configured for uploads and dataset runs -- which began pulling
+    # 14.5 GB onto the same disk the GPU runner was already pulling it onto.
+    # The GPU machine being away is a reason to wait, not a reason to load a
+    # 7B into the RAM of a box that exists to publish files.
+    #
+    # A studio with no serving machine at all -- a laptop trying the app out
+    # on its processor -- keeps the old behaviour, or it could never chat.
+    serving_fleet = [r for r in registered if _serves_models(r)]
+
     def usable(r: dict) -> bool:
         if fleet.busy.get(r["id"]):
+            return False
+        if serving_fleet and not _serves_models(r):
             return False
         caps = r["capabilities"] or {}
         if needs_grammar and not caps.get("constrained_decoding"):
@@ -2686,6 +2705,21 @@ def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict
             "No connected machine can hold a reply to a format: none of them "
             "has the grammar engine in its runner image. Update the runners, "
             "or ask for `response_format: {\"type\": \"text\"}`.")
+    connected = {r["id"] for r in online}
+    if serving_fleet and not any(r["id"] in connected for r in serving_fleet):
+        # 503 rather than 400: nothing about the request is wrong, and it
+        # will work as it stands once the machine is back.
+        raise HTTPException(503,
+            "%s %s the machine%s that serve%s models here, and %s not "
+            "connected right now. The other connected machines are not used "
+            "for conversations, so this waits for %s rather than loading the "
+            "model somewhere it does not belong."
+            % (", ".join(r["name"] for r in serving_fleet),
+               "is" if len(serving_fleet) == 1 else "are",
+               "" if len(serving_fleet) == 1 else "s",
+               "s" if len(serving_fleet) == 1 else "",
+               "it is" if len(serving_fleet) == 1 else "none of them is",
+               "it" if len(serving_fleet) == 1 else "one of them"))
     if busy:
         raise HTTPException(400,
             "%s is training right now. Wait for the run to finish, or connect "

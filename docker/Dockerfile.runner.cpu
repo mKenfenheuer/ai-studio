@@ -48,14 +48,21 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 # dataset, and the machine that scores it fetches it the way the tools that
 # publish those numbers do. Without it a benchmark run reaches the machine,
 # loads the model, and only then discovers it cannot read the questions.
+#
+# transformers 5, pinned, because every other runner in the fleet is on it and
+# a model is read by whichever machine picks it up. This line said ">=4.44",
+# and the image ended up on 4.57 -- not because pip chose it here but because
+# the llama.cpp layer below downgraded it -- so a Qwen fine-tune saved by the
+# GPU runner on 5.17 could not even have its tokenizer opened on this one:
+# "'list' object has no attribute 'keys'", from a field whose shape changed
+# between the two. Pinned, a build that cannot honour it fails here, loudly,
+# instead of shipping a machine that disagrees with the rest about file formats.
 RUN pip install --no-cache-dir \
-        "transformers>=4.44" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
+        "transformers>=5.0" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
         "datasets>=2.20" "Pillow>=10"
 
-# The grammar engine behind `response_format`. Pure Python and tiny, and
-# deliberately in a layer of its own AFTER the expensive build above: putting
-# it on the same pip line would invalidate the bitsandbytes source compile
-# every time this pin moves, and that compile is the long pole in this image.
+# The grammar engine behind `response_format`. Pure Python and tiny, and in a
+# layer of its own so a change to its pin does not reinstall the stack above.
 RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 
 # llama.cpp, for turning a finished model into the one file everything outside
@@ -69,6 +76,13 @@ RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 #
 # Only the quantiser is built -- not the server, not the CLI, not the tests --
 # which keeps this to a couple of minutes and a few tens of megabytes.
+#
+# Its converter gets an environment of its own, and this is not tidiness. Its
+# requirements pin `torch~=2.2.1` and `transformers<5.0.0`, and installed into
+# the runner's environment they quietly replaced the torch the layer above
+# asked for (>=2.4) and dragged transformers back to 4.x -- the whole runner
+# downgraded to suit one script. In /opt/llama.cpp/venv the converter keeps
+# exactly what it was tested against, and nothing else is affected by it.
 ARG LLAMA_CPP_TAG=b4586
 # libgomp1 is not a build dependency: llama-quantize links against the OpenMP
 # runtime and needs it at run time. It arrives with build-essential, which is
@@ -84,7 +98,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
     && cmake --build /opt/llama.cpp/build --target llama-quantize -j "$(nproc)" \
     && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/llama-quantize \
-    && pip install --no-cache-dir -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \
+    && python -m venv /opt/llama.cpp/venv \
+    && /opt/llama.cpp/venv/bin/pip install --no-cache-dir \
+         -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \
     && rm -rf /opt/llama.cpp/build /opt/llama.cpp/.git /opt/llama.cpp/tests \
     && apt-get purge -y git build-essential cmake \
     && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*

@@ -68,6 +68,9 @@ jobs:
       - name: Which run is allowed onto which machine
         run: python scripts/check-dispatch.py
 
+      - name: A runner fetches a model once, resumably, and only if it is one
+        run: python scripts/check-fetch.py
+
       - name: What the studio does about the attention kernel a machine has
         run: python scripts/check-attention.py
 

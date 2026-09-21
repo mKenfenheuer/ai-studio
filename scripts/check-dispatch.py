@@ -55,6 +55,61 @@ def job(**cfg: object) -> dict:
     return {"kind": cfg.pop("kind", "finetune_llm"), "config": dict(cfg)}
 
 
+def conversations() -> None:
+    """Which machine a conversation with a finished model is sent to.
+
+    Separate from `can_run`, and it was the half with the hole in it: the
+    machine a person talks to a model on is chosen by `_pick_chat_runner`,
+    which treated "is this a machine for serving" as an ordering. So the
+    morning the GPU runner dropped off, a chat with a new Mistral-7B fell
+    through to the CPU runner -- set aside for uploads -- and it started
+    pulling 14.5 GB onto the disk the GPU runner was already pulling it onto.
+    """
+    from fastapi import HTTPException
+
+    from controller import app as studio
+    from controller import db
+
+    print("\nWhich machine a conversation goes to")
+    gpu_caps = {"backend": "rocm", "vram_gb": 16.0,
+                "quantization": {"4bit": True, "4bit_decode": False}}
+    cpu_caps = {"backend": "cpu", "ram_gb": 31.4,
+                "kinds": ["upload", "generate_dataset", "export_gguf",
+                          "evaluate"]}
+    db.upsert_runner("run_chat_gpu", "docker-gpu", gpu_caps)
+    db.upsert_runner("run_chat_cpu", "controller-cpu", cpu_caps)
+    studio.fleet.connections["run_chat_gpu"] = object()
+    studio.fleet.connections["run_chat_cpu"] = object()
+    mistral = {"id": "job_chat_7b", "kind": "finetune_llm",
+               "config": {"params_b": 7.248}, "runner_id": "run_chat_gpu"}
+
+    rid, _ = studio._pick_chat_runner(mistral)
+    check("with the GPU runner there, it goes to the GPU runner",
+          rid, "run_chat_gpu")
+
+    # The morning in question: the GPU runner has dropped off.
+    studio.fleet.connections.pop("run_chat_gpu")
+    db.mark_runner_offline("run_chat_gpu")
+    try:
+        rid, _ = studio._pick_chat_runner(mistral)
+        check("with it away, the CPU runner is NOT the fallback", rid, None)
+    except HTTPException as e:
+        check("with it away, the CPU runner is NOT the fallback", True)
+        check("the answer is 'come back', not 'your request is wrong'",
+              e.status_code, 503)
+        check("and it names the machine being waited for",
+              "docker-gpu" in e.detail)
+
+    # A studio with no serving machine anywhere -- a laptop trying the app
+    # out on its processor -- must still be able to talk to what it trained.
+    db.delete_runner("run_chat_gpu")
+    rid, _ = studio._pick_chat_runner(mistral)
+    check("a studio with nothing but a processor still gets an answer",
+          rid, "run_chat_cpu")
+    studio.fleet.connections.pop("run_chat_cpu", None)
+    db.delete_runner("run_chat_cpu")
+
+
 def main() -> int:
     fleet = Fleet()
     try:
@@ -113,6 +168,7 @@ def main() -> int:
             {**CPU, "kinds": ["upload", "evaluate"]})
         check("and refuses a fine-tune", ok, False)
         check("naming what it does take", "upload" in why)
+        conversations()
     finally:
         shutil.rmtree(_TMP, ignore_errors=True)
 
