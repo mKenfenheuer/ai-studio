@@ -132,17 +132,44 @@ PREFILL_CHUNK = 256
 # over a long conversation.
 PREFILL_CHUNK_FUSED = 2048
 
-# Room kept for the working set of one prefill slice and the allocator's slack,
-# on top of the conversation's own key/value cache. Measured: a 256-token slice
-# peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
-PREFILL_HEADROOM_GB = 0.6
+# Room kept, on top of the conversation's own key/value cache, for reading one
+# prefill slice: two parts, and only one of them grows with the slice.
+#
+# The working set does. Measured: a 256-token slice peaks around 0.11 GB
+# against a 7B, which is the per-token figure below.
+#
+# The slack does not. It is the allocator's rounding and the margin for being
+# wrong, and it is the same whether the slice is 256 tokens or 2048. These two
+# were once a single 0.6 GB constant scaled by the chunk, which multiplied the
+# margin by eight along with the measurement: with FlexAttention switched on
+# the chunk is 2048, the "headroom" became 4.8 GB, a Mistral-7B leaves 2.2 GB
+# free on a 16 GB card, and every conversation -- 5,916 tokens, anything -- was
+# refused as too long for the memory left.
+PREFILL_SLACK_GB = 0.5
+PREFILL_GB_PER_TOKEN = 0.11 / 256
 
-# ...and the same, per token of chunk, so the two move together. A larger slice
-# is a larger working set, and a fused kernel raises the slice eightfold. This
-# is the number above divided by the chunk it was measured at, which is what
-# makes it a measurement rather than two constants that have to be kept in
-# step by hand.
-PREFILL_HEADROOM_PER_TOKEN = PREFILL_HEADROOM_GB / PREFILL_CHUNK
+
+def prefill_headroom_gb(chunk: int) -> float:
+    """What reading a prompt `chunk` tokens at a time needs beyond the cache."""
+    return PREFILL_SLACK_GB + chunk * PREFILL_GB_PER_TOKEN
+
+
+def choose_chunk(largest: int, tokens: int, per_token_bytes: int,
+                 free_gb: float) -> int:
+    """The largest prefill slice this exchange can afford, down to the floor.
+
+    A slice is a speed choice, never a length one: reading a prompt 2048 tokens
+    at a time is quicker than 256, and changes nothing about the answer. So the
+    big slice is used when there is room for it and halved until there is,
+    rather than a conversation that fits at 256 being refused because 2048 was
+    the default. `tokens` is the whole exchange, prompt and reply, because the
+    reply is cached exactly as the prompt is.
+    """
+    chunk = largest
+    cache_gb = tokens * per_token_bytes / 1024 ** 3
+    while chunk > PREFILL_CHUNK and cache_gb + prefill_headroom_gb(chunk) > free_gb:
+        chunk //= 2
+    return max(chunk, PREFILL_CHUNK)
 
 # How long one reply may take before it is stopped and handed back as it
 # stands. A runner answers one message at a time, so this is not really a limit
@@ -292,10 +319,12 @@ class ModelHost:
         # the process that will load the models, because part of the plan is
         # environment `from_pretrained` reads.
         self.attn = capabilities.attention_plan(caps)
+        # The largest prefill slice this machine's kernel makes worthwhile. The
+        # one actually used is chosen per request -- see `choose_chunk` -- and
+        # per model: a model loaded without the fused path it asked for is
+        # quadratic after all, whatever the plan said.
         self.prefill_chunk = (PREFILL_CHUNK if self.attn["quadratic"]
                               else PREFILL_CHUNK_FUSED)
-        self.prefill_headroom_gb = (self.prefill_chunk
-                                    * PREFILL_HEADROOM_PER_TOKEN)
 
     # ------------------------------------------------------------ device
     @property
@@ -896,21 +925,24 @@ class ModelHost:
                                              reasoning=reasoning)
 
     def _prefill(self, model, ids, log: Callable[[str], None],
-                 deadline: float | None = None):
+                 deadline: float | None = None, step: int | None = None):
         """Build the key/value cache for the prompt, a slice at a time.
 
         Returns the cache, positioned so the caller can carry straight on from
         the last token. Nothing is sampled here -- only the last position's
         logits are ever wanted, and asking for them at every position is a
         [1, prompt, vocab] tensor thrown away immediately.
+
+        `step` is the slice size chosen for this exchange; see `choose_chunk`.
         """
         import torch
+        step = step or PREFILL_CHUNK
         past = None
         total = ids.shape[1]
-        for i in range(0, total, self.prefill_chunk):
+        for i in range(0, total, step):
             if self._cancel.is_set() or (deadline and time.time() > deadline):
                 break
-            chunk = ids[:, i:i + self.prefill_chunk]
+            chunk = ids[:, i:i + step]
             with torch.no_grad():
                 if self._logits_to_keep is not False:
                     try:
@@ -927,9 +959,45 @@ class ModelHost:
                                 use_cache=True)
             past = out.past_key_values
             del out
-            if total > self.prefill_chunk and i == 0:
+            if total > step and i == 0:
                 log("Reading %s tokens of conversation…" % f"{total:,}")
         return past
+
+    def _largest_chunk(self, model) -> int:
+        """The biggest prefill slice worth using for THIS model.
+
+        The machine's plan says whether attention is fused, but a model asked
+        for FlexAttention can be refused it at load and fall back to the
+        ordinary path -- see `_load_causal_lm`. What the model actually got is
+        on its config, and that is what decides: 2048-token slices through a
+        quadratic kernel are the scores matrix this chunking exists to avoid.
+        """
+        if self.prefill_chunk <= PREFILL_CHUNK:
+            return PREFILL_CHUNK
+        wanted = self.attn.get("implementation")
+        got = getattr(getattr(model, "config", None),
+                      "_attn_implementation", None)
+        if wanted == "flex_attention" and got != "flex_attention":
+            return PREFILL_CHUNK
+        return self.prefill_chunk
+
+    @staticmethod
+    def _kv_bytes_per_token(model) -> int | None:
+        """What one token of conversation costs in key/value cache."""
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return None
+        layers = getattr(cfg, "num_hidden_layers", 0) or 0
+        attn_heads = getattr(cfg, "num_attention_heads", 0) or 0
+        # Grouped-query attention caches one key/value per *key* head, which on
+        # a 7B is a quarter of the attention heads. Reading the wrong one over-
+        # states the cost fourfold and refuses conversations that would fit.
+        kv_heads = getattr(cfg, "num_key_value_heads", None) or attn_heads
+        dim = getattr(cfg, "head_dim", None) or (
+            (getattr(cfg, "hidden_size", 0) or 0) // max(attn_heads, 1))
+        if not (layers and kv_heads and dim):
+            return None
+        return 2 * layers * kv_heads * dim * 2           # key and value, fp16
 
     def _context_budget(self, model) -> int | None:
         """How many tokens of conversation this card still has room for.
@@ -946,23 +1014,18 @@ class ModelHost:
 
         None when the shape cannot be read, which disables the check rather
         than guessing at it.
+
+        Worked out at the SMALLEST prefill slice, because that is the most
+        conversation the card can ever hold: a bigger slice is only a faster
+        way to read the same prompt, and is chosen afterwards if there is
+        room for it. Worked out at the largest, as it once was, the budget of
+        a 7B on a 16 GB card came to zero.
         """
-        cfg = getattr(model, "config", None)
         free = self._free_gb()
-        if cfg is None or free is None:
+        per_token = self._kv_bytes_per_token(model)
+        if free is None or not per_token:
             return None
-        layers = getattr(cfg, "num_hidden_layers", 0) or 0
-        attn_heads = getattr(cfg, "num_attention_heads", 0) or 0
-        # Grouped-query attention caches one key/value per *key* head, which on
-        # a 7B is a quarter of the attention heads. Reading the wrong one over-
-        # states the cost fourfold and refuses conversations that would fit.
-        kv_heads = getattr(cfg, "num_key_value_heads", None) or attn_heads
-        dim = getattr(cfg, "head_dim", None) or (
-            (getattr(cfg, "hidden_size", 0) or 0) // max(attn_heads, 1))
-        if not (layers and kv_heads and dim):
-            return None
-        per_token = 2 * layers * kv_heads * dim * 2      # key and value, fp16
-        room = (free - self.prefill_headroom_gb) * 1024 ** 3
+        room = (free - prefill_headroom_gb(PREFILL_CHUNK)) * 1024 ** 3
         return int(max(room, 0) // per_token)
 
     def diagnostics(self) -> dict:
@@ -1067,6 +1130,16 @@ class ModelHost:
             self.last_request["context_budget"] = budget
             if refusal := length_refusal(prompt_len, max_new, context, budget):
                 raise refusal
+            # The fastest prefill slice this exchange has room for. Chosen
+            # after the length check, never before it: the slice is a speed,
+            # and must not be the reason something that fits is turned away.
+            free = self._free_gb()
+            per_token = self._kv_bytes_per_token(model)
+            step = (choose_chunk(self._largest_chunk(model),
+                                 prompt_len + max_new, per_token, free)
+                    if free is not None and per_token
+                    else PREFILL_CHUNK)
+            self.last_request["prefill_chunk"] = step
 
             produced: list[int] = []
             t0 = time.time()
@@ -1077,7 +1150,7 @@ class ModelHost:
             # sampled. Feeding the whole prompt to the loop instead is one
             # attention matrix the size of the conversation squared.
             if prompt_len > 1:
-                past = self._prefill(model, ids[:, :-1], log, deadline)
+                past = self._prefill(model, ids[:, :-1], log, deadline, step)
             cur = ids[:, -1:]
 
             # What the reader has already been shown, per channel. A reply is
