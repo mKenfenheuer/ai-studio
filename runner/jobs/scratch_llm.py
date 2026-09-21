@@ -40,7 +40,7 @@ from runner import artifacts, checkpoints, earlystop
 from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
 from . import attentionfit, source
-from .lora_llm import Cancelled
+from .lora_llm import Cancelled, _rate
 
 EOS = "<|endoftext|>"
 
@@ -1070,7 +1070,7 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
             # Rates are for *this* attempt. Dividing the resumed step number
             # by the time since this process started would report a machine
             # several times faster than it is, and an ETA to match.
-            "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
+            "steps_per_sec": _rate(done_now, elapsed),
             "tokens_per_sec": round(
                 done_now * S["tokens_per_step"] / max(elapsed, 1e-6)),
             "vram_gb": peak_memory_gb(device),

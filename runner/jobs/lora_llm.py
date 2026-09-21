@@ -59,6 +59,23 @@ class Cancelled(Exception):
     """Raised when the controller asks for the job to stop."""
 
 
+def _rate(steps: float, elapsed: float) -> float:
+    """Steps per second, with enough precision left to be a number.
+
+    This was rounded to three decimal places, which is fine at one step a
+    second and destroys the reading below it. A 7B at 6144 tokens runs at
+    about 0.0012 steps a second: rounded, that is `0.002` -- one significant
+    figure, a 40% error, and an ETA built on it is wrong by hours. Slower
+    still and it rounds to `0.0`, which the job page cannot tell apart from a
+    run that has not started, and no amount of formatting downstream can
+    recover a number that was already thrown away here.
+
+    Six places holds a step that takes eleven days. The cost of carrying them
+    is nothing: it is one float in a JSON message that is already being sent.
+    """
+    return round(steps / max(elapsed, 1e-6), 6)
+
+
 def _fmt(n: int) -> str:
     if n >= 1e9:
         return "%.1fB" % (n / 1e9)
@@ -232,10 +249,26 @@ def _check_room_to_train(model, device: str, use_4bit: bool, ctx: Any) -> None:
     already on the card and there is nothing left to guess.
     """
     import torch
-    if device != "cuda":
+    if device not in ("cuda", "mps"):
         return
     try:
-        free, total = torch.cuda.mem_get_info()
+        if device == "mps":
+            # Metal has no mem_get_info. The budget is what Metal says this
+            # process should hold, and what it is holding is what torch has
+            # taken -- which is the same pair of numbers, by a different name.
+            #
+            # Skipping this check on Apple silicon was worse than skipping it
+            # on a discrete card, not better. A card refuses an allocation it
+            # cannot make; unified memory just takes it from the system and
+            # swaps, so the run does not fail, it crawls. Measured on an M3:
+            # 25.6 GB held on a 24 GB machine and ten hours for one step, with
+            # an ETA of a hundred and six days and nothing on screen that said
+            # anything was wrong. An out-of-memory error would have been the
+            # kinder outcome, and this is the check that produces one.
+            total = torch.mps.recommended_max_memory()
+            free = max(0, total - torch.mps.current_allocated_memory())
+        else:
+            free, total = torch.cuda.mem_get_info()
     except Exception:  # noqa: BLE001 - a backend that cannot say is not a failure
         return
     if not total:
@@ -1103,7 +1136,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 "learning_rate": lr_at(step),
                 # Rates describe this attempt, not the resumed step number
                 # divided by the time since this process started.
-                "steps_per_sec": round(done_now / max(elapsed, 1e-6), 3),
+                "steps_per_sec": _rate(done_now, elapsed),
                 "vram_gb": peak_memory_gb(device),
                 "eta_s": round((total_steps - step) * elapsed / max(done_now, 1)),
             })
