@@ -205,6 +205,22 @@ try:
             out["bnb_4bit_decode_error"] = round(_relative_error(1), 3)
             out["bnb_4bit"] = out["bnb_4bit_error"] < 0.35
             out["bnb_4bit_decode"] = out["bnb_4bit_decode_error"] < 0.35
+            # Wide shapes right and one row wrong is the half-broken case, and
+            # it has a cure that relies on nothing but what was just measured:
+            # never hand the kernel fewer rows than the count that came out
+            # correct (runner/bnb_compat.py). Measured through the real shim,
+            # not assumed -- serving trusts 4-bit only if this number is good.
+            if out["bnb_4bit"] and not out["bnb_4bit_decode"]:
+                try:
+                    from runner import bnb_compat
+                    if bnb_compat.install_decode_padding():
+                        padded = round(_relative_error(1), 3)
+                        out["bnb_4bit_decode_padded_error"] = padded
+                        if padded < 0.35:
+                            out["bnb_4bit_decode"] = True
+                            out["bnb_4bit_decode_padding"] = True
+                except Exception as e:
+                    out["bnb_padding_error"] = str(e)[:200]
             if not out["bnb_4bit"]:
                 out["bnb_error"] = (
                     "4-bit ran but returned wrong numbers (%.2f relative error "
@@ -252,10 +268,14 @@ def _run_subprocess_probe(timeout: int = 900) -> dict:
                 "flex_attn": False, "bnb_error": None,
                 "sdpa": False, "sdpa_error": None}
     try:
+        # The probe imports the runner's own bitsandbytes shim, so the package
+        # root has to be importable from a `python -c` child whatever its cwd.
+        root = str(Path(__file__).resolve().parent.parent)
+        path = os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH")) if p)
         proc = subprocess.run(
             [sys.executable, "-c", _SUBPROCESS_PROBE],
             capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "PYTHONWARNINGS": "ignore"},
+            env={**os.environ, "PYTHONWARNINGS": "ignore", "PYTHONPATH": path},
         )
     except subprocess.TimeoutExpired:
         fallback["bnb_error"] = "probe timed out"
@@ -517,6 +537,11 @@ def probe(quick: bool = False) -> dict:
             "4bit_decode": sub.get("bnb_4bit_decode", False),
             "4bit_error": sub.get("bnb_4bit_error"),
             "4bit_decode_error": sub.get("bnb_4bit_decode_error"),
+            # Whether decoding is only correct with small inputs padded up to
+            # the row count that measured right. Serving must install the same
+            # shim before it answers, or it gets the broken kernel back.
+            "4bit_decode_padding": sub.get("bnb_4bit_decode_padding", False),
+            "4bit_decode_padded_error": sub.get("bnb_4bit_decode_padded_error"),
             "8bit": sub["bnb_8bit"],
             "optim_8bit": sub["bnb_optim"],
         }
@@ -738,6 +763,17 @@ def _derive_recommendations(caps: dict) -> None:
             "4-bit quantization is unavailable on this runner, so large models "
             "cannot be shrunk to fit. That lowers the biggest model you can "
             "fine-tune here.")
+    elif caps["quantization"].get("4bit_decode_padding") and caps["backend"] != "cpu":
+        # Said, because it is a workaround and not the native kernel: someone
+        # reading "4-bit works" deserves to know it only works this way.
+        caps["notes"].append(
+            "4-bit decoding on this card is only correct with small inputs "
+            "padded up to 8 rows: the native kernel returns noise for one row "
+            "(%.2f relative error) and %.2f with padding, where correct is "
+            "about 0.10. Models can be served compressed; decoding is a little "
+            "slower than a working kernel would be."
+            % (caps["quantization"].get("4bit_decode_error") or 0,
+               caps["quantization"].get("4bit_decode_padded_error") or 0))
     elif not caps["quantization"].get("4bit_decode") and caps["backend"] != "cpu":
         # The half-broken case, and the one worth spelling out: it can train
         # this way and it must not answer this way. Left unsaid, the studio

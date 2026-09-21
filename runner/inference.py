@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import os
 import threading
 import time
 from pathlib import Path
@@ -42,6 +43,13 @@ CACHE_DIR = artifacts.CACHE_DIR
 # decide whether an uncompressed one is attempted -- see _plan_precision for
 # why that distinction is worth keeping.
 HEADROOM_GB = 1.5
+
+# A model is not served if it loads with no room to talk to it. One that would
+# be left with less key/value cache than this at full precision is loaded in
+# 4-bit instead, where 4-bit is trusted -- see _plan_precision. Overridable,
+# because what counts as a useful context depends on what the model is for;
+# a tagger with a 3,800-token system prompt needs more than a chat assistant.
+MIN_SERVE_CONTEXT = int(os.environ.get("AI_STUDIO_MIN_SERVE_CONTEXT", "8192"))
 
 
 class OutOfRoom(RuntimeError):
@@ -318,7 +326,14 @@ class ModelHost:
         # term that decides how long a conversation can get. Settled once, in
         # the process that will load the models, because part of the plan is
         # environment `from_pretrained` reads.
-        self.attn = capabilities.attention_plan(caps)
+        #
+        # FlexAttention is the exception. Training uses it, but serving runs it
+        # as decode kernels (one query row against a growing cache) that
+        # training never compiles. On gfx1030 those kernels page-fault the GPU
+        # (UTCL2 fault, runner killed) while the same card trains with flex for
+        # hours without one. So serving gets flex only when it is asked for on
+        # its own, via AI_STUDIO_SERVE_FLEX_ATTENTION.
+        self.attn = capabilities.attention_plan(self._serving_caps(caps))
         # The largest prefill slice this machine's kernel makes worthwhile. The
         # one actually used is chosen per request -- see `choose_chunk` -- and
         # per model: a model loaded without the fused path it asked for is
@@ -626,16 +641,26 @@ class ModelHost:
         return self.device == "cuda" \
             and bool((self.caps.get("quantization") or {}).get("4bit_decode"))
 
-    def _plan_precision(self, spec: dict, log: Callable[[str], None]) -> bool:
+    def _plan_precision(self, spec: dict, log: Callable[[str], None],
+                        path: Path | str | None = None) -> bool:
         """Whether to compress this model on the way in.
 
-        Only when full precision is *hopeless* -- when the weights alone will
-        not fit in what is free. A merely tight fit is attempted as it is and
-        compressed only if it actually fails, because quantizing costs answer
-        quality and the estimate is not good enough to spend that on a guess:
-        a 14.5 GB model on a card with 15.6 GB free fits and answers well, and
-        an allowance for the key/value cache added on top of it says it does
-        not.
+        When full precision is *hopeless* -- the weights alone will not fit in
+        what is free -- and also when it would load but leave no room to talk
+        to it. A merely tight fit is otherwise attempted as it is, because
+        quantizing costs answer quality and the estimate is not good enough to
+        spend that on a guess.
+
+        The second case is the one that used to be missed. "The weights fit"
+        was treated as success, and a 14.5 GB 7B on a card with 15.6 GB free
+        does fit -- with room for about 3,500 tokens of conversation, which is
+        less than some applications' system prompt. Every request then fails
+        with "too long for the memory left on this card", and nothing about
+        loading it looked wrong. Loaded is not the same as served. So the
+        key/value cache the model would have left is worked out from its
+        config, and a model that would be left below MIN_SERVE_CONTEXT is
+        compressed -- where compressing is trusted, and where it actually buys
+        more room.
 
         Decided against what is free *now* rather than against the card's size,
         and before the load rather than after: a model that cannot fit either
@@ -646,7 +671,7 @@ class ModelHost:
         if not params_b or free is None:
             return False
         if params_b * 2 <= free:
-            return False        # room for the weights; try it and see.
+            return self._too_little_context(spec, path, params_b, free, log)
         if not self._can_quantize():
             log("This model's weights need about %.1f GB and %.1f GB is free. "
                 "This machine cannot compress it to fit -- it is being loaded "
@@ -658,6 +683,71 @@ class ModelHost:
             "the model changes."
             % (params_b * 2, free, params_b * 0.5 + HEADROOM_GB))
         return True
+
+    def _too_little_context(self, spec: dict, path: Path | str | None,
+                            params_b: float, free: float,
+                            log: Callable[[str], None]) -> bool:
+        """Whether full precision would fit the weights but starve the context.
+
+        Worked out with the same arithmetic `_context_budget` uses once a model
+        is loaded -- free memory less the prefill's working space, divided by
+        what one token of conversation costs -- only against the memory the
+        weights *would* leave, at each precision.
+        """
+        if not self._can_quantize():
+            return False        # nothing better to offer; load as it is.
+        per_token = self._kv_bytes_from_config(self._model_config(spec, path))
+        if not per_token:
+            return False        # shape unknown: disable the check, don't guess.
+        headroom = prefill_headroom_gb(PREFILL_CHUNK)
+        gib = 1024 ** 3
+        full = int(max(free - params_b * 2 - headroom, 0) * gib // per_token)
+        if full >= MIN_SERVE_CONTEXT:
+            return False
+        compressed = int(max(free - params_b * 0.5 - headroom, 0) * gib // per_token)
+        if compressed <= full:
+            return False
+        log("At full precision this model would load with room for only about "
+            "%d tokens of conversation, below the %d this runner will serve "
+            "with. Loading it in 4-bit instead, which leaves room for about %d. "
+            "Answers are slightly worse, and they can be a great deal longer."
+            % (full, MIN_SERVE_CONTEXT, compressed))
+        return True
+
+    @staticmethod
+    def _serving_caps(caps: dict) -> dict:
+        """The capabilities with the training-only flex opt-in removed."""
+        att = (caps or {}).get("attention")
+        if not att or not att.get("flex_opt_in") \
+                or os.environ.get("AI_STUDIO_SERVE_FLEX_ATTENTION"):
+            return caps
+        return {**caps, "attention": {**att, "flex_opt_in": False}}
+
+    def _model_config(self, spec: dict, path: Path | str | None):
+        """The model's config.json, read without loading a single weight.
+
+        A trained model carries its own; an adapter does not, and its shape is
+        the base model's. None when neither can be read, which turns the
+        context check off rather than guessing at the model's size.
+        """
+        try:
+            from transformers import AutoConfig
+        except Exception:  # noqa: BLE001
+            return None
+        candidates: list[str] = []
+        if isinstance(path, Path):
+            if (path / "config.json").exists():
+                candidates.append(str(path))
+        elif path:
+            candidates.append(str(path))        # a Hub id
+        if spec.get("base_model"):
+            candidates.append(spec["base_model"])
+        for name in candidates:
+            try:
+                return AutoConfig.from_pretrained(name, token=spec.get("hf_token"))
+            except Exception:  # noqa: BLE001 - try the next source
+                continue
+        return None
 
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
         """Put this model on the card if it is not there already.
@@ -710,7 +800,7 @@ class ModelHost:
         params_b = spec.get("params_b")
         self._make_room(params_b * 2 + HEADROOM_GB if params_b else None, log)
 
-        quantize = self._plan_precision(spec, log)
+        quantize = self._plan_precision(spec, log, path)
         try:
             resident = self._load(spec, path, quantize, log)
         except Exception as e:  # noqa: BLE001 - re-raised below unless it fits
@@ -763,6 +853,20 @@ class ModelHost:
         # The same settings the trainer quantizes a frozen base with, so a
         # model served compressed behaves the way it did while it was learning.
         if quantize:
+            # On a card where 4-bit decoding is only correct with padded input,
+            # the probe's verdict was reached with the shim installed. Serving
+            # without it would put the broken kernel back under every reply --
+            # and nothing would raise; the model would just answer in noise.
+            if (self.caps.get("quantization") or {}).get("4bit_decode_padding"):
+                from runner import bnb_compat
+                if not bnb_compat.install_decode_padding():
+                    raise RuntimeError(
+                        "4-bit decoding on this card is only correct with the "
+                        "padding shim, and the shim could not be installed in "
+                        "this process. Refusing to serve compressed rather "
+                        "than answer with noise.")
+                log("4-bit decoding here goes through the padding shim: the "
+                    "native kernel is wrong for one row on this card.")
             from transformers import BitsAndBytesConfig
             extra["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -984,7 +1088,16 @@ class ModelHost:
     @staticmethod
     def _kv_bytes_per_token(model) -> int | None:
         """What one token of conversation costs in key/value cache."""
-        cfg = getattr(model, "config", None)
+        return ModelHost._kv_bytes_from_config(getattr(model, "config", None))
+
+    @staticmethod
+    def _kv_bytes_from_config(cfg) -> int | None:
+        """The same, from a model's config -- so it can be known before loading.
+
+        Separate from `_kv_bytes_per_token` because precision has to be chosen
+        before the weights are read, and at that point there is a config.json
+        but no model.
+        """
         if cfg is None:
             return None
         layers = getattr(cfg, "num_hidden_layers", 0) or 0
