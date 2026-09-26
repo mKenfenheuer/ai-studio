@@ -61,7 +61,10 @@ def _looks_like_model(d) -> bool:
            ("config.json", "adapter_config.json", "model_index.json")):
         return True
     try:
-        return any(p.suffix == ".safetensors" for p in d.iterdir())
+        # A GGUF export is a model too -- the one file everything outside the
+        # studio wants -- and publishing one used to be refused here for
+        # having no config.json, which a GGUF by design does not.
+        return any(p.suffix in (".safetensors", ".gguf") for p in d.iterdir())
     except OSError:
         return False
 

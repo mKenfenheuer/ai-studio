@@ -205,6 +205,17 @@ else:
               "the cached model itself is not touched")
         check(export_gguf._is_vision(got), "the copy is still recognised as a vision model")
 
+print("a GGUF export can be published")
+try:
+    from runner import artifacts
+except ImportError as e:
+    print("  --  skipped (%s)" % e)
+else:
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "model.Q8_0.gguf").write_bytes(b"GGUF")
+        check(artifacts._looks_like_model(Path(tmp)), "a folder holding a .gguf is a model")
+
 if failures:
     print("\n%d check(s) failed." % len(failures))
     sys.exit(1)
