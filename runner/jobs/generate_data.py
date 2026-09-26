@@ -249,6 +249,21 @@ class ProviderRefused(RuntimeError):
     """The provider said no in a way that will not change on the next row."""
 
 
+class RowRefused(RuntimeError):
+    """The provider said no to THIS row's content; the next one may be fine."""
+
+
+# How a content filter says no. Every provider answers 400, the same status as
+# a malformed request, and only the words tell them apart -- which matters,
+# because one means "this whole run is wrong" and the other means "this one
+# photograph of a fruit bowl tripped a classifier". Treated as the first, a
+# single false positive at row 1,800 failed a vision run and threw away the
+# 1,799 rows it had already paid for.
+_CONTENT_REFUSAL = re.compile(
+    r"content[ _-]?(policy|filter|management)|responsible ?ai|safety system"
+    r"|flagged|moderation", re.IGNORECASE)
+
+
 # Attempts per row before giving up on it, and the wait between them. Rate
 # limits are a fact of every hosted API, and a thousand-row generation that
 # fails the moment one arrives is not a feature.
@@ -352,6 +367,8 @@ class HostedModel:
             if r.status_code == 429 or r.status_code >= 500:
                 self._wait(attempt, r.headers.get("retry-after"), "the provider")
                 continue
+            if r.status_code == 400 and _CONTENT_REFUSAL.search(r.text or ""):
+                raise RowRefused(last)
             raise ProviderRefused(last)
         raise RuntimeError(last or "no reply")
 
@@ -443,6 +460,12 @@ def _attempt(host, spec: dict, messages: list[dict], params: dict,
     """One request, or None if it failed in a way the run can walk past."""
     try:
         return host.generate(spec, messages, params, None, lambda _l: None)
+    except RowRefused as e:
+        # Said at warning level, because a dataset with holes in it is worth
+        # knowing about -- but walked past, because the hole is one row.
+        ctx.log("Row %d was refused by the provider's content filter and is "
+                "left out (%s)." % (i + 1, str(e)[:160]), "warn")
+        return None
     except ProviderRefused:
         # A rejected key or a model that does not exist is not a bad row: it
         # is every row. Carrying on would spend five thousand attempts
