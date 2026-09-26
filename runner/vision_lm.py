@@ -377,3 +377,54 @@ def summary_pixels(path: Path) -> int | None:
     except (OSError, ValueError):
         return None
     return ((s.get("vision") or {}).get("image_max_pixels")) or None
+
+
+_REPEAT_CHECKED: set = set()
+
+
+def repair_repeat_interleave(torch, device: str, log) -> bool:
+    """Route `repeat_interleave` through the processor where the card gets it wrong.
+
+    On the RX 6900 XT with torch 2.9.1+rocm6.4, `torch.repeat_interleave` with
+    a tensor of repeat counts fails with hipErrorIllegalState -- on a three-
+    element tensor, in fp16 and fp32 alike, and in fp32 it takes the GPU down
+    with a memory access fault. Qwen3-VL's image encoder calls it first thing,
+    on the picture grids, so no vision model could train or answer on that
+    card. Everything around it works, and the calls vision models make are on
+    a handful of integers, so computing those on the processor and moving the
+    answer back costs nothing measurable.
+
+    Probed once per process and installed only where the probe fails: a card
+    that does this right keeps the native kernel.
+    """
+    if device != "cuda" or device in _REPEAT_CHECKED:
+        return False
+    _REPEAT_CHECKED.add(device)
+    try:
+        g = torch.tensor([30, 40], device="cuda")
+        torch.repeat_interleave(g, torch.tensor([2, 1], device="cuda"))
+        torch.cuda.synchronize()
+        return False
+    except Exception:  # noqa: BLE001 - the failure is the finding
+        pass
+    native = torch.repeat_interleave
+
+    def repeat_interleave(input, repeats=None, dim=None, *, output_size=None):
+        on_card = torch.is_tensor(input) and input.device.type == "cuda"
+        if on_card and repeats is None:
+            return native(input.cpu(), output_size=output_size).to(input.device)
+        if on_card and torch.is_tensor(repeats):
+            return native(input.cpu(), repeats.cpu(), dim=dim,
+                          output_size=output_size).to(input.device)
+        if repeats is None:
+            return native(input, output_size=output_size)
+        return native(input, repeats, dim=dim, output_size=output_size)
+
+    torch.repeat_interleave = repeat_interleave
+    torch.Tensor.repeat_interleave = (
+        lambda self, repeats=None, dim=None, *, output_size=None:
+        repeat_interleave(self, repeats, dim=dim, output_size=output_size))
+    log("This card's repeat_interleave kernel is broken (it fails on a "
+        "three-element tensor), and the image encoder needs it: those calls "
+        "are made on the processor instead. They are a few integers each.")
+    return True

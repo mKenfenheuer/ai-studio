@@ -479,6 +479,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     optional = {"attn_implementation": attn["implementation"]}
     if kernel:
         optional["experts_implementation"] = kernel
+    if vision:
+        vision_lm.repair_repeat_interleave(torch, device, ctx.log)
     model = attentionfit.load_base_model(
         vision_lm.model_class() if vision else AutoModelForCausalLM,
         base_model, load_kwargs, optional, ctx, attn)

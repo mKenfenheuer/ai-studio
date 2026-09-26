@@ -999,6 +999,8 @@ class ModelHost:
         resident = _Resident(spec["job_id"], model, tok, template, specials,
                              quantize, spec.get("params_b"), _added_tokens(tok))
         resident.processor = processor
+        if processor is not None:
+            vision_lm.repair_repeat_interleave(torch, self.device, log)
         return resident
 
     # --------------------------------------------------------- generating
