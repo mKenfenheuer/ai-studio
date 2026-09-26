@@ -44,15 +44,6 @@ RUN pip install --no-cache-dir \
 # does not rebuild it.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         "torch>=2.4"
-# torchvision, for vision-language models: their processors import it even to
-# read a still photograph (Qwen3-VL's carries a video processor that insists on
-# it). Pinned to the release built for the torch already installed -- torch
-# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
-# because left to resolve on its own pip will happily "upgrade" torch to
-# whatever torchvision it found first, from the wrong index.
-RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
-    && pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu "torchvision==${TV}" \
-    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 # `datasets` is here for the benchmarks: a published benchmark is a Hub
 # dataset, and the machine that scores it fetches it the way the tools that
 # publish those numbers do. Without it a benchmark run reaches the machine,
@@ -69,6 +60,17 @@ RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].spl
 RUN pip install --no-cache-dir \
         "transformers>=5.0" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
         "datasets>=2.20" "Pillow>=10"
+
+# torchvision, for vision-language models (after the line above, which
+# brings the numpy it imports): their processors import it even to
+# read a still photograph (Qwen3-VL's carries a video processor that insists on
+# it). Pinned to the release built for the torch already installed -- torch
+# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
+# because left to resolve on its own pip will happily "upgrade" torch to
+# whatever torchvision it found first, from the wrong index.
+RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
+    && pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu "torchvision==${TV}" \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 
 # The grammar engine behind `response_format`. Pure Python and tiny, and in a
 # layer of its own so a change to its pin does not reinstall the stack above.
