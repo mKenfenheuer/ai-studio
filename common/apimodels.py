@@ -485,7 +485,23 @@ def _responses_request(conn: dict, model: str, messages: list[dict],
                           "call_id": m.get("tool_call_id") or "",
                           "output": m.get("content") or ""})
             continue
-        if content := (m.get("content") or ""):
+        content = m.get("content") or ""
+        # A turn that shows a picture, in this surface's own part types:
+        # `input_text` and `input_image`, with the data URL as a plain string
+        # rather than Chat Completions' nested `image_url.url`. Without this
+        # the picture was dropped here and nowhere else -- Chat Completions
+        # sent it, so the same dataset answered through a Responses-API
+        # connection had the teacher describe a plate it could not see, in
+        # confident detail, for every row.
+        pictures = [mm["url"] for mm in (m.get("media") or [])
+                    if isinstance(mm, dict) and mm.get("kind") == "image"
+                    and str(mm.get("url") or "").startswith(("data:", "http"))]
+        if pictures and role == "user":
+            parts = [{"type": "input_text", "text": content}] if content else []
+            parts += [{"type": "input_image", "image_url": url}
+                      for url in pictures]
+            items.append({"role": role, "content": parts})
+        elif content:
             items.append({"role": role, "content": content})
         for call in m.get("tool_calls") or []:
             fn = call.get("function") or call

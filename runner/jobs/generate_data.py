@@ -573,7 +573,16 @@ def _sources(cfg: dict, mode: str, ctx: Any,
                              else "%s\n\n%s" % (instruction, prompt)})
             else:
                 msgs.append({"role": "user", "content": prompt})
-            yield msgs, {"prompt": prompt}
+            # The row's pictures go with its question. A photograph with
+            # "what is on this plate?" beside it is the commonest vision
+            # dataset there is, and answering only the words -- which is what
+            # this did -- asked the teacher to describe a plate it could not
+            # see, a thousand times, and it obliged.
+            if media := _media_of(row, fmt, cfg):
+                msgs[-1]["media"] = media
+                yield msgs, {"prompt": prompt, "media": media}
+            else:
+                yield msgs, {"prompt": prompt}
         if not seen_any:
             raise ValueError(
                 "No prompts could be read from that split. Name the column "
@@ -1024,7 +1033,14 @@ def _row(text: str, meta: dict, cfg: dict) -> dict | None:
     if system:
         messages.append({"role": "system", "content": system})
     if prompt is not None:
-        messages.append({"role": "user", "content": prompt})
+        user = {"role": "user", "content": prompt}
+        # Kept on the row as the reference it arrived as, never as the data
+        # URL the provider was sent: the picture is already in the store, and
+        # a row carrying its own base64 copy is a dataset forty times larger
+        # that no longer shares anything with the one it came from.
+        if meta.get("media"):
+            user["media"] = meta["media"]
+        messages.append(user)
         messages.append({"role": "assistant", "content": text})
     else:
         # No prompt: the generation is the whole example. Split it into a turn
@@ -1084,6 +1100,35 @@ def _prompt_of(row: dict, field: str, fmt: dict) -> str:
     return ""
 
 
+_MEDIA_KINDS = ("image", "audio", "video")
+
+
+def _media_of(row: dict, fmt: dict, cfg: dict) -> list[dict]:
+    """What one row of the source split shows, as message media.
+
+    Read the same two ways a prompt is. A conversation's pictures are on its
+    last user turn, beside the question `_prompt_of` took from it. A flat row
+    -- what a folder of photographs with a manifest uploads as -- names each
+    stored file in a column called after its kind (`image`, `audio`), which is
+    what the upload writes; `media_field` names another column outright.
+    """
+    if isinstance(row.get("messages"), list):
+        from common import conversation as C
+        conv, _ = C.repair(C.from_row(row, fmt))
+        for m in reversed(conv[C.MESSAGES_KEY]):
+            if m.get("role") == "user":
+                return list(m.get("media") or [])
+        return []
+    named = (cfg.get("media_field") or "").strip()
+    out = []
+    for key in ([named] if named else _MEDIA_KINDS):
+        ref = row.get(key)
+        if isinstance(ref, str) and ref.startswith("asset:"):
+            out.append({"kind": key if key in _MEDIA_KINDS else "image",
+                        "ref": ref})
+    return out
+
+
 def _dedupe_key(row: dict) -> str:
     """What makes two generated rows the same row.
 
@@ -1093,7 +1138,13 @@ def _dedupe_key(row: dict) -> str:
     """
     for m in row.get("messages") or []:
         if m.get("role") == "user" and (m.get("content") or "").strip():
-            return " ".join(m["content"].lower().split())[:2000]
+            said = " ".join(m["content"].lower().split())[:2000]
+            # What the person showed is part of what they asked. A vision set
+            # asks the same sentence of every picture, and keyed on the words
+            # alone its second row was already "a repeat of the first".
+            shown = " ".join(mm.get("ref") or mm.get("url") or ""
+                             for mm in m.get("media") or [])
+            return said + (" | " + shown if shown else "")
     return json.dumps(row, sort_keys=True)[:2000]
 
 
