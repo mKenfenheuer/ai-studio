@@ -91,9 +91,12 @@ def run(cfg: dict, ctx: Any) -> dict:
                 % (wanted, "an adapter" if is_adapter else "a whole model"))
         # Uploaded straight out of the cache rather than copied somewhere
         # first: a copy of a fourteen-gigabyte model, to add one text file
-        # beside it, is fourteen gigabytes of disk and several minutes.
+        # beside it, is fourteen gigabytes of disk and several minutes. The
+        # cache's own bookkeeping (when the copy was last used) lives in the
+        # same folder and is not part of the model, so it stays behind.
         files = [(p, p.relative_to(folder).as_posix())
-                 for p in sorted(folder.rglob("*")) if p.is_file()]
+                 for p in sorted(folder.rglob("*"))
+                 if p.is_file() and p.name != artifacts.USED_MARKER]
 
     card = cfg.get("card") or ""
     # The card the controller rendered wins over whatever README the training
