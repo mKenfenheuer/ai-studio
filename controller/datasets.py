@@ -698,6 +698,16 @@ def _json_rows(text: str) -> Iterator[dict]:
                     yield row if isinstance(row, dict) else {"text": str(row)}
                 return
         lists = {k: v for k, v in obj.items() if isinstance(v, list)}
+        # One conversation is also a dict whose values are all lists -- its
+        # `messages` -- and read as columns it came out as one row per turn: a
+        # system row, a user row, an assistant row, none of them trainable. A
+        # one-row JSONL file is exactly this, because its only line is also a
+        # valid JSON document, so every generation that kept a single row
+        # (and every one-example upload) arrived as three rows of nothing.
+        if any(v and all(isinstance(x, dict) and "role" in x for x in v)
+               for v in lists.values()):
+            yield obj
+            return
         if lists and len(lists) == len(obj):
             n = min(len(v) for v in lists.values())
             for i in range(n):

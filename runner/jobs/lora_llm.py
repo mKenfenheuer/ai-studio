@@ -15,7 +15,7 @@ from typing import Any
 from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
-from runner import artifacts, checkpoints, earlystop
+from runner import artifacts, checkpoints, earlystop, vision_lm
 from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
 from . import attentionfit, chunkedloss, merge, source
@@ -439,7 +439,21 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.log("Loading tokenizer and base model: %s" % base_model)
     ctx.progress(0, 0, stage="loading_model")
 
-    tok = AutoTokenizer.from_pretrained(base_model, token=ctx.hf_token, trust_remote_code=False)
+    # A model that looks as well as reads. Decided by the checkpoint's own
+    # config -- an image encoder is there or it is not -- rather than by the
+    # name, and everything that differs because of it lives in vision_lm.
+    vision = vision_lm.is_vision_model(base_model, ctx.hf_token)
+    processor = None
+    if vision:
+        processor = vision_lm.load_processor(base_model, ctx.hf_token,
+                                             cfg.get("image_max_pixels"))
+        tok = processor.tokenizer
+        ctx.log("This model has an image encoder. Pictures in the data are "
+                "shown to it, at most %s pixels each; the adapter trains the "
+                "language model only and leaves the encoder as it was."
+                % f"{int(cfg.get('image_max_pixels') or vision_lm.DEFAULT_MAX_PIXELS):,}")
+    else:
+        tok = AutoTokenizer.from_pretrained(base_model, token=ctx.hf_token, trust_remote_code=False)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -466,7 +480,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     if kernel:
         optional["experts_implementation"] = kernel
     model = attentionfit.load_base_model(
-        AutoModelForCausalLM, base_model, load_kwargs, optional, ctx, attn)
+        vision_lm.model_class() if vision else AutoModelForCausalLM,
+        base_model, load_kwargs, optional, ctx, attn)
     if not use_4bit:
         model = model.to(device)
     model.config.use_cache = False
@@ -585,9 +600,15 @@ def run(cfg: dict, ctx: Any) -> dict:
     else:
         targets = cfg.get("target_modules") or _pick_target_modules(
             model, moe, adapt_experts)
+        shown = list(targets)
+        if vision and not cfg.get("target_modules"):
+            # The same layer names, but only inside the language model -- see
+            # vision_lm.language_only_targets for why the encoder is left alone.
+            targets = vision_lm.language_only_targets(model, shown)
         last_n = _last_layers(model, train_layers)
-        ctx.log("Applying %s to: %s%s" % (
-            "DoRA" if method == "dora" else "LoRA", ", ".join(targets),
+        ctx.log("Applying %s to: %s%s%s" % (
+            "DoRA" if method == "dora" else "LoRA", ", ".join(shown),
+            " (language model only)" if vision else "",
             " in the last %d layers only" % train_layers if last_n is not None else ""))
         lconf = LoraConfig(
             r=int(cfg.get("lora_r", 16)),
@@ -686,8 +707,17 @@ def run(cfg: dict, ctx: Any) -> dict:
     # tokenizer here and rendered through the shared Jinja code rather than
     # through apply_chat_template, so that what trains is byte-for-byte what
     # the preview showed. Two renderers would be two chances to differ.
+    if vision and not fmt.get("chat_template") and not fmt.get("chat_format"):
+        # Pictures have to go where the model's own template puts them, and
+        # only that template knows (vision_lm.placeholder). A studio format
+        # would render the words and have nowhere to put the picture.
+        fmt["use_model_template"] = True
     if fmt.get("use_model_template") and not fmt.get("chat_template"):
         template = getattr(tok, "chat_template", None)
+        if not template and processor is not None:
+            # Vision checkpoints often keep the template on the processor
+            # and not the tokenizer, where a text-only reader never looks.
+            template = getattr(processor, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default") or next(iter(template.values()), None)
         if template:
@@ -725,6 +755,13 @@ def run(cfg: dict, ctx: Any) -> dict:
                 % (fmt.get("mode") or "plain text"))
 
     preview = format_example(sample_row, fmt)
+    if vision and preview:
+        # What actually trains, with each picture where the model's own
+        # template puts it -- the generic preview marks it `<image>` on a
+        # line of its own, which is not the text this run learns from.
+        conv, _ = conversation.repair(conversation.from_row(sample_row, fmt))
+        conv, _ = vision_lm.inline_pictures(conv, vision_lm.placeholder(processor))
+        preview = conversation.render(conv, fmt) or preview
     if not preview:
         raise ValueError(
             "Could not work out how to read this dataset. Its columns are: %s. "
@@ -849,14 +886,50 @@ def run(cfg: dict, ctx: Any) -> dict:
         return enc
 
     held_ds = None
-    if held_raw is not None and len(held_raw):
-        held_ds = held_raw.map(tokenize, batched=True, batch_size=64,
-                               remove_columns=held_raw.column_names,
-                               desc="Tokenizing the held-out split")
-        held_ds.set_format(type=None,
-                           columns=["input_ids", "attention_mask", "labels"])
-    ds = ds.map(tokenize, batched=True, batch_size=64,
-                remove_columns=ds.column_names, desc="Tokenizing")
+    pictures: dict = {}
+    if vision:
+        # Pictures first, every one the run will need, from the studio's
+        # store into this machine's cache -- then each row is tokenized with
+        # its pictures, because how many tokens a picture becomes depends on
+        # its size and the mask has to be carried across that expansion.
+        from . import vision_cls
+        wanted = set()
+        for part in (ds, held_raw):
+            for row in part if part is not None else []:
+                conv, _ = conversation.repair(conversation.from_row(row, fmt))
+                _, refs = vision_lm.inline_pictures(conv, "")
+                wanted.update(vision_lm.asset_ids(refs))
+        pictures = vision_cls._fetch_all(sorted(wanted), ctx) if wanted else {}
+        ctx.log("Preparing %s rows with %s pictures." % (
+            f"{len(ds) + (len(held_raw) if held_raw is not None else 0):,}",
+            f"{len(pictures):,}"))
+        counts = {}
+        if held_raw is not None and len(held_raw):
+            held_ds, counts = vision_lm.build(held_raw, fmt, train_on, tok, processor,
+                                              max_seq, ctx, conversation, pictures)
+        ds, more = vision_lm.build(ds, fmt, train_on, tok, processor, max_seq,
+                                   ctx, conversation, pictures)
+        counts = {k: counts.get(k, 0) + v for k, v in more.items()}
+        inexact = counts.pop("inexact", 0)
+        dropped = {k: v for k, v in counts.items() if v}
+        if dropped:
+            ctx.log("Left out: %s. A row is never cut short when it has a "
+                    "picture in it -- cutting through the image tokens breaks "
+                    "the forward pass -- so rows past %d tokens are skipped."
+                    % (", ".join("%d %s" % (v, k.replace("_", " "))
+                                 for k, v in dropped.items()), max_seq), "warn")
+        if not ds:
+            raise ValueError("No row of this dataset could be prepared with its "
+                             "pictures. See the warnings above for why.")
+    else:
+        if held_raw is not None and len(held_raw):
+            held_ds = held_raw.map(tokenize, batched=True, batch_size=64,
+                                   remove_columns=held_raw.column_names,
+                                   desc="Tokenizing the held-out split")
+            held_ds.set_format(type=None,
+                               columns=["input_ids", "attention_mask", "labels"])
+        ds = ds.map(tokenize, batched=True, batch_size=64,
+                    remove_columns=ds.column_names, desc="Tokenizing")
     if inexact:
         # Not a failure, but not something to pass over either: those rows
         # trained on every token including the questions, which is a different
@@ -865,7 +938,8 @@ def run(cfg: dict, ctx: Any) -> dict:
                 "allow to be measured -- some templates rewrite earlier turns "
                 "when a later one arrives. Those rows learned from the whole "
                 "conversation." % inexact, "warn")
-    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    if not vision:
+        ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     val_ds = None
     if held_ds is None:
@@ -936,6 +1010,10 @@ def run(cfg: dict, ctx: Any) -> dict:
     # Seeded, so the batches come in the same order on a second run.
     _gen = torch.Generator()
     _gen.manual_seed(seed)
+    if vision:
+        # Same padding rule, plus the pictures: each batch turns its own files
+        # into pixels, so host memory holds one batch of images, not all of them.
+        collate = vision_lm.Collator(processor, pad_id, pictures)
     loader = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=False,
                         generator=_gen, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=bs,
@@ -1011,6 +1089,11 @@ def run(cfg: dict, ctx: Any) -> dict:
     # `chunkedloss.enable` for why it is verified rather than assumed.
     sliced_loss = False
     try:
+        if vision:
+            # The sliced loss re-runs the output layer on the hidden states,
+            # which for a vision model would mean re-running the encoder too.
+            # The model's own loss is used as it comes.
+            raise StopIteration
         probe_batch = next(iter(loader))
         sliced_loss = chunkedloss.enable(
             model, {k: v.to(device) for k, v in probe_batch.items()}, torch,
@@ -1214,6 +1297,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     stamped = _stamp_chat_template(tok, fmt, cfg, ctx)
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
+    if processor is not None:
+        vision_lm.save_processor(processor, out_dir, ctx)
     # In BOTH places a reader looks, whatever this version of transformers
     # decided to write. See chat_formats.stamp_into.
     if put := chat_formats.stamp_into(out_dir, getattr(tok, "chat_template", None)):
@@ -1275,6 +1360,11 @@ def run(cfg: dict, ctx: Any) -> dict:
         # this run on this card can be checked against what it actually
         # took. The fit check learns from the pair.
         "peak_vram_gb": peak_memory_gb(device),
+        # What serving needs to know before it loads anything: this model
+        # takes pictures, at this size.
+        "vision": {"image_max_pixels": int(cfg.get("image_max_pixels")
+                                           or vision_lm.DEFAULT_MAX_PIXELS)}
+                  if vision else None,
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
     adapter_zip = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
@@ -1301,7 +1391,8 @@ def run(cfg: dict, ctx: Any) -> dict:
     # A full fine-tune saved the whole model above; there is no adapter
     # to fold into anything, and the saved directory is the model.
     merged_zip = None if method == "full" else _merge_here(model_box, tok, cfg, ctx, summary, out_dir,
-                             base_model, dtype_name, use_4bit, torch)
+                             base_model, dtype_name, use_4bit, torch,
+                             processor=processor)
 
     # The merged model is the primary artifact when there is one -- it is what
     # somebody means by "the model" -- and the adapter travels beside it.
@@ -1314,7 +1405,7 @@ def run(cfg: dict, ctx: Any) -> dict:
 
 def _merge_here(model_box: list, tok, cfg: dict, ctx: Any, summary: dict,
                 adapter_dir: Path, base_model: str, dtype_name: str,
-                use_4bit: bool, torch) -> Path | None:
+                use_4bit: bool, torch, processor=None) -> Path | None:
     """Fold this run's adapter into its base and pack the result. Or don't.
 
     Both artifacts are kept, and each answers a different question. The adapter
@@ -1351,6 +1442,9 @@ def _merge_here(model_box: list, tok, cfg: dict, ctx: Any, summary: dict,
 
         ctx.log("Merging the adapter into %s, so this run also produces a "
                 "model that loads on its own." % label)
+        if use_4bit and processor is not None:
+            raise ValueError("a vision model trained in 4-bit is not merged "
+                             "here yet; train it in 16-bit to get a merged copy")
         if use_4bit:
             # A 4-bit base cannot be merged into: the weights the adapter was
             # fitted against have already lost the precision it was fitted to.
@@ -1373,6 +1467,8 @@ def _merge_here(model_box: list, tok, cfg: dict, ctx: Any, summary: dict,
             merged.config.use_cache = True
             merged.save_pretrained(str(model_dir), safe_serialization=True)
             merge.save_tokenizer(tok, model_dir, ctx, "the fine-tune")
+            if processor is not None:
+                vision_lm.save_processor(processor, model_dir, ctx)
             info = {"params_total": sum(p.numel() for p in merged.parameters()),
                     "dtype": dtype_name, "base_model": label}
             del merged

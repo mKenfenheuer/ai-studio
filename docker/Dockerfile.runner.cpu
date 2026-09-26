@@ -44,6 +44,15 @@ RUN pip install --no-cache-dir \
 # does not rebuild it.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         "torch>=2.4"
+# torchvision, for vision-language models: their processors import it even to
+# read a still photograph (Qwen3-VL's carries a video processor that insists on
+# it). Pinned to the release built for the torch already installed -- torch
+# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
+# because left to resolve on its own pip will happily "upgrade" torch to
+# whatever torchvision it found first, from the wrong index.
+RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.%d.https://download.pytorch.org/whl/cpu" % (int(m) + 15, p))')" \
+    && pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu "torchvision==${TV}" \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 # `datasets` is here for the benchmarks: a published benchmark is a Hub
 # dataset, and the machine that scores it fetches it the way the tools that
 # publish those numbers do. Without it a benchmark run reaches the machine,
@@ -83,7 +92,10 @@ RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 # asked for (>=2.4) and dragged transformers back to 4.x -- the whole runner
 # downgraded to suit one script. In /opt/llama.cpp/venv the converter keeps
 # exactly what it was tested against, and nothing else is affected by it.
-ARG LLAMA_CPP_TAG=b4586
+# Moved from b4586 (January 2025) on 26.09.2026: that converter predates Qwen3
+# and every vision model, and its multimodal projector export (`--mmproj`)
+# did not exist yet. v0.5.0 converts Qwen3, Qwen3-VL and the projector.
+ARG LLAMA_CPP_TAG=v0.5.0
 # libgomp1 is not a build dependency: llama-quantize links against the OpenMP
 # runtime and needs it at run time. It arrives with build-essential, which is
 # purged below, and the first build of this image shipped a binary that could

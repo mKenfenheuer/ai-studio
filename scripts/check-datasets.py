@@ -210,8 +210,24 @@ def test_merge_keeps_names() -> None:
           {r[ds.ROW_ID_FIELD] for r in rows} == names)
 
 
+def test_one_conversation_is_one_row() -> None:
+    """A JSONL file with one line is one conversation, not one row per turn."""
+    print("\nOne conversation, alone in its file")
+    import json
+    line = json.dumps({"messages": [{"role": "system", "content": "s"},
+                                    {"role": "user", "content": "q"},
+                                    {"role": "assistant", "content": "a"}]})
+    rows = list(ds._json_rows(line + "\n"))
+    check("a one-line JSONL conversation is one row", len(rows) == 1, len(rows))
+    check("and its turns are still its turns",
+          len(rows) == 1 and len(rows[0].get("messages") or []) == 3, rows[:1])
+    cols = list(ds._json_rows(json.dumps({"question": ["a", "b"], "answer": ["1", "2"]})))
+    check("a dict of columns is still read as columns", len(cols) == 2, cols)
+
+
 def main() -> int:
     try:
+        test_one_conversation_is_one_row()
         test_names()
         test_editing_by_name()
         test_names_survive_transforms()

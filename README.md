@@ -418,6 +418,7 @@ python scripts/check-assets.py       # stored files are shared, counted, release
 python scripts/check-cards.py        # a model card says true things
 python scripts/check-benchmarks.py   # a benchmark is asked the published way
 python scripts/check-ops.py          # reservations, deployments, the usage ledger
+python scripts/check-vision.py       # pictures: loss mask, adapter targets, providers
 python scripts/check-workflow.py     # the whole workflow, against a real controller
 
 node --experimental-vm-modules scripts/check-web.mjs   # every browser script parses

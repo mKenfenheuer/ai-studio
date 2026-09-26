@@ -77,6 +77,9 @@ jobs:
       - name: What the serving API refuses, and what it queues
         run: python scripts/check-serving.py
 
+      - name: Fine-tuning and answering with pictures
+        run: python scripts/check-vision.py
+
       - name: A reply held to its format could not have been written otherwise
         run: python scripts/check-grammar.py
 

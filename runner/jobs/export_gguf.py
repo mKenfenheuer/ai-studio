@@ -28,6 +28,7 @@ conversion that fails says why in the same place as everything else.
 from __future__ import annotations
 
 import os
+import json
 import re
 import subprocess
 import time
@@ -135,6 +136,23 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.log("Converted in %s. %s"
             % (_took(time.time() - t0), _size(f16)))
 
+    # A model that looks is two files in llama.cpp: the language model, and
+    # the projector that turns a picture into what the language model reads
+    # (`mmproj`). The converter writes the second on its own pass. It is kept
+    # at 16 bits -- it is a few hundred megabytes, it is what every runtime
+    # expects, and quantising the image path costs accuracy the language
+    # model's quantisation does not.
+    mmproj = None
+    if _is_vision(folder):
+        mmproj = out_dir / ("mmproj-%s.f16.gguf" % name)
+        ctx.log("This model has an image encoder; writing its projector as a "
+                "second file, which llama.cpp loads beside the model "
+                "(--mmproj).")
+        t0 = time.time()
+        _stream([CONVERT_PYTHON, CONVERTER, str(folder), "--mmproj",
+                 "--outfile", str(mmproj), "--outtype", "f16"], ctx)
+        ctx.log("Projector written in %s. %s" % (_took(time.time() - t0), _size(mmproj)))
+
     final = f16
     if quant != "F16":
         if not Path(QUANTIZE).exists():
@@ -161,10 +179,13 @@ def run(cfg: dict, ctx: Any) -> dict:
         "FROM ./%s\n" % (name, name, final.name), encoding="utf-8")
     (out_dir / "README.txt").write_text(
         "%s\n\nQuantisation: %s -- %s\n\n"
-        "llama.cpp:\n  llama-cli -m %s -p \"Hello\"\n\n"
+        "llama.cpp:\n  llama-cli -m %s -p \"Hello\"\n%s\n"
         "Ollama:\n  ollama create %s -f Modelfile\n  ollama run %s\n\n"
         "Made by AI Studio from run %s.\n"
-        % (name, quant, QUANT_TYPES[quant], final.name, name, name, source_job),
+        % (name, quant, QUANT_TYPES[quant], final.name,
+           ("  llama-mtmd-cli -m %s --mmproj %s --image photo.jpg -p \"...\"\n"
+            % (final.name, mmproj.name)) if mmproj else "",
+           name, name, source_job),
         encoding="utf-8")
 
     ctx.progress(3, 3, stage="saving")
@@ -178,11 +199,20 @@ def run(cfg: dict, ctx: Any) -> dict:
         "source_job": source_job,
         "quantize": quant,
         "filename": final.name,
+        "mmproj": mmproj.name if mmproj else None,
         "bytes": size,
         "artifact_paths": {"gguf": str(zip_path)},
         "artifact_size": zip_path.stat().st_size,
         "note": "%s, %s" % (final.name, _size(final)),
     }
+
+
+def _is_vision(folder: Path) -> bool:
+    try:
+        cfg = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(cfg.get("vision_config"))
 
 
 def _size(path: Path) -> str:

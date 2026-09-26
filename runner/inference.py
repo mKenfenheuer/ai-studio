@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 from common import conversation, formatting
 
-from . import artifacts, capabilities, grammar as grammars
+from . import artifacts, capabilities, grammar as grammars, vision_lm
 
 CACHE_DIR = artifacts.CACHE_DIR
 
@@ -253,7 +253,10 @@ class _Resident:
                  # per request. Only the grammar's vocabulary table so far,
                  # which takes tens of seconds to build on a 152k vocabulary
                  # and depends on nothing but the tokenizer.
-                 "derived")
+                 "derived",
+                 # A model that takes pictures: what turns one into the tensors
+                 # its encoder reads, and says how many tokens it becomes.
+                 "processor")
 
     def __init__(self, job_id: str, model, tok, chat_template, specials,
                  quantized: bool, params_b: float | None,
@@ -268,6 +271,7 @@ class _Resident:
         self.params_b = params_b
         self.added_tokens = added_tokens
         self.last_used = time.time()
+        self.processor = None
 
 
 class ModelHost:
@@ -308,6 +312,7 @@ class ModelHost:
         self.loaded_id: str | None = None
         self.model = None
         self.tok = None
+        self.processor = None
         self.chat_template: str | None = None
         self.specials: dict = {}
         self.last_used = 0.0
@@ -417,6 +422,7 @@ class ModelHost:
         self.loaded_id = current.job_id if current else None
         self.model = current.model if current else None
         self.tok = current.tok if current else None
+        self.processor = current.processor if current else None
         self.chat_template = current.chat_template if current else None
         self.specials = current.specials if current else {}
         self.quantized = bool(current.quantized) if current else False
@@ -591,7 +597,8 @@ class ModelHost:
             pass
         return {"attn_implementation": self.attn["implementation"]}
 
-    def _load_causal_lm(self, name: str, token, extra: dict, log) -> Any:
+    def _load_causal_lm(self, name: str, token, extra: dict, log,
+                        cls=None) -> Any:
         """`from_pretrained`, retried without the attention path if refused.
 
         Model families that have no SDPA implementation raise a ValueError
@@ -601,9 +608,9 @@ class ModelHost:
         are read.
         """
         from transformers import AutoModelForCausalLM
+        cls = cls or AutoModelForCausalLM
         try:
-            return AutoModelForCausalLM.from_pretrained(name, token=token,
-                                                        **extra)
+            return cls.from_pretrained(name, token=token, **extra)
         except Exception as e:  # noqa: BLE001 - any refusal of the attention path
             message = str(e)
             # Widened from (TypeError, ValueError) because a FlexAttention
@@ -619,7 +626,7 @@ class ModelHost:
                 raise
             log("This model has no fused-attention implementation, so it is "
                 "being loaded with the library's own.")
-            return AutoModelForCausalLM.from_pretrained(
+            return cls.from_pretrained(
                 name, token=token,
                 **{k: v for k, v in extra.items() if k != "attn_implementation"})
 
@@ -911,12 +918,25 @@ class ModelHost:
         is_adapter = isinstance(path, Path) \
             and (path / "adapter_config.json").exists()
 
+        processor = None
         if not is_adapter:
             log("Loading your model…" if isinstance(path, Path)
                 else "Downloading %s…" % path)
             token = spec.get("hf_token")
-            tok = AutoTokenizer.from_pretrained(str(path), token=token)
-            model = self._load_causal_lm(str(path), token, extra, log)
+            vision = vision_lm.is_vision_dir(path) if isinstance(path, Path) \
+                else vision_lm.is_vision_model(str(path), token)
+            if vision:
+                # Shown pictures at the size it learned from, which the run
+                # wrote down; a base model off the Hub gets the studio default.
+                processor = vision_lm.load_processor(
+                    str(path), token,
+                    vision_lm.summary_pixels(path) if isinstance(path, Path) else None)
+                tok = processor.tokenizer
+            else:
+                tok = AutoTokenizer.from_pretrained(str(path), token=token)
+            model = self._load_causal_lm(
+                str(path), token, extra, log,
+                cls=vision_lm.model_class() if vision else None)
         else:
             base = spec.get("base_model")
             if base_job := spec.get("base_model_job"):
@@ -936,11 +956,21 @@ class ModelHost:
                     "trained on, but that model is not recorded on the run.")
             log("Loading %s, then applying what you trained…" % base)
             from peft import PeftModel
-            tok = AutoTokenizer.from_pretrained(str(path)) \
-                if (path / "tokenizer_config.json").exists() \
-                else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
-            model = self._load_causal_lm(base, spec.get("hf_token"),
-                                         extra, log)
+            vision = vision_lm.is_vision_model(base, spec.get("hf_token"))
+            if vision:
+                saved = any((path / f).exists() for f in
+                            ("processor_config.json", "preprocessor_config.json"))
+                source_dir = str(path) if saved else base
+                processor = vision_lm.load_processor(
+                    source_dir, spec.get("hf_token"), vision_lm.summary_pixels(path))
+                tok = processor.tokenizer
+            else:
+                tok = AutoTokenizer.from_pretrained(str(path)) \
+                    if (path / "tokenizer_config.json").exists() \
+                    else AutoTokenizer.from_pretrained(base, token=spec.get("hf_token"))
+            model = self._load_causal_lm(
+                base, spec.get("hf_token"), extra, log,
+                cls=vision_lm.model_class() if vision else None)
             model = PeftModel.from_pretrained(model, str(path))
 
         if tok.pad_token is None:
@@ -950,6 +980,8 @@ class ModelHost:
         # is about to run. Training reads the same field, so the playground and
         # the run it is talking to cannot disagree about the format.
         template = getattr(tok, "chat_template", None)
+        if not template and processor is not None:
+            template = getattr(processor, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default") or next(iter(template.values()), None)
         specials = {k: v for k, v in (
@@ -964,8 +996,10 @@ class ModelHost:
             model = model.to(self.device)
         model = model.eval()
         model.config.use_cache = True
-        return _Resident(spec["job_id"], model, tok, template, specials,
-                         quantize, spec.get("params_b"), _added_tokens(tok))
+        resident = _Resident(spec["job_id"], model, tok, template, specials,
+                             quantize, spec.get("params_b"), _added_tokens(tok))
+        resident.processor = processor
+        return resident
 
     # --------------------------------------------------------- generating
     def render(self, spec: dict, messages: list, reasoning: bool = False,
@@ -1196,7 +1230,27 @@ class ModelHost:
             if grammar is not None:
                 messages = _with_instruction(messages, grammar.instruction())
 
+            # Pictures, for a model that takes them: written into the text
+            # where its own template puts them -- exactly as in training, see
+            # vision_lm.inline_pictures -- and opened, so the processor can
+            # count their tokens and make their pixels.
+            pictures: list = []
+            processor = resident.processor if resident else None
+            if processor is not None:
+                conv, _refs = vision_lm.inline_pictures(
+                    {"messages": messages}, vision_lm.MARK)
+                pictures = [vision_lm.picture_from(mm, self.controller_url, self.token)
+                            for m in messages for mm in (m.get("media") or [])
+                            if mm.get("kind") == "image"]
+                messages = conv["messages"]
+            elif any(mm.get("kind") == "image" for m in messages
+                     for mm in (m.get("media") or [])):
+                log("This model was not trained to look at pictures; it is "
+                    "answering the words alone.")
+
             fmt, text = self.render(spec, messages, want_reasoning, log)
+            if processor is not None:
+                text = vision_lm.place(text, processor)
             stop_texts = spec.get("stop") or formatting.stop_sequences(
                 fmt, self.specials)
             # Everything this exact template writes around a message, read off
@@ -1205,7 +1259,14 @@ class ModelHost:
                 fmt, self.specials,
                 added=resident.added_tokens if resident else None)
 
-            ids = tok(text, return_tensors="pt").input_ids.to(self.device)
+            vision_inputs: dict = {}
+            if pictures:
+                enc = processor(text=[text], images=pictures, return_tensors="pt")
+                ids = enc["input_ids"].to(self.device)
+                vision_inputs = {k: v.to(self.device) for k, v in enc.items()
+                                 if k not in ("input_ids", "attention_mask")}
+            else:
+                ids = tok(text, return_tensors="pt").input_ids.to(self.device)
             prompt_len = ids.shape[1]
             max_new = int(params.get("max_new_tokens", 512))
             self.last_request = {
@@ -1262,7 +1323,19 @@ class ModelHost:
             # starts from that token and its logits are the first thing
             # sampled. Feeding the whole prompt to the loop instead is one
             # attention matrix the size of the conversation squared.
-            if prompt_len > 1:
+            if vision_inputs and prompt_len > 1:
+                # One pass, not slices: the pictures' embeddings are placed
+                # into the sequence by position, and a slice that holds half
+                # of an image's tokens has nowhere to put the other half. A
+                # photographed plate is a few hundred tokens, well inside what
+                # one pass can afford.
+                with torch.no_grad():
+                    first = {k: (v[:, :-1] if k == "mm_token_type_ids" else v)
+                             for k, v in vision_inputs.items()}
+                    out = model(input_ids=ids[:, :-1], use_cache=True, **first)
+                past = out.past_key_values
+                del out
+            elif prompt_len > 1:
                 past = self._prefill(model, ids[:, :-1], log, deadline, step)
             cur = ids[:, -1:]
 
