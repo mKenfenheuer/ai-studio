@@ -600,10 +600,12 @@ def run(cfg: dict, ctx: Any) -> dict:
     else:
         targets = cfg.get("target_modules") or _pick_target_modules(
             model, moe, adapt_experts)
-        shown = list(targets)
-        if vision and not cfg.get("target_modules"):
+        shown = [targets] if isinstance(targets, str) else list(targets)
+        if vision and not isinstance(targets, str):
             # The same layer names, but only inside the language model -- see
             # vision_lm.language_only_targets for why the encoder is left alone.
+            # Names chosen by hand are restricted the same way; only a pattern
+            # written out in full is taken as meaning exactly what it says.
             targets = vision_lm.language_only_targets(model, shown)
         last_n = _last_layers(model, train_layers)
         ctx.log("Applying %s to: %s%s%s" % (
