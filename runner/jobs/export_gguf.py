@@ -131,6 +131,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.log("Converting to GGUF. This reads every tensor once and writes one "
             "file at full precision; the quantisation comes after.")
     t0 = time.time()
+    folder = _readable_by_converter(folder, Path(ctx.workdir) / "convert-src")
     _stream([CONVERT_PYTHON, CONVERTER, str(folder), "--outfile", str(f16),
              "--outtype", "f16"], ctx)
     ctx.log("Converted in %s. %s"
@@ -205,6 +206,35 @@ def run(cfg: dict, ctx: Any) -> dict:
         "artifact_size": zip_path.stat().st_size,
         "note": "%s, %s" % (final.name, _size(final)),
     }
+
+
+def _readable_by_converter(folder: Path, shadow: Path) -> Path:
+    """The model as the converter's own transformers can read it.
+
+    The converter runs in its own environment on the transformers llama.cpp
+    pins (4.x -- see the image), and every model here is saved by 5.x, which
+    writes `extra_special_tokens` as a list where 4.x expects a mapping. The
+    tokenizer then refuses to open ("'list' object has no attribute 'keys'")
+    and no fine-tune of any model converts. The tokens it lists are declared
+    in tokenizer.json anyway, so the field is dropped -- from a copy made of
+    links, never from the cached model, which serving is reading.
+    """
+    cfg_path = folder / "tokenizer_config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return folder
+    if not isinstance(cfg.get("extra_special_tokens"), list):
+        return folder
+    shadow.mkdir(parents=True, exist_ok=True)
+    for item in folder.iterdir():
+        link = shadow / item.name
+        if item.name != "tokenizer_config.json" and not link.exists():
+            link.symlink_to(item.resolve())
+    cfg.pop("extra_special_tokens")
+    (shadow / "tokenizer_config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return shadow
 
 
 def _is_vision(folder: Path) -> bool:

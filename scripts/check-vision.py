@@ -184,6 +184,27 @@ else:
     check(not g._CONTENT_REFUSAL.search('{"error": {"message": "Unsupported parameter: temperature"}}'),
           "a bad parameter is still the whole run's problem")
 
+print("a model saved by transformers 5 is readable by the GGUF converter")
+try:
+    from runner.jobs import export_gguf
+except ImportError as e:
+    print("  --  skipped (%s)" % e)
+else:
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        model = Path(tmp) / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"vision_config": {"depth": 24}}))
+        (model / "tokenizer_config.json").write_text(json.dumps(
+            {"extra_special_tokens": ["<|im_start|>"], "eos_token": "<|im_end|>"}))
+        got = export_gguf._readable_by_converter(model, Path(tmp) / "shadow")
+        cfg = json.loads((got / "tokenizer_config.json").read_text())
+        check(got != model and "extra_special_tokens" not in cfg and cfg["eos_token"] == "<|im_end|>",
+              "the list-shaped field is dropped from a copy, the rest kept")
+        check("extra_special_tokens" in json.loads((model / "tokenizer_config.json").read_text()),
+              "the cached model itself is not touched")
+        check(export_gguf._is_vision(got), "the copy is still recognised as a vision model")
+
 if failures:
     print("\n%d check(s) failed." % len(failures))
     sys.exit(1)
