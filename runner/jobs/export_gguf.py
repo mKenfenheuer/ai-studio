@@ -44,6 +44,14 @@ CONVERTER = os.environ.get(
     "AI_STUDIO_GGUF_CONVERT", "/opt/llama.cpp/convert_hf_to_gguf.py")
 QUANTIZE = os.environ.get("AI_STUDIO_GGUF_QUANTIZE", "/opt/llama.cpp/llama-quantize")
 
+# The Python that runs the converter. Its own environment in the image, because
+# llama.cpp pins an older torch and transformers than the runner uses -- see the
+# note in docker/Dockerfile.runner.cpu. A bare-metal runner with no such
+# environment runs it with the runner's own interpreter, as before.
+_VENV_PYTHON = "/opt/llama.cpp/venv/bin/python"
+CONVERT_PYTHON = os.environ.get("AI_STUDIO_GGUF_PYTHON") or (
+    _VENV_PYTHON if os.path.exists(_VENV_PYTHON) else "python")
+
 # What to offer, and what each is for. Ordered by size.
 QUANT_TYPES = {
     "Q4_K_M": "About a quarter of the size. The one nearly everybody means.",
@@ -122,7 +130,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.log("Converting to GGUF. This reads every tensor once and writes one "
             "file at full precision; the quantisation comes after.")
     t0 = time.time()
-    _stream(["python", CONVERTER, str(folder), "--outfile", str(f16),
+    _stream([CONVERT_PYTHON, CONVERTER, str(folder), "--outfile", str(f16),
              "--outtype", "f16"], ctx)
     ctx.log("Converted in %s. %s"
             % (_took(time.time() - t0), _size(f16)))

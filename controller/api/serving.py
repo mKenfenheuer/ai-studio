@@ -599,6 +599,13 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 where = ", ".join("%s=%s" % kv for kv in sorted(facts.items()))
                 why = msg.get("error") or "Generation failed."
                 _record(job, who, msg, started, stream=False, failed=why)
+                if msg.get("code") == "context_length_exceeded":
+                    # The request's fault, not the machine's, and said with
+                    # the status and code OpenAI uses for it. A 502 tells a
+                    # client the upstream is broken and to try again -- and
+                    # trying again sends the same 133k tokens, which is how
+                    # one oversized document took a runner down twice.
+                    return _error(400, why, "context_length_exceeded")
                 return _error(502, "%s%s" % (
                     why, (" (%s)" % where) if where else ""), "upstream_error")
             elif kind == "generate_done":

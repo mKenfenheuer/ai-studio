@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -265,6 +266,47 @@ def ensure_room(need_bytes: int, keep: Iterable[str] = (),
     return True
 
 
+# One lock per cached artifact, so two callers asking for the same model at the
+# same time share one download instead of destroying each other's.
+#
+# Before this, every fetch began by deleting the staging directory -- which is
+# the right thing to do when the directory is debris from a crash, and exactly
+# the wrong thing when it is another thread's download in progress. A runner
+# serving a deployment and answering a chat about the same model at the same
+# moment runs two fetches, and on a 14.5 GB Mistral-7B that did three things at
+# once, all of them observed on one machine in one morning:
+#
+#   * the second fetch deleted the first's half-written zip, so the first
+#     finished writing into a file that no longer had a name and then failed
+#     with "No such file or directory: .../job_559a7255aa06.partial/
+#     artifact.zip";
+#   * the first fetch, part-way through unpacking, had its files deleted under
+#     it, went on to unpack the few members still to come -- the tokenizer,
+#     last in the archive alphabetically -- and moved that into place as the
+#     finished model: a directory of 3.6 MB with no weights and no config;
+#   * neither ever completed, so every later request started another 14.5 GB
+#     download. Two runners doing that against one disk is the iowait that
+#     stalled the host.
+#
+# A threading lock is enough: one runner is one process, and two runners on
+# the same host each have their own data volume.
+_FETCH_LOCKS: dict[str, threading.Lock] = {}
+_FETCH_LOCKS_GUARD = threading.Lock()
+
+
+def _fetch_lock(name: str) -> threading.Lock:
+    with _FETCH_LOCKS_GUARD:
+        return _FETCH_LOCKS.setdefault(name, threading.Lock())
+
+
+# Kept beside a partial download: the version of the file being downloaded, as
+# the controller named it. A resumed download sends it back, and the controller
+# answers with the rest of THAT file or, if the file has changed since, with
+# the whole of the new one. Without it, the tail of one artifact could be
+# spliced onto the head of another.
+_ETAG_FILE = "artifact.etag"
+
+
 def fetch(controller_url: str, token: str, job_id: str,
           log: Callable[[str], None] = lambda _s: None,
           kind: str | None = None,
@@ -276,26 +318,73 @@ def fetch(controller_url: str, token: str, job_id: str,
     reports as ready -- the failure that would produce is a missing-weights
     error hours later, blamed on the model rather than on the download.
 
+    Three guarantees, each of which was missing once:
+
+    * one download per artifact at a time, however many callers ask -- the
+      second waits for the first and then finds the model already here;
+    * an interrupted download carries on from where it stopped rather than
+      starting again, which for a 14.5 GB model is the difference between
+      finishing and not;
+    * nothing is moved into place that is not a model. A directory that
+      unpacks to anything else is thrown away and said to be wrong, rather
+      than handed to a loader that will report "unrecognized model" with no
+      hint that the download is what failed.
+
     `kind="adapter"` asks for the LoRA a fine-tune kept beside its merged
     model. `keep` names models that must survive the eviction this may need.
     """
     dest = cached_dir(job_id, kind)
-    if is_present(job_id, kind):
-        touch(job_id, kind)
-        return dest
+    with _fetch_lock(dest.name):
+        # Checked again inside the lock, and this is the check that matters:
+        # a caller that waited here while another fetched the same model now
+        # finds it complete, and returns without downloading a byte.
+        if is_present(job_id, kind):
+            touch(job_id, kind)
+            return dest
+        return _download(controller_url, token, job_id, kind, dest, keep, log)
 
-    log("Fetching the trained model from the studio...")
+
+def _download(controller_url: str, token: str, job_id: str,
+              kind: str | None, dest: Path, keep: Iterable[str],
+              log: Callable[[str], None]) -> Path:
     staging = dest.with_name(dest.name + ".partial")
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
     zip_path = staging / "artifact.zip"
+    tag_path = staging / _ETAG_FILE
+
+    # What survives from an earlier attempt: the zip and the version it is
+    # of, and nothing else. Anything unpacked beside them is from an unpack
+    # that did not finish, and is removed rather than trusted. A zip with no
+    # version beside it cannot be resumed safely -- there is nothing to prove
+    # the rest of it belongs to the same file -- so that starts again too.
+    offset, etag = 0, None
+    if zip_path.exists() and tag_path.exists():
+        offset = zip_path.stat().st_size
+        etag = tag_path.read_text(encoding="utf-8").strip() or None
+        for leftover in staging.iterdir():
+            if leftover.name not in (zip_path.name, tag_path.name):
+                if leftover.is_dir():
+                    shutil.rmtree(leftover, ignore_errors=True)
+                else:
+                    leftover.unlink(missing_ok=True)
+    if not etag:
+        offset = 0
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
 
     url = "%s/api/jobs/%s/download" % (controller_url.rstrip("/"), job_id)
     params = {"kind": kind} if _suffix(kind) else None
-    size = 0
+    headers = {"X-Runner-Token": token}
+    if offset and etag:
+        headers["Range"] = "bytes=%d-" % offset
+        headers["If-Range"] = etag
+        log("Carrying on with the download from %.1f GB rather than starting "
+            "again." % (offset / 1024 ** 3))
+    else:
+        log("Fetching the trained model from the studio...")
+
+    total = 0
     with httpx.stream("GET", url, params=params, timeout=1800,
-                      follow_redirects=True,
-                      headers={"X-Runner-Token": token}) as r:
+                      follow_redirects=True, headers=headers) as r:
         if r.status_code in (401, 403):
             raise ValueError(
                 "The controller would not hand over that model. The runner's "
@@ -305,26 +394,80 @@ def fetch(controller_url: str, token: str, job_id: str,
             raise ValueError(
                 "That run has no saved model on the controller any more. It "
                 "may have been deleted.")
-        r.raise_for_status()
-        # The zip and the unpacked copy live side by side in staging until the
-        # extract finishes, so room is made for both.
-        declared = int(r.headers.get("Content-Length") or 0)
-        ensure_room(declared * 2, list(keep) + [job_id], log)
-        with open(zip_path, "wb") as fh:
-            for chunk in r.iter_bytes(1 << 20):
-                fh.write(chunk)
-                size += len(chunk)
+        if r.status_code == 416:
+            # Asked for bytes past the end: the file was already whole, and
+            # only the unpack had not happened. Nothing to download.
+            total = offset
+        else:
+            r.raise_for_status()
+            if r.status_code == 206:
+                total = _range_total(r.headers.get("Content-Range")) or 0
+                mode = "ab"
+            else:
+                # A 200 to a ranged request means the controller has a
+                # different file from the one this partial was of, and is
+                # sending the new one whole. Start over, and remember which.
+                offset = 0
+                total = int(r.headers.get("Content-Length") or 0)
+                mode = "wb"
+                if r.headers.get("ETag"):
+                    tag_path.write_text(r.headers["ETag"], encoding="utf-8")
+                else:
+                    tag_path.unlink(missing_ok=True)
+            # The zip and the unpacked copy live side by side in staging until
+            # the extract finishes, so room is made for both -- less whatever
+            # of the zip is already here.
+            ensure_room(max(total * 2 - offset, 0), list(keep) + [job_id], log)
+            with open(zip_path, mode) as fh:
+                for chunk in r.iter_bytes(1 << 20):
+                    fh.write(chunk)
 
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(staging)
+    got = zip_path.stat().st_size if zip_path.exists() else 0
+    if total and got != total:
+        # Short, not wrong. Kept, so the next attempt asks for the rest.
+        raise RuntimeError(
+            "The download of this model stopped at %.1f of %.1f GB. What "
+            "arrived is kept and the next attempt will carry on from there."
+            % (got / 1024 ** 3, total / 1024 ** 3))
+
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(staging)
+    except (zipfile.BadZipFile, OSError) as e:
+        # A zip that is the right length and still does not open is not one
+        # a retry can finish. Removed whole, so the next attempt starts
+        # clean instead of resuming onto the same damage.
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(
+            "The model downloaded but would not unpack (%s). It has been "
+            "discarded and will be fetched again from the start." % e) from e
     zip_path.unlink(missing_ok=True)
+    tag_path.unlink(missing_ok=True)
+
+    if not _looks_like_model(staging):
+        found = sorted(p.name for p in staging.iterdir())[:8]
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(
+            "The saved result of %s unpacked to %s, which is not a model: "
+            "there is no config.json, adapter_config.json or weights file in "
+            "it. The artifact on the controller is incomplete; the run that "
+            "produced it needs looking at, not this machine."
+            % (job_id, ", ".join(found) or "nothing"))
 
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging.rename(dest)
     touch(job_id, kind)
-    log("Got %.0f MB." % (size / 1048576))
+    log("Got %.0f MB." % (got / 1048576))
     return dest
+
+
+def _range_total(content_range: str | None) -> int | None:
+    """The whole file's size, from `Content-Range: bytes 0-15/14499765169`."""
+    if not content_range or "/" not in content_range:
+        return None
+    tail = content_range.rsplit("/", 1)[1].strip()
+    return int(tail) if tail.isdigit() else None
 
 
 def pack(root_dir: Path | str, dest: Path | str) -> Path:

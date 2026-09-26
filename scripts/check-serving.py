@@ -224,9 +224,105 @@ async def queueing() -> None:
           [m["request_id"] for m in ws6.sent], ["e1", "e2"])
 
 
+def too_long() -> None:
+    """A conversation too long for the card is refused before it reaches it.
+
+    The numbers are the ones from the runner's log: a 132,875-token request
+    against a budget of 0, which `if budget and ...` let through because zero
+    is falsy. The prefill ran a 16 GB card to zero bytes free and ROCm aborted
+    the process -- twice, three minutes apart, the runner shown offline both
+    times.
+    """
+    from controller.api import serving as api
+    from runner.inference import ContextTooLong, OutOfRoom, length_refusal
+
+    print(chr(10) + "A conversation too long for the card never reaches it")
+    r = length_refusal(132875, 3000, 32768, 0)
+    check("this morning's request is refused", isinstance(r, ContextTooLong))
+    check("for being longer than the model can read at all, which is the "
+          "more useful of the two answers", "longer than this model" in str(r))
+    r = length_refusal(10000, 3000, 32768, 0)
+    check("a budget of ZERO refuses -- it is not 'unknown'",
+          isinstance(r, ContextTooLong))
+    check("and says it is the card's memory", "memory left" in str(r))
+    check("a conversation that fits is let through",
+          length_refusal(1000, 500, 32768, 13000), None)
+    check("an unknown budget is still not a refusal",
+          length_refusal(1000, 500, 0, None), None)
+    check("the refusal is already worded, so it is not rewritten as advice",
+          isinstance(r, OutOfRoom) and r.already_explained)
+    check("and carries the code clients know not to retry",
+          r.code, "context_length_exceeded")
+
+    print(chr(10) + "...but one that fits is not refused for how fast it is read")
+    # The first version of the fix above refused EVERYTHING on the Mistral,
+    # 5,916 tokens included, because the budget itself came out at zero: the
+    # prefill headroom scaled a safety margin by the slice size, and with
+    # FlexAttention on the slice is 2048 -- 4.8 GB of "headroom" against the
+    # 2.2 GB a 7B leaves free on 16 GB. These are that card's numbers.
+    from types import SimpleNamespace
+
+    from runner.inference import (PREFILL_CHUNK, PREFILL_CHUNK_FUSED,
+                                  ModelHost, choose_chunk)
+
+    mistral = SimpleNamespace(config=SimpleNamespace(
+        num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8,
+        head_dim=128, max_position_embeddings=32768,
+        _attn_implementation="flex_attention"))
+    host = ModelHost("http://unused", "token", {"backend": "rocm",
+        "attention": {"flex": True, "flex_opt_in": True}})
+    host._free_gb = lambda: 2.22
+    per_token = host._kv_bytes_per_token(mistral)
+    check("a Mistral-7B token costs 128 KiB of cache (8 key heads, not 32)",
+          per_token, 131072)
+    budget = host._context_budget(mistral)
+    check("the budget on that card is thousands of tokens, not zero",
+          budget > 12000, True)
+    check("so this morning's 5,916-token document is let through",
+          length_refusal(5916, 3000, 32768, budget), None)
+    check("and the 16,600-token one is still refused, honestly",
+          isinstance(length_refusal(16600, 3000, 32768, budget), ContextTooLong))
+    step = choose_chunk(host._largest_chunk(mistral), 5916 + 3000,
+                        per_token, 2.22)
+    check("it is read in the largest slice that fits, not refused for 2048",
+          PREFILL_CHUNK < step < PREFILL_CHUNK_FUSED)
+    check("with room to spare, the full slice is used",
+          choose_chunk(PREFILL_CHUNK_FUSED, 8916, per_token, 10.0),
+          PREFILL_CHUNK_FUSED)
+    check("and it never goes below the floor",
+          choose_chunk(PREFILL_CHUNK_FUSED, 12000, per_token, 1.0),
+          PREFILL_CHUNK)
+    fell_back = SimpleNamespace(config=SimpleNamespace(
+        **{**vars(mistral.config), "_attn_implementation": "sdpa"}))
+    check("a model refused FlexAttention at load is read in small slices",
+          host._largest_chunk(fell_back), PREFILL_CHUNK)
+
+    print(chr(10) + "...and the caller is told it is their request, not our machine")
+    api.FLEET = api.FLEET or Fleet()      # set by the app at startup
+
+    async def reply(frame):
+        q: asyncio.Queue = asyncio.Queue()
+        q.put_nowait(frame)
+        return await api._collect("gen_x", q, {"id": "job_x"}, 0,
+                                  {"user_id": "u"})
+
+    got = asyncio.run(reply({"type": "generate_error", "error": str(r),
+                             "code": "context_length_exceeded"}))
+    body = json.loads(bytes(got.body))
+    check("a 400, because resending it will fail the same way",
+          got.status_code, 400)
+    check("with the code OpenAI uses for exactly this",
+          body["error"]["code"], "context_length_exceeded")
+    got = asyncio.run(reply({"type": "generate_error",
+                             "error": "The GPU faulted."}))
+    check("a failure that is the machine's is still a 502",
+          got.status_code, 502)
+
+
 def main() -> int:
     options()
     asyncio.run(queueing())
+    too_long()
     print()
     if FAILED:
         print("%d check(s) failed:" % len(FAILED))

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import os
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,13 @@ CACHE_DIR = artifacts.CACHE_DIR
 # why that distinction is worth keeping.
 HEADROOM_GB = 1.5
 
+# A model is not served if it loads with no room to talk to it. One that would
+# be left with less key/value cache than this at full precision is loaded in
+# 4-bit instead, where 4-bit is trusted -- see _plan_precision. Overridable,
+# because what counts as a useful context depends on what the model is for;
+# a tagger with a 3,800-token system prompt needs more than a chat assistant.
+MIN_SERVE_CONTEXT = int(os.environ.get("AI_STUDIO_MIN_SERVE_CONTEXT", "8192"))
+
 
 class OutOfRoom(RuntimeError):
     """An out-of-memory that has already been explained in plain language.
@@ -54,6 +62,57 @@ class OutOfRoom(RuntimeError):
     one that reaches the screen.
     """
     already_explained = True
+
+
+class ContextTooLong(OutOfRoom):
+    """A request refused for its length, before any of it reached the card.
+
+    Its own class for the sake of whoever sent it. Every other failure here is
+    the machine's, and a client is right to try again later; this one is the
+    request's, and trying again sends the same request. So it carries the code
+    OpenAI uses for exactly this, which clients know not to retry, and the API
+    answers 400 rather than 502.
+    """
+    code = "context_length_exceeded"
+
+
+def length_refusal(prompt_len: int, max_new: int, context: int,
+                   budget: int | None) -> ContextTooLong | None:
+    """Why this exchange must not start, or None if it may.
+
+    `context` is the model's own length (0 if it does not say); `budget` is
+    how many tokens of conversation the card has room for, None if that could
+    not be worked out. Both count the whole exchange, because the reply is
+    cached exactly as the question is.
+
+    Two limits, checked in the order that gives the more useful answer. The
+    model's own length first: a request past it cannot be answered on ANY
+    card, and "not enough memory" would send somebody off to find a bigger one.
+
+    Then the card, and `is not None` rather than truthiness is the whole of
+    the fix this function was pulled out for. Zero is the budget when there is
+    no room left at all, and `if budget and ...` read it as "could not be
+    worked out" and let the request through: a 132,875-token conversation
+    against a budget of 0, twice, on a 7B filling a 16 GB card. The prefill ran
+    the card to zero bytes free, and at zero ROCm does not raise -- it aborts
+    the process with HSA_STATUS_ERROR_OUT_OF_RESOURCES. The runner restarted,
+    the studio showed it offline, and the next copy of the request did it again.
+    """
+    total = prompt_len + max_new
+    if context and total > context:
+        return ContextTooLong(
+            "This conversation is longer than this model can read: %s tokens "
+            "of history plus up to %s more of reply, and the model was built "
+            "for %s in all. Send less of it -- a document this size has to be "
+            "split or summarised first."
+            % (f"{prompt_len:,}", f"{max_new:,}", f"{context:,}"))
+    if budget is not None and total > budget:
+        return ContextTooLong(
+            "This conversation is too long for the memory left on this card: "
+            "%s tokens of history plus up to %s more of reply, against room "
+            "for about %s. Start a new conversation, or lower the length "
+            "limit." % (f"{prompt_len:,}", f"{max_new:,}", f"{budget:,}"))
+    return None
 
 
 # How many prompt tokens go through the model at once before writing starts.
@@ -81,17 +140,44 @@ PREFILL_CHUNK = 256
 # over a long conversation.
 PREFILL_CHUNK_FUSED = 2048
 
-# Room kept for the working set of one prefill slice and the allocator's slack,
-# on top of the conversation's own key/value cache. Measured: a 256-token slice
-# peaks around 0.11 GB against a 7B, so this is that with room to be wrong.
-PREFILL_HEADROOM_GB = 0.6
+# Room kept, on top of the conversation's own key/value cache, for reading one
+# prefill slice: two parts, and only one of them grows with the slice.
+#
+# The working set does. Measured: a 256-token slice peaks around 0.11 GB
+# against a 7B, which is the per-token figure below.
+#
+# The slack does not. It is the allocator's rounding and the margin for being
+# wrong, and it is the same whether the slice is 256 tokens or 2048. These two
+# were once a single 0.6 GB constant scaled by the chunk, which multiplied the
+# margin by eight along with the measurement: with FlexAttention switched on
+# the chunk is 2048, the "headroom" became 4.8 GB, a Mistral-7B leaves 2.2 GB
+# free on a 16 GB card, and every conversation -- 5,916 tokens, anything -- was
+# refused as too long for the memory left.
+PREFILL_SLACK_GB = 0.5
+PREFILL_GB_PER_TOKEN = 0.11 / 256
 
-# ...and the same, per token of chunk, so the two move together. A larger slice
-# is a larger working set, and a fused kernel raises the slice eightfold. This
-# is the number above divided by the chunk it was measured at, which is what
-# makes it a measurement rather than two constants that have to be kept in
-# step by hand.
-PREFILL_HEADROOM_PER_TOKEN = PREFILL_HEADROOM_GB / PREFILL_CHUNK
+
+def prefill_headroom_gb(chunk: int) -> float:
+    """What reading a prompt `chunk` tokens at a time needs beyond the cache."""
+    return PREFILL_SLACK_GB + chunk * PREFILL_GB_PER_TOKEN
+
+
+def choose_chunk(largest: int, tokens: int, per_token_bytes: int,
+                 free_gb: float) -> int:
+    """The largest prefill slice this exchange can afford, down to the floor.
+
+    A slice is a speed choice, never a length one: reading a prompt 2048 tokens
+    at a time is quicker than 256, and changes nothing about the answer. So the
+    big slice is used when there is room for it and halved until there is,
+    rather than a conversation that fits at 256 being refused because 2048 was
+    the default. `tokens` is the whole exchange, prompt and reply, because the
+    reply is cached exactly as the prompt is.
+    """
+    chunk = largest
+    cache_gb = tokens * per_token_bytes / 1024 ** 3
+    while chunk > PREFILL_CHUNK and cache_gb + prefill_headroom_gb(chunk) > free_gb:
+        chunk //= 2
+    return max(chunk, PREFILL_CHUNK)
 
 # How long one reply may take before it is stopped and handed back as it
 # stands. A runner answers one message at a time, so this is not really a limit
@@ -198,7 +284,11 @@ class ModelHost:
         self.controller_url = controller_url.rstrip("/")
         self.token = token
         self.caps = caps
-        self.lock = threading.Lock()
+        # The card, as a thing only one caller may change at a time. Re-entrant
+        # because `generate` holds it and then asks `ensure_loaded` -- which
+        # takes it too, since the other caller of `ensure_loaded` did not hold
+        # it. See the note there.
+        self.lock = threading.RLock()
         # Insertion-ordered, oldest use first: the next one to go.
         self._residents: dict[str, _Resident] = {}
         # Models somebody deployed to this machine on purpose. They are exempt
@@ -236,11 +326,20 @@ class ModelHost:
         # term that decides how long a conversation can get. Settled once, in
         # the process that will load the models, because part of the plan is
         # environment `from_pretrained` reads.
-        self.attn = capabilities.attention_plan(caps)
+        #
+        # FlexAttention is the exception. Training uses it, but serving runs it
+        # as decode kernels (one query row against a growing cache) that
+        # training never compiles. On gfx1030 those kernels page-fault the GPU
+        # (UTCL2 fault, runner killed) while the same card trains with flex for
+        # hours without one. So serving gets flex only when it is asked for on
+        # its own, via AI_STUDIO_SERVE_FLEX_ATTENTION.
+        self.attn = capabilities.attention_plan(self._serving_caps(caps))
+        # The largest prefill slice this machine's kernel makes worthwhile. The
+        # one actually used is chosen per request -- see `choose_chunk` -- and
+        # per model: a model loaded without the fused path it asked for is
+        # quadratic after all, whatever the plan said.
         self.prefill_chunk = (PREFILL_CHUNK if self.attn["quadratic"]
                               else PREFILL_CHUNK_FUSED)
-        self.prefill_headroom_gb = (self.prefill_chunk
-                                    * PREFILL_HEADROOM_PER_TOKEN)
 
     # ------------------------------------------------------------ device
     @property
@@ -542,16 +641,26 @@ class ModelHost:
         return self.device == "cuda" \
             and bool((self.caps.get("quantization") or {}).get("4bit_decode"))
 
-    def _plan_precision(self, spec: dict, log: Callable[[str], None]) -> bool:
+    def _plan_precision(self, spec: dict, log: Callable[[str], None],
+                        path: Path | str | None = None) -> bool:
         """Whether to compress this model on the way in.
 
-        Only when full precision is *hopeless* -- when the weights alone will
-        not fit in what is free. A merely tight fit is attempted as it is and
-        compressed only if it actually fails, because quantizing costs answer
-        quality and the estimate is not good enough to spend that on a guess:
-        a 14.5 GB model on a card with 15.6 GB free fits and answers well, and
-        an allowance for the key/value cache added on top of it says it does
-        not.
+        When full precision is *hopeless* -- the weights alone will not fit in
+        what is free -- and also when it would load but leave no room to talk
+        to it. A merely tight fit is otherwise attempted as it is, because
+        quantizing costs answer quality and the estimate is not good enough to
+        spend that on a guess.
+
+        The second case is the one that used to be missed. "The weights fit"
+        was treated as success, and a 14.5 GB 7B on a card with 15.6 GB free
+        does fit -- with room for about 3,500 tokens of conversation, which is
+        less than some applications' system prompt. Every request then fails
+        with "too long for the memory left on this card", and nothing about
+        loading it looked wrong. Loaded is not the same as served. So the
+        key/value cache the model would have left is worked out from its
+        config, and a model that would be left below MIN_SERVE_CONTEXT is
+        compressed -- where compressing is trusted, and where it actually buys
+        more room.
 
         Decided against what is free *now* rather than against the card's size,
         and before the load rather than after: a model that cannot fit either
@@ -562,7 +671,7 @@ class ModelHost:
         if not params_b or free is None:
             return False
         if params_b * 2 <= free:
-            return False        # room for the weights; try it and see.
+            return self._too_little_context(spec, path, params_b, free, log)
         if not self._can_quantize():
             log("This model's weights need about %.1f GB and %.1f GB is free. "
                 "This machine cannot compress it to fit -- it is being loaded "
@@ -575,7 +684,93 @@ class ModelHost:
             % (params_b * 2, free, params_b * 0.5 + HEADROOM_GB))
         return True
 
+    def _too_little_context(self, spec: dict, path: Path | str | None,
+                            params_b: float, free: float,
+                            log: Callable[[str], None]) -> bool:
+        """Whether full precision would fit the weights but starve the context.
+
+        Worked out with the same arithmetic `_context_budget` uses once a model
+        is loaded -- free memory less the prefill's working space, divided by
+        what one token of conversation costs -- only against the memory the
+        weights *would* leave, at each precision.
+        """
+        if not self._can_quantize():
+            return False        # nothing better to offer; load as it is.
+        per_token = self._kv_bytes_from_config(self._model_config(spec, path))
+        if not per_token:
+            return False        # shape unknown: disable the check, don't guess.
+        headroom = prefill_headroom_gb(PREFILL_CHUNK)
+        gib = 1024 ** 3
+        full = int(max(free - params_b * 2 - headroom, 0) * gib // per_token)
+        if full >= MIN_SERVE_CONTEXT:
+            return False
+        compressed = int(max(free - params_b * 0.5 - headroom, 0) * gib // per_token)
+        if compressed <= full:
+            return False
+        log("At full precision this model would load with room for only about "
+            "%d tokens of conversation, below the %d this runner will serve "
+            "with. Loading it in 4-bit instead, which leaves room for about %d. "
+            "Answers are slightly worse, and they can be a great deal longer."
+            % (full, MIN_SERVE_CONTEXT, compressed))
+        return True
+
+    @staticmethod
+    def _serving_caps(caps: dict) -> dict:
+        """The capabilities with the training-only flex opt-in removed."""
+        att = (caps or {}).get("attention")
+        if not att or not att.get("flex_opt_in") \
+                or os.environ.get("AI_STUDIO_SERVE_FLEX_ATTENTION"):
+            return caps
+        return {**caps, "attention": {**att, "flex_opt_in": False}}
+
+    def _model_config(self, spec: dict, path: Path | str | None):
+        """The model's config.json, read without loading a single weight.
+
+        A trained model carries its own; an adapter does not, and its shape is
+        the base model's. None when neither can be read, which turns the
+        context check off rather than guessing at the model's size.
+        """
+        try:
+            from transformers import AutoConfig
+        except Exception:  # noqa: BLE001
+            return None
+        candidates: list[str] = []
+        if isinstance(path, Path):
+            if (path / "config.json").exists():
+                candidates.append(str(path))
+        elif path:
+            candidates.append(str(path))        # a Hub id
+        if spec.get("base_model"):
+            candidates.append(spec["base_model"])
+        for name in candidates:
+            try:
+                return AutoConfig.from_pretrained(name, token=spec.get("hf_token"))
+            except Exception:  # noqa: BLE001 - try the next source
+                continue
+        return None
+
     def ensure_loaded(self, spec: dict, log: Callable[[str], None]) -> None:
+        """Put this model on the card if it is not there already.
+
+        Under the card's lock, always. `generate` took the lock before calling
+        this, and a deployment's preload called it without -- so a deployment
+        and a conversation arriving for the same model ran two loads at once.
+        On a 16 GB card serving a 7B that is two 13.65 GiB copies: the second
+        ran out of memory and reported, truthfully by its own lights, that the
+        model "is simply too large for this machine". Measured alone, the same
+        model loads in ten seconds with 2.3 GiB to spare. Both threads were
+        also importing transformers for the first time in the same instant,
+        and one of them got "cannot import name 'AutoModelForCausalLM'" from a
+        lazy module that is not safe to import from two threads at once.
+
+        Taking the lock here rather than trusting every caller to is the point:
+        it was the caller that forgot which caused both.
+        """
+        with self.lock:
+            self._ensure_loaded_locked(spec, log)
+
+    def _ensure_loaded_locked(self, spec: dict,
+                              log: Callable[[str], None]) -> None:
         job_id = spec["job_id"]
         if resident := self._residents.get(job_id):
             # Already here. Moved to the front of the queue and nothing else:
@@ -605,7 +800,7 @@ class ModelHost:
         params_b = spec.get("params_b")
         self._make_room(params_b * 2 + HEADROOM_GB if params_b else None, log)
 
-        quantize = self._plan_precision(spec, log)
+        quantize = self._plan_precision(spec, log, path)
         try:
             resident = self._load(spec, path, quantize, log)
         except Exception as e:  # noqa: BLE001 - re-raised below unless it fits
@@ -658,6 +853,20 @@ class ModelHost:
         # The same settings the trainer quantizes a frozen base with, so a
         # model served compressed behaves the way it did while it was learning.
         if quantize:
+            # On a card where 4-bit decoding is only correct with padded input,
+            # the probe's verdict was reached with the shim installed. Serving
+            # without it would put the broken kernel back under every reply --
+            # and nothing would raise; the model would just answer in noise.
+            if (self.caps.get("quantization") or {}).get("4bit_decode_padding"):
+                from runner import bnb_compat
+                if not bnb_compat.install_decode_padding():
+                    raise RuntimeError(
+                        "4-bit decoding on this card is only correct with the "
+                        "padding shim, and the shim could not be installed in "
+                        "this process. Refusing to serve compressed rather "
+                        "than answer with noise.")
+                log("4-bit decoding here goes through the padding shim: the "
+                    "native kernel is wrong for one row on this card.")
             from transformers import BitsAndBytesConfig
             extra["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -820,21 +1029,24 @@ class ModelHost:
                                              reasoning=reasoning)
 
     def _prefill(self, model, ids, log: Callable[[str], None],
-                 deadline: float | None = None):
+                 deadline: float | None = None, step: int | None = None):
         """Build the key/value cache for the prompt, a slice at a time.
 
         Returns the cache, positioned so the caller can carry straight on from
         the last token. Nothing is sampled here -- only the last position's
         logits are ever wanted, and asking for them at every position is a
         [1, prompt, vocab] tensor thrown away immediately.
+
+        `step` is the slice size chosen for this exchange; see `choose_chunk`.
         """
         import torch
+        step = step or PREFILL_CHUNK
         past = None
         total = ids.shape[1]
-        for i in range(0, total, self.prefill_chunk):
+        for i in range(0, total, step):
             if self._cancel.is_set() or (deadline and time.time() > deadline):
                 break
-            chunk = ids[:, i:i + self.prefill_chunk]
+            chunk = ids[:, i:i + step]
             with torch.no_grad():
                 if self._logits_to_keep is not False:
                     try:
@@ -851,9 +1063,54 @@ class ModelHost:
                                 use_cache=True)
             past = out.past_key_values
             del out
-            if total > self.prefill_chunk and i == 0:
+            if total > step and i == 0:
                 log("Reading %s tokens of conversation…" % f"{total:,}")
         return past
+
+    def _largest_chunk(self, model) -> int:
+        """The biggest prefill slice worth using for THIS model.
+
+        The machine's plan says whether attention is fused, but a model asked
+        for FlexAttention can be refused it at load and fall back to the
+        ordinary path -- see `_load_causal_lm`. What the model actually got is
+        on its config, and that is what decides: 2048-token slices through a
+        quadratic kernel are the scores matrix this chunking exists to avoid.
+        """
+        if self.prefill_chunk <= PREFILL_CHUNK:
+            return PREFILL_CHUNK
+        wanted = self.attn.get("implementation")
+        got = getattr(getattr(model, "config", None),
+                      "_attn_implementation", None)
+        if wanted == "flex_attention" and got != "flex_attention":
+            return PREFILL_CHUNK
+        return self.prefill_chunk
+
+    @staticmethod
+    def _kv_bytes_per_token(model) -> int | None:
+        """What one token of conversation costs in key/value cache."""
+        return ModelHost._kv_bytes_from_config(getattr(model, "config", None))
+
+    @staticmethod
+    def _kv_bytes_from_config(cfg) -> int | None:
+        """The same, from a model's config -- so it can be known before loading.
+
+        Separate from `_kv_bytes_per_token` because precision has to be chosen
+        before the weights are read, and at that point there is a config.json
+        but no model.
+        """
+        if cfg is None:
+            return None
+        layers = getattr(cfg, "num_hidden_layers", 0) or 0
+        attn_heads = getattr(cfg, "num_attention_heads", 0) or 0
+        # Grouped-query attention caches one key/value per *key* head, which on
+        # a 7B is a quarter of the attention heads. Reading the wrong one over-
+        # states the cost fourfold and refuses conversations that would fit.
+        kv_heads = getattr(cfg, "num_key_value_heads", None) or attn_heads
+        dim = getattr(cfg, "head_dim", None) or (
+            (getattr(cfg, "hidden_size", 0) or 0) // max(attn_heads, 1))
+        if not (layers and kv_heads and dim):
+            return None
+        return 2 * layers * kv_heads * dim * 2           # key and value, fp16
 
     def _context_budget(self, model) -> int | None:
         """How many tokens of conversation this card still has room for.
@@ -870,23 +1127,18 @@ class ModelHost:
 
         None when the shape cannot be read, which disables the check rather
         than guessing at it.
+
+        Worked out at the SMALLEST prefill slice, because that is the most
+        conversation the card can ever hold: a bigger slice is only a faster
+        way to read the same prompt, and is chosen afterwards if there is
+        room for it. Worked out at the largest, as it once was, the budget of
+        a 7B on a 16 GB card came to zero.
         """
-        cfg = getattr(model, "config", None)
         free = self._free_gb()
-        if cfg is None or free is None:
+        per_token = self._kv_bytes_per_token(model)
+        if free is None or not per_token:
             return None
-        layers = getattr(cfg, "num_hidden_layers", 0) or 0
-        attn_heads = getattr(cfg, "num_attention_heads", 0) or 0
-        # Grouped-query attention caches one key/value per *key* head, which on
-        # a 7B is a quarter of the attention heads. Reading the wrong one over-
-        # states the cost fourfold and refuses conversations that would fit.
-        kv_heads = getattr(cfg, "num_key_value_heads", None) or attn_heads
-        dim = getattr(cfg, "head_dim", None) or (
-            (getattr(cfg, "hidden_size", 0) or 0) // max(attn_heads, 1))
-        if not (layers and kv_heads and dim):
-            return None
-        per_token = 2 * layers * kv_heads * dim * 2      # key and value, fp16
-        room = (free - self.prefill_headroom_gb) * 1024 ** 3
+        room = (free - prefill_headroom_gb(PREFILL_CHUNK)) * 1024 ** 3
         return int(max(room, 0) // per_token)
 
     def diagnostics(self) -> dict:
@@ -983,17 +1235,24 @@ class ModelHost:
             off_template = False
 
             # Refused before anything is spent, where the arithmetic says it
-            # cannot end well. `budget` counts the whole exchange, because the
-            # reply is cached exactly as the question is.
+            # cannot end well. See `length_refusal`.
+            context = int(getattr(getattr(model, "config", None),
+                                  "max_position_embeddings", 0) or 0)
             budget = self._context_budget(model)
+            self.last_request["context_length"] = context or None
             self.last_request["context_budget"] = budget
-            if budget and prompt_len + max_new > budget:
-                raise OutOfRoom(
-                    "This conversation is too long for the memory left on this "
-                    "card: %s tokens of history plus up to %s more of reply, "
-                    "against room for about %s. Start a new conversation, or "
-                    "lower the length limit."
-                    % (f"{prompt_len:,}", f"{max_new:,}", f"{budget:,}"))
+            if refusal := length_refusal(prompt_len, max_new, context, budget):
+                raise refusal
+            # The fastest prefill slice this exchange has room for. Chosen
+            # after the length check, never before it: the slice is a speed,
+            # and must not be the reason something that fits is turned away.
+            free = self._free_gb()
+            per_token = self._kv_bytes_per_token(model)
+            step = (choose_chunk(self._largest_chunk(model),
+                                 prompt_len + max_new, per_token, free)
+                    if free is not None and per_token
+                    else PREFILL_CHUNK)
+            self.last_request["prefill_chunk"] = step
 
             produced: list[int] = []
             t0 = time.time()
@@ -1004,7 +1263,7 @@ class ModelHost:
             # sampled. Feeding the whole prompt to the loop instead is one
             # attention matrix the size of the conversation squared.
             if prompt_len > 1:
-                past = self._prefill(model, ids[:, :-1], log, deadline)
+                past = self._prefill(model, ids[:, :-1], log, deadline, step)
             cur = ids[:, -1:]
 
             # What the reader has already been shown, per channel. A reply is
