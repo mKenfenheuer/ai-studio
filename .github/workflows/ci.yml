@@ -92,6 +92,9 @@ jobs:
       - name: A benchmark is asked the way its published number was
         run: python scripts/check-benchmarks.py
 
+      - name: Rented GPUs start, stop and cost what they should
+        run: python scripts/check-cloud.py
+
       - name: Reservations, deployments and the usage ledger
         run: python scripts/check-ops.py
 

@@ -267,6 +267,10 @@ genuinely surprising thing to watch happen on your own desk.
 The runner **measures** the machine rather than trusting its spec sheet, and
 the UI disables what a given machine cannot do.
 
+No suitable machine? The studio can rent a GPU from RunPod for a queued run and
+give it back when it is idle, within a price cap, a pod limit and a daily
+budget — see **[docs/cloud-gpus.md](docs/cloud-gpus.md)**.
+
 | | NVIDIA | AMD (ROCm) | Apple Metal | CPU |
 |---|---|---|---|---|
 | LoRA fine-tuning | ✅ | ✅ | ✅ | ✅ (slow) |
@@ -347,6 +351,7 @@ automatic:
 | `AI_STUDIO_RUNNER_KINDS` | runner | Restrict to certain job kinds |
 | `AI_STUDIO_GPU_MEMORY_PCT` | runner | Give the studio at most this share of the card's memory |
 | `AI_STUDIO_GPU_COMPUTE_PCT` | runner | Give it at most this share of the card's time |
+| `AI_STUDIO_RUNPOD_API` | controller | RunPod API base (default `https://api.runpod.io`) |
 | `BNB_ROCM_ARCH` | rocm build | GPU arch, e.g. `gfx1030`, `gfx1100` |
 
 ---

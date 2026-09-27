@@ -245,6 +245,41 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_by  TEXT
 );
 
+-- GPU machines rented from a cloud provider (RunPod) for queued work: what
+-- was rented, at what price, which runner it became, and what it has cost.
+-- Kept after the pod is gone -- the spend of a deleted pod is still spend.
+CREATE TABLE IF NOT EXISTS cloud_pods (
+  id            TEXT PRIMARY KEY,
+  provider      TEXT NOT NULL,
+  provider_id   TEXT,
+  name          TEXT NOT NULL,
+  gpu_id        TEXT NOT NULL,
+  gpu_name      TEXT,
+  vram_gb       REAL,
+  cloud         TEXT NOT NULL,
+  price_per_hour REAL NOT NULL,
+  status        TEXT NOT NULL,
+  runner_id     TEXT,
+  job_id        TEXT,
+  reason        TEXT,
+  note          TEXT,
+  spent         REAL NOT NULL DEFAULT 0,
+  accrued_at    REAL,
+  created_at    REAL NOT NULL,
+  connected_at  REAL,
+  last_busy_at  REAL,
+  ended_at      REAL,
+  created_by    TEXT
+);
+
+-- Estimated cloud spend per calendar day (UTC), for the daily cap. Accrued by
+-- the cloud loop from each pod's hourly price; the provider's own billing is
+-- the truth, this is the brake.
+CREATE TABLE IF NOT EXISTS cloud_spend (
+  day   TEXT PRIMARY KEY,
+  usd   REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL,

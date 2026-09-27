@@ -365,6 +365,19 @@ export const api = {
   unpublish:   (id) =>
     req(`/api/library/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
+  // ---- rented GPUs (RunPod) ---------------------------------------------
+  cloud:        () => req("/api/cloud"),
+  // The cloud as one machine the run wizard can choose; any signed-in user.
+  cloudMachine: () => req("/api/cloud/machine"),
+  saveCloudSettings: (body) =>
+    req("/api/cloud/settings", { method: "PUT", body: JSON.stringify(body) }),
+  cloudGpus:    (cloud = "any", job = "") =>
+    req(`/api/cloud/gpus?cloud=${encodeURIComponent(cloud)}&job=${encodeURIComponent(job)}`),
+  startCloudPod: (gpu_id, cloud) =>
+    req("/api/cloud/pods", { method: "POST", body: JSON.stringify({ gpu_id, cloud }) }),
+  drainCloudPod: (id) => req(`/api/cloud/pods/${id}/drain`, { method: "POST" }),
+  deleteCloudPod: (id) => req(`/api/cloud/pods/${id}`, { method: "DELETE" }),
+
   // ---- backups ---------------------------------------------------------
   backups:     () => req("/api/backups"),
   backUpNow:   (body) =>

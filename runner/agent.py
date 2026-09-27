@@ -8,6 +8,7 @@ port, no fixed IP and no firewall rule -- it only needs to reach the controller.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -111,6 +112,7 @@ class JobContext:
         self.runner_token = runner_token
         self._outbox = outbox
         self._cancel = threading.Event()
+        self.preempted = False
         # Set alongside the cancel flag, never after it: a training loop that
         # reads "should I stop" and "should I keep it" as two separate events
         # can see the first before the second is written, and quietly throw
@@ -120,6 +122,19 @@ class JobContext:
 
     def cancel(self, save: bool = False) -> None:
         self._save_on_stop = bool(save)
+        self._cancel.set()
+
+    def preempt(self) -> None:
+        """Stop, keeping the checkpoints, so the run continues on another machine.
+
+        Not a cancel: a cancelled run is over (and, saved, ends with a partial
+        model). A preempted one is paused -- the studio puts it back in the queue
+        and the next machine carries on from its last checkpoint. Used when a
+        rented GPU has to be given back mid-run: the day's budget, its maximum
+        lifetime.
+        """
+        self.preempted = True
+        self._save_on_stop = False
         self._cancel.set()
 
     def should_cancel(self) -> bool:
@@ -318,6 +333,15 @@ class Runner:
             elif kind == "job_cancel":
                 if self.current and self.current.job_id == msg.get("job_id"):
                     self.current.cancel(save=bool(msg.get("save")))
+            elif kind == "job_preempt":
+                if self.current and self.current.job_id == msg.get("job_id"):
+                    self.current.preempt()
+            elif kind == "checkpoint_upload":
+                # Off the socket thread: a checkpoint is tens of megabytes to
+                # gigabytes, and the socket has heartbeats to answer meanwhile.
+                threading.Thread(target=self._upload_checkpoint,
+                                 args=(msg.get("job_id") or "",), daemon=True,
+                                 name="checkpoint-upload").start()
             elif kind == "job_kill":
                 # Off the socket thread: this blocks, and may end the process.
                 threading.Thread(target=self._force_kill,
@@ -720,6 +744,8 @@ class Runner:
     def _run_job(self, job: dict, ctx: JobContext, workdir: str) -> None:
         jid = job["id"]
         try:
+            if (held := job.get("checkpoint")) and not checkpoints.peek(jid):
+                self._fetch_checkpoint(jid, held, ctx)
             # The step this attempt begins at travels with the "started"
             # message, before any of the heavy machinery is imported. The
             # controller uses it to decide whether the measurements already on
@@ -769,8 +795,13 @@ class Runner:
             else:
                 self.outbox.put({"type": "job_done", "job_id": jid, "summary": result})
         except lora_llm.Cancelled:
-            checkpoints.discard(jid)
-            self.outbox.put({"type": "job_cancelled", "job_id": jid, "saved": False})
+            if ctx.preempted:
+                state = checkpoints.peek(jid) or {}
+                self.outbox.put({"type": "job_preempted", "job_id": jid,
+                                 "step": int(state.get("step") or 0)})
+            else:
+                checkpoints.discard(jid)
+                self.outbox.put({"type": "job_cancelled", "job_id": jid, "saved": False})
         except Exception as e:  # noqa: BLE001
             # Deliberately kept. A failure is the case a checkpoint is most
             # worth having: an out-of-memory crash six hours in, a disk that
@@ -801,6 +832,81 @@ class Runner:
             if self.host:
                 self.host.unload_all()
             _release_accelerator()
+
+    def _upload_checkpoint(self, job_id: str) -> None:
+        """Hand a run's checkpoints to the studio, so the run can continue elsewhere.
+
+        Asked for when this machine is about to go away for good -- a rented GPU
+        being given back. One tar of the job's checkpoint directory (resume state,
+        best adapter), uncompressed: safetensors do not compress, and the time
+        would come out of the drain.
+        """
+        import tarfile
+        folder = checkpoints.CHECKPOINT_DIR / job_id
+        if not job_id or not (folder / "state.json").exists():
+            self.outbox.put({"type": "checkpoint_uploaded", "job_id": job_id, "ok": False,
+                             "error": "no checkpoint on this machine"})
+            return
+        fd, tmp = tempfile.mkstemp(suffix=".tar")
+        os.close(fd)
+        try:
+            with tarfile.open(tmp, "w") as tar:
+                tar.add(str(folder), arcname=".")
+            total = os.path.getsize(tmp)
+
+            def chunks():
+                with open(tmp, "rb") as fh:
+                    while block := fh.read(1 << 20):
+                        yield block
+
+            r = httpx.put(_checkpoint_url(self.controller_url, job_id), content=chunks(),
+                          timeout=httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=600.0),
+                          headers={"X-Runner-Token": self.token, "Content-Type": "application/x-tar",
+                                   "Content-Length": str(total)})
+            r.raise_for_status()
+            self.outbox.put({"type": "checkpoint_uploaded", "job_id": job_id, "ok": True, "bytes": total})
+        except Exception as e:  # noqa: BLE001 -- reported; the drain decides
+            self.outbox.put({"type": "checkpoint_uploaded", "job_id": job_id, "ok": False,
+                             "error": "%s: %s" % (e.__class__.__name__, e)})
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+    def _fetch_checkpoint(self, job_id: str, held: dict, ctx: Any) -> None:
+        """Download the checkpoint the studio holds for this run and unpack it.
+
+        The run was interrupted on a machine that is gone (a rented GPU given
+        back); its checkpoint travelled to the studio, and this machine carries
+        on from it instead of from the beginning. A failed download is not fatal:
+        the run then starts over, as it would have without the checkpoint.
+        """
+        import tarfile
+        ctx.log("Fetching this run's checkpoint (step %d) from the studio..." % int(held.get("step") or 0))
+        fd, tmp = tempfile.mkstemp(suffix=".tar")
+        os.close(fd)
+        folder = checkpoints.CHECKPOINT_DIR / job_id
+        try:
+            with httpx.stream("GET", _checkpoint_url(self.controller_url, job_id),
+                              headers={"X-Runner-Token": self.token},
+                              timeout=httpx.Timeout(connect=30.0, pool=30.0, write=60.0, read=600.0)) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as fh:
+                    for block in r.iter_bytes(1 << 20):
+                        fh.write(block)
+            folder.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(tmp) as tar:
+                try:
+                    tar.extractall(str(folder), filter="data")
+                except TypeError:      # a Python without extraction filters
+                    tar.extractall(str(folder))  # noqa: S202 -- our own studio's tar
+            ctx.log("Checkpoint in place; the run carries on from it.")
+        except Exception as e:  # noqa: BLE001
+            shutil.rmtree(folder, ignore_errors=True)
+            ctx.log("The checkpoint could not be fetched (%s), so the run starts from the "
+                    "beginning." % e.__class__.__name__, "warn")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
 
     def _upload(self, job_id: str, path: str, kind: str = "model") -> None:
         """Send the finished thing to the controller.
@@ -843,6 +949,10 @@ class Runner:
                                "Content-Type": "application/zip",
                                "Content-Length": str(total)})
         r.raise_for_status()
+
+
+def _checkpoint_url(controller_url: str, job_id: str) -> str:
+    return "%s/api/runner/checkpoints/%s/checkpoint.tar" % (controller_url, job_id)
 
 
 def _release_accelerator() -> None:

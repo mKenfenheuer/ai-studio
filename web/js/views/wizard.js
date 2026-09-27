@@ -319,9 +319,14 @@ export async function wizardView(mount) {
 
   // In parallel: neither needs the other, and doing them in turn doubled the
   // wait before anything at all appeared.
-  const [allRunners, starters] = await Promise.all([
+  const [allRunners, starters, rented] = await Promise.all([
     api.runners(), api.starters(),
+    // A GPU rented from RunPod when the run starts, if an administrator has
+    // turned that on. Listed last: the studio's own machines come first.
+    api.cloudMachine().catch(() => ({ machine: null })),
   ]);
+  const cloudMachine = rented?.machine || null;
+  const withCloud = (list) => (cloudMachine ? list.concat([cloudMachine]) : list);
   let known = allRunners;
   // Best first, so the tiles read as a recommendation and the default is the
   // machine that can actually do the work. The first row used to win, which
@@ -329,7 +334,7 @@ export async function wizardView(mount) {
   // planned for a machine with no graphics card -- silently, because a
   // machine with no VRAM cannot say whether a model fits, and a machine with
   // no 4-bit support offers no 4-bit. A 20B model then looked impossible.
-  let runners = byCapability(allRunners.filter((r) => r.status !== "offline"));
+  let runners = withCloud(byCapability(allRunners.filter((r) => r.status !== "offline")));
   state.runnerId = runners[0]?.id ?? null;
   state.vocab = starters.default_vocab || 8192;
 
@@ -361,7 +366,7 @@ export async function wizardView(mount) {
   const recheck = async () => {
     const fresh = await api.runners().catch(() => null);
     if (!fresh) return;
-    const live = byCapability(fresh.filter((r) => r.status !== "offline"));
+    const live = withCloud(byCapability(fresh.filter((r) => r.status !== "offline")));
     const changed = live.length !== runners.length
       || live.some((r, i) => r.id !== runners[i]?.id);
     known = fresh;
@@ -535,6 +540,8 @@ function stepGoal(body, { state, runners, draw }) {
                     esc(l.label)}</span>`).join(""))}
                 ${raw(ceiling ? `<span class="badge badge-accent">${esc(ceiling)}</span>` : "")}
                 ${raw(r.status === "busy" ? `<span class="badge badge-warn">busy</span>` : "")}
+                ${raw(r.cloud ? `<span class="badge badge-accent" title="Rented only when the run starts, and given back when it is done">rented for the run · up to $${
+                  Number(r.offer?.max_price || 0).toFixed(2)}/h${r.offer?.policy === "secure" ? " · Secure Cloud" : ""}</span>` : "")}
               </span>
             </button>`;
         }).join(""))}

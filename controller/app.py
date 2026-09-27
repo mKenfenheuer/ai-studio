@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
 import zipfile
 from pathlib import Path
@@ -18,10 +19,10 @@ from common import apimodels, attention, formatting, gpulimits
 
 from . import assets
 from . import architectures as arch
-from . import cards, colab, config, datasets as dsets, db, diagnose, hfaccount, hub
+from . import cards, cloud, colab, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
-from .api import (accounts, conversations, data, evals, library, media, ops, projects,
+from .api import (accounts, cloud as cloud_api, conversations, data, evals, library, media, ops, projects,
                   providers, security,
                   serving as serving_api, sharing, sso)
 from .scheduler import Fleet
@@ -52,8 +53,9 @@ async def lifespan(app: FastAPI):
     sync = asyncio.create_task(_directory_loop())
     tidy = asyncio.create_task(_retention_loop())
     keep = asyncio.create_task(_backup_loop())
+    clouds = asyncio.create_task(_cloud_loop())
     yield
-    for t in (task, sync):
+    for t in (task, sync, clouds):
         t.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await t
@@ -138,6 +140,7 @@ app.include_router(evals.router)
 app.include_router(providers.router)
 app.include_router(ops.router)
 app.include_router(serving_api.router)
+app.include_router(cloud_api.router)
 app.include_router(serving_api.registry)
 app.include_router(sharing.router)
 app.include_router(sso.router)
@@ -148,6 +151,7 @@ app.include_router(sso.router)
 evals.FLEET = fleet
 serving_api.FLEET = fleet
 ops.FLEET = fleet
+cloud_api.FLEET = fleet
 
 
 # ===========================================================================
@@ -992,6 +996,17 @@ async def _create_job(request: Request, payload: dict) -> str:
     # Reject work that provably cannot run, at creation time. The scheduler
     # would otherwise skip it silently and the job would sit "queued" forever
     # with nothing telling the user why.
+    # Whether this run may go to a rented GPU when no machine of the studio can
+    # take it: "never", "any" cloud, or "secure" cloud only. Absent means the
+    # studio's default (Admin → Cloud GPUs).
+    if cfg.get("cloud") not in (None, "", *cloud.POLICIES):
+        raise HTTPException(400, "cloud must be one of: %s." % ", ".join(cloud.POLICIES))
+    # Planned for "Cloud GPU (RunPod)" in the wizard: not a machine to pin to,
+    # but a promise to rent one. Unpinned, the cloud manager picks the GPU.
+    if cfg.get("required_runner") == cloud.CLOUD_RUNNER_ID:
+        cfg.pop("required_runner")
+        if cfg.get("cloud") in (None, "", "never"):
+            cfg["cloud"] = cloud.settings()["default_cloud"] if cloud.settings()["default_cloud"] != "never" else "secure"
     if pinned := cfg.get("required_runner"):
         runner = db.get_runner(pinned)
         if not runner:
@@ -1241,6 +1256,8 @@ async def get_job(request: Request, job_id: str) -> dict:
         # What each machine says about it. Only on the one job being looked
         # at: it is a per-runner fit check and the list page shows a hundred.
         job["waiting_on"] = fleet.why_waiting(job)
+        if note := cloud.MANAGER.note_for(job["id"]):
+            job["cloud_note"] = note
     job["resumable"] = _resumable(job)
     _hide_credentials(job)
     return job
@@ -1890,6 +1907,8 @@ async def hub_model(id: str = Query(...)) -> dict:
         r["id"]: hub.fit_report(detail.get("params_b"), r["capabilities"])
         for r in db.list_runners() if r["status"] != "offline"
     }
+    if virtual := await cloud.virtual_runner():
+        detail["fit"][cloud.CLOUD_RUNNER_ID] = hub.fit_report(detail.get("params_b"), virtual["capabilities"])
     return detail
 
 
@@ -1919,7 +1938,8 @@ async def hub_recommendations(runner_id: str = Query(default="")) -> dict:
     table of assumptions, and ordered so that the largest one which still
     leaves room is the one being pointed at.
     """
-    runner = db.get_runner(runner_id) if runner_id else None
+    runner = (await cloud.virtual_runner() if runner_id == cloud.CLOUD_RUNNER_ID
+              else db.get_runner(runner_id) if runner_id else None)
     caps = dict(runner["capabilities"]) if runner else {}
     out = hub.recommend_models(caps)
     out["runner"] = runner["name"] if runner else None
@@ -2168,7 +2188,8 @@ async def plan(payload: dict = Body(...)) -> dict:
     This is the heart of the low-code promise: the user picks what they want to
     achieve, and the machine's measured capabilities decide the hyperparameters.
     """
-    runner = db.get_runner(payload.get("runner_id", "")) if payload.get("runner_id") else None
+    runner = (await cloud.virtual_runner() if payload.get("runner_id") == cloud.CLOUD_RUNNER_ID
+              else db.get_runner(payload.get("runner_id", "")) if payload.get("runner_id") else None)
     caps = (runner or {}).get("capabilities", {})
     # The size, worked out from the model's name when the caller does not have
     # it. Without it there is no fit report, so the plan quietly chooses
@@ -2282,6 +2303,8 @@ TIME_BUDGETS = [
 
 
 def _caps_for(runner_id: str | None) -> dict:
+    if runner_id == cloud.CLOUD_RUNNER_ID:
+        return ((cloud.virtual_runner_cached() or {}).get("capabilities")) or {}
     runner = db.get_runner(runner_id) if runner_id else None
     if not runner:
         raise HTTPException(400, "Choose a machine first.")
@@ -3082,3 +3105,68 @@ async def index() -> Any:
     if not idx.exists():
         return HTMLResponse("<h1>AI Studio</h1><p>Web UI not found.</p>", status_code=500)
     return FileResponse(idx, headers={"Cache-Control": "no-cache"})
+
+
+# ------------------------------------------------------------ rented GPUs
+
+async def _cloud_loop() -> None:
+    """Start, drain and delete rented GPU pods (controller.cloud.manager).
+
+    Every 30 seconds: often enough that a queued run does not wait long for its
+    pod or an idle pod bill long after its work is done, rarely enough to stay
+    well inside RunPod's rate limits. Does nothing until an API key is set.
+    """
+    await asyncio.sleep(20)
+    while True:
+        try:
+            if await cloud.MANAGER.reconcile(fleet):
+                await fleet.broadcast_ui({"type": "cloud_changed"})
+                await fleet.broadcast_ui({"type": "runners_changed"})
+                fleet.wake()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the loop must survive anything
+            print("[cloud] %s: %s" % (e.__class__.__name__, e), flush=True)
+            cloud.MANAGER.last_error = "%s: %s" % (e.__class__.__name__, e)
+        await asyncio.sleep(30)
+
+
+@app.put("/api/runner/checkpoints/{job_id}/checkpoint.tar")
+async def put_checkpoint(job_id: str, request: Request,
+                         x_runner_token: str = Header(default="")) -> dict:
+    """A run's checkpoints, handed over by a machine that is going away.
+
+    Stored as the tar the runner sent, and the run's checkpoint is from now on
+    the studio's: whichever machine takes the run next fetches it and carries
+    on, instead of the run starting over because its machine was deleted.
+    """
+    if x_runner_token != config.join_token():
+        raise HTTPException(401, "Invalid runner token.")
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "No such job.")
+    folder = cloud.checkpoint_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = cloud.checkpoint_file(job_id)
+    part = dest.with_suffix(".part")
+    size = 0
+    with open(part, "wb") as fh:
+        async for chunk in request.stream():
+            fh.write(chunk)
+            size += len(chunk)
+    os.replace(part, dest)
+    step = int(job.get("checkpoint_step") or 0)
+    db.set_checkpoint(job_id, step, cloud.STUDIO_HOLDER)
+    for held in fleet.checkpoints.values():
+        held.discard(job_id)
+    return {"ok": True, "bytes": size, "step": step}
+
+
+@app.get("/api/runner/checkpoints/{job_id}/checkpoint.tar")
+async def get_checkpoint(job_id: str, x_runner_token: str = Header(default="")):
+    if x_runner_token != config.join_token():
+        raise HTTPException(401, "Invalid runner token.")
+    path = cloud.checkpoint_file(job_id)
+    if not path.exists():
+        raise HTTPException(404, "The studio holds no checkpoint for this run.")
+    return FileResponse(path, media_type="application/x-tar", filename="checkpoint.tar")

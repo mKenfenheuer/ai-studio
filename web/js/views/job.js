@@ -2038,6 +2038,9 @@ function queueCard(job) {
           queueing several long runs does not hold up everyone else.</p>`
         : html`<p class="muted tiny" style="margin:6px 0 0">
           No machine that can run this is connected yet.</p>`)}
+      ${raw(job.cloud_note ? html`
+        <p class="tiny" style="margin:6px 0 0"><span class="badge badge-accent">cloud GPU</span>
+          ${job.cloud_note}</p>` : "")}
       ${raw(waitingDetail(job))}
     </div>`;
 }

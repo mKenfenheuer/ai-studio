@@ -19,6 +19,7 @@ const TABS = [
   { key: "overview", label: "Overview" },
   { key: "storage", label: "Storage" },
   { key: "backups", label: "Backups" },
+  { key: "cloud", label: "Cloud GPUs" },
 ];
 
 export async function adminView(mount, [tab]) {
@@ -35,6 +36,8 @@ export async function adminView(mount, [tab]) {
   let status = null;
   let storage = null;
   let backups = null;
+  let cloud = null;       // settings, spend, pods
+  let gpus = null;        // what can be rented now
 
   const draw = () => {
     mount.innerHTML = html`
@@ -55,6 +58,8 @@ export async function adminView(mount, [tab]) {
           rb("backupNow", "⭳", "Back up now", { cls: "primary" }),
         ]) : active === "storage" ? group("Now", [
           rb("sweepNow", "🧹", "Tidy now"),
+        ]) : active === "cloud" ? group("Now", [
+          rb("cloudRefresh", "↻", "Refresh prices"),
         ]) : ""),
         right: status
           ? `<span class="badge">${status.runners_online}/${status.runners_total} machines online</span>` : "",
@@ -62,6 +67,7 @@ export async function adminView(mount, [tab]) {
       <div id="adminBody">${raw(
         active === "storage" ? storageCard(storage)
         : active === "backups" ? backupsCard(backups)
+        : active === "cloud" ? cloudCard(cloud, gpus)
         : overview(status))}</div>`;
   };
 
@@ -75,8 +81,17 @@ export async function adminView(mount, [tab]) {
     const box = $("#adminBody", mount);
     if (box && active === "backups") box.innerHTML = backupsCard(backups);
   };
+  const loadCloud = async (withPrices = true) => {
+    try { cloud = await api.cloud(); } catch (e) { cloud = { error: e.message }; }
+    if (withPrices && cloud && !cloud.error && cloud.settings?.api_key_set) {
+      try { gpus = await api.cloudGpus("any"); } catch (e) { gpus = { error: e.message }; }
+    }
+    const box = $("#adminBody", mount);
+    if (box && active === "cloud") box.innerHTML = cloudCard(cloud, gpus);
+  };
   if (active === "storage") loadStorage();
   if (active === "backups") loadBackups();
+  if (active === "cloud") loadCloud();
 
   status = await api.status().catch((e) => ({ error: e.message }));
   draw();
@@ -88,6 +103,7 @@ export async function adminView(mount, [tab]) {
     draw();
     if (key === "storage") loadStorage();
     if (key === "backups") loadBackups();
+    if (key === "cloud") loadCloud();
     history.replaceState(null, "", `#/admin/${key}`);
   });
 
@@ -166,7 +182,71 @@ export async function adminView(mount, [tab]) {
     } catch (ex) { toast(ex.message, "err"); }
   });
 
+  // ---- rented GPUs
+  on(mount, "submit", "#cloudForm", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const body = {
+      enabled: f.get("enabled") === "on",
+      max_price_per_hour: Number(f.get("max_price_per_hour") || 0),
+      max_pods: Number(f.get("max_pods") || 0),
+      daily_cap: Number(f.get("daily_cap") || 0),
+      hard_cap: f.get("hard_cap") === "on",
+      idle_minutes: Number(f.get("idle_minutes") || 15),
+      max_hours_per_pod: Number(f.get("max_hours_per_pod") || 0),
+      default_cloud: f.get("default_cloud"),
+      strategy: f.get("strategy"),
+      image: f.get("image"),
+      disk_gb: Number(f.get("disk_gb") || 40),
+      volume_gb: Number(f.get("volume_gb") || 80),
+      controller_url: f.get("controller_url") || "",
+    };
+    if (f.get("api_key")) body.api_key = f.get("api_key");
+    try {
+      await api.saveCloudSettings(body);
+      toast("Saved. The studio checks for work every 30 seconds.", "ok");
+      await loadCloud();
+    } catch (ex) { toast(ex.message, "err"); }
+  });
+  on(mount, "click", "#cloudClearKey", async () => {
+    if (!await confirmDestructive({
+      title: "Remove the RunPod API key?",
+      consequences: ["No new pods can be started, and running ones can no longer be "
+                     + "stopped from here — stop them first, or in the RunPod console."],
+      confirmLabel: "Remove the key" })) return;
+    try { await api.saveCloudSettings({ clear_api_key: true }); await loadCloud(); }
+    catch (ex) { toast(ex.message, "err"); }
+  });
+  on(mount, "click", "#cloudRefresh", () => loadCloud());
+  on(mount, "click", "[data-start-gpu]", async (_e, t) => {
+    const [id, cl] = t.dataset.startGpu.split("|");
+    const o = (gpus?.gpus || []).find((g) => g.id === id && g.cloud === cl);
+    if (!await confirmDestructive({
+      title: `Start a ${o?.name || id} on ${cl.toLowerCase()} cloud?`,
+      consequences: [`It costs about $${(o?.price ?? 0).toFixed(2)} an hour from now until it is `
+                     + "deleted — automatically once it has been idle, or by hand.",
+                     "It joins the machines as a runner and takes queued GPU work."],
+      confirmLabel: "Start it" })) return;
+    try { await api.startCloudPod(id, cl); toast("Starting. It appears under Machines once it has booted.", "ok"); await loadCloud(false); }
+    catch (ex) { toast(ex.message, "err"); }
+  });
+  on(mount, "click", "[data-drain-pod]", async (_e, t) => {
+    try { await api.drainCloudPod(t.dataset.drainPod); toast("Stopping: checkpoints move to the studio first, then the pod is deleted.", "ok"); await loadCloud(false); }
+    catch (ex) { toast(ex.message, "err"); }
+  });
+  on(mount, "click", "[data-delete-pod]", async (_e, t) => {
+    if (!await confirmDestructive({
+      title: "Delete this pod now?",
+      consequences: ["Right away, without moving checkpoints to the studio: a run that "
+                     + "was interrupted there starts again from its beginning.",
+                     "Use Stop instead unless the pod is stuck."],
+      confirmLabel: "Delete now" })) return;
+    try { await api.deleteCloudPod(t.dataset.deletePod); await loadCloud(false); }
+    catch (ex) { toast(ex.message, "err"); }
+  });
+
   return events.subscribe((m) => {
+    if (m.type === "cloud_changed" && active === "cloud") loadCloud(false);
     if (m.type === "runners_changed") {
       api.status().then((s) => { status = s; }).catch(() => {});
     }
@@ -187,6 +267,8 @@ function overview(status) {
       + "and the rules for letting go of them.", "#/admin/storage"],
     ["⭳", "Backups", "A copy of the database, the datasets and the uploads, "
       + "and how to put it back.", "#/admin/backups"],
+    ["☁", "Cloud GPUs", "RunPod GPUs rented for queued work when no machine of "
+      + "the studio can take it — within your price and budget limits.", "#/admin/cloud"],
     ["⚙", "Settings", "The join token, Hugging Face access and the rest of "
       + "the studio-wide configuration.", "#/settings"],
   ];
@@ -391,5 +473,131 @@ function storageCard(st) {
           ${last.runs_thinned} run${last.runs_thinned === 1 ? "" : "s"} thinned,
           ${last.orphan_files} orphan file${last.orphan_files === 1 ? "" : "s"} swept,
           ${mb(last.bytes_freed)} freed.</p>` : "")}
+    </div>`;
+}
+
+
+// ---------------------------------------------------------------- cloud GPUs
+
+const money = (v) => "$" + Number(v || 0).toFixed(2);
+
+function cloudCard(c, g) {
+  if (!c) return `<div class="card"><h3>Cloud GPUs</h3><p class="muted tiny">Looking…</p></div>`;
+  if (c.error) return `<div class="card"><h3>Cloud GPUs</h3><p class="muted tiny">${esc(c.error)}</p></div>`;
+  if (!c.settings) return `<div class="card"><h3>Cloud GPUs</h3><p class="muted tiny">Looking…</p></div>`;
+  const s = c.settings;
+  const pct = s.daily_cap > 0 ? Math.min(100, (c.spend_today / s.daily_cap) * 100) : 0;
+  const active = (c.pods || []).filter((p) => ["starting", "running", "draining"].includes(p.status));
+  const ended = (c.pods || []).filter((p) => !["starting", "running", "draining"].includes(p.status));
+  const opt = (v, cur, label) => `<option value="${v}" ${v === cur ? "selected" : ""}>${label}</option>`;
+
+  const podRow = (p) => html`<tr>
+      <td><strong>${p.gpu_name || p.gpu_id}</strong><div class="tiny muted">${p.name}</div></td>
+      <td>${p.cloud.toLowerCase()}</td>
+      <td>${money(p.price_per_hour)}/h</td>
+      <td><span class="badge">${p.status}</span>${raw(p.note ? `<div class="tiny muted">${esc(p.note)}</div>` : "")}</td>
+      <td>${money(p.spent)}</td>
+      <td class="tiny muted">${p.reason || ""}<div>${fmtAgo(p.created_at)}</div></td>
+      <td style="white-space:nowrap">${raw(["starting", "running"].includes(p.status)
+        ? `<button class="btn-sm" data-drain-pod="${esc(p.id)}">Stop</button>
+           <button class="btn-sm btn-danger" data-delete-pod="${esc(p.id)}">Delete now</button>`
+        : p.status === "draining"
+        ? `<button class="btn-sm btn-danger" data-delete-pod="${esc(p.id)}">Delete now</button>` : "")}</td>
+    </tr>`;
+
+  const offers = g && !g.error ? (g.gpus || []) : [];
+  const offerRow = (o) => html`<tr class="${o.within_price_cap && o.availability !== "NONE" ? "" : "muted"}">
+      <td><strong>${o.name}</strong></td>
+      <td>${o.vram_gb} GB</td>
+      <td>${o.cloud.toLowerCase()}</td>
+      <td>${money(o.price)}/h${raw(o.within_price_cap ? "" : ` <span class="tiny">(over the cap)</span>`)}</td>
+      <td>${o.availability.toLowerCase()}</td>
+      <td>${o.speed.toFixed(1)}× <span class="tiny muted">${money(o.usd_per_speed)} per unit</span></td>
+      <td>${raw(o.within_price_cap && o.availability !== "NONE" && s.api_key_set
+        ? `<button class="btn-sm" data-start-gpu="${esc(o.id)}|${esc(o.cloud)}">Start</button>` : "")}</td>
+    </tr>`;
+
+  return html`
+    <div class="card" style="margin-bottom:14px">
+      <div class="row-between" style="flex-wrap:wrap;gap:8px">
+        <h3 style="margin:0">Cloud GPUs (RunPod)</h3>
+        <span class="tiny muted">${s.enabled ? "renting when needed" : "off — nothing is rented automatically"}</span>
+      </div>
+      <p class="muted tiny" style="margin:6px 0 0;max-width:80ch">
+        When a GPU run is queued and no machine of the studio could take it, the studio rents
+        the fastest (or cheapest) RunPod GPU the run fits on, within the limits below. The pod
+        joins as an ordinary runner. Once it has been idle, whatever exists only on it — the
+        checkpoints of unfinished runs — moves to the studio, and the pod is deleted. Finished
+        models reach the studio at the end of every run anyway.</p>
+      <div style="margin-top:12px">
+        <div class="row-between tiny"><span>Spent today ${money(c.spend_today)}</span>
+          <span class="muted">cap ${s.daily_cap > 0 ? money(s.daily_cap) : "none"}</span></div>
+        <div class="bar" style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:${pct >= 100 ? "var(--err)" : pct > 75 ? "var(--warn)" : "var(--ok)"}"></div></div>
+        <div class="tiny muted" style="margin-top:4px">Estimated from each pod's hourly price;
+          RunPod's billing is the exact figure.</div>
+      </div>
+      ${raw(c.last_error ? `<div class="callout callout-warn" style="margin-top:10px"><strong>RunPod</strong>${esc(c.last_error)}</div>` : "")}
+
+      <form id="cloudForm" class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:14px">
+        <div class="field" style="margin:0;min-width:260px;flex:1">
+          <label for="cgKey">RunPod API key</label>
+          <input id="cgKey" name="api_key" type="password" autocomplete="off"
+                 placeholder="${s.api_key_set ? "set (" + s.api_key_hint + ") — type to replace" : "rpa_…"}">
+          <div class="hint">Stored encrypted; never shown again.${raw(s.api_key_set ? ` <a href="#" id="cloudClearKey">Remove</a>` : "")}</div>
+        </div>
+        <label class="check" style="margin:0 0 10px"><input type="checkbox" name="enabled" ${raw(s.enabled ? "checked" : "")}>
+          Rent automatically</label>
+        <div class="field" style="margin:0"><label>Max price per GPU-hour</label>
+          $<input name="max_price_per_hour" type="number" step="0.01" min="0" value="${s.max_price_per_hour}" style="width:80px"></div>
+        <div class="field" style="margin:0"><label>Pods at once</label>
+          <input name="max_pods" type="number" min="0" max="16" value="${s.max_pods}" style="width:70px"></div>
+        <div class="field" style="margin:0"><label>Daily budget</label>
+          $<input name="daily_cap" type="number" step="1" min="0" value="${s.daily_cap}" style="width:80px">
+          <div class="hint">0 for no cap.</div></div>
+        <label class="check" style="margin:0 0 10px"><input type="checkbox" name="hard_cap" ${raw(s.hard_cap ? "checked" : "")}>
+          Pause running pods at the cap</label>
+        <div class="field" style="margin:0"><label>Give back after idle</label>
+          <input name="idle_minutes" type="number" min="1" max="1440" value="${s.idle_minutes}" style="width:70px"> min</div>
+        <div class="field" style="margin:0"><label>Longest life per pod</label>
+          <input name="max_hours_per_pod" type="number" min="0" max="168" value="${s.max_hours_per_pod}" style="width:70px"> h
+          <div class="hint">0 for no limit.</div></div>
+        <div class="field" style="margin:0"><label>Runs may use</label>
+          <select name="default_cloud">${raw(opt("secure", s.default_cloud, "Secure Cloud only")
+            + opt("any", s.default_cloud, "Secure or Community Cloud") + opt("never", s.default_cloud, "No cloud GPUs"))}</select>
+          <div class="hint">The default; each run can choose for itself.</div></div>
+        <div class="field" style="margin:0"><label>Prefer</label>
+          <select name="strategy">${raw(opt("fastest", s.strategy, "the fastest GPU under the cap")
+            + opt("cheapest", s.strategy, "the cheapest GPU that fits"))}</select></div>
+        <div class="field" style="margin:0;min-width:320px;flex:1"><label>Runner image</label>
+          <input name="image" class="mono" value="${esc(s.image)}"></div>
+        <div class="field" style="margin:0"><label>Disk / volume</label>
+          <input name="disk_gb" type="number" min="20" value="${s.disk_gb}" style="width:70px"> /
+          <input name="volume_gb" type="number" min="20" value="${s.volume_gb}" style="width:70px"> GB</div>
+        <div class="field" style="margin:0;min-width:240px"><label>Studio address for pods</label>
+          <input name="controller_url" class="mono" value="${esc(s.controller_url)}" placeholder="AI_STUDIO_PUBLIC_URL">
+          <div class="hint">How a pod on the internet reaches this studio.</div></div>
+        <button class="btn-primary btn-sm" type="submit">Save</button>
+      </form>
+    </div>
+
+    <div class="card" style="padding:0;margin-bottom:14px">
+      <div class="row-between" style="padding:12px 16px"><h3 style="margin:0">Pods</h3>
+        <span class="tiny muted">${active.length} running · ${s.max_pods} allowed</span></div>
+      ${raw(active.length || ended.length ? html`<table class="table"><thead><tr><th>GPU</th><th>Cloud</th>
+        <th>Price</th><th>Status</th><th>Spent</th><th>Why</th><th></th></tr></thead>
+        <tbody>${raw(active.concat(ended).map(podRow).join(""))}</tbody></table>`
+        : `<p class="muted tiny" style="padding:0 16px 14px">None yet.</p>`)}
+    </div>
+
+    <div class="card" style="padding:0">
+      <div class="row-between" style="padding:12px 16px"><h3 style="margin:0">What can be rented now</h3>
+        <span class="tiny muted">speed relative to an RTX 3090, for training; a ranking, not a benchmark</span></div>
+      ${raw(!s.api_key_set ? `<p class="muted tiny" style="padding:0 16px 14px">Add a RunPod API key to see prices and stock.</p>`
+        : g && g.error ? `<p class="muted tiny" style="padding:0 16px 14px">${esc(g.error)}</p>`
+        : !g ? `<p class="muted tiny" style="padding:0 16px 14px">Asking RunPod…</p>`
+        : html`<table class="table"><thead><tr><th>GPU</th><th>Memory</th><th>Cloud</th><th>Price</th>
+            <th>Stock</th><th>Speed</th><th></th></tr></thead>
+            <tbody>${raw(offers.map(offerRow).join(""))}</tbody></table>`)}
     </div>`;
 }

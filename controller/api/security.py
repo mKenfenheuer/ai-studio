@@ -57,6 +57,9 @@ RUNNER_TOKEN_PATHS = (
     # it -- a Colab VM following the notebook. It is the code that machine is
     # about to run as a runner, gated on the credential that lets it be one.
     "/runner/bundle.zip",
+    # A run's checkpoints, moved to the studio by a machine about to go away
+    # (a rented GPU being given back) and fetched by the one that carries on.
+    "/checkpoint.tar",
 )
 
 

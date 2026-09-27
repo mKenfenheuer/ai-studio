@@ -33,6 +33,9 @@ PERSISTED_STAGES = ("", "training", "writing", "uploading", "evaluating")
 # What each kind of job needs a machine to be able to decode. A kind not
 # listed is text. Filled in as the trainers arrive; a run may also say for
 # itself with `config.modality`.
+# jobs.checkpoint_runner when the studio itself holds a run's checkpoint.
+STUDIO_HOLDER = "studio"
+
 KIND_MODALITY: dict[str, str] = {
     "finetune_vision_cls": "vision",
     "finetune_vlm": "vision",
@@ -46,6 +49,11 @@ class Fleet:
     def __init__(self) -> None:
         self.connections: dict[str, WebSocket] = {}
         self.busy: dict[str, str] = {}          # runner_id -> job_id
+        # Machines being given back (rented GPUs moving their checkpoints to the
+        # studio before deletion). Never handed new work: a run paused there
+        # and requeued would otherwise go straight back to the machine that is
+        # about to disappear.
+        self.draining: set[str] = set()
         # Each browser socket, and who is signed in on it. The stream carries
         # run logs, metrics and playground tokens, and every one of those has
         # an owner; a socket that does not know whose it is cannot be told
@@ -725,7 +733,12 @@ class Fleet:
     def _eligible(self, job: dict, idle: list[str]) -> list[str]:
         """Which of the idle machines may take this job, best first."""
         holder = self.holder_of(job)
-        if not holder:
+        # A checkpoint the studio holds (moved off a rented GPU before it was
+        # given back) binds the run to no machine: whichever takes it fetches
+        # the checkpoint first. Without this the holder would look like a
+        # machine that has been away for ever, and the progress would be
+        # thrown away -- the one thing moving it was for.
+        if not holder or holder == STUDIO_HOLDER:
             return self._by_preference(job, idle)
         if holder in idle:
             return [holder]
@@ -772,6 +785,7 @@ class Fleet:
         # somebody asks, and a twenty-minute fine-tune on it makes the thing it
         # was reserved for impossible for twenty minutes.
         idle = [rid for rid in self.connections if rid not in self.busy
+                and rid not in self.draining
                 and db.runner_role(db.get_runner(rid)) != "serving"]
         if not idle:
             return
@@ -790,9 +804,11 @@ class Fleet:
                 db.assign_job(job["id"], runner_id)
                 self.busy[runner_id] = job["id"]
                 self.dispatched_at[runner_id] = time.time()
+                assignment = {"id": job["id"], "kind": job["kind"], "config": job["config"]}
+                if self.holder_of(job) == STUDIO_HOLDER:
+                    assignment["checkpoint"] = {"step": int(job.get("checkpoint_step") or 0)}
                 sent = await self.send_to_runner(runner_id, {
-                    "type": "job_assign",
-                    "job": {"id": job["id"], "kind": job["kind"], "config": job["config"]},
+                    "type": "job_assign", "job": assignment,
                 })
                 if not sent:
                     # Socket died between the idle check and the send.
@@ -1313,6 +1329,31 @@ class Fleet:
             db.touch_runner(runner_id, "online")
             await self.announce_end(jid, status)
             self.wake()
+
+        elif kind == "job_preempted":
+            # Paused, not ended: a rented GPU had to be given back mid-run. The
+            # run goes back in the queue with its checkpoint, which the drain
+            # then moves to the studio so any machine can carry on from it.
+            step = int(msg.get("step") or 0)
+            db.ex("UPDATE jobs SET status='queued', runner_id=NULL WHERE id=?", (jid,))
+            if step:
+                db.set_checkpoint(jid, step, runner_id)
+                self.checkpoints.setdefault(runner_id, set()).add(jid)
+            db.add_log(jid, "Paused at step %d; the run is back in the queue and continues "
+                       "from there." % step if step else
+                       "Paused before its first checkpoint; the run is back in the queue.", "warn")
+            self.busy.pop(runner_id, None)
+            db.touch_runner(runner_id, "online")
+            await self.broadcast_ui({"type": "jobs_changed", "job_id": jid})
+            self.wake()
+
+        elif kind == "checkpoint_uploaded":
+            if msg.get("ok"):
+                db.add_log(jid, "Checkpoint moved to the studio (%.0f MB)."
+                           % (float(msg.get("bytes") or 0) / 1e6))
+            else:
+                db.add_log(jid, "The checkpoint could not be moved to the studio: %s"
+                           % (msg.get("error") or "unknown error"), "warn")
 
         elif kind == "job_rejected":
             # A decline is information about the runner, not just about the

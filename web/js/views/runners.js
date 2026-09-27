@@ -365,7 +365,7 @@ function card(r, admin, dense = false) {
       <div class="card" style="padding:12px 14px">
         <div class="row-between" style="flex-wrap:wrap;gap:8px;align-items:center">
           <div style="min-width:0">
-            <strong><span class="dot ${dot}"></span> ${r.name}</strong>
+            <strong><span class="dot ${dot}"></span> ${r.name} ${raw(String(r.name || "").startsWith("ai-studio-cp_") ? `<span class="badge badge-accent" title="Rented from RunPod for queued work; given back when idle">rented · RunPod</span>` : "")}</strong>
             <span class="muted tiny mono" style="margin-left:8px">${
               c.device_name || "unknown device"}${c.vram_gb ? ` · ${c.vram_gb} GB` : ""}${
               c.backend ? ` · ${c.backend.toUpperCase()}` : ""}</span>
@@ -386,7 +386,7 @@ function card(r, admin, dense = false) {
   return html`
     <div class="card">
       <div class="row-between" style="flex-wrap:wrap;gap:6px">
-        <h3 style="margin:0"><span class="dot ${dot}"></span> ${r.name}</h3>
+        <h3 style="margin:0"><span class="dot ${dot}"></span> ${r.name} ${raw(String(r.name || "").startsWith("ai-studio-cp_") ? `<span class="badge badge-accent" title="Rented from RunPod for queued work; given back when idle">rented · RunPod</span>` : "")}</h3>
         <div class="row" style="gap:6px">
           ${raw(r.up_to_date === false
             ? `<span class="badge badge-warn" title="${esc(r.version_note || "")}"
