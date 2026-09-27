@@ -87,6 +87,11 @@ def main() -> int:
         check("in a cell and in a list",
               sorted(assets.ids_in_row(row)),
               sorted([a["id"], elsewhere["id"]]))
+        chat = {"messages": [
+            {"role": "user", "content": "What is on this plate?",
+             "media": [{"kind": "image", "ref": assets.ref(a["id"])}]},
+            {"role": "assistant", "content": "A cat, regrettably."}]}
+        check("in a conversation's media", assets.ids_in_row(chat), [a["id"]])
         check("a lookalike string is not one", assets.id_in("asset:nope"), "")
         check("nor is ordinary text", assets.id_in("a cat"), "")
 
@@ -101,6 +106,16 @@ def main() -> int:
               child_asset not in ("", a["id"]))
         check("at the same bytes",
               db.get_asset(child_asset)["sha256"], a["sha256"])
+
+        ds.write_rows("ds_D", iter([chat]), ann)
+        conv = list(ds.iter_rows("ds_D", 10))[0]
+        conv_asset = assets.id_in(conv["messages"][0]["media"][0]["ref"])
+        check("a conversation's picture is adopted too",
+              conv_asset not in ("", a["id"]))
+        check("and the rest of the conversation is untouched",
+              (conv["messages"][0]["content"], conv["messages"][1]),
+              (chat["messages"][0]["content"], chat["messages"][1]))
+        assets.release_dataset("ds_D")
 
         print("\nReleasing")
         freed = assets.release_dataset("ds_A")

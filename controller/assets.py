@@ -128,13 +128,34 @@ def id_in(value: object) -> str:
     return ""
 
 
+# How far into a cell a reference is looked for. A conversation keeps its
+# pictures at messages[i].media[j].ref -- four levels down -- and that is the
+# commonest vision dataset there is. Bounded so a pathological row costs a
+# little, not a stack.
+_DEPTH = 8
+
+
+def _ids_in(value: object, out: list[str], depth: int = 0) -> None:
+    if got := id_in(value):
+        out.append(got)
+    elif depth < _DEPTH and isinstance(value, list):
+        for v in value:
+            _ids_in(v, out, depth + 1)
+    elif depth < _DEPTH and isinstance(value, dict):
+        for v in value.values():
+            _ids_in(v, out, depth + 1)
+
+
 def ids_in_row(row: dict) -> list[str]:
-    out = []
+    """Every asset a row names, in a cell, a list, or a conversation's media.
+
+    Only the top level was looked at once. A conversation's pictures are
+    inside its messages, so a dataset of them adopted nothing, and deleting
+    the upload it was made from took every photograph out from under it.
+    """
+    out: list[str] = []
     for value in (row or {}).values():
-        if got := id_in(value):
-            out.append(got)
-        elif isinstance(value, list):
-            out += [g for g in (id_in(v) for v in value) if g]
+        _ids_in(value, out)
     return out
 
 
@@ -347,6 +368,8 @@ def rewrite(value: object, mapping: dict[str, str]) -> object:
         return ref(mapping[got]) if got in mapping else value
     if isinstance(value, list):
         return [rewrite(v, mapping) for v in value]
+    if isinstance(value, dict):
+        return {k: rewrite(v, mapping) for k, v in value.items()}
     return value
 
 
