@@ -1,10 +1,15 @@
 # AI Studio runner — NVIDIA / CUDA
 #
 # Needs the NVIDIA Container Toolkit on the host; run with `--gpus all`.
-ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+#
+# CUDA 12.8: PyTorch stopped publishing cu124 builds after 2.6, so the old base
+# pinned this image three releases behind the ROCm runner it trains alongside,
+# and cu124 has no kernels for Blackwell cards (RTX 50xx, B200) that rented
+# GPUs increasingly are. Needs a host driver of 570 or newer.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -23,10 +28,16 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
 
 # On CUDA the stock bitsandbytes wheel is correct, so 4-bit works out of the
 # box -- no source build needed, unlike the ROCm image.
+#
+# Quoted: unquoted, the shell read `transformers>=4.44` as `transformers`
+# redirected into a file named "=4.44", so none of these lower bounds was ever
+# applied. transformers 5, pinned, as on the CPU runner: a model is read by
+# whichever machine picks it up, and a tokenizer saved on 5.x cannot be opened
+# on 4.x (see docker/Dockerfile.runner.cpu).
 RUN pip install --no-cache-dir \
-        transformers>=4.44 peft>=0.12 accelerate>=0.34 datasets>=2.20 \
-        Pillow>=10 \
-        safetensors>=0.4 websockets>=12 httpx>=0.27 numpy bitsandbytes>=0.43
+        "transformers>=5.0" "peft>=0.12" "accelerate>=0.34" "datasets>=2.20" \
+        "Pillow>=10" \
+        "safetensors>=0.4" "websockets>=12" "httpx>=0.27" numpy "bitsandbytes>=0.43"
 
 # The grammar engine behind `response_format`. Pure Python and tiny, and
 # deliberately in a layer of its own AFTER the expensive build above: putting
