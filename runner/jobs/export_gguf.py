@@ -143,6 +143,8 @@ def run(cfg: dict, ctx: Any) -> dict:
             "file at full precision; the quantisation comes after.")
     t0 = time.time()
     folder = _readable_by_converter(folder, Path(ctx.workdir) / "convert-src")
+    folder = _with_sentencepiece(folder, cfg.get("base_model") or "",
+                                 Path(ctx.workdir) / "convert-spm", ctx)
     _stream([CONVERT_PYTHON, CONVERTER, str(folder), "--outfile", str(f16),
              "--outtype", "f16"], ctx)
     ctx.log("Converted in %s. %s"
@@ -318,6 +320,34 @@ def _readable_by_converter(folder: Path, shadow: Path) -> Path:
     cfg.pop("extra_special_tokens")
     (shadow / "tokenizer_config.json").write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return shadow
+
+
+def _with_sentencepiece(folder: Path, base_model: str, shadow: Path, ctx: Any) -> Path:
+    """The model with its SentencePiece file, which a Llama-family converter needs.
+
+    transformers 5 saves a fine-tune's tokenizer as tokenizer.json alone, and
+    llama.cpp reads a Llama vocabulary (EuroLLM, Mistral, Llama itself) from
+    tokenizer.model -- the conversion then fails on a file that was never
+    written. A fine-tune does not change the vocabulary, so the base model's
+    copy on the Hub is the right one. Nothing happens for models that have the
+    file or never had one (Qwen's vocabulary is BPE: tokenizer.json only).
+    """
+    if (folder / "tokenizer.model").exists() or not base_model or "/" not in base_model:
+        return folder
+    try:
+        from huggingface_hub import hf_hub_download
+        spm = hf_hub_download(base_model, "tokenizer.model")
+    except Exception:  # noqa: BLE001 - a base without one needs none
+        return folder
+    shadow.mkdir(parents=True, exist_ok=True)
+    for item in folder.iterdir():
+        link = shadow / item.name
+        if not link.exists():
+            link.symlink_to(item.resolve())
+    (shadow / "tokenizer.model").symlink_to(Path(spm).resolve())
+    ctx.log("The fine-tune was saved without tokenizer.model; using %s's, "
+            "which is the same vocabulary." % base_model)
     return shadow
 
 
