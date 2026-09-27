@@ -35,6 +35,23 @@ PERSISTED_STAGES = ("", "training", "writing", "uploading", "evaluating")
 # itself with `config.modality`.
 # jobs.checkpoint_runner when the studio itself holds a run's checkpoint.
 STUDIO_HOLDER = "studio"
+# `required_runner` for a run sent to a rented GPU: not one machine but any pod
+# the studio rented (controller/cloud). Kept on the run, not dropped, so the
+# laptop that happens to be online does not take the run that was sent away.
+CLOUD_PIN = "cloud"
+
+
+def is_cloud_runner(runner_id: str | None) -> bool:
+    """Whether this runner is one of the studio's rented pods.
+
+    By the pod ledger, by name as well as by link: a pod's runner is linked
+    to its row on the manager's next pass, and work can reach it before then.
+    """
+    if not runner_id:
+        return False
+    runner = db.get_runner(runner_id) or {}
+    return bool(db.q1("SELECT 1 AS x FROM cloud_pods WHERE runner_id=? OR name=?",
+                      (runner_id, runner.get("name") or "")))
 
 KIND_MODALITY: dict[str, str] = {
     "finetune_vision_cls": "vision",
@@ -408,7 +425,10 @@ class Fleet:
             return False, "runner has no working 4-bit support"
 
         required = job["config"].get("required_runner")
-        if required and required != caps.get("_id"):
+        if required == CLOUD_PIN:
+            if caps.get("_id") and not is_cloud_runner(caps["_id"]):
+                return False, "sent to a rented GPU, and this machine is not one"
+        elif required and required != caps.get("_id"):
             return False, "pinned to a different runner"
 
         if job["kind"] == "pretrain_llm":

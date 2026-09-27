@@ -67,6 +67,14 @@ class FakeRunPod:
     pods: dict[str, dict] = {}
     created: list[dict] = []
     terminated: list[str] = []
+    # One made by hand in the console, the way the first one was: an old image
+    # and the join token sitting in its env for anyone with console access.
+    templates: dict[str, dict] = {"tpl_hand": {
+        "id": "tpl_hand", "name": "ai-studio", "image": "ghcr.io/x/ai-studio-runner:cuda-old",
+        "disk": 50, "mounts": {"persistent": {"path": "/data", "size": 80}},
+        "env": {"AI_STUDIO_CONTROLLER": "https://studio.example/", "AI_STUDIO_JOIN_TOKEN": "leaked"},
+        "ports": [], "serverless": False, "startSsh": False, "startJupyter": False}}
+    template_calls: list[str] = []
 
     def __init__(self, api_key: str, base: str | None = None) -> None:
         assert api_key == "rp-secret-key-1234"
@@ -74,9 +82,28 @@ class FakeRunPod:
     async def gpus(self, cloud: str = "SECURE") -> list[dict]:
         return CATALOG[cloud]
 
+    async def list_templates(self) -> list[dict]:
+        return [dict(t) for t in FakeRunPod.templates.values()]
+
+    async def create_template(self, body: dict) -> dict:
+        tid = "tpl_%d" % (len(FakeRunPod.templates) + 1)
+        FakeRunPod.templates[tid] = {"id": tid, "serverless": False, **body}
+        FakeRunPod.template_calls.append("create")
+        return FakeRunPod.templates[tid]
+
+    async def update_template(self, template_id: str, body: dict) -> dict:
+        FakeRunPod.templates[template_id].update(body)
+        FakeRunPod.template_calls.append("update")
+        return FakeRunPod.templates[template_id]
+
     async def create_pod(self, **kw) -> dict:
         pid = "pod%d" % (len(FakeRunPod.created) + 1)
         FakeRunPod.created.append(kw)
+        if kw.get("template_id"):
+            # What RunPod does with one: its settings, the body's env merged over its own.
+            t = FakeRunPod.templates[kw["template_id"]]
+            kw = {**kw, "image": t["image"], "env": {**t["env"], **kw["env"]}}
+        FakeRunPod.created[-1] = kw
         FakeRunPod.pods[pid] = {"id": pid, "status": "RUNNING",
                                 "cost": [g for g in CATALOG[kw["cloud"]] if g["id"] == kw["gpu_id"]][0]["price"][kw["cloud"].lower()]}
         return FakeRunPod.pods[pid]
@@ -112,6 +139,28 @@ def main() -> int:
     check("not in the stored row", "rp-secret-key-1234" in (db.get_setting(manager.SETTING_KEY) or ""), False)
     check("not in the status", "rp-secret-key-1234" in json.dumps(m.status()), False)
 
+    print("the pod template")
+    out = asyncio.run(m.sync_template())
+    check("the hand-made one is adopted by name, not duplicated", (out["template_id"], len(FakeRunPod.templates)),
+          ("tpl_hand", 1))
+    check("and brought in line", out["result"].startswith("updated"))
+    t = FakeRunPod.templates["tpl_hand"]
+    check("to the image in the settings", t["image"], manager.DEFAULTS["image"])
+    check("with the join token taken out of it", "AI_STUDIO_JOIN_TOKEN" in t["env"], False)
+    check("and the studio's address", t["env"]["AI_STUDIO_CONTROLLER"], "https://studio.example")
+    check("remembered", manager.settings()["template_id"], "tpl_hand")
+    FakeRunPod.template_calls.clear()
+    out = asyncio.run(m.sync_template())
+    check("left alone when it already matches", (out["result"], FakeRunPod.template_calls),
+          ("already up to date", []))
+    manager.save_settings({"volume_gb": 120}, "admin")
+    asyncio.run(m.sync_template())
+    check("a changed setting reaches it", FakeRunPod.templates["tpl_hand"]["mounts"]["persistent"]["size"], 120)
+    manager.save_settings({"volume_gb": 80}, "admin")
+    del FakeRunPod.templates["tpl_hand"]
+    out = asyncio.run(m.sync_template())
+    check("made when there is none", (out["result"], out["template_id"] in FakeRunPod.templates), ("created", True))
+
     print("choosing a GPU")
     s = manager.settings()
     offers = asyncio.run(manager.offers("any", refresh=True))
@@ -137,6 +186,7 @@ def main() -> int:
     check("one pod requested", len(FakeRunPod.created), 1)
     req = FakeRunPod.created[0]
     check("on Secure Cloud, as the run asked", req["cloud"], "SECURE")
+    check("from the studio's template", req.get("template_id"), manager.settings()["template_id"])
     check("the runner image", req["image"], manager.DEFAULTS["image"])
     check("it dials home with the join token", req["env"]["AI_STUDIO_JOIN_TOKEN"], config.join_token())
     check("to the public address", req["env"]["AI_STUDIO_CONTROLLER"], "https://studio.example")
@@ -228,6 +278,20 @@ def main() -> int:
     db.clear_checkpoint(jp)
     fleet.note_checkpoints("run_x", [jp], [{"job_id": jp, "step": 58}])
     check("not once it has started over elsewhere", db.get_job(jp)["checkpoint_step"], 0)
+
+    print("a run sent to a rented GPU goes to one, even with a machine of the studio free")
+    from controller.scheduler import CLOUD_PIN
+    jc = finetune(1.7, required_runner=CLOUD_PIN, cloud="secure")
+    job = db.get_job(jc)
+    local = {"backend": "cuda", "vram_gb": 48, "_id": "run_x"}
+    check("the studio's own machine may not take it", fleet.can_run(job, local)[0], False)
+    check("so a pod is wanted for it", m._wants_cloud(fleet, job, manager.settings()))
+    db.ex("INSERT INTO cloud_pods (id, provider, name, gpu_id, cloud, price_per_hour, status, created_at) "
+          "VALUES ('cp_pin', 'runpod', 'ai-studio-cp_pin', 'NVIDIA RTX A6000', 'SECURE', 0.49, 'running', ?)",
+          (time.time(),))
+    db.upsert_runner("run_pin", "ai-studio-cp_pin", {"backend": "cuda", "vram_gb": 48})
+    check("and the pod's runner may, before it is even linked",
+          fleet.can_run(job, {"backend": "cuda", "vram_gb": 48, "_id": "run_pin"})[0])
 
     print()
     if FAILED:

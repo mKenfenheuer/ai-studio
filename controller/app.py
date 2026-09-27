@@ -1002,13 +1002,13 @@ async def _create_job(request: Request, payload: dict) -> str:
     # studio's default (Admin → Cloud GPUs).
     if cfg.get("cloud") not in (None, "", *cloud.POLICIES):
         raise HTTPException(400, "cloud must be one of: %s." % ", ".join(cloud.POLICIES))
-    # Planned for "Cloud GPU (RunPod)" in the wizard: not a machine to pin to,
-    # but a promise to rent one. Unpinned, the cloud manager picks the GPU.
+    # Planned for "Cloud GPU (RunPod)" in the wizard: not one machine but any
+    # pod the studio rents for it, and never one of its own -- see
+    # scheduler.CLOUD_PIN. The cloud manager picks the GPU.
     if cfg.get("required_runner") == cloud.CLOUD_RUNNER_ID:
-        cfg.pop("required_runner")
         if cfg.get("cloud") in (None, "", "never"):
             cfg["cloud"] = cloud.settings()["default_cloud"] if cloud.settings()["default_cloud"] != "never" else "secure"
-    if pinned := cfg.get("required_runner"):
+    elif pinned := cfg.get("required_runner"):
         runner = db.get_runner(pinned)
         if not runner:
             raise HTTPException(400, "That machine is not known to this studio.")

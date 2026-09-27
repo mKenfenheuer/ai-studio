@@ -59,7 +59,11 @@ DEFAULTS: dict[str, Any] = {
     "disk_gb": 40,
     "volume_gb": 80,
     "controller_url": "",            # empty: AI_STUDIO_PUBLIC_URL
+    # The RunPod pod template the studio keeps in step with these settings and
+    # starts its pods from. Found by name, so one made by hand is adopted.
+    "template_name": "ai-studio",
 }
+MOUNT = "/data"
 POLICIES = ("never", "any", "secure")
 GPU_KINDS = {"finetune_llm", "pretrain_llm", "finetune_vision_cls", "finetune_vlm",
              "finetune_asr", "finetune_tts", "finetune_diffusion"}
@@ -93,6 +97,8 @@ def settings() -> dict:
     key = _api_key(stored)
     out["api_key_set"] = bool(key)
     out["api_key_hint"] = ("…" + key[-4:]) if key else ""
+    out["template_id"] = stored.get("template_id") or ""
+    out["template_synced_at"] = stored.get("template_synced_at") or 0
     return out
 
 
@@ -133,6 +139,8 @@ def save_settings(payload: dict, user_id: str | None) -> dict:
             raise ValueError("The container disk needs at least 20 GB: a run's merged model is written there.")
         if k in ("volume_gb",) and v < 20:
             raise ValueError("The /data volume needs at least 20 GB for models and checkpoints.")
+        if k == "template_name" and not v:
+            raise ValueError("The template needs a name.")
         stored[k] = v
     if payload.get("api_key"):
         stored["api_key_enc"] = auth.encrypt_secret(str(payload["api_key"]).strip())
@@ -140,6 +148,82 @@ def save_settings(payload: dict, user_id: str | None) -> dict:
         stored.pop("api_key_enc", None)
     db.set_setting(SETTING_KEY, json.dumps(stored), user_id)
     return settings()
+
+
+def _remember(**fields: Any) -> None:
+    """Studio-kept facts beside the settings (the template's id), not settings."""
+    raw = db.get_setting(SETTING_KEY)
+    stored = json.loads(raw) if raw else {}
+    stored.update(fields)
+    db.set_setting(SETTING_KEY, json.dumps(stored), None)
+
+
+# ---------------------------------------------------------------- template
+
+def controller_url(s: dict) -> str:
+    return (s["controller_url"] or config.PUBLIC_URL or "").rstrip("/")
+
+
+def template_body(s: dict) -> dict:
+    """The pod template these settings describe.
+
+    Everything a pod of this studio has in common, and nothing secret: a
+    template is shown in the RunPod console, so the join token goes with each
+    pod instead, as do the runner's name and the pod's id. SSH and Jupyter are
+    off -- the runner dials out, and nothing on the pod needs to be reached.
+    """
+    return {
+        "name": s["template_name"],
+        "image": s["image"],
+        "disk": int(s["disk_gb"]),
+        "mounts": {"persistent": {"size": int(s["volume_gb"]), "path": MOUNT}},
+        "env": {"AI_STUDIO_CONTROLLER": controller_url(s)},
+        "ports": [],
+        "startSsh": False,
+        "startJupyter": False,
+    }
+
+
+def template_drift(have: dict, want: dict) -> list[str]:
+    """Which of the template's fields differ from what the settings describe."""
+    out = []
+    for k in ("name", "image", "disk", "startSsh", "startJupyter"):
+        if have.get(k) != want[k]:
+            out.append(k)
+    if ((have.get("mounts") or {}).get("persistent") or {}) != want["mounts"]["persistent"]:
+        out.append("mounts")
+    if (have.get("env") or {}) != want["env"]:
+        out.append("env")
+    if list(have.get("ports") or []) != want["ports"]:
+        out.append("ports")
+    return out
+
+
+async def ensure_template(rp: RunPod, s: dict) -> tuple[str, str]:
+    """Create or update the studio's template; returns (id, what was done).
+
+    Found by the id remembered from last time, else by name -- so a template
+    somebody made by hand in the console under that name is taken over and
+    brought in line rather than duplicated. Only its own fields are sent: a
+    template that already matches is left alone.
+    """
+    want = template_body(s)
+    templates = await rp.list_templates()
+    have = next((t for t in templates if s.get("template_id") and t.get("id") == s["template_id"]), None) \
+        or next((t for t in templates if t.get("name") == want["name"] and not t.get("serverless")), None)
+    if have is None:
+        made = await rp.create_template(want)
+        tid, done = (made or {}).get("id") or "", "created"
+    else:
+        tid = have["id"]
+        drift = template_drift(have, want)
+        if drift:
+            await rp.update_template(tid, want)
+            done = "updated (%s)" % ", ".join(drift)
+        else:
+            done = "already up to date"
+    _remember(template_id=tid, template_synced_at=time.time())
+    return tid, done
 
 
 def policy_of(job: dict, s: dict | None = None) -> str:
@@ -551,8 +635,8 @@ class Manager:
         if job["kind"] not in GPU_KINDS or policy_of(job, s) == "never":
             return False
         cfg = job.get("config") or {}
-        if cfg.get("required_runner"):
-            return False
+        if cfg.get("required_runner") not in (None, "", CLOUD_RUNNER_ID):
+            return False                # pinned to a machine of the studio's own
         holder = job.get("checkpoint_runner")
         if holder and holder != STUDIO_HOLDER and holder in fleet.connections:
             return False                # its own machine is back; it waits for it
@@ -565,7 +649,7 @@ class Manager:
                       user_id: str | None = None, reason: str = "") -> dict | None:
         pid = "cp_" + uuid.uuid4().hex[:10]
         name = NAME_PREFIX + pid
-        url = (s["controller_url"] or config.PUBLIC_URL or "").rstrip("/")
+        url = controller_url(s)
         if not url:
             self.last_error = "No public address for the studio: set AI_STUDIO_PUBLIC_URL or the controller URL in the cloud settings."
             return None
@@ -576,10 +660,19 @@ class Manager:
               (pid, PROVIDER, name, offer["id"], offer["name"], offer.get("vram_gb"), offer["cloud"],
                offer["price"], "starting", (job or {}).get("id"), reason or ("for run %s" % job["id"] if job else "started by hand"),
                now, now, user_id))
+        # The template is brought in line first, so a pod always starts from
+        # what the settings say now. If RunPod will not have the template, the
+        # pod is spelled out in full instead: a template is a convenience, and
+        # a run waiting on one is not.
+        try:
+            template_id, _ = await ensure_template(rp, s)
+        except RunPodError as e:
+            template_id = ""
+            self.last_error = "The pod template could not be updated (%s); starting the pod without it." % e
         try:
             info = await rp.create_pod(
-                name=name, image=s["image"], gpu_id=offer["id"], cloud=offer["cloud"],
-                disk_gb=s["disk_gb"], volume_gb=s["volume_gb"],
+                name=name, gpu_id=offer["id"], cloud=offer["cloud"], template_id=template_id or None,
+                image=s["image"], disk_gb=s["disk_gb"], volume_gb=s["volume_gb"], mount=MOUNT,
                 env={"AI_STUDIO_CONTROLLER": url, "AI_STUDIO_JOIN_TOKEN": config.join_token(),
                      "AI_STUDIO_RUNNER_NAME": name, "AI_STUDIO_CLOUD_POD": pid})
         except RunPodError as e:
@@ -595,6 +688,17 @@ class Manager:
                        "$%.2f/h) is starting for it. Rough estimate: %.1f h, about $%.2f."
                        % (offer["name"], offer["cloud"].lower(), offer["price"], est["hours"], est["usd"]))
         return pod(pid)
+
+    async def sync_template(self) -> dict:
+        """Bring the RunPod template in line with the settings now, for the admin page."""
+        key = _api_key()
+        if not key:
+            raise ValueError("Add a RunPod API key first.")
+        s = settings()
+        if not controller_url(s):
+            raise ValueError("Set the studio address for pods first: the template carries it.")
+        tid, done = await ensure_template(RunPod(key), s)
+        return {"template_id": tid, "result": done, "name": s["template_name"]}
 
     async def start_by_hand(self, offer_id: str, cloud: str, user_id: str | None) -> dict:
         s = settings()

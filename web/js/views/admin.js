@@ -200,11 +200,21 @@ export async function adminView(mount, [tab]) {
       disk_gb: Number(f.get("disk_gb") || 40),
       volume_gb: Number(f.get("volume_gb") || 80),
       controller_url: f.get("controller_url") || "",
+      template_name: f.get("template_name") || "ai-studio",
     };
     if (f.get("api_key")) body.api_key = f.get("api_key");
     try {
-      await api.saveCloudSettings(body);
-      toast("Saved. The studio checks for work every 30 seconds.", "ok");
+      const saved = await api.saveCloudSettings(body);
+      if (saved.template_error) toast("Saved, but the RunPod template was not: " + saved.template_error, "err");
+      else toast("Saved. The studio checks for work every 30 seconds."
+        + (saved.template ? " Template " + saved.template.result + "." : ""), "ok");
+      await loadCloud();
+    } catch (ex) { toast(ex.message, "err"); }
+  });
+  on(mount, "click", "#cloudSyncTemplate", async () => {
+    try {
+      const r = await api.syncCloudTemplate();
+      toast(`Template "${r.name}" ${r.result}.`, "ok");
       await loadCloud();
     } catch (ex) { toast(ex.message, "err"); }
   });
@@ -577,6 +587,13 @@ function cloudCard(c, g) {
         <div class="field" style="margin:0;min-width:240px"><label>Studio address for pods</label>
           <input name="controller_url" class="mono" value="${esc(s.controller_url)}" placeholder="AI_STUDIO_PUBLIC_URL">
           <div class="hint">How a pod on the internet reaches this studio.</div></div>
+        <div class="field" style="margin:0;min-width:200px"><label>RunPod template</label>
+          <input name="template_name" class="mono" value="${esc(s.template_name || "ai-studio")}">
+          <div class="hint">${raw(s.template_id
+            ? `Pods start from <span class="mono">${esc(s.template_id)}</span>${s.template_synced_at
+                ? ", synced " + esc(new Date(s.template_synced_at * 1000).toLocaleString()) : ""}.`
+            : "Created on first save or first pod.")}
+            <a href="#" id="cloudSyncTemplate">Sync now</a></div></div>
         <button class="btn-primary btn-sm" type="submit">Save</button>
       </form>
     </div>

@@ -62,21 +62,48 @@ class RunPod:
             "cloud": cloud, "minCudaVersion": MIN_CUDA})
         return list((body or {}).get("gpus") or [])
 
+    # ------------------------------------------------------------- templates
+    async def list_templates(self) -> list[dict]:
+        body = await self._call("GET", "/v2/templates")
+        if isinstance(body, dict):
+            return list(body.get("templates") or [])
+        return list(body or [])
+
+    async def create_template(self, body: dict) -> dict:
+        return await self._call("POST", "/v2/templates", json=body)
+
+    async def update_template(self, template_id: str, body: dict) -> dict:
+        return await self._call("PATCH", "/v2/templates/%s" % template_id, json=body)
+
     # ------------------------------------------------------------------ pods
-    async def create_pod(self, *, name: str, image: str, gpu_id: str, cloud: str,
-                         env: dict[str, str], disk_gb: int, volume_gb: int,
-                         mount: str = "/data") -> dict:
-        return await self._call("POST", "/v2/pods", json={
+    async def create_pod(self, *, name: str, gpu_id: str, cloud: str,
+                         env: dict[str, str], template_id: str | None = None,
+                         image: str | None = None, disk_gb: int | None = None,
+                         volume_gb: int | None = None, mount: str = "/data") -> dict:
+        """A pod from the studio's template, or spelled out in full without one.
+
+        With a template the container settings come from it, and the body
+        carries only what differs per pod: the GPU, the cloud, and the env
+        that must never sit in a template -- RunPod merges env per key, with
+        the body's values winning.
+        """
+        body: dict[str, Any] = {
             "name": name,
-            "image": image,
             "cloud": cloud,
             "gpu": {"id": gpu_id, "count": 1, "minCudaVersion": MIN_CUDA},
-            "disk": int(disk_gb),
-            "mounts": {"persistent": {"size": int(volume_gb), "path": mount}},
             "env": env,
-            # The runner dials out to the studio; nothing needs to reach it.
-            "ports": [],
-        })
+        }
+        if template_id:
+            body["templateId"] = template_id
+        else:
+            body.update({
+                "image": image,
+                "disk": int(disk_gb or 40),
+                "mounts": {"persistent": {"size": int(volume_gb or 80), "path": mount}},
+                # The runner dials out to the studio; nothing needs to reach it.
+                "ports": [],
+            })
+        return await self._call("POST", "/v2/pods", json=body)
 
     async def get_pod(self, pod_id: str) -> dict | None:
         try:

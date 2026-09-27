@@ -376,6 +376,7 @@ export const api = {
   startCloudPod: (gpu_id, cloud) =>
     req("/api/cloud/pods", { method: "POST", body: JSON.stringify({ gpu_id, cloud }) }),
   drainCloudPod: (id) => req(`/api/cloud/pods/${id}/drain`, { method: "POST" }),
+  syncCloudTemplate: () => req("/api/cloud/template", { method: "POST" }),
   deleteCloudPod: (id) => req(`/api/cloud/pods/${id}`, { method: "DELETE" }),
 
   // ---- backups ---------------------------------------------------------

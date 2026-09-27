@@ -39,9 +39,29 @@ async def status(request: Request) -> dict:
 async def put_settings(request: Request, payload: dict = Body(...)) -> dict:
     user = require_admin(request)
     try:
-        return manager.save_settings(payload, user["id"])
+        saved = manager.save_settings(payload, user["id"])
     except (TypeError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
+    # Settings the template carries take effect there at once, not at the next
+    # pod: somebody reading the template in the RunPod console sees the truth.
+    if saved["api_key_set"] and manager.controller_url(saved):
+        try:
+            saved["template"] = await manager.MANAGER.sync_template()
+        except (ValueError, RunPodError) as e:
+            saved["template_error"] = str(e)
+    return saved
+
+
+@router.post("/template")
+async def sync_template(request: Request) -> dict:
+    """Create or update the RunPod template pods are started from."""
+    require_admin(request)
+    try:
+        return await manager.MANAGER.sync_template()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RunPodError as e:
+        raise HTTPException(502, "RunPod: %s" % e) from e
 
 
 @router.get("/gpus")

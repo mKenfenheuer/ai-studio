@@ -60,9 +60,26 @@ anyway, and that run starts over.
    HTTPS address needs to be reachable — nothing on the pod is exposed.
 3. The runner image defaults to `ghcr.io/mkenfenheuer/ai-studio-runner:cuda`
    (CUDA 12.8; RunPod hosts with an older driver are excluded automatically).
+   Prefer a dated tag (`cuda-2026.09.27-02fa20f`) over `cuda`: a host that has
+   pulled `cuda` before may start the copy it already has.
 4. Turn on **Rent automatically**. In the run wizard, **Cloud GPU (RunPod)** then
    appears as a machine: the run is planned for the largest GPU on offer under
-   the cap, and not pinned — the manager rents the GPU that fits it best.
+   the cap and sent to a rented GPU — never to one of the studio's own machines,
+   even one that is free — and the manager rents the GPU that fits it best.
+
+### The pod template
+
+Pods are started from a RunPod pod template the studio keeps in step with these
+settings: the image, the container disk, the volume at `/data`, the studio's
+address, SSH and Jupyter off. It is found by name (**RunPod template**,
+`ai-studio` by default), so one made by hand in the console is taken over and
+brought in line rather than duplicated. Saving the settings updates it, as does
+**Sync now** and every pod start; a template that already matches is left alone.
+
+Nothing secret goes in it. A template is readable in the RunPod console, so the
+join token — and each pod's runner name — are passed with each pod instead, and
+a hand-made template that carried the token has it removed. Starting a pod from
+the template by hand therefore needs `AI_STUDIO_JOIN_TOKEN` added to that pod.
 
 ## Privacy
 
@@ -79,6 +96,7 @@ Administrators only, except `/api/cloud/machine`.
 |---|---|
 | `GET /api/cloud` | settings (never the key), today's spend, recent pods |
 | `PUT /api/cloud/settings` | change settings; `api_key` to set, `clear_api_key` to remove |
+| `POST /api/cloud/template` | create or update the pod template now |
 | `GET /api/cloud/gpus?cloud=any\|secure&job=<id>` | what can be rented now; with a job, whether it fits and a cost estimate |
 | `POST /api/cloud/pods` | start a pod by hand: `{"gpu_id", "cloud"}` |
 | `POST /api/cloud/pods/{id}/drain` | give a pod back the careful way |
