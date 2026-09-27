@@ -541,7 +541,9 @@ async def run_eval(request: Request, eval_id: str,
         # Tools the set declares, for scoring tool calls. Stored on the set
         # as JSON text; sent to the runner parsed.
         "tools": (row.get("source") or {}).get("tools") or None,
-        "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 512),
+        # A structured answer (a recipe, a report in JSON) is often longer than
+        # 512 tokens, and one cut short scores as malformed rather than long.
+        "max_new_tokens": min(int(payload.get("max_new_tokens") or 200), 2048),
         "temperature": float(payload.get("temperature") or 0.0),
         "system_prompt": override,
         "system_prompt_override": bool(override),

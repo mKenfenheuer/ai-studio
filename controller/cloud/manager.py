@@ -65,7 +65,9 @@ DEFAULTS: dict[str, Any] = {
 }
 MOUNT = "/data"
 POLICIES = ("never", "any", "secure")
-GPU_KINDS = {"finetune_llm", "pretrain_llm", "finetune_vision_cls", "finetune_vlm",
+# Scoring is on the list because a run sent to a rented GPU is often the only
+# place its model can be loaded at a useful speed once the studio has no card.
+GPU_KINDS = {"evaluate", "finetune_llm", "pretrain_llm", "finetune_vision_cls", "finetune_vlm",
              "finetune_asr", "finetune_tts", "finetune_diffusion"}
 ACTIVE = ("starting", "running", "draining")
 STARTUP_TIMEOUT_S = 25 * 60       # requested to connected: image pull on a cold host
@@ -378,6 +380,13 @@ def fits(fleet: Any, job: dict, offer: dict) -> tuple[bool, str]:
 def estimate(job: dict, offer: dict) -> dict:
     """Hours and dollars for this run on this GPU. Rough, and labelled as such."""
     cfg = job.get("config") or {}
+    if job.get("kind") == "evaluate":
+        # Generation, not training: each prompt to each model, a few seconds
+        # apiece on a card, plus loading every model once.
+        asked = len(cfg.get("items") or []) * max(len(cfg.get("models") or []), 1)
+        hours = asked * 6 / offer["speed"] / 3600 + 0.1 * max(len(cfg.get("models") or []), 1) + 0.25
+        return {"hours": round(hours, 2), "usd": round(hours * offer["price"], 2),
+                "basis": "%d answers" % asked}
     params_b = float(cfg.get("params_b") or 1.5)
     seq = int(cfg.get("max_seq_len") or 1024)
     per_step = int(cfg.get("batch_size") or 1) * int(cfg.get("grad_accum") or 1)

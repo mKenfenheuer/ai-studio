@@ -292,6 +292,11 @@ def main() -> int:
     db.upsert_runner("run_pin", "ai-studio-cp_pin", {"backend": "cuda", "vram_gb": 48})
     check("and the pod's runner may, before it is even linked",
           fleet.can_run(job, {"backend": "cuda", "vram_gb": 48, "_id": "run_pin"})[0])
+    ev = db.create_job("ev", "evaluate", {"items": [{"prompt": "x"}] * 100, "models": [{"ref": "a"}, {"ref": "b"}],
+                                          "required_runner": CLOUD_PIN, "cloud": "secure"})
+    check("a scoring sent to a rented GPU wants one too", m._wants_cloud(fleet, db.get_job(ev), manager.settings()))
+    est = manager.estimate(db.get_job(ev), {"speed": 1.0, "price": 0.5})
+    check("and is estimated as answers, not training steps", est["basis"], "200 answers")
 
     print()
     if FAILED:
