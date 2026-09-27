@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -269,8 +270,12 @@ def too_long() -> None:
         num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8,
         head_dim=128, max_position_embeddings=32768,
         _attn_implementation="flex_attention"))
+    # Serving takes flex only when asked for on its own (see `_serving_caps`),
+    # and this is the card that was serving with it.
+    os.environ["AI_STUDIO_SERVE_FLEX_ATTENTION"] = "1"
     host = ModelHost("http://unused", "token", {"backend": "rocm",
         "attention": {"flex": True, "flex_opt_in": True}})
+    del os.environ["AI_STUDIO_SERVE_FLEX_ATTENTION"]
     host._free_gb = lambda: 2.22
     per_token = host._kv_bytes_per_token(mistral)
     check("a Mistral-7B token costs 128 KiB of cache (8 key heads, not 32)",

@@ -435,7 +435,13 @@ window.WebSocket = class { constructor() { this.readyState = 0; } send() {} clos
 
 const results = [];
 const errors = [];
-window.addEventListener("error", (e) => errors.push("window error: " + e.message));
+window.addEventListener("error", (e) => {
+  // The browser's own note that a chart resized inside its resize callback
+  // and the rest waits for the next frame. Not an error in any view, and it
+  // comes and goes with how fast the machine running this check is.
+  if (/^ResizeObserver loop/.test(e.message || "")) return;
+  errors.push("window error: " + e.message);
+});
 window.addEventListener("unhandledrejection", (e) => errors.push("unhandled: " + (e.reason?.stack || e.reason?.message || e.reason)));
 
 const VIEWS = [

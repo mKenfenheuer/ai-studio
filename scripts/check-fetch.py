@@ -333,7 +333,7 @@ def main() -> int:
 
     host._fetch = lambda job_id, log: _TMP
     host._make_room = lambda need, log: None
-    host._plan_precision = lambda spec, log: False
+    host._plan_precision = lambda spec, log, path=None: False
     host._load = slow_load
     spec = {"job_id": "job_mistral", "params_b": 7.248}
 
