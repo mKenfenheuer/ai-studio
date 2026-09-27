@@ -935,12 +935,34 @@ async def _create_job(request: Request, payload: dict) -> str:
         # is the honest answer. Checked here so the refusal costs nothing,
         # rather than after a runner has downloaded fourteen gigabytes.
         kinds = {a["kind"] for a in db.list_artifacts(src["id"])}
-        if "model" not in kinds:
+        what = (cfg.get("what") or "model").strip().lower()
+        if what not in ("model", "adapter"):
+            raise HTTPException(400, "Export what: the model, or the adapter.")
+        cfg["what"] = what
+        if what == "adapter":
+            # A LoRA as its own GGUF, which llama.cpp applies at run time to
+            # the base it was fitted to: one base on the device and a small
+            # file per variant (a language, a task). Useless without that
+            # exact base, so the base is part of the export's record.
+            if not kinds & {"adapter", "model"}:
+                raise HTTPException(400, "That run left nothing to export.")
+            scfg = src.get("config") or {}
+            cfg["base_job"] = (cfg.get("base_job") or scfg.get("base_model_job") or "").strip()
+            cfg["base_model"] = cfg.get("base_model") or scfg.get("base_model") or ""
+            if cfg["base_job"]:
+                base = _job_or_404(request, cfg["base_job"])
+                if "model" not in {a["kind"] for a in db.list_artifacts(base["id"])}:
+                    raise HTTPException(
+                        400, "The adapter was fitted to run %s, which left no "
+                             "standalone model; the converter needs that model "
+                             "to read the adapter's shapes." % base["id"])
+            elif not cfg["base_model"]:
+                raise HTTPException(400, "The adapter's base model is not recorded on the run.")
+        elif "model" not in kinds:
             raise HTTPException(
-                400, "That run left an adapter, not a standalone model, and "
-                     "there is no such thing as a GGUF of an adapter — it is a "
-                     "few megabytes that mean nothing without the exact weights "
-                     "they were fitted to. Run it again with \"also produce a "
+                400, "That run left an adapter, not a standalone model. Export "
+                     "the adapter on its own (it runs on top of the model it "
+                     "was fitted to), or run it again with \"also produce a "
                      "standalone model\" turned on, and export that.")
         cfg["allow_cpu"] = True
         cfg.setdefault("name_hint", src["name"])

@@ -44,6 +44,14 @@ from .lora_llm import Cancelled
 CONVERTER = os.environ.get(
     "AI_STUDIO_GGUF_CONVERT", "/opt/llama.cpp/convert_hf_to_gguf.py")
 QUANTIZE = os.environ.get("AI_STUDIO_GGUF_QUANTIZE", "/opt/llama.cpp/llama-quantize")
+# The adapter converter sits beside the model converter in every llama.cpp.
+LORA_CONVERTER = os.environ.get(
+    "AI_STUDIO_GGUF_CONVERT_LORA",
+    str(Path(CONVERTER).with_name("convert_lora_to_gguf.py")))
+# What an adapter can be written as. Small either way -- a rank-32 adapter on
+# a 1.7B model's attention is 26 MB at f16 -- so there is little to gain from
+# going lower, and it is applied on top of whatever the base was quantised to.
+LORA_TYPES = {"F16": "f16", "Q8_0": "q8_0", "BF16": "bf16"}
 
 # The Python that runs the converter. Its own environment in the image, because
 # llama.cpp pins an older torch and transformers than the runner uses -- see the
@@ -100,6 +108,9 @@ def run(cfg: dict, ctx: Any) -> dict:
     source_job = cfg.get("source_job") or ""
     if not source_job:
         raise ValueError("No run was named to export.")
+    if (cfg.get("what") or "model") == "adapter":
+        return _export_adapter(cfg, ctx, source_job,
+                               (cfg.get("quantize") or "F16").upper())
     quant = (cfg.get("quantize") or "Q4_K_M").upper()
     if quant not in QUANT_TYPES:
         raise ValueError("%s is not a quantisation this can produce. Choose "
@@ -205,6 +216,79 @@ def run(cfg: dict, ctx: Any) -> dict:
         "artifact_paths": {"gguf": str(zip_path)},
         "artifact_size": zip_path.stat().st_size,
         "note": "%s, %s" % (final.name, _size(final)),
+    }
+
+
+def _export_adapter(cfg: dict, ctx: Any, source_job: str, quant: str) -> dict:
+    """A run's LoRA as a GGUF adapter, for llama.cpp to apply to its base.
+
+    `convert_lora_to_gguf.py` reads the adapter's weights, and the base's
+    config for the shapes and names they belong to; the base's weights are
+    never read. The base is the model the adapter was fitted to -- another
+    run's merged model, fetched like any other, or a Hub id.
+    """
+    if not Path(LORA_CONVERTER).exists():
+        raise ValueError("This machine's llama.cpp has no convert_lora_to_gguf.py.")
+    outtype = LORA_TYPES.get(quant)
+    if not outtype:
+        raise ValueError("An adapter is written as %s; %s is for models."
+                         % (", ".join(LORA_TYPES), quant))
+    ctx.progress(0, 3, stage="loading_model")
+    # A run that also merged keeps its adapter beside the model; one that did
+    # not keeps it under the run's own name.
+    try:
+        adapter = artifacts.fetch(ctx.controller_url, ctx.runner_token,
+                                  source_job, ctx.log, kind="adapter",
+                                  keep=[source_job, cfg.get("base_job") or ""])
+    except Exception:  # noqa: BLE001 - the other place it can be
+        adapter = artifacts.fetch(ctx.controller_url, ctx.runner_token,
+                                  source_job, ctx.log)
+    if not (adapter / "adapter_config.json").exists():
+        raise ValueError("Run %s has no adapter to export." % source_job)
+
+    base_args: list[str]
+    if base_job := cfg.get("base_job"):
+        base = artifacts.fetch(ctx.controller_url, ctx.runner_token, base_job,
+                               ctx.log, keep=[source_job, base_job])
+        base = _readable_by_converter(base, Path(ctx.workdir) / "convert-base")
+        base_args = ["--base", str(base)]
+        ctx.log("The adapter's base is run %s's model." % base_job)
+    else:
+        base_args = ["--base-model-id", cfg["base_model"]]
+        ctx.log("The adapter's base is %s." % cfg["base_model"])
+
+    out_dir = Path(ctx.workdir) / "gguf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                  cfg.get("name_hint") or source_job).strip("-") or "adapter"
+    final = out_dir / ("%s.lora.%s.gguf" % (name, outtype))
+    ctx.progress(1, 3, stage="converting")
+    t0 = time.time()
+    _stream([CONVERT_PYTHON, LORA_CONVERTER, str(adapter), *base_args,
+             "--outfile", str(final), "--outtype", outtype], ctx)
+    ctx.log("Adapter written in %s. %s" % (_took(time.time() - t0), _size(final)))
+    (out_dir / "README.txt").write_text(
+        "%s\n\nA LoRA adapter, %s. It means nothing on its own: load it on top of\n"
+        "the model it was fitted to (%s).\n\n"
+        "llama.cpp:\n  llama-cli -m <base>.gguf --lora %s -p \"Hello\"\n\n"
+        "Made by AI Studio from run %s.\n"
+        % (name, outtype, cfg.get("base_job") or cfg.get("base_model"), final.name, source_job),
+        encoding="utf-8")
+    ctx.progress(3, 3, stage="saving")
+    zip_path = artifacts.pack(out_dir, Path(ctx.workdir) / ("%s-gguf.zip" % name))
+    return {
+        "kind": "export_gguf",
+        "what": "adapter",
+        "source_job": source_job,
+        "base_job": cfg.get("base_job") or None,
+        "base_model": cfg.get("base_model") or None,
+        "quantize": quant,
+        "filename": final.name,
+        "mmproj": None,
+        "bytes": final.stat().st_size,
+        "artifact_paths": {"gguf": str(zip_path)},
+        "artifact_size": zip_path.stat().st_size,
+        "note": "%s, %s (adapter)" % (final.name, _size(final)),
     }
 
 
