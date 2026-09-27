@@ -46,7 +46,8 @@ async def put_settings(request: Request, payload: dict = Body(...)) -> dict:
     # pod: somebody reading the template in the RunPod console sees the truth.
     if saved["api_key_set"] and manager.controller_url(saved):
         try:
-            saved["template"] = await manager.MANAGER.sync_template()
+            template = await manager.MANAGER.sync_template()
+            saved = {**manager.settings(), "template": template}
         except (ValueError, RunPodError) as e:
             saved["template_error"] = str(e)
     return saved

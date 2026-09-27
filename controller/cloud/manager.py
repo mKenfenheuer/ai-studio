@@ -684,9 +684,11 @@ class Manager:
         _update(pid, provider_id=(info or {}).get("id"),
                 price_per_hour=float((info or {}).get("cost") or offer["price"]))
         if job:
-            db.add_log(job["id"], "No machine of the studio can take this run, so a RunPod %s (%s cloud, "
-                       "$%.2f/h) is starting for it. Rough estimate: %.1f h, about $%.2f."
-                       % (offer["name"], offer["cloud"].lower(), offer["price"], est["hours"], est["usd"]))
+            why = ("This run was sent to a rented GPU" if (job.get("config") or {}).get("required_runner") == CLOUD_RUNNER_ID
+                   else "No machine of the studio can take this run")
+            db.add_log(job["id"], "%s, so a RunPod %s (%s cloud, $%.2f/h) is starting for it. "
+                       "Rough estimate: %.1f h, about $%.2f."
+                       % (why, offer["name"], offer["cloud"].lower(), offer["price"], est["hours"], est["usd"]))
         return pod(pid)
 
     async def sync_template(self) -> dict:
