@@ -34,6 +34,16 @@ RUN pip install --no-cache-dir \
 # every time this pin moves, and that compile is the long pole in this image.
 RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 
+# torchvision, for vision-language models: their processors import it even to
+# read a still photograph (Qwen3-VL's carries a video processor that insists on
+# it). Pinned to the release built for the torch already installed -- torch
+# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
+# because left to resolve on its own pip will happily "upgrade" torch to
+# whatever torchvision it found first, from the wrong index.
+RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
+    && pip install --no-cache-dir --no-deps --index-url ${TORCH_INDEX} "torchvision==${TV}" \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
+
 COPY runner /app/runner
 COPY common /app/common
 COPY pyproject.toml /app/
