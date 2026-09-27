@@ -821,7 +821,8 @@ class Fleet:
                 await self.broadcast_ui({"type": "jobs_changed", "job_id": job["id"]})
                 break
 
-    def note_checkpoints(self, runner_id: str, job_ids: list[str]) -> None:
+    def note_checkpoints(self, runner_id: str, job_ids: list[str],
+                         detail: list | None = None) -> None:
         """Record what a machine can resume, and reconcile it with the database.
 
         Both directions matter. A checkpoint the controller forgot (its
@@ -840,6 +841,26 @@ class Fleet:
                            "beginning."
                            % (db.get_runner(runner_id) or {}).get("name", "that machine"),
                            "warn")
+        # The other direction. A queued run the studio stopped waiting for --
+        # its machine was away past CHECKPOINT_WAIT_S: a laptop asleep, a
+        # process killed for memory -- still has its progress on that machine,
+        # and the machine is back. Until the run has started over somewhere
+        # else, the checkpoint is worth more than the minutes it cost.
+        steps = {d.get("job_id"): int(d.get("step") or 0)
+                 for d in detail or [] if isinstance(d, dict)}
+        for jid in held:
+            step = steps.get(jid, 0)
+            job = db.get_job(jid) if step > 0 else None
+            if not job or job.get("status") != "queued" \
+                    or int(job.get("checkpoint_step") or 0):
+                continue
+            db.set_checkpoint(jid, step, runner_id)
+            self.gave_up_waiting.discard(jid)
+            db.add_log(jid, "%s is back with this run's checkpoint from step "
+                       "%d, so the run carries on from there rather than "
+                       "starting over."
+                       % ((db.get_runner(runner_id) or {}).get("name", "The machine"),
+                          step))
 
     @staticmethod
     def _refresh_cards(job_id: str, summary: dict) -> None:
@@ -1090,7 +1111,8 @@ class Fleet:
         if kind == "heartbeat":
             db.touch_runner(runner_id, "busy" if msg.get("busy") else "online")
             if (held := msg.get("checkpoints")) is not None:
-                self.note_checkpoints(runner_id, held)
+                self.note_checkpoints(runner_id, held,
+                                      msg.get("checkpoint_detail"))
             if (resident := msg.get("loaded")) is not None:
                 self.loaded[runner_id] = list(resident)
             if (held := msg.get("pinned")) is not None:

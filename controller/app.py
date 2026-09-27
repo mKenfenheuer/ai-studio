@@ -177,7 +177,8 @@ async def runner_ws(ws: WebSocket) -> None:
         runner_id = first["runner_id"]
         db.upsert_runner(runner_id, first.get("name") or runner_id,
                          first.get("capabilities") or {})
-        fleet.note_checkpoints(runner_id, first.get("checkpoints") or [])
+        fleet.note_checkpoints(runner_id, first.get("checkpoints") or [],
+                               first.get("checkpoint_detail"))
         fleet.attach(runner_id, ws)
         await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
         # And what it may use of its own card, if this studio has narrowed it.

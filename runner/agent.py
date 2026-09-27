@@ -302,6 +302,9 @@ class Runner:
                 # the work to a machine that does not have it means starting
                 # from noise.
                 "checkpoints": checkpoints.list_ids(),
+                # With their steps, so a run the controller gave up waiting
+                # for can be handed back before it is sent somewhere else.
+                "checkpoint_detail": checkpoints.describe(),
                 # And what it is training right now, which on a fresh start is
                 # nothing. The controller needs this at connect time, not at
                 # the next heartbeat: a container that restarts and dials back

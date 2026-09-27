@@ -217,6 +217,18 @@ def main() -> int:
     check("with its checkpoint", (jr["checkpoint_step"], jr["checkpoint_runner"]), (40, "run_x"))
     check("the machine is free", "run_x" in fleet.busy, False)
 
+    print("a machine that comes back after the studio gave up waiting gets its run back")
+    db.clear_checkpoint(jp)            # what _eligible does after CHECKPOINT_WAIT_S
+    fleet.gave_up_waiting.add(jp)
+    fleet.note_checkpoints("run_x", [jp], [{"job_id": jp, "step": 58}])
+    jr = db.get_job(jp)
+    check("bound to it again, at its step", (jr["checkpoint_step"], jr["checkpoint_runner"]), (58, "run_x"))
+    check("and the run says so", any("back with" in (l.get("line") or "") for l in db.get_logs(jp)))
+    db.set_job_status(jp, "running")
+    db.clear_checkpoint(jp)
+    fleet.note_checkpoints("run_x", [jp], [{"job_id": jp, "step": 58}])
+    check("not once it has started over elsewhere", db.get_job(jp)["checkpoint_step"], 0)
+
     print()
     if FAILED:
         print("%d check(s) failed:" % len(FAILED))
