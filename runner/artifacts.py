@@ -184,12 +184,19 @@ def _protected(keep: Iterable[str]) -> set[str]:
     itself by deleting the directory it was about to write into, and failed
     with "no such file" on a path it had just created.
     """
-    names = set()
-    for job_id in keep or ():
-        for name in (job_id, job_id + "-adapter"):
-            names.add(name)
-            names.add(name + ".partial")
-    return names
+    return {job_id for job_id in keep or () if job_id}
+
+
+def _is_protected(name: str, protected: set[str]) -> bool:
+    """Whether a cache directory holds one of the protected runs' artifacts.
+
+    By prefix, not by a list of kinds: a run's merged model, its adapter and
+    its GGUF are `<id>`, `<id>-adapter` and `<id>-gguf`, each with a
+    `.partial` while it downloads. Listing the kinds missed the GGUF, and an
+    upload of one evicted the directory it was downloading into.
+    """
+    base = name[:-len(".partial")] if name.endswith(".partial") else name
+    return any(base == j or base.startswith(j + "-") for j in protected)
 
 
 def _shortfall(need_bytes: int) -> int:
@@ -203,7 +210,7 @@ def _shortfall(need_bytes: int) -> int:
 def _oldest_model(protected: set[str]) -> Path | None:
     try:
         candidates = [d for d in CACHE_DIR.iterdir()
-                      if d.is_dir() and d.name not in protected]
+                      if d.is_dir() and not _is_protected(d.name, protected)]
     except OSError:
         return None
     if not candidates:

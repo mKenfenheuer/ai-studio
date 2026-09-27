@@ -302,6 +302,23 @@ def main() -> int:
           stale.exists(), False)
 
     # ------------------------------------------------------------------
+    print(NL + "Making room never takes the download it is making room for")
+    # An upload of a GGUF, on a disk near its floor: the staging directory was
+    # `<id>-gguf.partial`, which the protected list (model and adapter only)
+    # did not name, and partials are evicted first.
+    for name in ("job_g-gguf.partial", "job_old", "job_g-adapter"):
+        (artifacts.CACHE_DIR / name).mkdir(parents=True, exist_ok=True)
+        (artifacts.CACHE_DIR / name / ".ai_studio_used").write_text("0")
+    protected = artifacts._protected(["job_g"])
+    victim = artifacts._oldest_model(protected)
+    check("a kept run's GGUF download is not evicted",
+          victim is not None and not victim.name.startswith("job_g"))
+    check("nor are its other artifacts",
+          [artifacts._is_protected(n, protected) for n in
+           ("job_g", "job_g.partial", "job_g-adapter", "job_g-gguf", "job_gx", "job_old")],
+          [True, True, True, True, False, False])
+
+    # ------------------------------------------------------------------
     print(NL + "A deployment and a conversation never load onto the card at once")
     # The second half of the same morning. With the download fixed, both
     # callers got the model -- and then both loaded it, because a deployment's
