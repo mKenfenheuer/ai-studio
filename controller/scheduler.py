@@ -1123,6 +1123,19 @@ class Fleet:
                     load_s=msg.get("load_s") if state in ("ready", "failed") else None)
             if state in ("ready", "failed"):
                 self.deploying.pop(did, None)
+            if state == "ready" and (job_id := msg.get("job_id")):
+                # The runner pins a model before it says ready, so this is
+                # what its next heartbeat will say -- written down now rather
+                # than in fifteen seconds. Waiting for it, the reconciler ran
+                # in between, saw a deployment no longer in flight and not yet
+                # pinned, took it for lost and sent it again; the runner, still
+                # holding it, answered ready at once, and on the third round
+                # the deployment was written off as a machine that "did not
+                # survive loading the model" -- with the model loaded.
+                pinned = self.pinned.setdefault(runner_id, [])
+                if job_id not in pinned:
+                    pinned.append(job_id)
+                self.preload_attempts.pop(did, None)
             await self.broadcast_ui({"type": "deployments_changed",
                                      "deployment_id": did, "state": state,
                                      "detail": msg.get("detail") or ""})

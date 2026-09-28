@@ -172,6 +172,41 @@ ok("saying what actually happened",
    "did not survive" in (db.get_deployment(silent["id"])["detail"] or ""))
 db.delete_deployment(silent["id"])
 
+# The opposite case, and the one that actually happened: a model that loaded,
+# said so, and was written off anyway because the reconciler ran before the
+# heartbeat that lists it as pinned.
+print("")
+print("A model that loaded and said so")
+
+fleet3 = Fleet()
+fleet3.attach(a, object())
+loaded = db.create_deployment(job["id"], a, owner_id="usr_1")
+resent = []
+
+
+async def _answers_ready():
+    async def fake_send(row):
+        resent.append(row["id"])
+        fleet3.deploying[row["id"]] = 0.0
+    fleet3.send_deployment = fake_send
+
+    async def no_ui(_msg):
+        return None
+    fleet3.broadcast_ui = no_ui
+    await fleet3.reconcile_deployments()            # sent once
+    await fleet3.handle_runner_message(a, {
+        "type": "deployment_state", "deployment_id": loaded["id"],
+        "job_id": job["id"], "state": "ready", "detail": "held"})
+    for _ in range(5):                              # before any heartbeat
+        await fleet3.reconcile_deployments()
+
+asyncio.run(_answers_ready())
+ok("is sent once, not again while its heartbeat is on the way",
+   len(resent) == 1, "-- sent %d times" % len(resent))
+ok("and stays ready", db.get_deployment(loaded["id"])["state"] == "ready",
+   "-- %r" % db.get_deployment(loaded["id"])["detail"])
+db.delete_deployment(loaded["id"])
+
 bad = False
 try:
     db.set_deployment_state("dep_nope", "sideways")
