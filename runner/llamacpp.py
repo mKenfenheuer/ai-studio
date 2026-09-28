@@ -119,10 +119,20 @@ def available() -> tuple[bool, str]:
 # ----------------------------------------------------------------- converting
 
 class _Log:
-    """What the export job's helpers expect of a run: somewhere to log to."""
+    """What the export job's helpers expect of a run: somewhere to log to.
+
+    Less of it than an export shows. Here each line becomes a deployment's
+    status, written to the database, and the quantiser reports every one of a
+    7B's 291 tensors -- worth nothing to somebody watching "loading".
+    """
+    _PER_TENSOR = re.compile(r"^\[\s*\d+/\s*\d+\]|^INFO:hf-to-gguf:(blk|gguf:)")
 
     def __init__(self, log: Callable[[str], None]):
-        self.log = log
+        self._out = log
+
+    def log(self, line: str) -> None:
+        if not self._PER_TENSOR.search(line):
+            self._out(line)
 
     @staticmethod
     def should_cancel() -> bool:

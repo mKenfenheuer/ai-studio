@@ -94,11 +94,20 @@ RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 # month and does not this month, because an image was rebuilt, is the worst
 # kind of surprise. Move the pin deliberately.
 #
-# The quantiser and the server are built -- not the CLI, not the tests. The
+# Only the quantiser and the server are kept -- not the CLI, not the tests. The
 # server is what a runner set to AI_STUDIO_CPU_QUANTIZATION=gguf answers
 # conversations with (runner/llamacpp.py): llama.cpp's Q4_K_M kernels are the
 # only quantised path that is fast on a processor without AVX-512, where
 # bitsandbytes took nine seconds a token for a 7B.
+#
+# Built for every x86 processor rather than for the one building it. CMake's
+# default is -march=native, and the image is built on a GitHub runner with
+# AVX-512: the first build of the server died with "Illegal instruction" on
+# the lab's Ryzen 5 5600 before it printed its version. So, as llama.cpp's
+# own images do, the CPU code is built once per instruction-set level as a
+# loadable backend (GGML_CPU_ALL_VARIANTS) and the best one this machine can
+# run is picked when the server starts. That needs shared libraries; they go
+# beside the binaries, which look for them there ($ORIGIN).
 #
 # Its converter gets an environment of its own, and this is not tidiness. Its
 # requirements pin `torch~=2.2.1` and `transformers<5.0.0`, and installed into
@@ -121,9 +130,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
          https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
     && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
-         -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
-    && cmake --build /opt/llama.cpp/build --target llama-quantize llama-server -j "$(nproc)" \
+         -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+         -DLLAMA_BUILD_EXAMPLES=OFF \
+         -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+         -DBUILD_SHARED_LIBS=ON \
+         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON "-DCMAKE_INSTALL_RPATH=\$ORIGIN" \
+    && cmake --build /opt/llama.cpp/build -j "$(nproc)" \
     && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/build/bin/llama-server /opt/llama.cpp/ \
+    && find /opt/llama.cpp/build -name "*.so*" -exec cp -P {} /opt/llama.cpp/ \; \
+    && /opt/llama.cpp/llama-server --version \
     && python -m venv /opt/llama.cpp/venv \
     && /opt/llama.cpp/venv/bin/pip install --no-cache-dir \
          -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \
