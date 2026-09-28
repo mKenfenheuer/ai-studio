@@ -628,6 +628,17 @@ class Runner:
             say("failed", "This machine has no model host -- it is not one "
                           "that can serve.")
             return
+        if self.caps.get("backend") == "cpu" and not self.caps.get("cpu_serving"):
+            # A deployment outlives the setting that allowed it. The lab's
+            # was made while this runner served in 4-bit; switched to llama.cpp
+            # on an image whose server could not start, it fell back to
+            # float32 and the reconciler put the Mistral-7B back -- 28.7 of
+            # the box's 31.5 GB, with no swap and the controller beside it.
+            say("failed", "This machine has no card and is not set to serve "
+                          "models compressed (AI_STUDIO_CPU_QUANTIZATION), so "
+                          "holding one would take four bytes a parameter. "
+                          "Check its warnings on the Machines page.")
+            return
         say("loading", "Fetching and loading the model.")
         try:
             self.host.ensure_loaded(spec, lambda line: say("loading", line))
