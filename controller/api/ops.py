@@ -130,11 +130,13 @@ async def create_deployment(request: Request, payload: dict = Body(...)) -> dict
     if not runner:
         raise HTTPException(404, "No such machine.")
     caps = runner.get("capabilities") or {}
-    if caps.get("backend") not in ("cuda", "rocm", "mps"):
+    if caps.get("backend") not in ("cuda", "rocm", "mps") \
+            and caps.get("cpu_serving") != "4bit":
         raise HTTPException(
             400, "That machine has no graphics card. It would load the model "
                  "and answer at a word every few seconds, which is not worth "
-                 "the memory it would hold.")
+                 "the memory it would hold. A processor-only runner can be "
+                 "set to serve in 4-bit with AI_STUDIO_CPU_QUANTIZATION=4bit.")
     if db.runner_role(runner) == "training":
         raise HTTPException(
             400, "That machine is reserved for training. Set it to serving, "

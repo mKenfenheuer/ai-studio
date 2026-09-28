@@ -251,6 +251,86 @@ print("RESULT:" + json.dumps(out))
 """
 
 
+# 4-bit on the processor, for a runner told to serve that way -- see
+# cpu_quantization(). The same measurement the GPU probe makes, against float32
+# because that is what a processor computes in, and with one check the GPU
+# probe does not need: that the weight really was quantized. A bitsandbytes
+# with no processor backend leaves the float32 tensor where it is, and then
+# measures zero error and "passes" while quantizing nothing at all.
+_CPU_4BIT_PROBE = r"""
+import json, warnings
+warnings.filterwarnings("ignore")
+out = {"bnb_4bit": False, "bnb_4bit_decode": False, "bnb_4bit_error": None,
+       "bnb_4bit_decode_error": None, "bnb_error": None}
+try:
+    import torch
+    from bitsandbytes.nn import Linear4bit, Params4bit
+    n_in, n_out = 1024, 2048
+    ref = torch.nn.Linear(n_in, n_out, bias=False).eval()
+    lin = Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float32,
+                     quant_type="nf4")
+    lin.weight = Params4bit(ref.weight.data.clone(), requires_grad=False,
+                            quant_type="nf4")
+    lin = lin.to("cpu").eval()
+    if getattr(lin.weight, "quant_state", None) is None:
+        raise RuntimeError("this bitsandbytes does not quantize on the "
+                           "processor (0.46 or newer is needed)")
+
+    def _relative_error(rows):
+        x = torch.randn(rows, n_in)
+        with torch.no_grad():
+            want, got = ref(x), lin(x)
+        scale = want.abs().mean().clamp(min=1e-6)
+        return float((got - want).abs().mean() / scale)
+
+    out["bnb_4bit_error"] = round(_relative_error(8), 3)
+    out["bnb_4bit_decode_error"] = round(_relative_error(1), 3)
+    out["bnb_4bit"] = out["bnb_4bit_error"] < 0.35
+    out["bnb_4bit_decode"] = out["bnb_4bit_decode_error"] < 0.35
+    if not out["bnb_4bit_decode"]:
+        out["bnb_error"] = ("4-bit ran on the processor but returned wrong "
+                            "numbers (%.2f relative error against float32)."
+                            % out["bnb_4bit_decode_error"])
+except Exception as e:
+    out["bnb_error"] = str(e)[:200]
+print("RESULT:" + json.dumps(out))
+"""
+
+
+def cpu_quantization() -> str | None:
+    """What this machine's owner asked a processor-only runner to serve in.
+
+    `AI_STUDIO_CPU_QUANTIZATION=4bit`. Unset, a runner with no card loads a
+    model in float32 -- four bytes a parameter, so a 7B is 28 GB of RAM, more
+    than the box beside the controller has to spare. In 4-bit it is about
+    4 GB. Asked for rather than automatic, because it is a trade somebody
+    should choose: answers get slightly worse, and on a processor the
+    decompression costs time as well as saving memory.
+    """
+    value = os.environ.get("AI_STUDIO_CPU_QUANTIZATION", "").strip().lower()
+    return "4bit" if value in ("4bit", "nf4", "1", "true", "yes", "on") else None
+
+
+def _probe_cpu_4bit(timeout: int = 300) -> dict:
+    """Run the processor's 4-bit probe out of process, as the GPU one is."""
+    failed = {"bnb_4bit": False, "bnb_4bit_decode": False,
+              "bnb_4bit_error": None, "bnb_4bit_decode_error": None}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CPU_4BIT_PROBE],
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "PYTHONWARNINGS": "ignore"},
+        )
+    except subprocess.TimeoutExpired:
+        return {**failed, "bnb_error": "probe timed out"}
+    except OSError as e:
+        return {**failed, "bnb_error": str(e)[:200]}
+    if (found := _extract(proc.stdout, "RESULT:")) is not None:
+        return found
+    return {**failed, "bnb_error": "bitsandbytes stopped the probe (exit %s)"
+                                  % proc.returncode}
+
+
 def _run_subprocess_probe(timeout: int = 900) -> dict:
     """Run the dangerous probes in a child process.
 
@@ -586,6 +666,33 @@ def probe(quick: bool = False) -> dict:
                 "This machine's GPU could not run an attention kernel at all "
                 "(%s). Training here will fail; the PyTorch build most likely "
                 "does not match the hardware." % sub["sdpa_error"])
+
+    if device == "cpu" and cpu_quantization():
+        sub = _probe_cpu_4bit()
+        caps["quantization"] = {
+            "4bit": sub["bnb_4bit"],
+            "4bit_decode": sub["bnb_4bit_decode"],
+            "4bit_error": sub.get("bnb_4bit_error"),
+            "4bit_decode_error": sub.get("bnb_4bit_decode_error"),
+            "8bit": False, "optim_8bit": False,
+        }
+        if sub["bnb_4bit_decode"]:
+            # What the controller reads to hand this machine conversations
+            # and deployments at all, which it otherwise refuses a machine
+            # with no card. Only set once the probe has measured 4-bit right.
+            caps["cpu_serving"] = "4bit"
+            caps["notes"].append(
+                "Serving on the processor in 4-bit (AI_STUDIO_CPU_QUANTIZATION): "
+                "every model this machine answers with is loaded compressed, "
+                "about an eighth of its float32 size. Measured %.2f relative "
+                "error against float32, which is ordinary 4-bit loss."
+                % (sub.get("bnb_4bit_decode_error") or 0))
+        else:
+            caps["quantization"]["error"] = sub.get("bnb_error")
+            caps["warnings"].append(
+                "AI_STUDIO_CPU_QUANTIZATION asks for 4-bit on the processor, "
+                "and it does not work here (%s). Models load in float32."
+                % (sub.get("bnb_error") or "no reason reported"))
 
     _derive_recommendations(caps)
     caps["modalities"] = _modalities(caps)

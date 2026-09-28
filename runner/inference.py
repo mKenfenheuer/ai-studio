@@ -645,7 +645,20 @@ class ModelHost:
         neither, and is trusted for neither. Refusing to load is recoverable;
         serving somebody noise is not.
         """
+        if self.device == "cpu":
+            return self._cpu_4bit()
         return self.device == "cuda" \
+            and bool((self.caps.get("quantization") or {}).get("4bit_decode"))
+
+    def _cpu_4bit(self) -> bool:
+        """A processor-only runner told to serve every model in 4-bit.
+
+        Always, rather than only when full precision will not fit as on a
+        card: on a processor full precision is float32, eight times the size,
+        and there is no free-memory figure to plan against -- the first sign
+        of a model too big for the RAM is the kernel killing the runner.
+        """
+        return self.device == "cpu" and self.caps.get("cpu_serving") == "4bit" \
             and bool((self.caps.get("quantization") or {}).get("4bit_decode"))
 
     def _plan_precision(self, spec: dict, log: Callable[[str], None],
@@ -673,6 +686,14 @@ class ModelHost:
         and before the load rather than after: a model that cannot fit either
         way should not be read off disk twice to find that out.
         """
+        if self._cpu_4bit():
+            params_b = spec.get("params_b")
+            log("Loading in 4-bit on the processor, as this machine is set to "
+                "serve: %s." % (
+                    "about %.1f GB of weights instead of %.1f GB in float32"
+                    % (params_b * 0.5, params_b * 4)
+                    if params_b else "an eighth of its float32 size"))
+            return True
         params_b = spec.get("params_b")
         free = self._free_gb()
         if not params_b or free is None:
@@ -883,7 +904,7 @@ class ModelHost:
             )
             # bitsandbytes places the weights as it quantizes them; a model
             # built this way must not be moved afterwards.
-            extra["device_map"] = {"": 0}
+            extra["device_map"] = {"": "cpu" if self.device == "cpu" else 0}
         else:
             extra["dtype"] = dtype
             # Place the weights on the card as they are read, instead of

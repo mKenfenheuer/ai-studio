@@ -26,6 +26,7 @@ import { session } from "../app.js";
 import { html, raw, esc, $, on, toast, fmtAgo, fmtNum, fmtDuration, modal } from "../util.js";
 import { ribbon, rb, group, rbSelect, wireRibbon, tabState } from "../ribbon.js";
 import { pageHead, emptyState, confirmDestructive } from "../components.js";
+import { canServe, servingNote } from "../machines.js";
 
 const TABS = [
   { key: "overview", label: "Overview" },
@@ -149,9 +150,7 @@ export async function opsView(mount) {
 
   // ---- deploying ---------------------------------------------------------
   function deployDialog() {
-    const servers = runners.filter((r) =>
-      ["cuda", "rocm", "mps"].includes((r.capabilities || {}).backend)
-      && r.role !== "training");
+    const servers = runners.filter((r) => canServe(r) && r.role !== "training");
     const dlg = modal({
       title: "Hold a model on a machine",
       width: 580,
@@ -167,12 +166,13 @@ export async function opsView(mount) {
         <div class="field">
           <label for="dpRunner">On</label>
           <select id="dpRunner">${raw(servers.length
-            ? servers.map((r) => html`<option value="${r.id}">${r.name}${
+            ? servers.map((r) => html`<option value="${r.id}">${r.name}${servingNote(r)}${
                 r.role === "serving" ? " · reserved for serving" : ""}${
                 r.connected ? "" : " · offline"}</option>`).join("")
             : `<option value="">No machine here can serve a model</option>`)}</select>
-          <div class="hint">A machine with no graphics card is not offered: it
-            would answer at a word every few seconds.</div>
+          <div class="hint">A machine with no graphics card is offered only if
+            it is set to serve in 4-bit (AI_STUDIO_CPU_QUANTIZATION), and it
+            answers far more slowly than a card.</div>
         </div>
         <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
           <button type="button" class="btn" data-modal-close>Cancel</button>

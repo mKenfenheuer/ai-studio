@@ -10,6 +10,7 @@ import { mountCardEditor } from "./cardeditor.js";
 import { kindOf, subjectOf, stagesFor } from "../kinds.js";
 import { ribbon, rb, group, wireRibbon, tabState } from "../ribbon.js";
 import { breadcrumb, confirmDestructive } from "../components.js";
+import { canServe, servingNote } from "../machines.js";
 
 export async function jobView(mount, [jobId]) {
   let job = await api.job(jobId);
@@ -426,12 +427,11 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
       [runners, deployments] = await Promise.all([
         api.runners(), api.deployments().catch(() => [])]);
     } catch (e) { return toast(e.message, "err"); }
-    // A machine with no card would answer at a word every few seconds, and a
-    // machine reserved for training is somebody's arrangement. Neither is
-    // offered rather than being offered and then refused by the server.
-    const servers = runners.filter((r) =>
-      ["cuda", "rocm", "mps"].includes((r.capabilities || {}).backend)
-      && r.role !== "training");
+    // A machine with no card would answer at a word every few seconds unless
+    // it was set to serve in 4-bit, and a machine reserved for training is
+    // somebody's arrangement. Neither is offered rather than being offered
+    // and then refused by the server.
+    const servers = runners.filter((r) => canServe(r) && r.role !== "training");
     const already = deployments.filter((d) => d.job_id === job.id);
 
     const dlg = modal({ title: `Hold "${job.name}" on a machine`, width: 520,
@@ -448,7 +448,7 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
         <label for="dpTo">Machine</label>
         <select id="dpTo">${raw(servers.length
           ? servers.filter((r) => !already.some((d) => d.runner_id === r.id))
-              .map((r) => html`<option value="${r.id}">${r.name}${
+              .map((r) => html`<option value="${r.id}">${r.name}${servingNote(r)}${
                 r.role === "serving" ? " · reserved for serving" : ""}${
                 r.connected ? "" : " · offline"}</option>`).join("")
           : `<option value="">No machine here can serve a model</option>`)}</select>

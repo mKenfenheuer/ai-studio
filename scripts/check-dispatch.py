@@ -109,6 +109,41 @@ def conversations() -> None:
     studio.fleet.connections.pop("run_chat_cpu", None)
     db.delete_runner("run_chat_cpu")
 
+    # The same box told to serve in 4-bit (AI_STUDIO_CPU_QUANTIZATION): it
+    # serves what is deployed to it, and nothing else while a card is there.
+    print("\nA processor-only machine set to serve in 4-bit")
+    db.upsert_runner("run_chat_gpu", "docker-gpu", gpu_caps)
+    db.upsert_runner("run_chat_cpu", "controller-cpu",
+                     {**cpu_caps, "cpu_serving": "4bit",
+                      "quantization": {"4bit": True, "4bit_decode": True}})
+    studio.fleet.connections["run_chat_gpu"] = object()
+    studio.fleet.connections["run_chat_cpu"] = object()
+    rid, _ = studio._pick_chat_runner(mistral)
+    check("a model deployed nowhere still goes to the card", rid, "run_chat_gpu")
+    db.set_runner_role("run_chat_cpu", "serving")
+    rid, _ = studio._pick_chat_runner(mistral)
+    check("even when the processor is the one reserved for serving",
+          rid, "run_chat_gpu")
+    dep = db.create_deployment(mistral["id"], "run_chat_cpu")
+    db.set_deployment_state(dep["id"], "ready")
+    rid, _ = studio._pick_chat_runner(mistral)
+    check("a model deployed to the processor is answered there",
+          rid, "run_chat_cpu")
+    studio.fleet.connections.pop("run_chat_gpu")
+    db.mark_runner_offline("run_chat_gpu")
+    db.delete_deployment(dep["id"])
+    huge = {"id": "job_chat_70b", "kind": "finetune_llm",
+            "config": {"params_b": 70.0}, "runner_id": "run_chat_gpu"}
+    try:
+        rid, _ = studio._pick_chat_runner(huge)
+    except HTTPException:
+        rid = None
+    check("a model too large for its RAM even in 4-bit is not sent to it",
+          rid, None)
+    for r in ("run_chat_gpu", "run_chat_cpu"):
+        studio.fleet.connections.pop(r, None)
+        db.delete_runner(r)
+
 
 def main() -> int:
     fleet = Fleet()

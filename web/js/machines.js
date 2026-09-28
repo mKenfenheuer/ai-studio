@@ -28,6 +28,19 @@ export function byCapability(runners) {
   });
 }
 
+/** Whether a model may be held on this machine and talked to there: one
+ *  with a card, or a processor-only runner set to serve in 4-bit
+ *  (AI_STUDIO_CPU_QUANTIZATION). The server makes the same test. */
+export const canServe = (r) => {
+  const c = r?.capabilities || {};
+  return ["cuda", "rocm", "mps"].includes(c.backend) || c.cpu_serving === "4bit";
+};
+
+/** Said beside a processor-only machine in a list of places to serve from,
+ *  so choosing it is choosing slow on purpose. */
+export const servingNote = (r) =>
+  (r?.capabilities || {}).backend === "cpu" ? " · processor, 4-bit" : "";
+
 /** The machines worth offering, best first. */
 export const usableMachines = (runners) =>
   byCapability((runners || []).filter((r) => r.status !== "offline"));

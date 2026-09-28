@@ -72,6 +72,15 @@ RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].spl
     && pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu "torchvision==${TV}" \
     && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 
+# bitsandbytes, for serving in 4-bit on the processor when the runner is told
+# to (AI_STUDIO_CPU_QUANTIZATION=4bit). From 0.46 its Linux wheel carries a
+# processor backend, and NF4 there measures the same ~0.1 relative error as on
+# a card. --no-deps for the torchvision reason above: resolved on its own, pip
+# may fetch a CUDA torch from PyPI to satisfy it. Unused unless asked for --
+# the capability probe only imports it when the variable is set.
+RUN pip install --no-cache-dir --no-deps "bitsandbytes>=0.50" \
+    && python -c "import bitsandbytes, torch; print('bitsandbytes', bitsandbytes.__version__, 'torch', torch.__version__)"
+
 # The grammar engine behind `response_format`. Pure Python and tiny, and in a
 # layer of its own so a change to its pin does not reinstall the stack above.
 RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
