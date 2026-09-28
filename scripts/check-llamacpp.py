@@ -140,9 +140,13 @@ def main() -> int:
     host = host_with(FakeServer(["done.", "<|im_", "end|>"]))
     host.generate(SPEC, ASK, {}, lambda d, ch: seen.append(d), lambda _l: None)
     check("half a marker is never shown", any("<|im_" in d for d in seen), False)
+    floor = llamacpp.DEADLINE_FLOOR_S
+    check("a processor gets longer than a card's five minutes", floor > 300)
+    llamacpp.DEADLINE_FLOOR_S = 0.0
     slow = FakeServer(["a"] * 50, delay=0.05)
     host = host_with(slow)
     out = host.generate(SPEC, ASK, {"deadline_s": 0.3}, None, lambda _l: None)
+    llamacpp.DEADLINE_FLOOR_S = floor
     check("a deadline stops it and says so", out["stop_reason"], "timeout")
     check("keeping what was written", 0 < len(out["text"]) < 50)
 

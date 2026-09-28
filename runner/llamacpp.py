@@ -77,6 +77,15 @@ CONTEXT = int(os.environ.get("AI_STUDIO_GGUF_CONTEXT", "16384"))
 # conversation. Past it the least recently used undeployed one is stopped.
 MAX_RESIDENT = max(1, int(os.environ.get("AI_STUDIO_GGUF_MAX_MODELS", "2")))
 
+# How long one reply may take here, at least. The controller sends one
+# deadline for every machine -- five minutes, sized for a card -- and a
+# processor reads a prompt at about 21 tokens a second (a Mistral-7B on the
+# lab's four cores): a tagger's 6,245-token prompt was 98% read when those
+# five minutes ran out. Raised rather than replaced, and kept under the
+# controller's own wait of 600 seconds, which is how long it listens to a
+# runner that says nothing -- and a prefill says nothing.
+DEADLINE_FLOOR_S = float(os.environ.get("AI_STUDIO_GGUF_DEADLINE_S") or 540)
+
 # How long a server may take to come up. It memory-maps the file, so this is
 # seconds on a warm disk; the allowance is for a cold one.
 START_TIMEOUT_S = 600.0
@@ -145,7 +154,8 @@ def _cache_name(ref: str) -> str:
 
 
 def _gguf_of(folder: Path, ref: str, base_model: str,
-             log: Callable[[str], None], keep: set[str]) -> Path:
+             log: Callable[[str], None], keep: set[str],
+             hub_id: str | None = None) -> Path:
     """The quantised GGUF of a model folder, converting it if need be.
 
     Built in a `.partial` directory and renamed into place, like every other
@@ -165,7 +175,11 @@ def _gguf_of(folder: Path, ref: str, base_model: str,
     # The full-precision intermediate is the peak: two bytes a parameter,
     # plus the quantised file written beside it.
     need = int((params_b or 8.0) * 2.7 * artifacts.GB)
-    artifacts.ensure_room(need, keep={*keep, final_dir.name}, log=log)
+    # The source may itself be in the Hugging Face cache, which is what
+    # eviction reaches for second -- so it is named, or it is the first thing
+    # to go and the converter is handed a directory that no longer exists.
+    artifacts.ensure_room(need, keep={*keep, final_dir.name}, log=log,
+                          keep_hf=[hub_id] if hub_id else ())
 
     staging = final_dir.with_name(final_dir.name + ".partial")
     shutil.rmtree(staging, ignore_errors=True)
@@ -421,7 +435,7 @@ class LlamaCppHost(inference.ModelHost):
         if isinstance(path, str):                       # a Hub id
             folder = _hub_folder(path, token, log)
             tok = AutoTokenizer.from_pretrained(str(folder))
-            gguf = _gguf_of(folder, spec["job_id"], path, log, keep)
+            gguf = _gguf_of(folder, spec["job_id"], path, log, keep, hub_id=path)
         elif (path / "adapter_config.json").exists():
             base = spec.get("base_model")
             base_folder: Path | None = None
@@ -439,7 +453,8 @@ class LlamaCppHost(inference.ModelHost):
                 base_folder, base_ref = _hub_folder(base, token, log), "hub:" + base
             log("Serving the adapter on top of %s through llama.cpp."
                 % (base or base_ref))
-            gguf = _gguf_of(base_folder, base_ref, base or "", log, keep)
+            gguf = _gguf_of(base_folder, base_ref, base or "", log, keep,
+                            hub_id=base if base_ref.startswith("hub:") else None)
             lora = _lora_of(path, spec["job_id"],
                             ["--base", str(base_folder)], log)
             tok = AutoTokenizer.from_pretrained(
@@ -560,8 +575,9 @@ class LlamaCppHost(inference.ModelHost):
                     else {"type": "object"}
 
             t0 = time.time()
-            deadline = t0 + float(params.get("deadline_s")
-                                  or inference.GENERATION_DEADLINE_S)
+            deadline = t0 + max(float(params.get("deadline_s")
+                                      or inference.GENERATION_DEADLINE_S),
+                                DEADLINE_FLOOR_S)
             state = {"full": "", "emitted": "", "hit_stop": False,
                      "off_template": False, "reason": None}
             shown = {"reasoning": "", "content": ""}

@@ -51,6 +51,12 @@ HEADROOM_GB = 1.5
 # a tagger with a 3,800-token system prompt needs more than a chat assistant.
 MIN_SERVE_CONTEXT = int(os.environ.get("AI_STUDIO_MIN_SERVE_CONTEXT", "8192"))
 
+# What `_make_room` aims to have free for a model whose size nobody recorded:
+# a 3B at 16 bits and its headroom. A floor rather than "clear the card" --
+# see the note there. Referred to since 2026-09-09 and never defined, so every
+# such load died of a NameError before it reached the card.
+UNKNOWN_NEED_GB = 8.0
+
 
 class OutOfRoom(RuntimeError):
     """An out-of-memory that has already been explained in plain language.

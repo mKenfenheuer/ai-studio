@@ -220,7 +220,7 @@ def _oldest_model(protected: set[str]) -> Path | None:
     return min(partials or candidates, key=_used_at)
 
 
-def _evict_hf(log: Callable[[str], None]) -> bool:
+def _evict_hf(log: Callable[[str], None], keep_hf: Iterable[str] = ()) -> bool:
     """Drop the least recently used revision from the Hugging Face cache.
 
     Second in line after our own cache, because a base model here was pulled
@@ -238,7 +238,9 @@ def _evict_hf(log: Callable[[str], None]) -> bool:
         from huggingface_hub import scan_cache_dir
 
         info = scan_cache_dir(HF_CACHE_DIR)
-        revisions = [(rev, repo) for repo in info.repos for rev in repo.revisions]
+        spared = set(keep_hf or ())
+        revisions = [(rev, repo) for repo in info.repos
+                     if repo.repo_id not in spared for rev in repo.revisions]
         if not revisions:
             return False
         rev, repo = min(revisions, key=lambda pair: pair[0].last_modified or 0)
@@ -252,12 +254,16 @@ def _evict_hf(log: Callable[[str], None]) -> bool:
 
 
 def ensure_room(need_bytes: int, keep: Iterable[str] = (),
-                log: Callable[[str], None] = lambda _s: None) -> bool:
+                log: Callable[[str], None] = lambda _s: None,
+                keep_hf: Iterable[str] = ()) -> bool:
     """Free space until `need_bytes` fits above the watermark. True if it does.
 
     Evicts our own cache first, least recently used, then the Hugging Face
     cache. Models named in `keep` -- loaded on the card, or being fetched right
-    now -- are never candidates. Returning False rather than raising is
+    now -- are never candidates, and nor are the Hugging Face repos named in
+    `keep_hf`: a model being converted from the Hub cache was the first thing
+    the eviction reached for, and the converter then found no directory.
+    Returning False rather than raising is
     deliberate: the fetch is still worth attempting, and the disk's own error
     is a better one than a guess made in advance.
     """
@@ -269,7 +275,7 @@ def ensure_room(need_bytes: int, keep: Iterable[str] = (),
             shutil.rmtree(victim, ignore_errors=True)
             log("Cache full: evicted %s (%.1f GB)." % (victim.name, freed))
             continue
-        if _evict_hf(log):
+        if _evict_hf(log, keep_hf):
             continue
         log("Cache full and nothing left to evict; the download may fail.")
         return False
