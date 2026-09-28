@@ -307,7 +307,8 @@ class TooManyRequests(HTTPException):
 
 
 async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
-    """Send the request to a runner and return (request_id, queue, runner_id)."""
+    """Send the request to a runner and return (request_id, queue, runner_id,
+    how long to wait for each frame of the reply)."""
     from ..app import _pick_chat_runner        # local: avoids an import cycle
 
     fmt = payload.get("response_format") or {}
@@ -373,7 +374,7 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
             "a time; try again shortly."
             % FLEET.queue_depth(runner_id),
             retry_after=config.SERVING_QUEUE_RETRY_S)
-    return rid, queue, runner_id
+    return rid, queue, runner_id, wait_s
 
 
 def unsupported_options(payload: dict):
@@ -496,7 +497,8 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
 
     started = time.time()
     try:
-        rid, queue, who["runner_id"] = await _dispatch(job, messages, payload)
+        rid, queue, who["runner_id"], wait_s = await _dispatch(job, messages,
+                                                               payload)
     except HTTPException as e:
         # A request that never reached a machine is still a request that
         # failed, and it is the failure most worth seeing: it means the fleet
