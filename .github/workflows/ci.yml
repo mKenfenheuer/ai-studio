@@ -83,6 +83,9 @@ jobs:
       - name: A reply held to its format could not have been written otherwise
         run: python scripts/check-grammar.py
 
+      - name: Serving on a processor through llama.cpp
+        run: python scripts/check-llamacpp.py
+
       - name: Stored files are shared, counted and released
         run: python scripts/check-assets.py
 

@@ -300,14 +300,21 @@ print("RESULT:" + json.dumps(out))
 def cpu_quantization() -> str | None:
     """What this machine's owner asked a processor-only runner to serve in.
 
-    `AI_STUDIO_CPU_QUANTIZATION=4bit`. Unset, a runner with no card loads a
-    model in float32 -- four bytes a parameter, so a 7B is 28 GB of RAM, more
-    than the box beside the controller has to spare. In 4-bit it is about
-    4 GB. Asked for rather than automatic, because it is a trade somebody
-    should choose: answers get slightly worse, and on a processor the
-    decompression costs time as well as saving memory.
+    `AI_STUDIO_CPU_QUANTIZATION=gguf` or `=4bit`. Unset, a runner with no card
+    loads a model in float32 -- four bytes a parameter, so a 7B is 28 GB of
+    RAM, more than the box beside the controller has to spare. Asked for
+    rather than automatic, because it is a trade somebody should choose:
+    answers get slightly worse.
+
+    `gguf` serves through llama.cpp (runner/llamacpp.py) and is the one to
+    use: its kernels multiply the packed weights directly. `4bit` is
+    bitsandbytes, which saves the same memory but on a processor without
+    AVX-512 unpacks every weight for every token -- nine seconds a token for
+    a 7B on the lab's Ryzen.
     """
     value = os.environ.get("AI_STUDIO_CPU_QUANTIZATION", "").strip().lower()
+    if value in ("gguf", "llama.cpp", "llamacpp"):
+        return "gguf"
     return "4bit" if value in ("4bit", "nf4", "1", "true", "yes", "on") else None
 
 
@@ -667,7 +674,24 @@ def probe(quick: bool = False) -> dict:
                 "(%s). Training here will fail; the PyTorch build most likely "
                 "does not match the hardware." % sub["sdpa_error"])
 
-    if device == "cpu" and cpu_quantization():
+    if device == "cpu" and cpu_quantization() == "gguf":
+        from . import llamacpp
+        ok, detail = llamacpp.available()
+        if ok:
+            caps["cpu_serving"] = "gguf"
+            caps["llama_cpp"] = detail
+            caps["notes"].append(
+                "Serving on the processor through llama.cpp "
+                "(AI_STUDIO_CPU_QUANTIZATION=gguf, %s): every model this "
+                "machine answers conversations with is converted to %s GGUF "
+                "once, cached, and served from it. Scoring runs still load "
+                "models through transformers." % (detail, llamacpp.QUANT))
+        else:
+            caps["warnings"].append(
+                "AI_STUDIO_CPU_QUANTIZATION=gguf asks for serving through "
+                "llama.cpp, and it is not usable here (%s). This machine will "
+                "not be offered conversations." % detail)
+    elif device == "cpu" and cpu_quantization():
         sub = _probe_cpu_4bit()
         caps["quantization"] = {
             "4bit": sub["bnb_4bit"],

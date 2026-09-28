@@ -171,7 +171,7 @@ export async function opsView(mount) {
                 r.connected ? "" : " · offline"}</option>`).join("")
             : `<option value="">No machine here can serve a model</option>`)}</select>
           <div class="hint">A machine with no graphics card is offered only if
-            it is set to serve in 4-bit (AI_STUDIO_CPU_QUANTIZATION), and it
+            it is set to serve compressed (AI_STUDIO_CPU_QUANTIZATION), and it
             answers far more slowly than a card.</div>
         </div>
         <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">

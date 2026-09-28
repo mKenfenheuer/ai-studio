@@ -253,7 +253,7 @@ class Runner:
             self.caps.get("arch") or "-"))
         for w in self.caps.get("warnings", []):
             print("[runner] note: %s" % w)
-        self.host = inference.ModelHost(self.controller_url, self.token, self.caps)
+        self.host = inference.host_for(self.controller_url, self.token, self.caps)
 
         backoff = RECONNECT_MIN_S
         while True:

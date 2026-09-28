@@ -94,8 +94,11 @@ RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 # month and does not this month, because an image was rebuilt, is the worst
 # kind of surprise. Move the pin deliberately.
 #
-# Only the quantiser is built -- not the server, not the CLI, not the tests --
-# which keeps this to a couple of minutes and a few tens of megabytes.
+# The quantiser and the server are built -- not the CLI, not the tests. The
+# server is what a runner set to AI_STUDIO_CPU_QUANTIZATION=gguf answers
+# conversations with (runner/llamacpp.py): llama.cpp's Q4_K_M kernels are the
+# only quantised path that is fast on a processor without AVX-512, where
+# bitsandbytes took nine seconds a token for a 7B.
 #
 # Its converter gets an environment of its own, and this is not tidiness. Its
 # requirements pin `torch~=2.2.1` and `transformers<5.0.0`, and installed into
@@ -119,8 +122,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
     && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
-    && cmake --build /opt/llama.cpp/build --target llama-quantize -j "$(nproc)" \
-    && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/llama-quantize \
+    && cmake --build /opt/llama.cpp/build --target llama-quantize llama-server -j "$(nproc)" \
+    && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/build/bin/llama-server /opt/llama.cpp/ \
     && python -m venv /opt/llama.cpp/venv \
     && /opt/llama.cpp/venv/bin/pip install --no-cache-dir \
          -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \

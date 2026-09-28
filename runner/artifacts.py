@@ -518,7 +518,7 @@ def summary(job_id: str, kind: str | None = None) -> dict:
 def clear(job_id: str | None = None) -> None:
     """Forget a run's cached artifacts -- both of them -- or the lot."""
     if job_id:
-        for name in (job_id, job_id + "-adapter"):
+        for name in (job_id, job_id + "-adapter", job_id + "-llamacpp"):
             shutil.rmtree(CACHE_DIR / name, ignore_errors=True)
             shutil.rmtree(CACHE_DIR / (name + ".partial"), ignore_errors=True)
     else:

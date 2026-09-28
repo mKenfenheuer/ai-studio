@@ -1563,5 +1563,18 @@ class ModelHost:
             }
 
 
+def host_for(controller_url: str, token: str, caps: dict) -> ModelHost:
+    """The host this runner answers conversations with.
+
+    llama.cpp on a processor-only runner set to serve that way, transformers
+    everywhere else. Scoring builds its own ModelHost regardless: it reads
+    log-probabilities off the model, which only transformers gives it.
+    """
+    if caps.get("backend") == "cpu" and caps.get("cpu_serving") == "gguf":
+        from .llamacpp import LlamaCppHost
+        return LlamaCppHost(controller_url, token, caps)
+    return ModelHost(controller_url, token, caps)
+
+
 def clear_cache(job_id: str | None = None) -> None:
     artifacts.clear(job_id)

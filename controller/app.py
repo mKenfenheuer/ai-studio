@@ -2629,11 +2629,12 @@ def _serves_models(r: dict) -> bool:
     somebody's deliberate arrangement, not a serving box.
     """
     caps = r.get("capabilities") or {}
-    # Unless its owner set it to serve in 4-bit (AI_STUDIO_CPU_QUANTIZATION),
+    # Unless its owner set it to serve compressed (AI_STUDIO_CPU_QUANTIZATION:
+    # llama.cpp or bitsandbytes 4-bit),
     # which is choosing the slow answer on purpose: usually to keep a small
     # tagging model off the card that is training.
     if caps.get("backend") not in ("cuda", "rocm", "mps") \
-            and caps.get("cpu_serving") != "4bit":
+            and not caps.get("cpu_serving"):
         return False
     # A machine reserved for training is one somebody set aside for runs. It
     # can serve and will not be asked to: a conversation landing on it is the
@@ -2691,7 +2692,7 @@ def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict
             # when nothing can, says which capability was missing.
             return False
         params_b = job["config"].get("params_b")
-        if caps.get("cpu_serving") == "4bit" and params_b and caps.get("ram_gb") \
+        if caps.get("cpu_serving") and params_b and caps.get("ram_gb") \
                 and params_b * 0.5 + 2 > caps["ram_gb"]:
             # In RAM, compressed, with the same allowance for the conversation
             # a card gets. Past that the kernel kills the runner mid-load.
@@ -2730,7 +2731,7 @@ def _pick_chat_runner(job: dict, needs_grammar: bool = False) -> tuple[str, dict
             # on that card because a person said it should be, and the whole
             # value of having said so is that requests go there.
             rid not in deployed,
-            # A processor serving in 4-bit comes after every card: slower by
+            # A processor serving compressed comes after every card: slower by
             # an order of magnitude, and only the right place for a model
             # somebody deployed there.
             (r.get("capabilities") or {}).get("backend") == "cpu",

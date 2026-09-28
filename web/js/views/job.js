@@ -428,7 +428,7 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
         api.runners(), api.deployments().catch(() => [])]);
     } catch (e) { return toast(e.message, "err"); }
     // A machine with no card would answer at a word every few seconds unless
-    // it was set to serve in 4-bit, and a machine reserved for training is
+    // it was set to serve compressed, and a machine reserved for training is
     // somebody's arrangement. Neither is offered rather than being offered
     // and then refused by the server.
     const servers = runners.filter((r) => canServe(r) && r.role !== "training");

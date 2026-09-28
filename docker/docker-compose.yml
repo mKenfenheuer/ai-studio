@@ -94,11 +94,13 @@ services:
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
       AI_STUDIO_RUNNER_KINDS: ${AI_STUDIO_CPU_RUNNER_KINDS:-upload,generate_dataset,export_gguf,evaluate,finetune_vision_cls}
-      # `4bit` lets this machine hold models and answer with them, compressed:
-      # a 7B is about 4 GB of RAM instead of 28 in float32. Far slower than
-      # any card, and meant for a model deployed here on purpose, such as a
-      # tagger that should not queue behind training.
-      # Empty, it serves nothing, and conversations never come to it.
+      # `gguf` lets this machine hold models and answer with them through
+      # llama.cpp: each is converted to Q4_K_M once and served from that, a 7B
+      # in about 5 GB of RAM. `4bit` does the same through bitsandbytes, which
+      # is far slower on a processor without AVX-512. Meant for a model
+      # deployed here on purpose, such as a tagger that should not queue
+      # behind training. Empty, it serves nothing, and conversations never
+      # come to it.
       AI_STUDIO_CPU_QUANTIZATION: ${AI_STUDIO_CPU_QUANTIZATION:-}
       HF_TOKEN: ${HF_TOKEN:-}
 
