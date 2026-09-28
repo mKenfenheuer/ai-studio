@@ -905,6 +905,14 @@ class ModelHost:
             # bitsandbytes places the weights as it quantizes them; a model
             # built this way must not be moved afterwards.
             extra["device_map"] = {"": "cpu" if self.device == "cpu" else 0}
+            if self.device == "cpu":
+                # What is not quantized -- embeddings, norms, the output
+                # layer, and with them every activation -- in float32 rather
+                # than the checkpoint's own bfloat16. A processor without
+                # native bfloat16 (AVX2: the lab's Ryzen 5 5600) multiplies it
+                # at 0.4 GFLOP/s against 279 in float32, so a Mistral-7B read
+                # a 12,000-token prompt for five minutes and wrote nothing.
+                extra["dtype"] = dtype
         else:
             extra["dtype"] = dtype
             # Place the weights on the card as they are read, instead of
