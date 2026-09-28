@@ -321,9 +321,9 @@ class Fleet:
         """
         from . import config
 
-        cutoff = time.time() - (config.GENERATION_DEADLINE_S + 120.0)
         for runner_id, started in list(self.serving_since.items()):
-            if started > cutoff:
+            caps = (db.get_runner(runner_id) or {}).get("capabilities")
+            if started > time.time() - (config.generation_deadline(caps) + 120.0):
                 continue
             rid = self.serving_now.get(runner_id) or ""
             print("[serving] freeing a stuck slot on %s (request %s, %ds)"

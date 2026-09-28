@@ -680,6 +680,9 @@ def probe(quick: bool = False) -> dict:
         if ok:
             caps["cpu_serving"] = "gguf"
             caps["llama_cpp"] = detail
+            # How long a reply may take here, said so the controller neither
+            # cuts it shorter nor gives up on it while it is being read.
+            caps["min_deadline_s"] = llamacpp.DEADLINE_FLOOR_S
             caps["notes"].append(
                 "Serving on the processor through llama.cpp "
                 "(AI_STUDIO_CPU_QUANTIZATION=gguf, %s): every model this "

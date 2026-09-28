@@ -3059,7 +3059,7 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
             # meaningful if it was trained that way; a model that never saw a
             # reasoning block will simply carry on writing prose inside one.
             "reasoning": bool(payload.get("reasoning")),
-            "deadline_s": config.GENERATION_DEADLINE_S,
+            "deadline_s": config.generation_deadline(runner.get("capabilities")),
         },
     })
     if placed == "gone":

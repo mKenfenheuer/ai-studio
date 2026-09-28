@@ -86,6 +86,20 @@ MAX_NEW_TOKENS: int = int(os.environ.get("AI_STUDIO_MAX_NEW_TOKENS") or 4096)
 GENERATION_DEADLINE_S: float = float(
     os.environ.get("AI_STUDIO_GENERATION_DEADLINE_S") or 300)
 
+
+def generation_deadline(caps: dict | None) -> float:
+    """The deadline for a reply on this machine: the studio's, or longer if
+    the machine says it needs it.
+
+    A processor serving through llama.cpp reads a prompt at about 21 tokens a
+    second, so a 6,000-token tagging prompt alone is five minutes. It says so
+    in `min_deadline_s`, and every place that sets a deadline or waits on one
+    asks here -- the runner raising its own was not enough: the controller
+    freed the "stuck" slot at 420 seconds while the runner was still reading.
+    """
+    floor = float((caps or {}).get("min_deadline_s") or 0)
+    return max(GENERATION_DEADLINE_S, floor)
+
 # How many requests may be WAITING for one machine, on top of the one it is
 # answering. A runner serves one message at a time because it holds one model
 # on one card, and that is not going to change -- so the only question is

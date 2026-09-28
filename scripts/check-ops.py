@@ -215,6 +215,44 @@ except ValueError:
 ok("and a state nobody defined is refused", bad,
    "-- a typo must not become a state the page then has to render")
 
+# ------------------------------------------------------------ deadlines
+# A processor serving through llama.cpp says it needs longer than the studio's
+# five minutes. The slot watchdog freed its reply at 420 seconds while the
+# runner was still reading a 6,000-token prompt.
+print("\nA machine that needs longer to answer")
+
+from controller import config  # noqa: E402
+
+slow_caps = {"backend": "cpu", "cpu_serving": "gguf", "min_deadline_s": 540.0}
+ok("gets the deadline it asks for",
+   config.generation_deadline(slow_caps) == 540.0)
+ok("and a card keeps the studio's",
+   config.generation_deadline(GPU) == config.GENERATION_DEADLINE_S)
+
+db.upsert_runner("run_slow", "processor", slow_caps)
+fleet4 = Fleet()
+freed = []
+
+
+async def _watch_slots():
+    async def fake_fail(rid, _why):
+        freed.append(rid)
+    fleet4._fail_generation = fake_fail
+
+    async def nothing(_rid):
+        return None
+    fleet4._drain_serving = nothing
+    now = __import__("time").time()
+    fleet4.serving_now = {"run_slow": "gen_slow", a: "gen_card"}
+    fleet4.serving_since = {"run_slow": now - 500, a: now - 500}
+    await fleet4.reconcile_serving()
+
+asyncio.run(_watch_slots())
+ok("its reply is not freed as stuck inside that deadline",
+   "gen_slow" not in freed, "-- freed: %s" % freed)
+ok("while a card's, past its own, still is", "gen_card" in freed)
+db.delete_runner("run_slow")
+
 # ------------------------------------------------------------------ ledger
 print("\nWhat the numbers are made of")
 

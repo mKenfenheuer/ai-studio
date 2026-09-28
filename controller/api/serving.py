@@ -313,6 +313,11 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
     fmt = payload.get("response_format") or {}
     constrained = (fmt.get("type") or "text") != "text"
     runner_id, _runner = _pick_chat_runner(job, needs_grammar=constrained)
+    deadline = config.generation_deadline(_runner.get("capabilities"))
+    # How long to listen for the next frame. A prefill sends nothing, so on a
+    # machine that may take its whole deadline reading, waiting less than the
+    # deadline gives up on a reply that is on its way.
+    wait_s = max(GENERATE_TIMEOUT_S, deadline + 60.0)
     spec = spec_for.chat_spec(job)
     if config.HF_TOKEN:
         spec["hf_token"] = config.HF_TOKEN
@@ -351,7 +356,7 @@ async def _dispatch(job: dict, messages: list[dict], payload: dict) -> tuple:
             "top_p": float(payload.get("top_p", 0.95)),
             "top_k": int(payload.get("top_k") or 50),
             "reasoning": bool(payload.get("reasoning")),
-            "deadline_s": config.GENERATION_DEADLINE_S,
+            "deadline_s": deadline,
         },
     })
     if placed == "gone":
@@ -516,10 +521,10 @@ async def chat_completions(request: Request, payload: dict = Body(...)):
             # nothing can appear that needs parsing, and it streams token by
             # token as before.
             _stream(rid, queue, job, created, who,
-                    buffer=bool(payload.get("tools"))),
+                    buffer=bool(payload.get("tools")), wait_s=wait_s),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return await _collect(rid, queue, job, created, who)
+    return await _collect(rid, queue, job, created, who, wait_s=wait_s)
 
 
 def _shell(job: dict, created: int, rid: str) -> dict:
@@ -580,13 +585,13 @@ def _record(job: dict, who: dict, msg: dict, started: float,
 
 
 async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
-                   who: dict):
+                   who: dict, wait_s: float = GENERATE_TIMEOUT_S):
     """Wait for the whole reply and answer once."""
     text: list[str] = []
     started = time.time()
     try:
         while True:
-            msg = await asyncio.wait_for(queue.get(), GENERATE_TIMEOUT_S)
+            msg = await asyncio.wait_for(queue.get(), wait_s)
             kind = msg.get("type")
             if kind == "generate_delta":
                 text.append(msg.get("delta") or "")
@@ -652,16 +657,17 @@ async def _collect(rid: str, queue: asyncio.Queue, job: dict, created: int,
                     },
                 }
     except asyncio.TimeoutError:
-        why = "No reply within %d seconds." % GENERATE_TIMEOUT_S
+        why = "No reply within %d seconds." % wait_s
         _record(job, who, {}, started, stream=False, failed=why)
         return _error(504, "The model did not finish in %d seconds."
-                      % GENERATE_TIMEOUT_S, "timeout")
+                      % wait_s, "timeout")
     finally:
         FLEET.waiters.pop(rid, None)
 
 
 async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
-                  who: dict, buffer: bool = False):
+                  who: dict, buffer: bool = False,
+                  wait_s: float = GENERATE_TIMEOUT_S):
     """Server-sent events, in the exact chunk shape OpenAI clients parse."""
     started = time.time()
     def chunk(delta: dict, finish=None) -> str:
@@ -673,7 +679,7 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
     try:
         yield chunk({"role": "assistant", "content": ""})
         while True:
-            msg = await asyncio.wait_for(queue.get(), GENERATE_TIMEOUT_S)
+            msg = await asyncio.wait_for(queue.get(), wait_s)
             kind = msg.get("type")
             if kind == "generate_delta":
                 if not buffer:
@@ -709,7 +715,7 @@ async def _stream(rid: str, queue: asyncio.Queue, job: dict, created: int,
                 return
     except asyncio.TimeoutError:
         _record(job, who, {}, started, stream=True,
-                failed="No reply within %d seconds." % GENERATE_TIMEOUT_S)
+                failed="No reply within %d seconds." % wait_s)
         yield chunk({"content": "\n\n[error: timed out]"})
         yield chunk({}, "stop")
         yield "data: [DONE]\n\n"
