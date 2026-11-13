@@ -315,6 +315,30 @@ def _in_layers(param_name: str, layers: list[int]) -> bool:
     return bool(m) and int(m.group(1)) in layers
 
 
+def restore_adapter(model, weights: dict) -> int:
+    """Copy a saved adapter's tensors back into the live model; how many.
+
+    PEFT saves its tensors without the adapter's name -- `...q_proj.lora_A.weight`
+    on disk is `...q_proj.lora_A.default.weight` in the model -- so they are put
+    back through PEFT's own loader, which knows the mapping, rather than matched
+    by name here. Matching by suffix did not know it: not one tensor of a LoRA
+    matched, the best adapter of every run that was stopped past its low point
+    was silently replaced by the last one, and the run said "keeps the one it
+    ended with" as if that were a choice.
+
+    Counted afterwards: a tensor counts as restored when the model now holds
+    exactly the saved value, because a loader that reports nothing wrong is
+    not the same as one that loaded everything.
+    """
+    import torch
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+
+    set_peft_model_state_dict(model, weights)
+    now = get_peft_model_state_dict(model)
+    return sum(1 for k, v in weights.items()
+               if k in now and torch.equal(now[k].to(v.device, v.dtype), v))
+
+
 def _versions() -> dict:
     """What this run was trained with.
 
@@ -1269,20 +1293,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                 from safetensors.torch import load_file
                 weights = load_file(str(Path(best["path"]) / "adapter"
                                         / "adapter_model.safetensors"))
-                # PEFT names its saved tensors without the wrapper prefix that
-                # the live module tree uses, so they are matched by suffix
-                # rather than assumed to line up.
-                live = dict(model.named_parameters())
-                loaded = 0
-                for name, tensor in weights.items():
-                    key = next((k for k in live
-                                if k.endswith(name.replace("base_model.model.", ""))
-                                or k == name), None)
-                    if key is not None:
-                        with torch.no_grad():
-                            live[key].copy_(tensor.to(live[key].device,
-                                                      live[key].dtype))
-                        loaded += 1
+                loaded = restore_adapter(model, weights)
                 if loaded < len(weights):
                     raise ValueError("only %d of %d adapter tensors matched"
                                      % (loaded, len(weights)))
