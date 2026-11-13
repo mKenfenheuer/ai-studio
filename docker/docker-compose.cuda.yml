@@ -5,6 +5,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.runner.cuda
+      args:
+        # Which cards llama.cpp's CUDA kernels are built for. Blank keeps the
+        # Dockerfile's list (Ampere to Blackwell). One card builds far faster:
+        # CUDA_ARCHS=86 in .env for an RTX 3090.
+        CUDA_ARCHS: ${CUDA_ARCHS:-80;86;89;90;120}
     image: ai-studio/runner:cuda
     restart: unless-stopped
     depends_on: [controller]
