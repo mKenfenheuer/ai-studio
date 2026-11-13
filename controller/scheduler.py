@@ -431,6 +431,10 @@ class Fleet:
         elif required and required != caps.get("_id"):
             return False, "pinned to a different runner"
 
+        if job["kind"] == "export_gguf" and job["config"].get("imatrix") \
+                and not caps.get("gguf_imatrix"):
+            return False, "cannot calibrate a quantisation (no llama-imatrix)"
+
         if job["kind"] == "pretrain_llm":
             return self._can_pretrain(job, caps)
 

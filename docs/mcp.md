@@ -57,3 +57,13 @@ starting a fresh one.
 (cd output/lora/best && zip -q -r - .) | curl -X PUT -H "Authorization: Bearer $KEY" \
   --data-binary @- "http://studio/api/jobs/import?name=EN%20step%20330&project_id=prj_…"
 ```
+
+## Calibrated GGUF export
+
+The export dialog (and `start_run` with `kind: "export_gguf"`) can calibrate
+the quantisation: `config.imatrix = {"studio_dataset": "ds_…", "rows": 300,
+"split": "train"}` renders that many conversations with the model's own chat
+template and tools, measures an importance matrix with `llama-imatrix` on the
+GPU, and quantises with it. `config.chat_template` replaces the template in
+the GGUF (for example one with a default system prompt). Calibration needs a
+machine with `llama-imatrix`, which the CUDA runner image ships.

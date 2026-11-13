@@ -971,6 +971,33 @@ async def _create_job(request: Request, payload: dict) -> str:
         cfg["allow_cpu"] = True
         cfg.setdefault("name_hint", src["name"])
         cfg["source_run_name"] = src["name"]
+        # Calibrated quantisation: conversations from a dataset of the
+        # studio's own, fetched by the runner with its join token like a
+        # training set. Checked here, so a dataset the account cannot see is
+        # refused before a runner downloads six gigabytes of model for it.
+        if imx := cfg.get("imatrix"):
+            if not isinstance(imx, dict) or not (did := str(imx.get("studio_dataset") or "")):
+                raise HTTPException(400, "Calibrating needs a dataset: "
+                                         "imatrix.studio_dataset.")
+            d = db.get_dataset(did)
+            if not d:
+                raise HTTPException(404, "No such dataset.")
+            security.require_view(request, "dataset", d)
+            try:
+                rows = int(imx.get("rows") or 300)
+                ctx_len = int(imx.get("ctx") or 4096)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "imatrix.rows and imatrix.ctx are numbers.") from None
+            cfg["imatrix"] = {
+                "studio_dataset": did, "dataset_label": d["name"],
+                "dataset": "%s/api/datasets/%s/dataset-file" % (
+                    str(request.base_url).rstrip("/"), did),
+                "split": str(imx.get("split") or "train"),
+                "rows": max(1, min(rows, 5000)), "ctx": max(512, min(ctx_len, 32768)),
+                "seed": int(imx.get("seed") or 0)}
+        if (tpl := cfg.get("chat_template")) is not None:
+            if not isinstance(tpl, str) or not tpl.strip() or len(tpl) > 100_000:
+                raise HTTPException(400, "chat_template is the Jinja text, up to 100 KB.")
     elif kind == "upload":
         # Sending something to Hugging Face. No GPU, no model to load: this
         # one is network and patience, and it comes through the same door as

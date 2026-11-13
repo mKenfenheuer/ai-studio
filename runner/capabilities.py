@@ -543,6 +543,9 @@ def probe(quick: bool = False) -> dict:
     # matter for the same reason on the CPU-bound stages -- decoding a
     # thousand images a step is not GPU work.
     caps["libraries"] = _libraries()
+    # Whether an export here can calibrate its quantisation (llama-imatrix).
+    from .jobs import export_gguf
+    caps["gguf_imatrix"] = export_gguf.can_calibrate()
     # Said in its own key as well as in the library list, because it is a
     # promise the serving API makes to callers rather than a package somebody
     # installed. A runner whose image predates this reports False and the

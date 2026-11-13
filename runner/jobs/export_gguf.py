@@ -44,6 +44,15 @@ from .lora_llm import Cancelled
 CONVERTER = os.environ.get(
     "AI_STUDIO_GGUF_CONVERT", "/opt/llama.cpp/convert_hf_to_gguf.py")
 QUANTIZE = os.environ.get("AI_STUDIO_GGUF_QUANTIZE", "/opt/llama.cpp/llama-quantize")
+# Measures which weights matter on real text before quantising (see
+# `_importance_matrix`). Only in the CUDA image: on a processor it reads the
+# calibration text at a few hundred tokens a second, which for the default
+# 300 conversations is hours.
+IMATRIX = os.environ.get("AI_STUDIO_GGUF_IMATRIX", "/opt/llama.cpp/llama-imatrix")
+# Rewrites a GGUF's metadata (the chat template) without touching its tensors.
+NEW_METADATA = os.environ.get(
+    "AI_STUDIO_GGUF_NEW_METADATA",
+    str(Path(CONVERTER).parent / "gguf-py" / "gguf" / "scripts" / "gguf_new_metadata.py"))
 # The adapter converter sits beside the model converter in every llama.cpp.
 LORA_CONVERTER = os.environ.get(
     "AI_STUDIO_GGUF_CONVERT_LORA",
@@ -104,6 +113,116 @@ def _stream(cmd: list[str], ctx: Any, cwd: str | None = None) -> None:
                             proc.returncode, "\n".join(tail[-12:])))
 
 
+def can_calibrate() -> bool:
+    """Whether this machine can build an importance matrix."""
+    return Path(IMATRIX).exists()
+
+
+def _calibration_text(imx: dict, model_dir: Path, ctx: Any) -> str:
+    """Conversations from a dataset, rendered exactly as the model reads them.
+
+    Through the same renderer the fine-tune trained with -- the model's own
+    chat template, with the tool schema of each row -- so the importance
+    matrix is measured on the text this model actually sees, system prompt,
+    device lists and tool calls included, rather than on Wikipedia.
+    """
+    import json
+    import random
+
+    from transformers import AutoTokenizer
+
+    from common import conversation
+    from common.formatting import detect_format
+
+    from . import source
+
+    path = source.local_copy({"dataset": imx["dataset"], "dataset_is_local": True,
+                              "dataset_label": imx.get("dataset_label")}, ctx)
+    split = imx.get("split") or "train"
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                row = json.loads(line)
+                if (row.get("split") or "train") == split:
+                    rows.append(row)
+    if not rows:
+        raise ValueError("The calibration dataset has no rows in the %s split." % split)
+    random.Random(int(imx.get("seed") or 0)).shuffle(rows)
+    rows = rows[:int(imx.get("rows") or 300)]
+
+    tok = AutoTokenizer.from_pretrained(str(model_dir))
+    fmt = {"use_model_template": True}
+    if tok.chat_template:
+        fmt["chat_template"] = tok.chat_template
+        fmt["specials"] = {k: v for k, v in (
+            ("bos_token", tok.bos_token), ("eos_token", tok.eos_token),
+            ("pad_token", tok.pad_token), ("unk_token", tok.unk_token)) if v}
+    detected = detect_format(list(rows[0].keys()), rows[:1])
+    detected.pop("confidence", None)
+    fmt = {**detected, **fmt}
+    parts = []
+    for row in rows:
+        conv, _ = conversation.repair(conversation.from_row(row, fmt))
+        parts.append(conversation.render(conv, fmt))
+    text = "".join(parts)
+    ctx.log("Calibrating on %d conversations from %s (%s split), %s characters, "
+            "rendered with the model's own chat template."
+            % (len(rows), imx.get("dataset_label") or "the dataset", split,
+               f"{len(text):,}"))
+    return text
+
+
+def _importance_matrix(imx: dict, model_dir: Path, f16: Path, work: Path,
+                       ctx: Any) -> Path:
+    """Which weights matter, measured on the model's own kind of text.
+
+    A plain Q4_K_M rounds every weight the same way. With an importance matrix
+    llama-quantize keeps more precision where the activations are large on
+    real inputs. For a narrow fine-tune that is not polish: a Home Assistant
+    model scored 291/300 at f16 and 243/300 at plain Q4_K_M, and the matrix
+    from its own conversations brought the quantised one back.
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    calib = work / "calibration.txt"
+    calib.write_text(_calibration_text(imx, model_dir, ctx), encoding="utf-8")
+    out = work / "imatrix.gguf"
+    gpu = (ctx.capabilities or {}).get("backend") in ("cuda", "rocm")
+    ctx.log("Measuring the importance matrix%s." % (" on the GPU" if gpu else
+                                                    " on the processor -- slow"))
+    t0 = time.time()
+    _stream([IMATRIX, "-m", str(f16), "-f", str(calib), "-o", str(out),
+             "-c", str(int(imx.get("ctx") or 4096)), "-ngl", "99" if gpu else "0"], ctx)
+    if not out.exists():
+        # Older llama.cpp writes the legacy .dat format whatever it is called.
+        legacy = out.with_suffix(".dat")
+        if legacy.exists():
+            out = legacy
+        else:
+            raise ValueError("llama-imatrix finished without writing a matrix.")
+    ctx.log("Importance matrix measured in %s." % _took(time.time() - t0))
+    return out
+
+
+def _set_chat_template(final: Path, template: str, work: Path, ctx: Any,
+                       general_name: str = "") -> None:
+    """Put a chat template into the GGUF itself, in place of the tokenizer's.
+
+    The template travels with the file: llama-server, Ollama and the Home
+    Assistant add-on read it from the GGUF, so a default system prompt or a
+    template tuned for one language belongs here and nowhere else.
+    """
+    tpl = work / "chat_template.jinja"
+    tpl.write_text(template, encoding="utf-8")
+    tmp = final.with_name(final.stem + ".tmpl.gguf")
+    cmd = [CONVERT_PYTHON, NEW_METADATA, "--force", "--chat-template-file", str(tpl)]
+    if general_name:
+        cmd += ["--general-name", general_name]
+    _stream(cmd + [str(final), str(tmp)], ctx)
+    os.replace(tmp, final)
+    ctx.log("Chat template written into the GGUF (%s characters)." % f"{len(template):,}")
+
+
 def run(cfg: dict, ctx: Any) -> dict:
     source_job = cfg.get("source_job") or ""
     if not source_job:
@@ -125,6 +244,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     ctx.progress(0, 3, stage="loading_model")
     folder = artifacts.fetch(ctx.controller_url, ctx.runner_token,
                              source_job, ctx.log)
+    model_dir = folder
     if (folder / "adapter_config.json").exists():
         raise ValueError(
             "That is an adapter, not a model. An adapter is a few megabytes "
@@ -176,13 +296,24 @@ def run(cfg: dict, ctx: Any) -> dict:
                 "a built copy.")
         ctx.progress(2, 3, stage="quantizing")
         final = out_dir / ("%s.%s.gguf" % (name, quant))
-        ctx.log("Quantising to %s. %s" % (quant, QUANT_TYPES[quant]))
+        qargs: list[str] = []
+        if imx := cfg.get("imatrix"):
+            if not can_calibrate():
+                raise ValueError("This machine has no llama-imatrix, so it cannot "
+                                 "calibrate. The CUDA runner image ships one.")
+            qargs = ["--imatrix", str(_importance_matrix(
+                imx, model_dir, f16, Path(ctx.workdir) / "imatrix", ctx))]
+        ctx.log("Quantising to %s%s. %s" % (quant, " with the importance matrix"
+                                            if qargs else "", QUANT_TYPES[quant]))
         t0 = time.time()
-        _stream([QUANTIZE, str(f16), str(final), quant], ctx)
+        _stream([QUANTIZE, *qargs, str(f16), str(final), quant], ctx)
         ctx.log("Quantised in %s. %s" % (_took(time.time() - t0), _size(final)))
         # The intermediate is several times the size of the answer and is of
         # no use to anybody once the answer exists.
         f16.unlink(missing_ok=True)
+    if template := cfg.get("chat_template"):
+        _set_chat_template(final, template, Path(ctx.workdir), ctx,
+                           cfg.get("general_name") or "")
 
     # What to do with it, in the file, because a model downloaded in six weeks
     # will not have this page open beside it.
@@ -212,6 +343,8 @@ def run(cfg: dict, ctx: Any) -> dict:
         "kind": "export_gguf",
         "source_job": source_job,
         "quantize": quant,
+        "imatrix": bool(cfg.get("imatrix")),
+        "chat_template": "custom" if cfg.get("chat_template") else "the tokenizer's",
         "filename": final.name,
         "mmproj": mmproj.name if mmproj else None,
         "bytes": size,

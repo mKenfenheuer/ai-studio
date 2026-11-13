@@ -517,12 +517,17 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
   // are looking at.
   // A conversion, as a job: it reads every tensor and writes a new file, so
   // it wants a progress bar and a stop button like everything else here.
-  on(mount, "click", "#exportGguf", () => {
+  on(mount, "click", "#exportGguf", async () => {
     const job = getJob();
+    // The run's own training set is the natural calibration text: it is what
+    // the model will be asked. Any other dataset can be picked instead.
+    const sets = await api.datasets().catch(() => []);
+    const trained = job.config?.studio_dataset || "";
     const dlg = modal({ title: "Export as GGUF", width: 520, body: html`
       <p class="muted tiny">One file, quantised, that loads in Ollama,
         llama.cpp and LM Studio with no Python at all. It runs as a job on
-        whichever machine is free — no graphics card needed.</p>
+        whichever machine is free — no graphics card needed, unless it is
+        calibrated.</p>
       <div class="field">
         <label for="ggufQ">How much to shrink it</label>
         <select id="ggufQ">
@@ -531,6 +536,28 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
               esc(why)}</option>`).join(""))}
         </select>
       </div>
+      <div class="field">
+        <label for="ggufCal">Calibrate the quantisation on</label>
+        <select id="ggufCal">
+          <option value="">nothing — plain quantisation</option>
+          ${raw((sets || []).map((d) => `<option value="${esc(d.id)}"${
+            d.id === trained ? " selected" : ""}>${esc(d.name)}${
+            d.id === trained ? " (trained on)" : ""}</option>`).join(""))}
+        </select>
+        <div class="hint">Measures which weights matter on real conversations
+          before rounding them (llama-imatrix), rendered with the model's own
+          chat template. For a narrow fine-tune this is what keeps Q4 as good
+          as the original. Needs a machine with a GPU and llama-imatrix — the
+          CUDA runner.</div>
+        <div class="row" style="gap:6px;margin-top:6px">
+          <label class="tiny" for="ggufRows">conversations</label>
+          <input id="ggufRows" type="number" min="1" max="5000" value="300" style="width:90px">
+        </div>
+      </div>
+      <details class="adv">
+        <summary>Chat template in the file</summary>
+        <textarea id="ggufTpl" rows="6" class="mono" placeholder="Blank: the tokenizer's own template. Paste Jinja to replace it — e.g. one with a default system prompt."></textarea>
+      </details>
       <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px">
         <button type="button" class="btn" data-modal-close>Cancel</button>
         <button type="button" class="btn btn-primary" id="ggufGo">Export it</button>
@@ -541,7 +568,14 @@ function wireRunControls(mount, jobId, getJob, getLatest, getStage) {
         const { id } = await api.createJob({
           name: `${job.name} → GGUF`,
           kind: "export_gguf",
-          config: { source_job: job.id, quantize: $("#ggufQ", dlg).value },
+          config: {
+            source_job: job.id, quantize: $("#ggufQ", dlg).value,
+            ...($("#ggufCal", dlg).value ? { imatrix: {
+              studio_dataset: $("#ggufCal", dlg).value,
+              rows: Number($("#ggufRows", dlg).value) || 300 } } : {}),
+            ...($("#ggufTpl", dlg).value.trim()
+              ? { chat_template: $("#ggufTpl", dlg).value } : {}),
+          },
         });
         dlg.close();
         toast("Export queued.", "ok", { href: `#/jobs/${id}`, label: "Watch it" });

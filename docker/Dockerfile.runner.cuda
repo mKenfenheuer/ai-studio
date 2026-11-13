@@ -7,6 +7,47 @@
 # and cu124 has no kernels for Blackwell cards (RTX 50xx, B200) that rented
 # GPUs increasingly are. Needs a host driver of 570 or newer.
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+# llama.cpp, built for the GPU, in a stage of its own: compiling the CUDA
+# kernels needs nvcc and the toolkit headers, which the runtime image does not
+# have and should not carry. Only the binaries, their libraries and the Python
+# side (converter, gguf-py) are copied across.
+#
+# Why a GPU runner needs it at all: a calibrated export (llama-imatrix) reads
+# a few hundred conversations through the model before quantising. On the CPU
+# runner that is hours; on a card it is minutes. And the converter and the
+# quantiser are the same as in the CPU image, so either machine can export.
+#
+# Same pin as docker/Dockerfile.runner.cpu -- move both together.
+# CUDA_ARCHS: which cards the kernels are compiled for. The default covers
+# Ampere (A100 80, RTX 30xx 86), Ada (89), Hopper (90) and Blackwell (120), which
+# is what rented GPUs are. Building for one card is much faster:
+#   docker compose build --build-arg CUDA_ARCHS=86 runner-cuda
+FROM ${CUDA_DEVEL_IMAGE} AS llamacpp
+ARG LLAMA_CPP_TAG=v0.5.0
+ARG CUDA_ARCHS="80;86;89;90;120"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential cmake ca-certificates \
+    && git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+         https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
+    && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
+         -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+         -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CUDA=ON \
+         "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
+         -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+         -DBUILD_SHARED_LIBS=ON \
+         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON "-DCMAKE_INSTALL_RPATH=\$ORIGIN" \
+    && cmake --build /opt/llama.cpp/build -j "$(nproc)" \
+         --target llama-quantize llama-imatrix llama-server \
+    && mkdir -p /out \
+    && cp /opt/llama.cpp/build/bin/llama-quantize /opt/llama.cpp/build/bin/llama-imatrix \
+          /opt/llama.cpp/build/bin/llama-server /out/ \
+    && find /opt/llama.cpp/build -name "*.so*" -exec cp -P {} /out/ \; \
+    && cp -r /opt/llama.cpp/gguf-py /opt/llama.cpp/requirements /opt/llama.cpp/requirements.txt \
+          /opt/llama.cpp/convert_hf_to_gguf.py /opt/llama.cpp/convert_lora_to_gguf.py /out/ \
+    && (cp -r /opt/llama.cpp/conversion /out/ 2>/dev/null || true)
+
 FROM ${CUDA_IMAGE}
 
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
@@ -54,6 +95,19 @@ RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
     && pip install --no-cache-dir --no-deps --index-url ${TORCH_INDEX} "torchvision==${TV}" \
     && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
+
+# The GPU llama.cpp from the stage above, and the converter's own environment
+# (it pins an older torch and transformers than the runner -- see the CPU
+# image for why that has to be a venv of its own). libgomp1 is what the
+# binaries link for OpenMP at run time.
+COPY --from=llamacpp /out /opt/llama.cpp
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/llama.cpp/venv \
+    && /opt/llama.cpp/venv/bin/pip install --no-cache-dir \
+         -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt \
+    && /opt/llama.cpp/llama-quantize --help >/dev/null 2>&1; \
+    test -x /opt/llama.cpp/llama-imatrix
 
 COPY runner /app/runner
 COPY common /app/common
