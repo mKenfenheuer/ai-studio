@@ -448,6 +448,22 @@ CREATE TABLE IF NOT EXISTS deployments (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deploy_pair
     ON deployments(job_id, runner_id);
 CREATE INDEX IF NOT EXISTS idx_deploy_runner ON deployments(runner_id);
+
+-- A sign-in handed to another program through OAuth (IndieAuth): the code it
+-- trades for a token, kept only for the minute that trade may take. The client
+-- is named by a URL rather than registered here, which is the IndieAuth idea --
+-- see controller/api/oauth.py. Stored hashed, like every other secret here.
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    client_id      TEXT NOT NULL,
+    client_name    TEXT,
+    redirect_uri   TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    scope          TEXT,
+    resource       TEXT,
+    created_at     REAL NOT NULL
+);
 """
 
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT
@@ -534,6 +550,15 @@ _ADDED_COLUMNS = [
     # permanent key to everything the account can see.
     ("api_keys", "expires_at", "REAL"),
     ("api_keys", "scope", "TEXT"),
+    # What a key may do. NULL is what every key could always do: talk to the
+    # models on /v1. "studio" is everything its account can do on /api and
+    # /mcp -- upload a dataset, start a run, read its chart -- for scripts and
+    # for the MCP clients that sign in through OAuth.
+    ("api_keys", "access", "TEXT"),
+    # A key an OAuth client holds: the client it was issued to, and the hash
+    # of the refresh token that replaces it when it expires.
+    ("api_keys", "client_id", "TEXT"),
+    ("api_keys", "refresh_hash", "TEXT"),
     # Short labels on a dataset, the same as on a run: for finding, not
     # for reading.
     ("datasets", "tags", "TEXT"),
@@ -1589,13 +1614,57 @@ def key_scope(key_id: str) -> list[str] | None:
 
 def create_api_key(user_id: str, name: str, key_hash: str, prefix: str,
                    expires_at: float | None = None,
-                   scope: list[str] | None = None) -> str:
+                   scope: list[str] | None = None, access: str | None = None,
+                   client_id: str | None = None,
+                   refresh_hash: str | None = None) -> str:
     kid = new_id("key")
     ex("INSERT INTO api_keys (id,user_id,name,key_hash,prefix,created_at,"
-       "expires_at,scope) VALUES (?,?,?,?,?,?,?,?)",
+       "expires_at,scope,access,client_id,refresh_hash)"
+       " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
        (kid, user_id, name, key_hash, prefix, now(), expires_at,
-        json.dumps(scope) if scope else None))
+        json.dumps(scope) if scope else None, access, client_id, refresh_hash))
     return kid
+
+
+def studio_key_identity(key_hash: str) -> tuple[dict | None, str]:
+    """The account behind a key that may use the whole studio, not only /v1.
+
+    A key made for the models is refused here even when it is valid: it was
+    handed out as "this script may ask the assistant things", and reading it
+    as "this script may delete my runs" would widen it behind its owner's back.
+    """
+    row = q1("SELECT id, access FROM api_keys WHERE key_hash=?", (key_hash,))
+    if not row or row.get("access") != "studio":
+        return None, ""
+    return api_key_identity(key_hash)
+
+
+def api_key_by_refresh(refresh_hash: str) -> dict | None:
+    return q1("SELECT * FROM api_keys WHERE refresh_hash=?", (refresh_hash,))
+
+
+def delete_api_key_by_id(key_id: str) -> None:
+    ex("DELETE FROM api_keys WHERE id=?", (key_id,))
+
+
+def save_oauth_code(code_hash: str, user_id: str, client_id: str,
+                    client_name: str, redirect_uri: str, code_challenge: str,
+                    scope: str, resource: str) -> None:
+    ex("DELETE FROM oauth_codes WHERE created_at < ?", (now() - 600,))
+    ex("INSERT INTO oauth_codes (code_hash,user_id,client_id,client_name,"
+       "redirect_uri,code_challenge,scope,resource,created_at)"
+       " VALUES (?,?,?,?,?,?,?,?,?)",
+       (code_hash, user_id, client_id, client_name, redirect_uri,
+        code_challenge, scope, resource, now()))
+
+
+def take_oauth_code(code_hash: str, max_age_s: float = 120) -> dict | None:
+    """The code's grant, once: it is deleted as it is read."""
+    row = q1("SELECT * FROM oauth_codes WHERE code_hash=?", (code_hash,))
+    ex("DELETE FROM oauth_codes WHERE code_hash=?", (code_hash,))
+    if not row or now() - row["created_at"] > max_age_s:
+        return None
+    return row
 
 
 def api_key_identity(key_hash: str) -> tuple[dict | None, str]:
@@ -1632,8 +1701,9 @@ def api_key_owner(key_hash: str) -> dict | None:
 
 
 def list_api_keys(user_id: str) -> list[dict]:
-    rows = q("SELECT id,name,prefix,created_at,last_used,calls,expires_at,scope"
-             " FROM api_keys WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+    rows = q("SELECT id,name,prefix,created_at,last_used,calls,expires_at,scope,"
+             "access,client_id FROM api_keys WHERE user_id=? ORDER BY created_at DESC",
+             (user_id,))
     for r in rows:
         try:
             r["scope"] = json.loads(r["scope"]) if r.get("scope") else None

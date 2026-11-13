@@ -260,11 +260,18 @@ async def api_key_create(request: Request, payload: dict = Body(default=None)) -
         models = [m for m in (x.strip() for x in models.replace(";", ",").split(","))
                   if m]
     scope = [str(m)[:80] for m in (models or [])][:50] or None
+    # "studio": the key may do everything this account can on /api and /mcp,
+    # not only talk to the models. Asked for explicitly, never a default, and
+    # never together with a model list, which would read as a limit it is not.
+    access = "studio" if (payload or {}).get("access") == "studio" else None
+    if access and scope:
+        raise HTTPException(400, "A key with studio access reaches everything "
+                                 "this account can. Leave the model list empty.")
     raw, key_hash, prefix = auth.new_api_key()
     kid = db.create_api_key(user["id"], name[:60], key_hash, prefix,
-                            expires_at=expires_at, scope=scope)
+                            expires_at=expires_at, scope=scope, access=access)
     return {"id": kid, "name": name[:60], "prefix": prefix, "key": raw,
-            "expires_at": expires_at, "scope": scope,
+            "expires_at": expires_at, "scope": scope, "access": access,
             "note": "Copy this now. It is stored hashed and cannot be shown "
                     "again -- if you lose it, delete it and make another."}
 

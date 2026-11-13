@@ -271,6 +271,10 @@ No suitable machine? The studio can rent a GPU from RunPod for a queued run and
 give it back when it is idle, within a price cap, a pod limit and a daily
 budget — see **[docs/cloud-gpus.md](docs/cloud-gpus.md)**.
 
+Scripts and MCP clients such as Claude can drive the studio too: API keys with
+studio access, an MCP server at `/mcp` with OAuth sign-in in the IndieAuth way,
+and an import for adapters trained elsewhere — see **[docs/mcp.md](docs/mcp.md)**.
+
 | | NVIDIA | AMD (ROCm) | Apple Metal | CPU |
 |---|---|---|---|---|
 | LoRA fine-tuning | ✅ | ✅ | ✅ | ✅ (slow) |

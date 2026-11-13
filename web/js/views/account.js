@@ -45,6 +45,7 @@ export async function accountView(mount) {
         freshKey = await api.createApiKey(f.get("name"), {
           expires_days: f.get("expires_days") || 0,
           models: f.get("models") || "",
+          access: f.get("studio") ? "studio" : "",
         });
         keys = await api.apiKeys();
         draw();
@@ -423,6 +424,14 @@ function keysCard(keys, fresh) {
           </select>
           <button class="btn-primary btn-sm" type="submit">Create a key</button>
         </div>
+        <label class="row tiny" style="gap:6px;margin-top:6px">
+          <input type="checkbox" name="studio">
+          <span>Studio access: this key may do everything your account can —
+            upload datasets, start and stop runs, read their charts — through
+            <span class="mono">/api</span> and the MCP server at
+            <span class="mono">/mcp</span>. Without it the key only talks to the
+            models on <span class="mono">/v1</span>.</span>
+        </label>
         <details class="adv" style="margin-top:6px">
           <summary>Only some models</summary>
           <input type="text" name="models" class="mono"
@@ -439,7 +448,9 @@ function keysCard(keys, fresh) {
           ${raw(keys.map((k) => html`
             <tr>
               <td>${k.name}
-                <div class="muted tiny mono">${k.prefix}…</div></td>
+                <div class="muted tiny mono">${k.prefix}…</div>
+                ${raw(k.access === "studio" ? `<div><span class="badge">studio access</span>${
+                  k.client_id ? ` <span class="muted tiny">signed in by ${esc(k.client_id)}</span>` : ""}</div>` : "")}</td>
               <td class="tiny muted">${k.last_used
                 ? `used ${fmtAgo(k.last_used)}` : "never used"}
                 ${raw(k.expired ? `<div><span class="badge badge-err">expired</span></div>`

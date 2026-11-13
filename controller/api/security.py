@@ -165,6 +165,12 @@ async def authenticate(request: Request, call_next):
         return JSONResponse({"detail": "Invalid runner token."}, status_code=403)
 
     user = auth.session_user(request.cookies.get(auth.SESSION_COOKIE))
+    if not user and (raw := _bearer(request)):
+        # A script, or an MCP client signed in through OAuth: the same account
+        # and the same rules as its browser session, from a key made with
+        # studio access. A key made for the models alone is not one of these.
+        user, request.state.api_key_id = db.studio_key_identity(
+            auth.api_key_hash(raw))
     if not user:
         # 401 rather than 403: the browser app treats it as "show the login
         # screen", and the distinction is the difference between "log in" and

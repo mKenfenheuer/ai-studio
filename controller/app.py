@@ -22,6 +22,7 @@ from . import architectures as arch
 from . import cards, cloud, colab, config, datasets as dsets, db, diagnose, hfaccount, hub
 from . import preflight
 from . import serving
+from .api import mcp as mcp_api, oauth
 from .api import (accounts, cloud as cloud_api, conversations, data, evals, library, media, ops, projects,
                   providers, security,
                   serving as serving_api, sharing, sso)
@@ -144,6 +145,9 @@ app.include_router(cloud_api.router)
 app.include_router(serving_api.registry)
 app.include_router(sharing.router)
 app.include_router(sso.router)
+# Sign-in for other programs (IndieAuth) and the MCP server they then use.
+app.include_router(oauth.router)
+app.include_router(mcp_api.router)
 
 # The evaluation routes queue jobs, which means they need the live fleet. Set
 # here rather than imported the other way round, because the fleet is created
@@ -1500,6 +1504,83 @@ async def put_artifact(job_id: str, request: Request, kind: str = "",
             fh.write(chunk)
             size += len(chunk)
     return await _artifact_stored(job_id, dest, size)
+
+
+@app.put("/api/jobs/import")
+async def import_model(request: Request, name: str = "", base_model: str = "",
+                       project_id: str = "") -> dict:
+    """A LoRA adapter or a model trained somewhere else, as a finished run.
+
+    The body is a zip of the directory `save_pretrained` wrote -- for an
+    adapter, `adapter_config.json` and `adapter_model.safetensors` at the top
+    of the archive. It becomes a fine-tune run that succeeded, so everything a
+    run of this studio can be used for works on it too, and the one that
+    matters is carrying on: a new fine-tune with this run as `base_model_job`
+    loads the adapter and keeps training it, rather than starting a fresh one
+    and throwing away what it learned elsewhere.
+
+    The base model is read from the adapter's own config unless it is given,
+    because an adapter is useless without the exact model it was built on and
+    the config is the one place that is never retyped wrong.
+    """
+    user = security.current_user(request)
+    project_id = (project_id or "").strip()
+    prj = db.get_project(project_id) if project_id else None
+    if not prj or db.access_level("project", project_id, prj.get("owner_id"),
+                                  user) != "edit":
+        raise HTTPException(404, "Choose a project of yours to file the import in.")
+    from . import retention
+    try:
+        retention.check_quota(user["id"])
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    config.ensure_dirs()
+    label = (name or "").strip()[:120] or "Imported model"
+    jid = db.create_job(label, "finetune_llm", {"imported": True},
+                        owner_id=user["id"], project_id=project_id)
+    dest = artifact_file(jid)
+    size = 0
+    try:
+        with open(dest, "wb") as fh:
+            async for chunk in request.stream():
+                fh.write(chunk)
+                size += len(chunk)
+        with zipfile.ZipFile(dest) as z:
+            names = set(z.namelist())
+            adapter = json.loads(z.read("adapter_config.json")) \
+                if "adapter_config.json" in names else None
+            if adapter is None and "config.json" not in names:
+                raise ValueError(
+                    "The archive has neither adapter_config.json nor config.json "
+                    "at its top level. Zip the files of the directory "
+                    "save_pretrained wrote, not the directory itself.")
+    except (OSError, zipfile.BadZipFile, ValueError, KeyError) as e:
+        with contextlib.suppress(OSError):
+            dest.unlink()
+        db.delete_job(jid)
+        raise HTTPException(400, "That is not a model archive: %s" % e) from e
+    base = (base_model or "").strip() or (adapter or {}).get("base_model_name_or_path") or ""
+    if adapter is not None and not base:
+        dest.unlink()
+        db.delete_job(jid)
+        raise HTTPException(400, "The adapter does not say which model it was "
+                                 "built on. Give it as base_model.")
+    cfg = {"imported": True, "method": "lora" if adapter is not None else "full",
+           "base_model": base or None, "base_model_label": base or None}
+    if adapter is not None:
+        cfg.update({"lora_r": adapter.get("r"), "lora_alpha": adapter.get("lora_alpha"),
+                    "target_modules": adapter.get("target_modules")})
+    db.update_job_config(jid, cfg)
+    db.set_job_summary(jid, {"imported": True, "bytes": size})
+    db.set_job_status(jid, "succeeded")
+    db.add_log(jid, "Imported %s (%s MB)%s. Start a fine-tune with this run as "
+                    "its base to carry on training it." % (
+                        "a LoRA adapter" if adapter is not None else "a model",
+                        f"{size / 1048576:,.0f}", " for %s" % base if base else ""))
+    await _artifact_stored(jid, dest, size)
+    await fleet.broadcast_ui({"type": "jobs_changed"})
+    return {"id": jid, "kind": "adapter" if adapter is not None else "model",
+            "base_model": base or None, "bytes": size}
 
 
 @app.post("/api/jobs/{job_id}/artifact")

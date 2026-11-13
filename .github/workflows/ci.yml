@@ -101,6 +101,9 @@ jobs:
       - name: Reservations, deployments and the usage ledger
         run: python scripts/check-ops.py
 
+      - name: API keys, OAuth sign-in, MCP and imports
+        run: python scripts/check-mcp.py
+
       # Starts a controller of its own on a throwaway data directory and drives
       # the same HTTP endpoints a browser drives, in the order a person uses
       # them. This is the one that catches faults living in the seam between a
