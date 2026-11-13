@@ -1149,19 +1149,28 @@ def _call_for_template(call: dict, form: str, ids: dict | None = None) -> dict:
     }
 
 
-def tools_for_template(conv: dict) -> list[dict]:
-    """Tool definitions in both the nested and the flattened shape.
+def tools_for_template(conv: dict, flat: bool = True) -> list[dict]:
+    """Tool definitions in the nested shape, and with `flat` the flat one too.
 
     The nested one is what published templates iterate; the flat `name` and
     `description` are what `formatting.BUILTIN_CHAT_TEMPLATE` and the Harmony
     namespace writer read. Same objects, two ways in.
+
+    Only the studio's own templates get both. A model's published template
+    is handed exactly what `apply_chat_template(tools=...)` hands it, because
+    some of them print the whole object: Qwen2.5's writes `{{ tool | tojson }}`,
+    and given both shapes it wrote every definition twice -- 1,150 tokens more
+    per row for a Home Assistant tool set, and a prompt the model never sees
+    when it is served.
     """
     out = []
     for t in conv.get(TOOLS_KEY) or []:
         fn = t.get("function") or {}
-        out.append({"type": "function", "function": fn,
-                    "name": fn.get("name"), "description": fn.get("description") or "",
-                    "parameters": fn.get("parameters") or {}})
+        item = {"type": "function", "function": fn}
+        if flat:
+            item.update(name=fn.get("name"), description=fn.get("description") or "",
+                        parameters=fn.get("parameters") or {})
+        out.append(item)
     return out
 
 
@@ -1218,7 +1227,7 @@ def render(conv: dict, fmt: dict | None = None, *,
     fmt = formatting.resolve_format(fmt or {})
     template = template_for(fmt)
     conv = _system_into_first_user(conv, template, fmt.get("specials"))
-    tools = tools_for_template(conv)
+    tools = tools_for_template(conv, flat=not fmt.get("use_model_template"))
     text = formatting.render_template(
         template,
         row=conv.get(META_KEY) or {},
@@ -1368,11 +1377,41 @@ def segments(conv: dict, fmt: dict | None = None) -> list[dict]:
             return [{"role": None, "text": whole, "trainable": True,
                      "exact": False}]
         out.append({"role": msgs[i].get("role"), "text": prefix[len(previous):],
-                    "trainable": _trainable(msgs[i]), "exact": True})
+                    "trainable": _trainable(msgs[i]), "exact": True,
+                    "head": _turn_head(conv, fmt, msgs, i, previous,
+                                       prefix[len(previous):])})
         previous = prefix
-    out.append({"role": msgs[-1].get("role"), "text": whole[len(previous):],
-                "trainable": _trainable(msgs[-1]), "exact": True})
+    last = whole[len(previous):]
+    out.append({"role": msgs[-1].get("role"), "text": last,
+                "trainable": _trainable(msgs[-1]), "exact": True,
+                "head": _turn_head(conv, fmt, msgs, len(msgs) - 1, previous, last)})
     return out
+
+
+def _turn_head(conv: dict, fmt: dict | None, msgs: list[dict], i: int,
+               previous: str, text: str) -> int:
+    """How many characters at the start of an assistant turn are its header.
+
+    The header -- `<|im_start|>assistant\n` in ChatML -- is what the
+    generation prompt already puts there when the model is asked to answer,
+    so the model never writes it and is not scored on it: the same split the
+    `{% generation %}` markers of the published templates make. Measured
+    rather than assumed, like the turns themselves: the generation prompt
+    after the earlier messages, minus those messages, is the header, if the
+    turn actually starts with it. Anything else returns 0 and the whole turn
+    is trained, as before.
+    """
+    if msgs[i].get("role") != "assistant":
+        return 0
+    try:
+        gen = render({**conv, MESSAGES_KEY: msgs[:i]}, fmt,
+                     add_generation_prompt=True, more_turns=True)
+    except Exception:  # noqa: BLE001 - a template without one: train it all
+        return 0
+    if not gen.startswith(previous):
+        return 0
+    head = gen[len(previous):]
+    return len(head) if head and text.startswith(head) and len(head) < len(text) else 0
 
 
 # What a run learns from, when the data is a conversation.
@@ -1416,6 +1455,6 @@ def trainable_spans(conv: dict, fmt: dict | None = None,
     for p in parts:
         end = at + len(p["text"])
         if p["trainable"]:
-            spans.append((at, end))
+            spans.append((at + p.get("head", 0), end))
         at = end
     return text, spans, True
