@@ -42,8 +42,17 @@ RUN pip install --no-cache-dir \
 # on a machine with no card; this one is a fraction of the size and is the
 # same arithmetic. Installed in its own layer so a change to the line above
 # does not rebuild it.
+#
+# torchvision comes in the same resolve, for vision-language models: their
+# processors import it even to read a still photograph (Qwen3-VL's carries a
+# video processor that insists on it). Each torchvision pins the one torch it
+# was built for, so resolving both together from one index gives the newest
+# pair that is actually published. Picking torch first and deriving the
+# torchvision version from it broke the day the index had torch 2.15.0 and
+# no torchvision 0.30.0 -- its pair is 0.29.2: the old "0.(x+15)" rule no
+# longer holds.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-        "torch>=2.4"
+        "torch>=2.4" torchvision
 # `datasets` is here for the benchmarks: a published benchmark is a Hub
 # dataset, and the machine that scores it fetches it the way the tools that
 # publish those numbers do. Without it a benchmark run reaches the machine,
@@ -61,16 +70,9 @@ RUN pip install --no-cache-dir \
         "transformers>=5.0" "peft>=0.12" "accelerate>=0.33" "safetensors>=0.4" \
         "datasets>=2.20" "Pillow>=10"
 
-# torchvision, for vision-language models (after the line above, which
-# brings the numpy it imports): their processors import it even to
-# read a still photograph (Qwen3-VL's carries a video processor that insists on
-# it). Pinned to the release built for the torch already installed -- torch
-# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
-# because left to resolve on its own pip will happily "upgrade" torch to
-# whatever torchvision it found first, from the wrong index.
-RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
-    && pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cpu "torchvision==${TV}" \
-    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
+# The torch/torchvision pair from the layer above must survive the line just
+# before (pip may not swap torch for a PyPI build behind our back).
+RUN python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 
 # bitsandbytes, for serving in 4-bit on the processor when the runner is told
 # to (AI_STUDIO_CPU_QUANTIZATION=4bit). From 0.46 its Linux wheel carries a

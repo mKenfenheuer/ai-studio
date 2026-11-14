@@ -65,7 +65,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --no-cache-dir --upgrade pip wheel \
-    && pip install --no-cache-dir torch --index-url ${TORCH_INDEX}
+    && pip install --no-cache-dir torch torchvision --index-url ${TORCH_INDEX}
 
 # On CUDA the stock bitsandbytes wheel is correct, so 4-bit works out of the
 # box -- no source build needed, unlike the ROCm image.
@@ -86,15 +86,10 @@ RUN pip install --no-cache-dir \
 # every time this pin moves, and that compile is the long pole in this image.
 RUN pip install --no-cache-dir "lm-format-enforcer>=0.10" "jsonschema>=4.0"
 
-# torchvision, for vision-language models: their processors import it even to
-# read a still photograph (Qwen3-VL's carries a video processor that insists on
-# it). Pinned to the release built for the torch already installed -- torch
-# 2.x.y pairs with torchvision 0.(x+15).y -- and installed with --no-deps,
-# because left to resolve on its own pip will happily "upgrade" torch to
-# whatever torchvision it found first, from the wrong index.
-RUN TV="$(python -c 'import torch; M, m, p = torch.__version__.split("+")[0].split(".")[:3]; print("0.{}.{}".format(int(m) + 15, p))')" \
-    && pip install --no-cache-dir --no-deps --index-url ${TORCH_INDEX} "torchvision==${TV}" \
-    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
+# torchvision came with torch above, in one resolve from the same index:
+# each torchvision pins the torch it was built for, so pip takes the newest
+# published pair. Check it survived the layers in between.
+RUN python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
 
 # The GPU llama.cpp from the stage above, and the converter's own environment
 # (it pins an older torch and transformers than the runner -- see the CPU
