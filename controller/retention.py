@@ -189,7 +189,7 @@ def drop_model(job_id: str, why: str) -> dict:
     rows = db.list_artifacts(job_id)
     freed = 0
     for a in rows:
-        path = config.ARTIFACT_DIR / a["filename"]
+        path = config.artifact_path(a["filename"])
         try:
             freed += path.stat().st_size
             path.unlink()

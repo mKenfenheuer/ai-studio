@@ -13,7 +13,25 @@ def _env_path(name: str, default: str) -> Path:
 
 # Where the studio keeps its state. Mount this as a volume in Docker.
 DATA_DIR: Path = _env_path("AI_STUDIO_DATA", "./data")
-ARTIFACT_DIR: Path = DATA_DIR / "artifacts"
+# A directory the controller and its runners both mount, on one host or over
+# NFS/SMB. Optional. With it, a runner writes its finished model straight into
+# the place the controller keeps it and reads a model back without downloading
+# it, so a 6 GB result is on the disk once instead of in the runner's workdir,
+# in transit and on the controller. Without it, everything travels over HTTP
+# as it always has.
+SHARED_DIR: Path | None = (_env_path("AI_STUDIO_SHARED_DIR", "")
+                           if os.environ.get("AI_STUDIO_SHARED_DIR") else None)
+# Where artifacts lived before there was a shared directory. Still read, so an
+# install that turns sharing on keeps every model it already has.
+LEGACY_ARTIFACT_DIR: Path = DATA_DIR / "artifacts"
+ARTIFACT_DIR: Path = (SHARED_DIR / "artifacts" if SHARED_DIR
+                      else LEGACY_ARTIFACT_DIR)
+# Runners write here first; the controller moves a file into ARTIFACT_DIR when
+# the runner says it is complete, so a half-written zip is never an artifact.
+INCOMING_DIR: Path | None = SHARED_DIR / "incoming" if SHARED_DIR else None
+# Proves to a runner that the directory it mounts is this controller's and not
+# an empty folder of the same name. Its content is sent at registration.
+SHARE_MARKER = ".ai-studio-share"
 DB_PATH: Path = DATA_DIR / "studio.db"
 
 HOST: str = os.environ.get("AI_STUDIO_HOST", "0.0.0.0")
@@ -126,5 +144,73 @@ SERVING_QUEUE_RETRY_S: float = float(
     os.environ.get("AI_STUDIO_SERVING_QUEUE_RETRY_S") or 20)
 
 
+def artifact_path(filename: str) -> Path:
+    """Where an artifact file is: the shared directory, or where it used to be."""
+    path = ARTIFACT_DIR / filename
+    if SHARED_DIR and not path.exists():
+        old = LEGACY_ARTIFACT_DIR / filename
+        if old.exists():
+            return old
+    return path
+
+
+def share_id() -> str | None:
+    """The shared directory's identity, created on first use. None without one."""
+    if not SHARED_DIR:
+        return None
+    marker = SHARED_DIR / SHARE_MARKER
+    try:
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip() or None
+        SHARED_DIR.mkdir(parents=True, exist_ok=True)
+        tok = secrets.token_hex(16)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(tok, encoding="utf-8")
+        os.replace(tmp, marker)
+        return tok
+    except OSError:
+        return None
+
+
+def migrate_artifacts(log=print) -> None:
+    """Move artifacts from the data volume into the shared directory.
+
+    Only by rename, which is instant on one filesystem. A file on another
+    filesystem stays where it is and `artifact_path` keeps finding it there;
+    copying hundreds of gigabytes at startup would hold the controller down
+    for as long as that takes.
+    """
+    if not SHARED_DIR or not LEGACY_ARTIFACT_DIR.is_dir():
+        return
+    moved = stayed = 0
+    for old in LEGACY_ARTIFACT_DIR.iterdir():
+        if not old.is_file() or (ARTIFACT_DIR / old.name).exists():
+            continue
+        try:
+            os.rename(old, ARTIFACT_DIR / old.name)
+            moved += 1
+        except OSError:
+            stayed += 1
+    if moved or stayed:
+        log("[controller] shared directory: moved %d artifacts into %s%s"
+            % (moved, ARTIFACT_DIR, ", %d on another filesystem stay in %s"
+               % (stayed, LEGACY_ARTIFACT_DIR) if stayed else ""))
+
+
+def clean_incoming(max_age_s: float = 86400.0) -> None:
+    """Drop zips a runner began writing and never handed over, after a day."""
+    if not INCOMING_DIR or not INCOMING_DIR.is_dir():
+        return
+    import time
+    for f in INCOMING_DIR.iterdir():
+        try:
+            if f.is_file() and time.time() - f.stat().st_mtime > max_age_s:
+                f.unlink()
+        except OSError:
+            pass
+
+
 def ensure_dirs() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    if INCOMING_DIR:
+        INCOMING_DIR.mkdir(parents=True, exist_ok=True)

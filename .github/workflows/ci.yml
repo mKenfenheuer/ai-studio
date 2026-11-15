@@ -89,6 +89,9 @@ jobs:
       - name: Stored files are shared, counted and released
         run: python scripts/check-assets.py
 
+      - name: Runners share models with the controller through one directory
+        run: python scripts/check-shared.py
+
       - name: A model card says true things
         run: python scripts/check-cards.py
 

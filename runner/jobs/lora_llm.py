@@ -15,7 +15,7 @@ from typing import Any
 from common import chat_formats, conversation
 from common.formatting import (conversation_style, detect_format,
                                format_example)
-from runner import artifacts, checkpoints, earlystop, vision_lm
+from runner import artifacts, checkpoints, earlystop, shared, vision_lm
 from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
 from . import attentionfit, chunkedloss, merge, source
@@ -1159,8 +1159,7 @@ def run(cfg: dict, ctx: Any) -> dict:
         ctx, int(cfg.get("early_stop_patience") or earlystop.PATIENCE_FINETUNE),
         enabled=bool(cfg.get("early_stop", True)) and val_loader is not None,
         kind="adapter")
-    stopper.best = prior.get("best_val")
-    stopper.best_step = int(prior.get("best_step") or 0)
+    stopper.restore(prior)
     keep_best = bool(cfg.get("checkpointing_enabled", True))
     saver = checkpoints.Saver(
         ctx.job_id, ctx, every_s=float(cfg.get("checkpoint_every_s") or 600),
@@ -1172,8 +1171,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                     "scaler": scaler.state_dict() if use_scaler else None},
                    str(path / "trainer.pt"))
         (path / "train.json").write_text(json.dumps({
-            "first_loss": first_loss, "best_val": stopper.best,
-            "best_step": stopper.best_step,
+            "first_loss": first_loss, **stopper.state(),
             "duration_s": prior_seconds + (time.time() - t_start),
         }), encoding="utf-8")
 
@@ -1382,7 +1380,7 @@ def run(cfg: dict, ctx: Any) -> dict:
                   if vision else None,
     }
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
-    adapter_zip = artifacts.pack(out_dir, Path(ctx.workdir) / "adapter.zip")
+    adapter_zip = artifacts.pack(out_dir, shared.result_path(ctx, "adapter.zip"))
 
     ctx.log("%s Loss %.4f -> %.4f over %d steps%s."
             % ("Stopped early." if stopped_early else "Training done.",
@@ -1505,13 +1503,13 @@ def _merge_here(model_box: list, tok, cfg: dict, ctx: Any, summary: dict,
         json.dumps(merged_summary, indent=2))
     merge.write_readme(model_dir, {**merged_summary, "base_model": label})
 
-    archive = artifacts.pack(model_dir, Path(ctx.workdir) / "model.zip")
+    archive = artifacts.pack(model_dir, shared.result_path(ctx, "model.zip"))
     summary["merged"] = True
     summary["params_total"] = info.get("params_total")
     ctx.log("Done. The merged model is %.1f GB and loads with "
             "from_pretrained; the adapter is kept beside it at %.0f MB."
             % (archive.stat().st_size / 1024 ** 3,
-               (Path(ctx.workdir) / "adapter.zip").stat().st_size / 1048576))
+               shared.result_path(ctx, "adapter.zip").stat().st_size / 1048576))
     return archive
 
 

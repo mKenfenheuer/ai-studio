@@ -23,7 +23,7 @@ from typing import Callable, Iterable
 
 import httpx
 
-from . import paths
+from . import paths, shared
 
 CACHE_DIR = paths.ensure(Path(
     os.environ.get("AI_STUDIO_MODEL_CACHE") or paths.data_root() / "models"))
@@ -235,6 +235,11 @@ def _evict_hf(log: Callable[[str], None], keep_hf: Iterable[str] = ()) -> bool:
             return False
         if os.stat(HF_CACHE_DIR).st_dev != os.stat(_usable_cache_dir()).st_dev:
             return False  # a different volume; deleting there frees nothing here
+        if shared.contains(HF_CACHE_DIR):
+            # Other runners load base models from here too, and this one
+            # cannot see which they are using. The share is the admin's to
+            # size; evicting from it could pull a model out from under a run.
+            return False
         from huggingface_hub import scan_cache_dir
 
         info = scan_cache_dir(HF_CACHE_DIR)
@@ -357,6 +362,8 @@ def fetch(controller_url: str, token: str, job_id: str,
         if is_present(job_id, kind):
             touch(job_id, kind)
             return dest
+        if src := shared.artifact_zip(job_id, kind):
+            return _unpack_shared(src, job_id, kind, dest, keep, log)
         return _download(controller_url, token, job_id, kind, dest, keep, log)
 
 
@@ -475,6 +482,40 @@ def _download(controller_url: str, token: str, job_id: str,
     staging.rename(dest)
     touch(job_id, kind)
     log("Got %.0f MB." % (got / 1048576))
+    return dest
+
+
+def _unpack_shared(src: Path, job_id: str, kind: str | None, dest: Path,
+                   keep: Iterable[str], log: Callable[[str], None]) -> Path:
+    """Unpack a model from the shared directory, with no download and no copy.
+
+    The zip stays where the controller keeps it and is read in place, so the
+    only new bytes on disk are the unpacked model -- not a second zip beside it.
+    """
+    staging = dest.with_name(dest.name + ".partial")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    size = src.stat().st_size
+    ensure_room(size, list(keep) + [job_id], log)
+    log("Unpacking the trained model from the shared directory...")
+    try:
+        with zipfile.ZipFile(src) as z:
+            z.extractall(staging)
+    except (zipfile.BadZipFile, OSError) as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(
+            "The model in the shared directory would not unpack (%s)." % e) from e
+    if not _looks_like_model(staging):
+        found = sorted(p.name for p in staging.iterdir())[:8]
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(
+            "The saved result of %s unpacked to %s, which is not a model."
+            % (job_id, ", ".join(found) or "nothing"))
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging.rename(dest)
+    touch(job_id, kind)
+    log("Got %.0f MB." % (size / 1048576))
     return dest
 
 

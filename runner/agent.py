@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 import websockets
 
-from . import artifacts, capabilities, checkpoints, inference
+from . import artifacts, capabilities, checkpoints, inference, shared
 from . import limits as gpu_limits
 from .jobs import (evaluate, export_gguf, generate_data, lora_llm, scratch_llm, upload, vision_cls)
 
@@ -318,6 +318,8 @@ class Runner:
             if first.get("type") == "error":
                 print("[runner] controller rejected us: %s" % first.get("message"))
                 raise SystemExit(1)
+            if note := shared.confirm(first.get("share")):
+                print(note)
             print("[runner] connected to %s as %s" % (self.controller_url, self.runner_id))
             self._touch_liveness()
 
@@ -838,6 +840,11 @@ class Runner:
         finally:
             self.current = None
             shutil.rmtree(workdir, ignore_errors=True)
+            # A result packed into the share and never handed over: a run that
+            # failed after packing, or a controller that refused it.
+            if shared.active():
+                for leftover in shared.incoming_dir().glob(jid + "-*"):
+                    leftover.unlink(missing_ok=True)
             # Give the card back before anything else asks for it. A finished
             # run's model is unreachable but not yet collected, and until it is
             # the allocator holds every block it was using -- which is how the
@@ -940,6 +947,21 @@ class Runner:
         # No parameter for the primary artifact, so an older controller -- one
         # that has never heard of a second one -- still stores the model.
         params = None if kind in (None, "", "model") else {"kind": kind}
+
+        # Packed straight into the shared directory: nothing to send, only to
+        # say it is complete. Should the controller refuse, the same file is
+        # still here and goes over HTTP like any other.
+        if shared.is_incoming(path):
+            try:
+                r = httpx.post(url + "/shared",
+                               params={**(params or {}), "name": Path(path).name},
+                               headers={"X-Runner-Token": self.token},
+                               timeout=httpx.Timeout(120.0))
+                r.raise_for_status()
+                return
+            except httpx.HTTPError as e:
+                print("[runner] the controller did not take %s from the shared "
+                      "directory (%s); sending it over HTTP." % (Path(path).name, e))
         timeout = httpx.Timeout(connect=30.0, pool=30.0, write=1800.0, read=7200.0)
         total = os.path.getsize(path)
 

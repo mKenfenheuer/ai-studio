@@ -392,7 +392,7 @@ def _runs_to_score(request: Request, user: dict, wanted: list) -> list[dict]:
         # must not be distinguishable from one that is not there.
         if not db.access_level("job", job_id, job.get("owner_id"), user):
             raise HTTPException(404, "One of those runs does not exist.")
-        if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+        if not (config.artifact_path("%s.zip" % job_id)).exists():
             raise HTTPException(
                 400, "\"%s\" has no saved model, so there is nothing to "
                      "score." % job["name"])

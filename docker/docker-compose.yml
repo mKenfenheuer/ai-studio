@@ -43,7 +43,9 @@ services:
     ipc: host
     volumes:
       - runner-data:/data
+      - studio-shared:/shared
     environment:
+      AI_STUDIO_SHARED_DIR: /shared
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-amd-runner}
@@ -89,7 +91,9 @@ services:
     depends_on: [controller]
     volumes:
       - runner-cpu-data:/data
+      - studio-shared:/shared
     environment:
+      AI_STUDIO_SHARED_DIR: /shared
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_CPU_RUNNER_NAME:-controller-cpu}
@@ -106,5 +110,11 @@ services:
 
 volumes:
   studio-data:
+  # Models and the Hugging Face cache, mounted by the controller and every
+  # runner: a result is written once and read in place, with no upload or
+  # download between containers. For runners on other machines, make this an
+  # NFS or SMB volume they mount too (see docs/shared-storage.md); a runner
+  # that cannot see it falls back to HTTP on its own.
+  studio-shared:
   runner-data:
   runner-cpu-data:

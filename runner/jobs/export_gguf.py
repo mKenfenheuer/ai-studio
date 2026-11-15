@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from runner import artifacts
+from runner import artifacts, shared
 
 from .lora_llm import Cancelled
 
@@ -338,7 +338,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     # Stored, not deflated, for the same reason every other artifact is: a
     # quantised GGUF is dense and comes back one percent smaller having read
     # every byte.
-    zip_path = artifacts.pack(out_dir, Path(ctx.workdir) / ("%s-gguf.zip" % name))
+    zip_path = artifacts.pack(out_dir, shared.result_path(ctx, "%s-gguf.zip" % name))
     return {
         "kind": "export_gguf",
         "source_job": source_job,
@@ -410,7 +410,7 @@ def _export_adapter(cfg: dict, ctx: Any, source_job: str, quant: str) -> dict:
         % (name, outtype, cfg.get("base_job") or cfg.get("base_model"), final.name, source_job),
         encoding="utf-8")
     ctx.progress(3, 3, stage="saving")
-    zip_path = artifacts.pack(out_dir, Path(ctx.workdir) / ("%s-gguf.zip" % name))
+    zip_path = artifacts.pack(out_dir, shared.result_path(ctx, "%s-gguf.zip" % name))
     return {
         "kind": "export_gguf",
         "what": "adapter",

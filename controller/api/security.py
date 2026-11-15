@@ -44,6 +44,8 @@ PUBLIC_PREFIXES = ("/api/auth/sso/",)
 # has no session and no user.
 RUNNER_TOKEN_PATHS = (
     "/artifact",
+    # A result the runner wrote into the shared directory, handed over.
+    "/artifact/shared",
     "/download",
     # A sample a running job produced, into the asset store.
     "/sample",

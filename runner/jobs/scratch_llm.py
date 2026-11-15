@@ -36,7 +36,7 @@ from typing import Any, Iterator
 from common import chat_formats
 from common.formatting import (conversation_style,
                                detect_format, format_example, resolve_format)
-from runner import artifacts, checkpoints, earlystop
+from runner import artifacts, checkpoints, earlystop, shared
 from runner.capabilities import attention_plan, expert_kernel, peak_memory_gb
 
 from . import attentionfit, source
@@ -954,8 +954,7 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
         ctx, int(cfg.get("early_stop_patience") or earlystop.PATIENCE_PRETRAIN),
         enabled=bool(cfg.get("early_stop", True)) and n_val > 0,
         kind="model")
-    stopper.best = prior.get("best_val")
-    stopper.best_step = int(prior.get("best_step") or 0)
+    stopper.restore(prior)
     # The best snapshot is only worth going back for if it can still be read.
     # A run resumed on a machine that has the checkpoint but lost the `best`
     # directory should keep training, not promise a model it cannot produce.
@@ -981,7 +980,7 @@ def _train(cfg, ctx, model, tok, tokens, arch, S, np, torch) -> dict:
             "tokens_seen": tokens_seen, "first_loss": first_loss,
             "last_loss": last_loss, "worst_share": worst_share,
             "warned_router": warned_router,
-            "best_val": stopper.best, "best_step": stopper.best_step,
+            **stopper.state(),
             "duration_s": prior_seconds + (time.time() - t_start),
             "samples": samples[-6:],
         }), encoding="utf-8")
@@ -1322,7 +1321,7 @@ def _save(cfg, ctx, model, tok, arch, S, stats) -> dict:
     (out_dir / "ai_studio_summary.json").write_text(json.dumps(summary, indent=2))
     _write_readme(out_dir, summary, stats["samples"], cfg)
 
-    archive = artifacts.pack(out_dir, Path(ctx.workdir) / "model.zip")
+    archive = artifacts.pack(out_dir, shared.result_path(ctx, "model.zip"))
     summary["artifact_path"] = str(archive)
     summary["artifact_size"] = archive.stat().st_size
     summary["samples"] = stats["samples"][-3:]

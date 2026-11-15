@@ -15,7 +15,9 @@ services:
     depends_on: [controller]
     volumes:
       - runner-cuda-data:/data
+      - studio-shared:/shared
     environment:
+      AI_STUDIO_SHARED_DIR: /shared
       AI_STUDIO_CONTROLLER: http://controller:8420
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN}
       AI_STUDIO_RUNNER_NAME: ${AI_STUDIO_RUNNER_NAME:-nvidia-runner}
@@ -36,3 +38,4 @@ services:
 
 volumes:
   runner-cuda-data:
+  studio-shared:

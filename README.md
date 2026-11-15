@@ -349,6 +349,7 @@ automatic:
 | `AI_STUDIO_PORT` | controller | UI port (default `8420`) |
 | `AI_STUDIO_PUBLIC_URL` | controller | External URL, so SSO redirects are right |
 | `AI_STUDIO_JOIN_TOKEN` | both | Shared join secret; generated if unset |
+| `AI_STUDIO_SHARED_DIR` | both | A directory controller and runners all mount (same host or NFS/SMB): results are written and read in place, the Hugging Face cache is shared. See [docs/shared-storage.md](docs/shared-storage.md) |
 | `HF_TOKEN` | both | For gated models (Llama, Gemma) |
 | `AI_STUDIO_CONTROLLER` | runner | Controller URL |
 | `AI_STUDIO_RUNNER_NAME` | runner | Display name |

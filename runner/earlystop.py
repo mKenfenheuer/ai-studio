@@ -64,9 +64,30 @@ class Stopper:
         self.stopped = False
         self.announced = False
 
+    def state(self) -> dict:
+        """What a checkpoint must carry for a resume to stop where this would.
+
+        Without `waited`, a resumed run starts counting patience from zero and
+        trains up to `patience` more checks past the point where the
+        interrupted attempt would already have stopped.
+        """
+        return {"best_val": self.best, "best_step": self.best_step,
+                "stop_waited": self.waited}
+
+    def restore(self, prior: dict) -> None:
+        """Take back a `state()` from a checkpoint. Older ones lack `stop_waited`."""
+        self.best = prior.get("best_val")
+        self.best_step = int(prior.get("best_step") or 0)
+        self.waited = int(prior.get("stop_waited") or 0)
+
     def announce(self, eval_every: int) -> None:
         if not self.enabled:
             return
+        if self.waited:
+            self.ctx.log(
+                "Resuming with the %s %d of %d checks without improvement, "
+                "as the interrupted attempt left it."
+                % (self.metric, self.waited, self.patience))
         self.ctx.log(
             "Watching the %s. If it has not improved after %d "
             "checks in a row -- that is %d steps -- training stops there, and "

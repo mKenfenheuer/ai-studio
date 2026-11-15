@@ -135,7 +135,7 @@ def _servable(user: dict) -> list[dict]:
     for job in db.visible_jobs(user, 300):
         if job["status"] not in ("succeeded", "cancelled"):
             continue
-        if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
+        if not (config.artifact_path("%s.zip" % job["id"])).exists():
             continue
         if job["kind"] not in spec_for.MODEL_KINDS:
             continue
@@ -815,7 +815,7 @@ async def register_model(request: Request, alias: str,
     require_view(request, "job", job)
     if job["kind"] not in spec_for.MODEL_KINDS:
         raise HTTPException(400, "That run did not produce a model to serve.")
-    if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+    if not (config.artifact_path("%s.zip" % job_id)).exists():
         raise HTTPException(400, "That run has no saved model, so nothing "
                                  "could be served under this name.")
 

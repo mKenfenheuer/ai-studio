@@ -37,6 +37,9 @@ def _tune_allocator() -> None:
 
 def main() -> None:
     _tune_allocator()
+    # Before anything imports huggingface_hub, which reads its cache path once.
+    from . import shared
+    shared.configure_env()
     p = argparse.ArgumentParser(
         prog="ai-studio-runner",
         description="Join this machine's GPU to an AI Studio controller.")

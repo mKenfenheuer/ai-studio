@@ -39,6 +39,8 @@ _UNSET = object()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
+    config.migrate_artifacts()
+    config.clean_incoming()
     dsets.ensure_dirs()
     db.connect()
     # Any runner marked online in a previous process is stale until it dials in.
@@ -184,7 +186,8 @@ async def runner_ws(ws: WebSocket) -> None:
         fleet.note_checkpoints(runner_id, first.get("checkpoints") or [],
                                first.get("checkpoint_detail"))
         fleet.attach(runner_id, ws)
-        await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id}))
+        await ws.send_text(json.dumps({"type": "registered", "runner_id": runner_id,
+                                       "share": config.share_id()}))
         # And what it may use of its own card, if this studio has narrowed it.
         # Sent on every connect rather than only when it changes: a runner
         # restarts with whatever its compose file says and has no memory of
@@ -795,7 +798,7 @@ async def _create_job(request: Request, payload: dict) -> str:
             source_id := (cfg.get("continue_from") or cfg.get("base_model_job")
                           or cfg.get("source_job"))):
         src = _job_or_404(request, source_id)
-        if not (config.ARTIFACT_DIR / ("%s.zip" % source_id)).exists():
+        if not (config.artifact_path("%s.zip" % source_id)).exists():
             raise HTTPException(400, "That run has no saved model to build on.")
         if src["status"] not in ("succeeded", "cancelled"):
             raise HTTPException(400, "That run has not finished yet.")
@@ -1476,7 +1479,7 @@ async def delete_job(request: Request, job_id: str) -> dict:
     assets.release_job(job_id)
     for filename in db.delete_job(job_id):
         with contextlib.suppress(OSError):
-            (config.ARTIFACT_DIR / filename).unlink()
+            config.artifact_path(filename).unlink()
 
     # Runners cache a copy of any model they have served. Ask them to drop it,
     # so deleting a run actually reclaims the space rather than only hiding it.
@@ -1497,7 +1500,7 @@ def artifact_file(job_id: str, kind: str = "") -> Path:
     one -- download, publish, the fit checks, an older runner -- still finds
     the thing it expects.
     """
-    return config.ARTIFACT_DIR / (
+    return config.artifact_path(
         "%s.zip" % job_id if kind in ("", "model", None)
         else "%s-%s.zip" % (job_id, kind))
 
@@ -1531,6 +1534,38 @@ async def put_artifact(job_id: str, request: Request, kind: str = "",
             fh.write(chunk)
             size += len(chunk)
     return await _artifact_stored(job_id, dest, size)
+
+
+@app.post("/api/jobs/{job_id}/artifact/shared")
+async def adopt_shared_artifact(job_id: str, name: str, kind: str = "",
+                                x_runner_token: str = Header(default="")) -> dict:
+    """Take a result the runner wrote into the shared directory.
+
+    Nothing travels: the runner packed the zip into `incoming/` on the
+    directory both of them mount, and this moves it to where artifacts live.
+    The rename is on one filesystem, so it is instant whatever the size, and
+    the zip only becomes an artifact once the runner has finished writing it.
+    """
+    if x_runner_token != config.join_token():
+        raise HTTPException(401, "Invalid runner token.")
+    if not db.get_job(job_id):
+        raise HTTPException(404, "No such job.")
+    if not config.INCOMING_DIR:
+        raise HTTPException(409, "This controller has no shared directory.")
+    if (Path(name).name != name or not name.startswith(job_id)
+            or not name.endswith(".zip")):
+        raise HTTPException(400, "Not a file this run may hand over.")
+    src = config.INCOMING_DIR / name
+    if not src.is_file():
+        raise HTTPException(404, "There is no %s in the shared directory." % name)
+    config.ensure_dirs()
+    dest = config.ARTIFACT_DIR / artifact_file(job_id, kind).name
+    os.replace(src, dest)
+    old = config.LEGACY_ARTIFACT_DIR / dest.name
+    if old != dest:
+        with contextlib.suppress(OSError):
+            old.unlink()
+    return await _artifact_stored(job_id, dest, dest.stat().st_size)
 
 
 @app.put("/api/jobs/import")
@@ -1941,7 +1976,7 @@ async def job_chat_template(request: Request, job_id: str) -> dict:
     showing the user something the run will not produce.
     """
     _job_or_404(request, job_id)
-    path = config.ARTIFACT_DIR / ("%s.zip" % job_id)
+    path = config.artifact_path("%s.zip" % job_id)
     if not path.exists():
         return {"available": False, "reason": "This run has no saved model."}
     import zipfile
@@ -2914,7 +2949,7 @@ async def playground(request: Request) -> list[dict]:
         # to talk to; the status only says how it got there.
         if job["status"] not in ("succeeded", "cancelled"):
             continue
-        if not (config.ARTIFACT_DIR / ("%s.zip" % job["id"])).exists():
+        if not (config.artifact_path("%s.zip" % job["id"])).exists():
             continue
         # Resolved, not raw: a merge records how to perform the merge, and
         # borrows from the run it was made from everything about how to talk
@@ -3103,7 +3138,7 @@ async def chat(request: Request, job_id: str, payload: dict = Body(...)) -> dict
     # keeping pointless.
     if job["status"] not in ("succeeded", "cancelled"):
         raise HTTPException(400, "This run has not finished.")
-    if not (config.ARTIFACT_DIR / ("%s.zip" % job_id)).exists():
+    if not (config.artifact_path("%s.zip" % job_id)).exists():
         raise HTTPException(400, "This run did not leave a downloadable model.")
     # A conversation, not a string. The playground keeps the turns so the model
     # sees the same running context it was trained on; a single prompt is still

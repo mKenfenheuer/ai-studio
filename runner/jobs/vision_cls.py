@@ -41,7 +41,7 @@ from typing import Any
 
 import httpx
 
-from runner import artifacts, earlystop
+from runner import artifacts, earlystop, shared
 
 from . import source
 from .lora_llm import Cancelled, _versions
@@ -345,7 +345,7 @@ def run(cfg: dict, ctx: Any) -> dict:
     processor.save_pretrained(str(out_dir))
     (out_dir / "labels.json").write_text(json.dumps(labels, ensure_ascii=False, indent=1),
                                          encoding="utf-8")
-    zip_path = artifacts.pack(out_dir, Path(ctx.workdir) / "model.zip")
+    zip_path = artifacts.pack(out_dir, shared.result_path(ctx, "model.zip"))
 
     summary = {
         "kind": "finetune_vision_cls",
