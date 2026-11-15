@@ -14,9 +14,11 @@ services:
       - "${AI_STUDIO_UI_PORT:-8420}:8420"
     volumes:
       - studio-data:/data
+      - studio-shared:/shared
     environment:
       # Set a fixed token so runners can be configured before first boot.
       AI_STUDIO_JOIN_TOKEN: ${AI_STUDIO_JOIN_TOKEN:?set AI_STUDIO_JOIN_TOKEN in .env}
+      AI_STUDIO_SHARED_DIR: /shared
       HF_TOKEN: ${HF_TOKEN:-}
 
   runner-rocm:
